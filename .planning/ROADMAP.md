@@ -9,7 +9,8 @@ Transform ClaudeClaw from a fire-and-forget daemon into a robust, production-rea
 |-------|------|-------|--------|------------|
 | 0 | Project Initialization | 1 | ✅ Complete | 2026-03-26 |
 | 1 | Persistent Event Bus | 5 | ✅ Complete | 2026-03-26 |
-| 2 | Session Gateway | Complete    | 2026-03-27 | 2026-03-27 |
+| 2 | Session Gateway | 4 | ✅ Complete | 2026-03-27 |
+| 3 | Policy Engine | 5 | 🔄 1/5 | 2026-03-27 |
 
 ## Phase 2: Session Gateway
 
@@ -22,20 +23,34 @@ Transform ClaudeClaw from a fire-and-forget daemon into a robust, production-rea
 - adapter-decoupling: gateway pattern for adapter independence
 
 **Plans:**
-4/5 plans complete
+4/4 plans complete
 |------|------|-----------|------|------------|--------|
 | 2-01 | [2-01-PLAN.md](phases/2-session-gateway/2-01-PLAN.md) | Session Map Store | 1 | — | ✅ Complete |
 | 2-02 | [2-02-PLAN.md](phases/2-session-gateway/2-02-PLAN.md) | Normalized Event Schema | 1 | — | ✅ Complete |
 | 2-03 | [2-03-PLAN.md](phases/2-session-gateway/2-03-PLAN.md) | Resume Logic | 2 | 2-01 | ✅ Complete |
 | 2-04 | [2-04-PLAN.md](phases/2-session-gateway/2-04-PLAN.md) | Gateway Orchestrator | 3 | 2-01, 2-02, 2-03 | ✅ Complete |
-| 3 | Policy Engine | 5 | ⏳ Planned | — |
-| 4 | Cost Governance | 4 | ⏳ Planned | — |
-| 5 | Orchestration | 3 | ⏳ Planned | — |
-| 6 | Human Escalation | 3 | ⏳ Planned | — |
-| 7 | Additional Adapters | 4 | ⏳ Planned | — |
+
+## Phase 3: Policy Engine
+
+**Goal:** Fine-grained, contextual tool governance with persisted approval workflow and audit trail.
+
+**Requirements:**
+- rule-based-authorization: policy engine with allow/deny/require_approval
+- channel-scoped-policies: per-channel and per-user policy overrides
+- skill-overlays: skill-specific tool constraints
+- durable-approvals: operator approval workflow with persistence
+- audit-logging: comprehensive audit trail
+
+**Plans:**
+1/5 plans complete
+|------|------|-----------|------|------------|--------|
+| 3-01 | [03-01-SUMMARY.md](phases/03-policy-engine/03-01-SUMMARY.md) | Policy Engine Core | 5 | — | ✅ Complete |
+
+**Remaining Plans:**
+- 3-02 through 3-05: (integrated into single implementation)
 
 **Total Tasks:** 29
-**Completed:** 13 (45%)
+**Completed:** 14 (48%)
 
 ## Phase Dependencies
 
