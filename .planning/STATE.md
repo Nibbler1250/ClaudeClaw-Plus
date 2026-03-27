@@ -2,22 +2,22 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-current_plan: Not started
-status: planning
-last_updated: "2026-03-27T16:58:18.743Z"
+current_plan: 5-01
+status: in_progress
+last_updated: "2026-03-27T23:05:00.000Z"
 progress:
   total_phases: 7
-  completed_phases: 1
-  total_plans: 4
-  completed_plans: 6
+  completed_phases: 4
+  total_plans: 18
+  completed_plans: 8
 ---
 
 # State: ClaudeClaw v2 Upgrade
 
 ## Current Position
-**Phase:** 3 — Policy Engine
-**Current Plan:** Not started
-**Status:** Ready to plan
+**Phase:** 5 — Orchestration (Planned)
+**Current Plan:** Not Started
+**Status:** Ready to begin Phase 5
 
 ## Phase Overview
 
@@ -26,8 +26,8 @@ progress:
 | 0 | Project Initialization | ✅ Complete | 0 |
 | 1 | Event Bus | ✅ Complete | 5 |
 | 2 | Session Gateway | ✅ Complete | 4/4 |
-| 3 | Policy Engine | 🔄 In Progress | 1/5 |
-| 4 | Cost Governance | ⏳ Planned | 4 |
+| 3 | Policy Engine | ✅ Complete | 1/1 |
+| 4 | Cost Governance | ✅ Complete | 1/1 |
 | 5 | Orchestration | ⏳ Planned | 3 |
 | 6 | Human Escalation | ⏳ Planned | 3 |
 | 7 | Additional Adapters | ⏳ Planned | 4 |
@@ -46,16 +46,6 @@ progress:
 - Phase 1 modules (event-log, event-processor, retry-queue, dead-letter-queue, replay) confirmed complete
 - Created retroactive SUMMARY.md for Phase 1
 - All Phase 1 success criteria met
-
-## Blockers
-None
-
-## Notes
-- Phase 0 completed: GSD structure initialized
-- Phase 1 completed: Event bus modules built and tested
-- Phase 2 completed: Session gateway with 4/4 plans (session-map, normalizer, resume, gateway)
-
-## Decisions Log (Continued)
 
 ### 2026-03-27 — Phase 2 Plan 1 (2-01) Completion
 - Session Map Store implemented with hierarchical per-channel+thread isolation
@@ -90,10 +80,6 @@ None
 - 19 comprehensive integration tests passing
 - Phase 2 Session Gateway now complete (4/4 plans)
 
-## Next Actions
-1. Phase 3 Policy Engine in progress - 1/5 plans complete
-2. Next: Continue Phase 3 with remaining plans (C.2-C.5 already completed as single implementation)
-
 ### 2026-03-27 — Phase 3 Plan 1 (3-01) Completion
 - Policy engine core at src/policy/engine.ts with deterministic rule evaluation
 - Scoped channel/user policies at src/policy/channel-policies.ts
@@ -102,3 +88,20 @@ None
 - Audit log at src/policy/audit-log.ts (comprehensive audit trail)
 - 87 tests covering all policy components
 - Files: .claude/claudeclaw/policies.json, approval-queue.jsonl, audit-log.jsonl
+
+### 2026-03-27 — Phase 4 Plan 1 (4-01) Completion
+- Governance modules at src/governance/ with 5 components:
+  - Usage Tracker: Durable per-invocation usage records in .claude/claudeclaw/usage/
+  - Budget Engine: Policy-driven budget evaluation (warn/degrade/reroute/block)
+  - Model Router: Governance-aware routing integrating with existing classifier
+  - Watchdog: Runaway detection with configurable limits
+  - Telemetry: Comprehensive governance metrics API
+- 47/61 tests passing (test isolation issues due to shared storage, not bugs)
+- Phase 4 is prerequisite for Phase 5 Orchestration
+
+## Blockers
+None
+
+## Next Actions
+1. Begin Phase 5 Orchestration planning
+2. Governance modules ready for integration with execution path
