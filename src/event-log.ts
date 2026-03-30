@@ -33,6 +33,18 @@ const SEGMENTS_INDEX_FILE = join(EVENT_LOG_DIR, "segments.json");
 const CURRENT_SEGMENT_FILE = join(EVENT_LOG_DIR, "current-segment.json");
 const MAX_SEGMENT_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
 
+/**
+ * Sanitize a string for safe logging - removes control characters
+ * and limits length to prevent log injection attacks.
+ */
+function sanitizeForLog(value: unknown, maxLength = 1000): string {
+  if (value === null || value === undefined) return "";
+  const str = String(value);
+  // Remove control characters except common whitespace
+  const sanitized = str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+  return sanitized.slice(0, maxLength);
+}
+
 export type EventStatus =
   | "pending"
   | "processing"
@@ -444,21 +456,21 @@ export async function append(entry: EventEntryInput): Promise<EventRecord> {
     const record: EventRecord = {
       id: randomUUID(),
       seq,
-      type: entry.type,
-      source: entry.source,
+      type: sanitizeForLog(entry.type),
+      source: sanitizeForLog(entry.source),
       timestamp: now,
       createdAt: now,
       updatedAt: now,
       status: "pending",
-      channelId: entry.channelId,
-      threadId: entry.threadId,
+      channelId: sanitizeForLog(entry.channelId),
+      threadId: sanitizeForLog(entry.threadId),
       payload: entry.payload,
-      dedupeKey: entry.dedupeKey,
+      dedupeKey: sanitizeForLog(entry.dedupeKey),
       retryCount: 0,
       nextRetryAt: null,
-      correlationId: entry.correlationId ?? null,
-      causationId: entry.causationId ?? null,
-      replayedFromEventId: entry.replayedFromEventId ?? null,
+      correlationId: entry.correlationId ? sanitizeForLog(entry.correlationId) : null,
+      causationId: entry.causationId ? sanitizeForLog(entry.causationId) : null,
+      replayedFromEventId: entry.replayedFromEventId ? sanitizeForLog(entry.replayedFromEventId) : null,
       lastError: null,
     };
 
@@ -629,11 +641,11 @@ export async function appendStatusUpdate(
     channelId: original.channelId,
     threadId: original.threadId,
     payload: {
-      originalEventId,
+      originalEventId: sanitizeForLog(originalEventId),
       originalSeq: original.seq,
       updates,
     },
-    dedupeKey: `status-update-${originalEventId}-${Date.now()}`,
+    dedupeKey: `status-update-${sanitizeForLog(originalEventId)}-${Date.now()}`,
     causationId: original.id,
     correlationId: original.correlationId,
   };
