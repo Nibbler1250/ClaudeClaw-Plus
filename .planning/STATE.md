@@ -2,21 +2,21 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-current_plan: 7-01 (Complete)
+current_plan: 8-01 (Complete)
 status: complete
-last_updated: "2026-03-28T13:55:00Z"
+last_updated: "2026-03-30T08:23:32Z"
 progress:
-  total_phases: 7
-  completed_phases: 7
-  total_plans: 11
-  completed_plans: 11
+  total_phases: 8
+  completed_phases: 8
+  total_plans: 12
+  completed_plans: 12
 ---
 
 # State: ClaudeClaw v2 Upgrade
 
 ## Current Position
-**Phase:** 7 — Additional Adapters (Complete)
-**Current Plan:** 7-01 (Complete)
+**Phase:** 8 — Policy Integration (Complete)
+**Current Plan:** 8-01 (Complete)
 **Status:** Complete — All phases finished
 
 ## Phase Overview
@@ -31,6 +31,7 @@ progress:
 | 5 | Orchestration | ✅ Complete | 1/1 |
 | 6 | Human Escalation | ✅ Complete | 2/2 |
 | 7 | Additional Adapters | ✅ Complete | 1/1 |
+| 8 | Policy Integration | ✅ Complete | 1/1 |
 
 ## Decisions Log
 
@@ -152,6 +153,18 @@ progress:
 - All scaffolds explicitly state "no working implementation included"
 - 3,161 lines of documentation created
 - 7 per-task commits with no fake code
+
+### 2026-03-30 — Phase 8 Plan 1 (8-01) Gap Closure
+- GovernanceClient interface created at src/governance/client.ts
+  - Unified access to policy evaluation, approval queue, and governance telemetry
+  - Singleton pattern with getGovernanceClient() and initGovernanceClient()
+- Policy engine evaluate() wired to gateway via evaluatePolicy() and checkToolApproval()
+  - Policy evaluation happens after session mapping (Step 2b)
+  - Denied requests return error immediately
+  - require_approval requests enqueue to durable approval queue
+- Runner prepared with evaluateToolForExecution() wrapper for future per-tool hooks
+- 4 tasks completed: GovernanceClient, gateway wiring, runner wrapper, integration tests
+- REQ-3.1, REQ-3.3, REQ-5.1 requirements completed
 
 ## Blockers
 None
