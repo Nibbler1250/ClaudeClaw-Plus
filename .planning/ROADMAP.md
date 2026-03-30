@@ -15,6 +15,8 @@ Transform ClaudeClaw from a fire-and-forget daemon into a robust, production-rea
 | 5 | Orchestration | 5 | ✅ Complete | 2026-03-28 |
 | 6 | Human Escalation | 6 | ✅ Complete | 2026-03-28 |
 | 7 | Additional Adapters | 7 | ✅ Complete | 2026-03-28 |
+| 8 | Policy Integration | 4 | Pending | — |
+| 9 | Gateway Integration | 3 | Pending | — |
 
 ## Phase 2: Session Gateway
 
@@ -85,7 +87,7 @@ Phase 0 ────────────────────────
 Phase 1 (Event Bus) ──────────────────────────────────────►
      │
      ▼
-Phase 2 (Gateway) ────────────────────────────────────────►
+Phase 2 (Gateway) ───────────────────────────────────────►
      │
      ├──► Phase 3 (Policy) ────────────────────────────────►
      │         │
@@ -94,8 +96,12 @@ Phase 2 (Gateway) ────────────────────�
      │                    └──► Phase 5 (Orchestration) ────►
      │                              │
      │                              └──► Phase 6 (Escalation) ►
+     │                                        │
+     │                                        └──► Phase 8 (Policy Integration) ──►
      │
       └──► Phase 7 (Adapters) ──────────────────────────────►
+                                                          │
+                                                          └──► Phase 9 (Gateway Integration) ──►
 ```
 
 ## Phase 6 Gap Closure: Wire Escalation Integration
@@ -114,6 +120,37 @@ Phase 2 (Gateway) ────────────────────�
 |------|------|-----------|------|------------|--------|
 | 6-01 | [6-01-SUMMARY.md](phases/06-human-escalation/6-01-SUMMARY.md) | Human Escalation Core | 5 | — | ✅ Complete |
 | 6-02 | [6-02-SUMMARY.md](phases/06-human-escalation/6-02-SUMMARY.md) | Wire Escalation Integration | 5 | 6-01 | ✅ Complete |
+
+## Phase 8: Policy Integration (Gap Closure)
+
+**Goal:** Wire policy engine and approval queue into execution path, implement GovernanceClient integration.
+
+**Requirements:**
+- rule-based-authorization: policy engine wired to gateway/runner
+- durable-approvals: approval queue wired to event processing
+
+**Gap Closure:** Closes gaps from v1.0 audit:
+- REQ-3.1: policy/engine evaluate() never called
+- REQ-3.3: approval-queue enqueue() never called
+- REQ-5.1: GovernanceClient interface not implemented
+
+**Plans:**
+|------|------|-----------|------|------------|--------|
+| 8-01 | [8-01-PLAN.md](phases/08-policy-integration/8-01-PLAN.md) | Wire Policy to Execution | TBD | — | Pending |
+
+## Phase 9: Gateway Integration (Gap Closure)
+
+**Goal:** Wire adapters to gateway, connect event processor to gateway flow.
+
+**Requirements:**
+- adapter-decoupling: adapters must route through gateway
+
+**Gap Closure:** Closes gaps from v1.0 audit:
+- GATEWAY-01: telegram/discord bypass gateway
+
+**Plans:**
+|------|------|-----------|------|------------|--------|
+| 9-01 | [9-01-PLAN.md](phases/09-gateway-integration/9-01-PLAN.md) | Wire Adapters to Gateway | TBD | — | Pending |
 
 ## Milestones
 
@@ -167,7 +204,9 @@ Phase 2 (Gateway) ────────────────────�
 | 5 | 5 | 5 |
 | 6 | 6 | 6 |
 | 7 | 7 | 7 |
-| **Total** | **38** | **38 (100%)** |
+| 8 | TBD | TBD |
+| 9 | TBD | TBD |
+| **Total** | **38+** | **38 (pending 8-9)** |
 
 ## Risk Areas
 
