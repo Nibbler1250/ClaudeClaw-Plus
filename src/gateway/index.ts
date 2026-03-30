@@ -26,6 +26,9 @@ import {
   type ResumeArgs,
 } from "./resume";
 import { shouldBlockAdmission } from "../escalation";
+import { evaluate, type ToolRequestContext, type PolicyDecision } from "../policy/engine";
+import { enqueue } from "../policy/approval-queue";
+import { getGovernanceClient } from "../governance/client";
 
 // --- Gateway Configuration ---
 
@@ -118,6 +121,55 @@ export class Gateway {
   }
 
   /**
+   * Evaluate a tool request against policy rules.
+   */
+  private evaluatePolicy(event: NormalizedEvent, toolName: string, toolArgs?: Record<string, unknown>): PolicyDecision {
+    const gc = getGovernanceClient();
+    const request: ToolRequestContext = {
+      eventId: event.id || crypto.randomUUID(),
+      source: event.channel,
+      channelId: event.channelId,
+      threadId: event.threadId,
+      userId: event.userId,
+      toolName,
+      toolArgs,
+      timestamp: new Date(event.timestamp).toISOString(),
+      metadata: event.metadata,
+    };
+    return gc.evaluateToolRequest(request);
+  }
+
+  /**
+   * Check if approval is required and enqueue if so.
+   * Returns true if the request was enqueued for approval.
+   */
+  private async checkToolApproval(
+    event: NormalizedEvent, 
+    decision: PolicyDecision
+  ): Promise<{ needsApproval: boolean; approvalId?: string }> {
+    if (decision.action !== "require_approval") {
+      return { needsApproval: false };
+    }
+    
+    const gc = getGovernanceClient();
+    const request: ToolRequestContext = {
+      eventId: event.id || crypto.randomUUID(),
+      source: event.channel,
+      channelId: event.channelId,
+      threadId: event.threadId,
+      userId: event.userId,
+      toolName: decision.matchedRuleId || "unknown",
+      timestamp: new Date(event.timestamp).toISOString(),
+    };
+    
+    const entry = await gc.requestApproval(request, decision);
+    if (entry) {
+      return { needsApproval: true, approvalId: entry.id };
+    }
+    return { needsApproval: false };
+  }
+
+  /**
    * Process an inbound normalized event.
    * 
    * Flow:
@@ -157,6 +209,30 @@ export class Gateway {
         event.channelId,
         event.threadId
       );
+
+      // Step 2b: Evaluate policy for inbound event
+      // This evaluates the incoming message as a "tool" request
+      const policyDecision = this.evaluatePolicy(event, "InboundMessage", {
+        messageLength: event.text?.length ?? 0,
+        hasAttachments: (event.attachments ?? []).length > 0,
+      });
+
+      // Check if approval is required
+      const { needsApproval, approvalId } = await this.checkToolApproval(event, policyDecision);
+      if (needsApproval) {
+        return { 
+          success: false, 
+          error: `Request requires approval (ID: ${approvalId}). Please wait for operator approval.`,
+        };
+      }
+
+      // If denied, reject the request
+      if (policyDecision.action === "deny") {
+        return { 
+          success: false, 
+          error: `Request denied: ${policyDecision.reason}`,
+        };
+      }
 
       // Step 3: Append event to event log (sequence number assigned by event log)
       const eventRecord = await this.deps.eventLog.append({
