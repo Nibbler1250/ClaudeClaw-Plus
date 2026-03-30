@@ -4,18 +4,18 @@ milestone: v1.0
 milestone_name: milestone
 current_plan: Not started
 status: completed
-last_updated: "2026-03-30T19:40:21.974Z"
+last_updated: "2026-03-30T20:22:29Z"
 progress:
-  total_phases: 12
-  completed_phases: 9
-  total_plans: 14
-  completed_plans: 18
+  total_phases: 13
+  completed_phases: 13
+  total_plans: 15
+  completed_plans: 19
 ---
 
 # State: ClaudeClaw v2 Upgrade
 
 ## Current Position
-**Phase:** 12 — Verify Adapter Docs (Complete)
+**Phase:** 13 — Gap Closure (Complete)
 **Current Plan:** Not started
 **Status:** Milestone complete
 
@@ -36,6 +36,7 @@ progress:
 | 10 | Orchestrator Governance Bridge | ✅ Complete | 1/1 |
 | 11 | Policy Engine Verification | ✅ Complete | 2/2 |
 | 12 | Verify Adapter Docs | ✅ Complete | 1/1 |
+| 13 | Gap Closure | ✅ Complete | 1/1 |
 
 ## Decisions Log
 
@@ -206,6 +207,12 @@ progress:
 - Cross-document consistency confirmed (ChannelAdapter in contracts.md, referenced by all adapter READMEs)
 - All per-adapter scaffolds explicitly disclaim implementation ("no working implementation")
 - Created 12-VERIFICATION.md with full verification report
+
+### 2026-03-30 — Phase 13 Plan 1 (13-01) Gap Closure
+- Wired OrchestratorGovernanceAdapter via setGovernanceClient() in initializeJobSystem()
+- Policy denials trigger escalation via handlePolicyDenial() in gateway
+- DLQ overflow triggers escalation via handleDlqOverflow() when threshold (100) exceeded
+- All 3 remaining integration gaps from v1.0 milestone audit now closed
 
 ## Blockers
 None
