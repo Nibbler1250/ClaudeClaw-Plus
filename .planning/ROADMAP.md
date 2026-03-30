@@ -199,8 +199,8 @@ Phase 2 (Gateway) ────────────────────�
 - Phase 7 has no verification file
 
 **Plans:**
-0/1 plans pending
-| 12-01 | TBD | Verify Adapter Documentation | — | Pending |
+1/1 plans complete
+| 12-01 | [12-01-PLAN.md](phases/12-verify-adapter-docs/12-01-PLAN.md) | Verify Adapter Documentation | — | Pending |
 
 ## Milestones
 
