@@ -6,6 +6,50 @@ import { readHeartbeatSettings, updateHeartbeatSettings } from "./services/setti
 import { createQuickJob, deleteJob } from "./services/jobs";
 import { readLogs } from "./services/logs";
 
+// --- Security: CSRF Protection ---
+const CSRF_SECRET = process.env.CSRF_SECRET ?? "claudeclaw-insecure-default-change-in-production";
+const CSRF_COOKIE_NAME = "csrf_token";
+const CSRF_HEADER_NAME = "X-CSRF-Token";
+
+interface CsrfToken {
+  token: string;
+  expiresAt: number;
+}
+
+const csrfTokens = new Map<string, CsrfToken>();
+
+function generateCsrfToken(sessionId: string): string {
+  const token = crypto.randomUUID();
+  csrfTokens.set(sessionId, {
+    token,
+    expiresAt: Date.now() + 3600000, // 1 hour
+  });
+  return token;
+}
+
+function validateCsrfToken(sessionId: string, token: string): boolean {
+  const entry = csrfTokens.get(sessionId);
+  if (!entry) return false;
+  if (Date.now() > entry.expiresAt) {
+    csrfTokens.delete(sessionId);
+    return false;
+  }
+  if (entry.token !== token) return false;
+  return true;
+}
+
+function sanitizeForLog(value: string): string {
+  // Remove newlines and control characters to prevent log injection
+  return value.replace(/[\x00-\x08\x0A-\x0F\x1F]/g, "").slice(0, 1000);
+}
+
+function createCsrfHeaders(token: string): Record<string, string> {
+  return {
+    [CSRF_HEADER_NAME]: token,
+    "Cache-Control": "no-store",
+  };
+}
+
 export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
   const server = Bun.serve({
     hostname: opts.host,
@@ -24,6 +68,17 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
         return json({ ok: true, now: Date.now() });
       }
 
+      if (url.pathname === "/api/csrf-token") {
+        const sessionId = req.headers.get("Cookie")?.match(/session_id=([^;]+)/)?.[1] ?? "anonymous";
+        const token = generateCsrfToken(sessionId);
+        return new Response(JSON.stringify({ token }), {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          },
+        });
+      }
+
       if (url.pathname === "/api/state") {
         return json(await buildState(opts.getSnapshot()));
       }
@@ -33,6 +88,15 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
       }
 
       if (url.pathname === "/api/settings/heartbeat" && req.method === "POST") {
+        // CSRF validation
+        const csrfToken = req.headers.get(CSRF_HEADER_NAME);
+        const sessionId = req.headers.get("Cookie")?.match(/session_id=([^;]+)/)?.[1] ?? "anonymous";
+        if (!csrfToken || !validateCsrfToken(sessionId, csrfToken)) {
+          return new Response(JSON.stringify({ ok: false, error: "Invalid CSRF token" }), {
+            status: 403,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
         try {
           const body = await req.json();
           const payload = body as {
@@ -113,6 +177,15 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
       }
 
       if (url.pathname === "/api/jobs/quick" && req.method === "POST") {
+        // CSRF validation
+        const csrfToken = req.headers.get(CSRF_HEADER_NAME);
+        const sessionId = req.headers.get("Cookie")?.match(/session_id=([^;]+)/)?.[1] ?? "anonymous";
+        if (!csrfToken || !validateCsrfToken(sessionId, csrfToken)) {
+          return new Response(JSON.stringify({ ok: false, error: "Invalid CSRF token" }), {
+            status: 403,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
         try {
           const body = await req.json();
           const result = await createQuickJob(body as { time?: unknown; prompt?: unknown });
@@ -151,6 +224,15 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
 
       if (url.pathname === "/api/chat" && req.method === "POST") {
         if (!opts.onChat) return json({ ok: false, error: "chat not configured" });
+        // CSRF validation
+        const csrfToken = req.headers.get(CSRF_HEADER_NAME);
+        const sessionId = req.headers.get("Cookie")?.match(/session_id=([^;]+)/)?.[1] ?? "anonymous";
+        if (!csrfToken || !validateCsrfToken(sessionId, csrfToken)) {
+          return new Response(JSON.stringify({ ok: false, error: "Invalid CSRF token" }), {
+            status: 403,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
         try {
           const body = await req.json();
           const message = String(body?.message ?? "").trim();
