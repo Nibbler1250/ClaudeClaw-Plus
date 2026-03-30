@@ -15,7 +15,7 @@ Transform ClaudeClaw from a fire-and-forget daemon into a robust, production-rea
 | 5 | Orchestration | 5 | ✅ Complete | 2026-03-28 |
 | 6 | Human Escalation | 6 | ✅ Complete | 2026-03-28 |
 | 7 | Additional Adapters | 7 | ✅ Complete | 2026-03-28 |
-| 8 | Policy Integration | Complete    | 2026-03-30 | — |
+| 8 | Policy Integration | 4 | ✅ Complete | 2026-03-30 |
 | 9 | Gateway Integration | 3 | Pending | — |
 
 ## Phase 2: Session Gateway
@@ -150,13 +150,14 @@ Phase 2 (Gateway) ────────────────────�
 
 **Requirements:**
 - adapter-decoupling: adapters must route through gateway
+- GATEWAY-01: telegram/discord bypass gateway
 
 **Gap Closure:** Closes gaps from v1.0 audit:
 - GATEWAY-01: telegram/discord bypass gateway
 
 **Plans:**
 |------|------|-----------|------|------------|--------|
-| 9-01 | [9-01-PLAN.md](phases/09-gateway-integration/9-01-PLAN.md) | Wire Adapters to Gateway | TBD | — | Pending |
+| 9-01 | [9-01-PLAN.md](phases/09-gateway-integration/9-01-PLAN.md) | Wire Adapters to Gateway | 3 | — | Pending |
 
 ## Milestones
 
@@ -210,9 +211,9 @@ Phase 2 (Gateway) ────────────────────�
 | 5 | 5 | 5 |
 | 6 | 6 | 6 |
 | 7 | 7 | 7 |
-| 8 | 4 | 0 |
+| 8 | 4 | 4 |
 | 9 | 3 | 0 |
-| **Total** | **42** | **38** |
+| **Total** | **45** | **42** |
 
 ## Risk Areas
 
