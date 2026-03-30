@@ -15,7 +15,7 @@ Transform ClaudeClaw from a fire-and-forget daemon into a robust, production-rea
 | 5 | Orchestration | 5 | ✅ Complete | 2026-03-28 |
 | 6 | Human Escalation | 6 | ✅ Complete | 2026-03-28 |
 | 7 | Additional Adapters | 7 | ✅ Complete | 2026-03-28 |
-| 8 | Policy Integration | 4 | Planned | — |
+| 8 | Policy Integration | Complete    | 2026-03-30 | — |
 | 9 | Gateway Integration | 3 | Pending | — |
 
 ## Phase 2: Session Gateway
@@ -135,7 +135,7 @@ Phase 2 (Gateway) ────────────────────�
 - REQ-5.1: GovernanceClient interface not implemented
 
 **Plans:**
-|------|------|-----------|------|------------|--------|
+1/1 plans complete
 | 8-01 | [8-01-PLAN.md](phases/08-policy-integration/8-01-PLAN.md) | Wire Policy to Execution | 4 | — | Pending |
 
 **Plan 8-01 Tasks:**
