@@ -175,8 +175,8 @@ Phase 2 (Gateway) ────────────────────�
 - orchestrator-governance-flow (broken)
 
 **Plans:**
-0/1 plans pending
-| 10-01 | TBD | Bridge GovernanceClient Interface | — | Pending |
+1/1 plans pending
+| 10-01 | [10-01-PLAN.md](phases/10-orchestrator-governance-bridge/10-01-PLAN.md) | Bridge GovernanceClient Interface | 2 | — | Pending |
 
 ## Phase 11: Re-verify Phase 3 Policy Engine
 
