@@ -94,3 +94,11 @@ export {
   type GovernanceTelemetry,
   type TelemetryFilters,
 } from "./telemetry";
+
+// GovernanceClient
+export {
+  GovernanceClient,
+  getGovernanceClient,
+  initGovernanceClient,
+  type GovernanceClientConfig,
+} from "./client";
