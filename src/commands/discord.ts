@@ -107,6 +107,10 @@ let resumeGatewayUrl: string | null = null;
 let heartbeatAcked = true;
 let running = true;
 let discordDebug = false;
+let botUserId: string | null = null;
+let botUsername: string | null = null;
+let applicationId: string | null = null;
+let readyGuildIds: Set<string> | null = null;
 
 // --- Security: Rate Limiting ---
 interface DiscordRateLimitEntry {
