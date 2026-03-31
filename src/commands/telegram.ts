@@ -411,15 +411,23 @@ async function sendDocumentToChat(
 
 function extractReactionDirective(text: string): { cleanedText: string; reactionEmoji: string | null } {
   let reactionEmoji: string | null = null;
-  const cleanedText = text
-    .replace(/\[react:([^\]\r\n]+)\]/gi, (_match, raw) => {
-      const candidate = String(raw).trim();
-      if (!reactionEmoji && candidate) reactionEmoji = candidate;
-      return "";
-    })
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  
+  // Step 1: Extract reaction directive
+  let cleanedText = text.replace(/\[react:([^\]\r\n]+)\]/gi, (_match, raw) => {
+    const candidate = String(raw).trim();
+    if (!reactionEmoji && candidate) reactionEmoji = candidate;
+    return "";
+  });
+  
+  // Step 2: Remove trailing whitespace before newlines
+  cleanedText = cleanedText.replace(/[ \t]+\n/g, "\n");
+  
+  // Step 3: Collapse excessive newlines
+  cleanedText = cleanedText.replace(/\n{3,}/g, "\n\n");
+  
+  // Step 4: Trim final result
+  cleanedText = cleanedText.trim();
+  
   return { cleanedText, reactionEmoji };
 }
 
@@ -923,7 +931,13 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
     try {
       const resp = await fetch(`http://127.0.0.1:9999/confirm/${pendingId}/${action}`);
       const result = await resp.json() as { ok: boolean };
-      answerText = action === "yes" && result.ok ? "✅ Đã gửi!" : result.ok ? "❌ Dismissed" : "⚠️ Not found";
+      if (action === "yes" && result.ok) {
+        answerText = "✅ Đã gửi!";
+      } else if (result.ok) {
+        answerText = "❌ Dismissed";
+      } else {
+        answerText = "⚠️ Not found";
+      }
       if (query.message) {
         const statusLine = action === "yes" ? "\n\n✅ Sent" : "\n\n❌ Dismissed";
         const newText = (query.message.text ?? "").replace(/\n\nReply:.*$/s, statusLine);

@@ -481,7 +481,12 @@ export function formatStatus(status: EscalationStatus): string {
     lines.push("No handoffs");
   } else {
     for (const h of status.handoffs.slice(0, 10)) {
-      const icon = h.severity === "critical" ? "🔴" : h.severity === "warning" ? "🟡" : "🔵";
+      let icon = "🔵";
+      if (h.severity === "critical") {
+        icon = "🔴";
+      } else if (h.severity === "warning") {
+        icon = "🟡";
+      }
       lines.push(`${icon} [${h.status.toUpperCase()}] ${h.reason.slice(0, 50)}${h.reason.length > 50 ? "..." : ""}`);
       lines.push(`   ID: ${h.handoffId} | Created: ${h.createdAt}`);
     }

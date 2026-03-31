@@ -243,8 +243,14 @@ export function normalizeTelegramMessage(message: TelegramMessage): NormalizedEv
   if (message.document) {
     const isImage = message.document.mime_type?.startsWith("image/");
     const isAudio = message.document.mime_type?.startsWith("audio/");
+    let attachmentType = "document";
+    if (isImage) {
+      attachmentType = "image";
+    } else if (isAudio) {
+      attachmentType = "voice";
+    }
     attachments.push({
-      type: isImage ? "image" : isAudio ? "voice" : "document",
+      type: attachmentType,
       mimeType: message.document.mime_type,
       filename: message.document.file_name,
       sizeBytes: message.document.file_size,
@@ -310,8 +316,14 @@ export function normalizeDiscordMessage(message: DiscordMessage): NormalizedEven
     const isVoice =
       (att.flags ?? 0) & (1 << 13) || att.content_type?.startsWith("audio/");
 
+    let attachmentType = "document";
+    if (isImage) {
+      attachmentType = "image";
+    } else if (isVoice) {
+      attachmentType = "voice";
+    }
     return {
-      type: isImage ? "image" : isVoice ? "voice" : "document",
+      type: attachmentType,
       url: att.url,
       filename: att.filename,
       sizeBytes: att.size,
