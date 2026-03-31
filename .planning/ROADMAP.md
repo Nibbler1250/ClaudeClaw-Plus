@@ -22,6 +22,7 @@ Transform ClaudeClaw from a fire-and-forget daemon into a robust, production-rea
 | 12 | 1/1 | Complete    | 2026-03-30 | 2026-03-30 |
 | 13 | Gap Closure | Complete    | 2026-03-30 |
 | 14 | Security Hardening | Complete    | 2026-03-30 | 2026-03-30 |
+| 15 | Test Fix & Simplification | [To be planned] | — | — |
 
 ## Phase 2: Session Gateway
 
@@ -314,3 +315,29 @@ Phase 2 (Gateway) ────────────────────�
 10. **Path traversal in filenames** → Fixed in Phase 14
 11. **No CSRF on web UI** → Fixed in Phase 14
 12. **Log injection vulnerability** → Fixed in Phase 14
+13. **41 test failures** → Fixed in Phase 15
+14. **Code complexity** → Simplified in Phase 15
+
+## Phase 15: Test Fix & Simplification
+
+**Goal:** 
+1. Fix all 41 pre-existing test failures across gateway, governance, escalation, and policy test suites
+2. Apply code simplification across entire codebase to improve maintainability
+
+**Requirements:**
+- TEST-01: All pre-existing test failures diagnosed and categorized
+- TEST-02: Gateway test failures fixed (7+ tests passing)
+- TEST-03: Governance test failures fixed (12+ tests passing)
+- TEST-04: Escalation/Policy test failures fixed (6+ tests passing)
+- TEST-05: All remaining test failures fixed
+- TEST-06: Full test suite passes with >95% pass rate
+- SIMP-01: Code simplified with clear, explicit patterns
+- SIMP-02: Nested ternaries converted to if/else or switch
+- SIMP-03: Overly compact code broken into clear steps
+- SIMP-04: Redundant abstractions removed
+- SIMP-05: Project standards consistently applied
+- SIMP-06: All simplifications preserve exact functionality
+
+**Plans:**
+- [ ] 15-01-PLAN.md — Fix test failures (Wave 1)
+- [ ] 15-02-PLAN.md — Code simplification (Wave 2, depends on 15-01)
