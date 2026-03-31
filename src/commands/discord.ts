@@ -260,15 +260,23 @@ async function sendReaction(
 
 function extractReactionDirective(text: string): { cleanedText: string; reactionEmoji: string | null } {
   let reactionEmoji: string | null = null;
-  const cleanedText = text
-    .replace(/\[react:([^\]\r\n]+)\]/gi, (_match, raw) => {
-      const candidate = String(raw).trim();
-      if (!reactionEmoji && candidate) reactionEmoji = candidate;
-      return "";
-    })
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+
+  // Step 1: Extract reaction directive
+  let cleanedText = text.replace(/\[react:([^\]\r\n]+)\]/gi, (_match, raw) => {
+    const candidate = String(raw).trim();
+    if (!reactionEmoji && candidate) reactionEmoji = candidate;
+    return "";
+  });
+
+  // Step 2: Remove trailing whitespace before newlines
+  cleanedText = cleanedText.replace(/[ \t]+\n/g, "\n");
+
+  // Step 3: Collapse excessive newlines
+  cleanedText = cleanedText.replace(/\n{3,}/g, "\n\n");
+
+  // Step 4: Trim final result
+  cleanedText = cleanedText.trim();
+
   return { cleanedText, reactionEmoji };
 }
 
