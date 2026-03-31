@@ -2,14 +2,14 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-current_plan: "15-01"
+current_plan: "15-02"
 status: in_progress
-last_updated: "2026-03-31T08:50:00.000Z"
+last_updated: "2026-03-31T09:02:00.000Z"
 progress:
   total_phases: 15
   completed_phases: 14
   total_plans: 19
-  completed_plans: 21
+  completed_plans: 22
 ---
 
 # State: ClaudeClaw v2 Upgrade
@@ -38,7 +38,7 @@ progress:
 | 12 | Verify Adapter Docs | ✅ Complete | 1/1 |
 | 13 | Gap Closure | ✅ Complete | 1/1 |
 | 14 | Security Hardening | ✅ Complete | 1/1 |
-| 15 | Test Fix & Simplification | ◐ Partial | 1/2 |
+| 15 | Test Fix & Simplification | ◐ Partial | 2/2 |
 
 ## Decisions Log
 
@@ -232,13 +232,22 @@ progress:
 - Test pass rate: 574/577 (99.5%) - exceeds >95% target
 - Remaining 3 failures are pre-existing test isolation issues
 
+### 2026-03-31 — Phase 15 Plan 2 (15-02) Code Simplification
+- Converted nested ternary operators to if/else chains in 4 files:
+  - telegram.ts: handleCallbackQuery() answer text selection
+  - status.ts: formatStatus() icon emoji selection
+  - normalizer.ts: normalizeTelegramMessage() and normalizeDiscordMessage() attachment types
+- Simplified chained .replace() calls in extractReactionDirective() (telegram.ts and discord.ts)
+- Preserved intentional HTML escaping pipelines (3 chained replaces) as deliberate patterns
+- Test pass rate maintained: 574 pass / 3 fail (pre-existing)
+
 ## Blockers
 None
 
 ## Next Actions
 1. ✅ All 14 phases complete — ClaudeClaw v2 architecture fully verified
 2. ✅ Phase 15 Plan 1 (15-01) Complete - 99.5% test pass rate
-3. **Current:** Phase 15 Plan 2 (15-02) - Code simplification across codebase
+3. ✅ Phase 15 Plan 2 (15-02) Complete - Code simplification complete
 4. Future: Implement Slack adapter (requires Phase 7 documentation as guide)
 5. Future: Implement GitHub adapter (requires Phase 7 documentation as guide)
 6. Future: Implement Email adapter (requires Phase 7 documentation as guide)
