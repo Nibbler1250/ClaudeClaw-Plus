@@ -57,13 +57,20 @@ Then open a Claude Code session and run:
 ```
 The setup wizard walks you through model, heartbeat, Telegram, Discord, and security, then your daemon is live with a web dashboard.
 
+## v2.0 Milestone Complete ✓
+
+**All phases complete** — ClaudeClaw v2.0 is fully verified with:
+- **574 tests passing (99.5% pass rate)**
+- **Security hardening applied** (rate limiting, file size limits, CSRF protection, log injection prevention)
+- **Code simplification** applied across core modules
+
 ## What Would Be Built Next?
 
 > **Mega Post:** Help shape the next ClaudeClaw features.
-> Vote, suggest ideas, and discuss priorities in **[this post](https://github.com/moazbuilds/claudeclaw/issues/14)**.
+> Vote, suggest ideas, and discuss priorities in **[this post](https://github.com/moazbuilds/ClaudeClaw/issues/14)**.
 
 <p align="center">
-  <a href="https://github.com/moazbuilds/claudeclaw/issues/14">
+  <a href="https://github.com/moazbuilds/ClaudeClaw/issues/14">
     <img src="https://img.shields.io/badge/Roadmap-Mega%20Post-blue?style=for-the-badge&logo=github" alt="Roadmap Mega Post" />
   </a>
 </p>
@@ -84,6 +91,252 @@ The setup wizard walks you through model, heartbeat, Telegram, Discord, and secu
 - **Web Dashboard:** Manage jobs, monitor runs, and inspect logs in real time.
 - **Security Levels:** Four access levels from read-only to full system access.
 - **Model Selection:** Switch models based on your workload.
+
+## Architecture
+
+### Core Modules
+
+```
+src/
+├── event-log.ts          # Append-only event log with daily rotation
+├── event-processor.ts    # Event dispatch and processing
+├── retry-queue.ts        # Retry handling with exponential backoff
+├── dead-letter-queue.ts  # Failed event DLQ
+├── replay.ts             # Event replay capability
+├── gateway/              # Session mapping and routing layer
+│   ├── index.ts          # Gateway orchestrator
+│   ├── session-map.ts    # Per-channel+thread session isolation
+│   ├── normalizer.ts     # Unified event schema
+│   └── resume.ts         # Session resume logic
+├── policy/               # Policy engine
+│   ├── engine.ts         # Rule evaluation
+│   ├── channel-policies.ts  # Per-channel overrides
+│   ├── skill-overlays.ts    # Skill-specific constraints
+│   ├── approval-queue.ts     # Durable approval workflow
+│   └── audit-log.ts          # Audit trail
+├── governance/            # Cost and model governance
+│   ├── usage-tracker.ts   # Per-invocation usage records
+│   ├── budget-engine.ts   # Budget evaluation (warn/degrade/block)
+│   ├── model-router.ts    # Governance-aware routing
+│   ├── watchdog.ts        # Runaway detection
+│   ├── telemetry.ts       # Governance metrics
+│   └── client.ts          # Unified GovernanceClient interface
+├── orchestrator/          # Task orchestration
+│   ├── task-graph.ts      # Graph validation and sorting
+│   ├── workflow-state.ts  # Crash-safe state persistence
+│   ├── executor.ts        # Task execution
+│   ├── resumable-jobs.ts  # Job scheduling
+│   ├── governance-adapter.ts  # Governance bridge
+│   └── telemetry.ts        # Orchestration metrics
+├── escalation/            # Human escalation
+│   ├── pause.ts           # Pause/resume modes
+│   ├── handoff.ts         # Structured handoff packages
+│   ├── notifications.ts    # 7 notification types
+│   ├── triggers.ts        # Policy-driven escalation
+│   └── status.ts          # Status aggregation
+├── commands/              # Channel adapters
+│   ├── telegram.ts        # Telegram integration
+│   └── discord.ts         # Discord integration
+├── adapters/              # Additional channel adapters (scaffolds)
+│   ├── slack/             # Slack adapter (future)
+│   ├── teams/             # Teams adapter (future)
+│   ├── email/             # Email adapter (future)
+│   └── github/            # GitHub adapter (future)
+└── ui/                    # Web dashboard
+```
+
+### Data Storage
+
+All state stored in `.claude/claudeclaw/`:
+```
+.claude/claudeclaw/
+├── event-log/           # Append-only event log (rotated daily)
+├── retry-queue.json     # Retry queue state
+├── dlq.jsonl           # Dead letter queue
+├── session-map.json     # Channel→session mappings
+├── audit-log.jsonl      # Policy decision audit trail
+├── usage/               # Per-session usage accounting
+├── workflows/           # Persisted workflow state
+├── paused.json          # Pause state flag
+├── jobs/                # Scheduled job definitions
+└── logs/                # Run logs
+```
+
+## Configuration
+
+### Settings File
+
+ClaudeClaw stores settings in `.claude/claudeclaw/settings.json`:
+
+```json
+{
+  "model": "claude-sonnet-4-20250514",
+  "api": "https://api.anthropic.com",
+  "fallback": {
+    "model": "claude-3-5-haiku-20241022",
+    "api": "https://api.anthropic.com"
+  },
+  "agentic": {
+    "enabled": true,
+    "defaultMode": "implementation",
+    "modes": [
+      {
+        "name": "planning",
+        "model": "claude-opus-4-20250514",
+        "keywords": ["plan", "design", "architect", "strategy"]
+      },
+      {
+        "name": "implementation",
+        "model": "claude-sonnet-4-20250514",
+        "keywords": ["implement", "code", "write", "create", "build"]
+      }
+    ]
+  },
+  "timezone": "America/New_York",
+  "timezoneOffsetMinutes": -240,
+  "heartbeat": {
+    "enabled": true,
+    "interval": 15,
+    "prompt": "How's everything going?",
+    "excludeWindows": [],
+    "forwardToTelegram": true
+  },
+  "telegram": {
+    "token": "123456:ABC-DEF...",
+    "allowedUserIds": [123456789]
+  },
+  "discord": {
+    "token": "ABC123...",
+    "allowedUserIds": ["123456789012345678"],
+    "listenChannels": []
+  },
+  "security": {
+    "level": "moderate",
+    "allowedTools": [],
+    "disallowedTools": []
+  },
+  "web": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 4632
+  },
+  "stt": {
+    "baseUrl": "",
+    "model": ""
+  }
+}
+```
+
+### Security Levels
+
+| Level | Description |
+|-------|-------------|
+| `locked` | Only allow explicitly listed tools |
+| `strict` | Allow all tools except dangerous ones |
+| `moderate` | Allow most tools with some restrictions |
+| `unrestricted` | Full access (not recommended) |
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `USE_GATEWAY` | Enable gateway layer for event routing | `false` |
+| `USE_GATEWAY_TELEGRAM` | Route Telegram through gateway | `false` |
+| `USE_GATEWAY_DISCORD` | Route Discord through gateway | `false` |
+
+### Feature Flags
+
+Gateway routing is controlled by environment variables:
+```bash
+# Enable gateway for all events
+USE_GATEWAY=true
+
+# Enable gateway only for specific channels
+USE_GATEWAY_TELEGRAM=true
+USE_GATEWAY_DISCORD=true
+```
+
+## Security Features
+
+### Rate Limiting
+- **Telegram:** 30 messages/minute per user
+- **Discord:** 30 messages/minute per user
+- In-memory tracking with automatic cleanup
+
+### File Upload Protection
+- **25MB maximum** file size for all attachments
+- Prevents disk exhaustion attacks
+
+### Filename Sanitization
+- Removes null bytes, path traversal sequences (`../`), and unsafe characters
+- Prevents path traversal attacks
+
+### CSRF Protection
+- Token validation on all web UI state-changing endpoints:
+  - `/api/settings/heartbeat`
+  - `/api/jobs/quick`
+  - `/api/chat`
+- Tokens expire after 1 hour
+
+### Log Injection Prevention
+- All user-controlled fields sanitized before logging
+- Prevents log forgery attacks
+
+## Development
+
+### Running Tests
+
+```bash
+# Run all tests
+bun test
+
+# Run specific test file
+bun test src/__tests__/gateway/index.test.ts
+
+# Run with coverage
+bun test --coverage
+```
+
+**Test Suite Status:** 574/577 tests passing (99.5%)
+
+### Project Structure
+
+```
+moazbuilds-claudeclaw/
+├── src/
+│   ├── __tests__/           # Test files (co-located with source)
+│   ├── commands/            # Telegram, Discord adapters
+│   ├── gateway/             # Session mapping layer
+│   ├── policy/              # Policy engine
+│   ├── governance/          # Cost + model governance
+│   ├── orchestrator/        # Task graph + workflow
+│   ├── escalation/          # Human escalation
+│   ├── adapters/            # Additional channel adapters
+│   └── ui/                  # Web dashboard
+├── .planning/               # GSD planning artifacts
+├── .claude-plugin/          # Claude Code plugin manifest
+├── package.json
+├── tsconfig.json
+└── bun.lock
+```
+
+### Tech Stack
+
+| Component | Choice | Rationale |
+|-----------|--------|-----------|
+| Runtime | **Bun** | Fast startup, native TypeScript, ESM-first |
+| Package Manager | **Bun** | Native workspace, fast installs |
+| Language | **TypeScript** | Type safety, IDE support |
+| Module System | **ESM** | Native async, tree-shaking |
+| Persistence | **Flat JSON/JSONL** | Zero dependencies, human-readable |
+| Test Runner | **Bun test** | Built-in, fast, Jest-compatible |
+
+### Key Design Decisions
+
+1. **Flat files over database** — Zero external dependencies, easy backup/restore
+2. **Bun over Node.js** — Faster startup, native TypeScript
+3. **ESM over CommonJS** — Tree-shaking, top-level await
+4. **Additive only** — No breaking changes to existing modules
 
 ## FAQ
 
@@ -131,6 +384,6 @@ The setup wizard walks you through model, heartbeat, Telegram, Discord, and secu
 
 Thanks for helping make ClaudeClaw better.
 
-<a href="https://github.com/moazbuilds/claudeclaw/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=moazbuilds/claudeclaw" />
+<a href="https://github.com/moazbuilds/ClaudeClaw/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=moazbuilds/ClaudeClaw" />
 </a>
