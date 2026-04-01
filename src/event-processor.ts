@@ -28,6 +28,7 @@ import {
   readFrom,
   appendStatusUpdate,
   getLastSeq,
+  findEventById,
   type EventRecord,
   type EventStatus,
 } from "./event-log";
@@ -311,6 +312,66 @@ export async function processNext(): Promise<boolean> {
 }
 
 /**
+ * Process a specific persisted event by ID.
+ * Used by the gateway to process inbound events.
+ */
+export async function processPersistedEvent(eventId: string): Promise<ProcessingResult> {
+  if (!processorConfig) {
+    return { success: false, error: "Processor not initialized. Call initProcessor() first." };
+  }
+
+  // Find the event
+  const event = await findEventById(eventId);
+  if (!event) {
+    return { success: false, error: `Event ${eventId} not found` };
+  }
+
+  // Check for duplicates
+  const dedupeKey = getDedupeKey(event);
+  if (isDuplicate(dedupeKey)) {
+    console.log(`[processor] Skipping duplicate event ${event.id} (seq ${event.seq})`);
+    return { success: true }; // Already processed
+  }
+
+  // Process the event
+  console.log(`[processor] Processing persisted event ${event.id} (seq ${event.seq}, type: ${event.type})`);
+
+  let result: ProcessingResult;
+  try {
+    result = await processorConfig.onEvent(event);
+  } catch (err) {
+    result = {
+      success: false,
+      error: err instanceof Error ? err.message : String(err),
+      shouldRetry: true,
+    };
+  }
+
+  if (result.success) {
+    // Mark as done
+    await appendStatusUpdate(event.id, { status: "done" });
+    // Record for deduplication
+    await recordProcessed(event, dedupeKey);
+    console.log(`[processor] Successfully processed persisted event ${event.id}`);
+  } else {
+    // Handle failure
+    if (result.shouldRetry) {
+      await appendStatusUpdate(event.id, {
+        status: "retry_scheduled",
+        lastError: result.error ?? null,
+      });
+    } else {
+      await appendStatusUpdate(event.id, {
+        status: "dead_lettered",
+        lastError: result.error ?? null,
+      });
+    }
+  }
+
+  return result;
+}
+
+/**
  * Process all pending events sequentially.
  * Returns the number of events processed.
  */
@@ -382,4 +443,64 @@ export function getDedupeStats(): {
  */
 export function hasDedupeKey(key: string): boolean {
   return isDuplicate(key);
+}
+
+// --- Gateway wiring ---
+
+let gatewayProcessFn: ((eventId: string) => Promise<ProcessingResult>) | null = null;
+
+/**
+ * Initialize the event processor for use with the gateway.
+ * This must be called before processing Discord/Telegram events through the gateway.
+ * 
+ * @param processFn - The function to call for each persisted event.
+ *                     For Discord/Telegram, this should call runUserMessage.
+ */
+export async function initGatewayProcessor(
+  processFn: (source: string, prompt: string) => Promise<{ exitCode: number; stdout: string; stderr: string }>
+): Promise<void> {
+  await initProcessor({
+    retentionDays: 7,
+    onEvent: async (event) => {
+      try {
+        const normalizedEvent = (event.payload as any)?.normalizedEvent;
+        if (!normalizedEvent) {
+          return { success: false, error: "No normalizedEvent in payload" };
+        }
+
+        // Get prompt from metadata if already built, otherwise use text
+        const prompt = (normalizedEvent.metadata as any)?.prompt || normalizedEvent.text;
+        if (!prompt) {
+          return { success: false, error: "No prompt in event" };
+        }
+
+        const source = event.source || normalizedEvent.channel;
+        const result = await processFn(source, prompt);
+
+        return {
+          success: result.exitCode === 0,
+          error: result.exitCode !== 0 ? result.stderr : undefined,
+        };
+      } catch (err) {
+        return {
+          success: false,
+          error: err instanceof Error ? err.message : String(err),
+          shouldRetry: true,
+        };
+      }
+    },
+  });
+
+  // Create the processPersistedEvent wrapper for the gateway
+  gatewayProcessFn = async (eventId: string): Promise<ProcessingResult> => {
+    return processPersistedEvent(eventId);
+  };
+}
+
+/**
+ * Get the gateway processor function.
+ * Returns null if initGatewayProcessor hasn't been called.
+ */
+export function getGatewayProcessor(): ((eventId: string) => Promise<ProcessingResult>) | null {
+  return gatewayProcessFn;
 }

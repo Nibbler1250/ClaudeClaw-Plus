@@ -8,7 +8,9 @@ import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
 import { mkdir } from "node:fs/promises";
 import { extname, join } from "node:path";
-import { submitDiscordToGateway } from "../gateway";
+import { processInboundEvent, setGatewayEnabled } from "../gateway";
+import { normalizeDiscordMessage, type NormalizedEvent } from "../gateway/normalizer";
+
 
 // --- Discord API constants ---
 
@@ -531,23 +533,41 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
       );
     }
 
-    // Check per-adapter feature flag for gateway routing
+    // Build the prompt for Claude
+    const prompt = promptParts.join("\n");
+    debugLog(`Prompt: ${prompt.slice(0, 100)}...`);
+
+    // Use v2 gateway path if enabled
     if (process.env.USE_GATEWAY_DISCORD === "true") {
-      const gatewayResult = await submitDiscordToGateway(message);
+      // Normalize the Discord message and pass through the gateway
+      const normalized = normalizeDiscordMessage(message);
+      
+      // Store the built prompt in metadata for the event processor
+      (normalized.metadata as any).prompt = prompt;
+      (normalized.metadata as any).label = label;
+
+      const gatewayResult = await processInboundEvent(normalized);
       if (!gatewayResult.success) {
         await sendMessage(config.token, channelId, `Gateway error: ${gatewayResult.error}`);
         return;
       }
-      // Gateway processed successfully - response handled by processor
-      return;
-    } else {
-      await sendMessage(
-        config.token,
-        channelId,
-        "Claude is currently being upgraded. Please try again shortly."
-      );
+      // For v2, the response is handled asynchronously via the resume system
+      // For now, send a processing message
+      await sendMessage(config.token, channelId, "Processing your request...");
       return;
     }
+
+    // Legacy path - run Claude directly
+    const result = await runUserMessage("discord", prompt);
+
+    if (result.exitCode !== 0) {
+      await sendMessage(config.token, channelId, `Error: ${result.stderr || "Unknown error"}`);
+      return;
+    }
+
+    // Send response back to Discord
+    const responseText = result.stdout || "Done.";
+    await sendMessage(config.token, channelId, responseText);
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     console.error(`[Discord] Error for ${label}: ${errMsg}`);

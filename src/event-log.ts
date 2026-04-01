@@ -657,7 +657,7 @@ export async function appendStatusUpdate(
  * Find an event by ID. Searches from most recent backwards.
  * Note: This is O(n) and should be used sparingly.
  */
-async function findEventById(eventId: string): Promise<EventRecord | null> {
+export async function findEventById(eventId: string): Promise<EventRecord | null> {
   // Search backwards from current segment
   const allSegments = [...(segmentsIndex?.segments ?? [])];
   if (currentSegment) {

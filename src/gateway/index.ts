@@ -61,17 +61,25 @@ export interface GatewayDependencies {
 
 // --- Default Dependencies (module globals) ---
 
+// Import the event processor's gateway function
+import { getGatewayProcessor } from "../event-processor";
+
 function createDefaultDependencies(): GatewayDependencies {
+  // Try to get the event processor from event-processor module
+  const eventProcessorFn = getGatewayProcessor();
+
   return {
     eventLog: {
       append: eventLogAppend,
     },
     processor: {
-      processPersistedEvent: async (_eventId: string): Promise<ProcessorResult> => {
-        // Default: processor not available in this context
-        // Actual implementation should use event-processor.ts
-        return { success: false, error: "Processor not configured" };
-      },
+      processPersistedEvent: eventProcessorFn
+        ? eventProcessorFn
+        : async (_eventId: string): Promise<ProcessorResult> => {
+            // Default: processor not available in this context
+            // Actual implementation should use initGatewayProcessor from event-processor.ts
+            return { success: false, error: "Processor not configured" };
+          },
     },
     resume: {
       getOrCreateSessionMapping,
