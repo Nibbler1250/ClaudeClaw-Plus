@@ -6,7 +6,7 @@ current_plan: Not started
 status: completed
 last_updated: "2026-03-31T09:12:27.891Z"
 progress:
-  total_phases: 15
+  total_phases: 16
   completed_phases: 12
   total_plans: 18
   completed_plans: 22
@@ -240,6 +240,9 @@ progress:
 - Simplified chained .replace() calls in extractReactionDirective() (telegram.ts and discord.ts)
 - Preserved intentional HTML escaping pipelines (3 chained replaces) as deliberate patterns
 - Test pass rate maintained: 574 pass / 3 fail (pre-existing)
+
+### Roadmap Evolution
+- Phase 16 added: Create Agent Command — /claudeclaw:create-agent slash command with wizard flow (refs #78)
 
 ## Blockers
 None
