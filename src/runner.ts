@@ -9,6 +9,7 @@ import { recordInvocationStart, recordInvocationCompletion, recordInvocationFail
 import { recordExecutionMetric, checkLimits, handleTrigger as watchdogHandleTrigger } from "./governance/watchdog";
 import { getGovernanceClient, type GovernanceClient } from "./governance/client";
 import { loadMemory, loadMemoryInstructions, ensureMemoryFile, getMemoryPath } from "./memory";
+import { loadAgent } from "./agents";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
 
@@ -418,13 +419,32 @@ async function getPolicyContext(source: string): Promise<{
   };
 }
 
-async function execClaude(name: string, prompt: string): Promise<RunResult> {
+/**
+ * Load IDENTITY.md, SOUL.md, and CLAUDE.md from an agent's directory
+ * and concatenate them into a single system-prompt string.
+ */
+async function loadAgentPrompts(agentName: string): Promise<string> {
+  const ctx = await loadAgent(agentName);
+  const files = [ctx.identityPath, ctx.soulPath, ctx.claudeMdPath];
+  const parts: string[] = [];
+  for (const file of files) {
+    try {
+      const content = await Bun.file(file).text();
+      if (content.trim()) parts.push(content.trim());
+    } catch {
+      // missing file is non-fatal
+    }
+  }
+  return parts.join("\n\n");
+}
+
+async function execClaude(name: string, prompt: string, agentName?: string): Promise<RunResult> {
   await mkdir(LOGS_DIR, { recursive: true });
 
   // Ensure governance client is initialized
   const gc = getGovernanceClient();
 
-  const existing = await getSession();
+  const existing = await getSession(agentName);
   const isNew = !existing;
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const logFile = join(LOGS_DIR, `${name}-${timestamp}.log`);
@@ -492,30 +512,37 @@ async function execClaude(name: string, prompt: string): Promise<RunResult> {
   // Build the appended system prompt: prompt files + directory scoping
   // This is passed on EVERY invocation (not just new sessions) because
   // --append-system-prompt does not persist across --resume.
-  const promptContent = await loadPrompts();
-  const memPath = getMemoryPath();
+  const memPath = getMemoryPath(agentName);
   const appendParts: string[] = [
     `You are running inside ClaudeClaw. IMPORTANT: After completing any task, you MUST update your memory file at ${memPath} using the Write tool.`,
   ];
-  if (promptContent) appendParts.push(promptContent);
 
-  // Load the project's CLAUDE.md if it exists
-  if (existsSync(PROJECT_CLAUDE_MD)) {
-    try {
-      const claudeMd = await Bun.file(PROJECT_CLAUDE_MD).text();
-      if (claudeMd.trim()) appendParts.push(claudeMd.trim());
-    } catch (e) {
-      console.error(`[${new Date().toLocaleTimeString()}] Failed to read project CLAUDE.md:`, e);
+  if (agentName) {
+    // Agent path: load only the agent's IDENTITY/SOUL/CLAUDE.md.
+    const agentPrompts = await loadAgentPrompts(agentName);
+    if (agentPrompts) appendParts.push(agentPrompts);
+  } else {
+    // Main session path: global prompts + project CLAUDE.md.
+    const promptContent = await loadPrompts();
+    if (promptContent) appendParts.push(promptContent);
+
+    if (existsSync(PROJECT_CLAUDE_MD)) {
+      try {
+        const claudeMd = await Bun.file(PROJECT_CLAUDE_MD).text();
+        if (claudeMd.trim()) appendParts.push(claudeMd.trim());
+      } catch (e) {
+        console.error(`[${new Date().toLocaleTimeString()}] Failed to read project CLAUDE.md:`, e);
+      }
     }
   }
 
   // Load memory (put after static files for optimal prompt caching)
-  if (isNew) await ensureMemoryFile();
-  const memoryContent = await loadMemory();
+  if (isNew) await ensureMemoryFile(agentName);
+  const memoryContent = await loadMemory(agentName);
   if (memoryContent) {
     appendParts.push(`## Your Memory (from MEMORY.md)\n\n${memoryContent}`);
   }
-  const memoryInstructions = await loadMemoryInstructions();
+  const memoryInstructions = await loadMemoryInstructions(agentName);
   if (memoryInstructions) appendParts.push(memoryInstructions);
 
   if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
@@ -542,7 +569,7 @@ async function execClaude(name: string, prompt: string): Promise<RunResult> {
   // Capture memory file mtime before invocation (for fallback write detection)
   let memMtimeBefore = 0;
   try {
-    const memPath = getMemoryPath();
+    const memPath = getMemoryPath(agentName);
     if (existsSync(memPath)) {
       const { statSync } = await import("fs");
       memMtimeBefore = statSync(memPath).mtimeMs;
@@ -591,7 +618,7 @@ async function execClaude(name: string, prompt: string): Promise<RunResult> {
       sessionId = json.session_id;
       stdout = json.result ?? "";
       // Save the real session ID from Claude Code
-      await createSession(sessionId);
+      await createSession(sessionId, agentName);
       console.log(`[${new Date().toLocaleTimeString()}] Session created: ${sessionId}`);
     } catch (e) {
       console.error(`[${new Date().toLocaleTimeString()}] Failed to parse session from Claude output:`, e);
@@ -641,7 +668,7 @@ async function execClaude(name: string, prompt: string): Promise<RunResult> {
   // Fallback: append session log to MEMORY.md only if Claude didn't write it
   if (exitCode === 0 && stdout && name !== "bootstrap") {
     try {
-      const memPath = getMemoryPath();
+      const memPath = getMemoryPath(agentName);
       if (existsSync(memPath)) {
         const { statSync } = await import("fs");
         const afterMtime = statSync(memPath).mtimeMs;
@@ -675,7 +702,7 @@ async function execClaude(name: string, prompt: string): Promise<RunResult> {
   if (COMPACT_TIMEOUT_ENABLED && exitCode === 124 && !isNew && existing) {
     // Save memory before compact wipes context
     try {
-      const memPath = getMemoryPath();
+      const memPath = getMemoryPath(agentName);
       console.log(`[${new Date().toLocaleTimeString()}] Pre-compact: saving memory to ${memPath}`);
       await runClaudeOnce(
         ["claude", "-p", `Session is about to compact. Save your current memory to ${memPath} now. Include: current status, what was accomplished, key context for next session. Keep it concise.`,
@@ -714,7 +741,7 @@ async function execClaude(name: string, prompt: string): Promise<RunResult> {
       });
 
       if (retryExec.exitCode === 0) {
-        const count = await incrementTurn();
+        const count = await incrementTurn(agentName);
         console.log(`[${new Date().toLocaleTimeString()}] Turn count: ${count} (after compact + retry)`);
         // Check watchdog after successful retry
         const retryWatchdogDecision = await checkLimits({ invocationId, sessionId: invocationSessionId });
@@ -729,11 +756,11 @@ async function execClaude(name: string, prompt: string): Promise<RunResult> {
 
   // --- Turn tracking & compact warning ---
   if (exitCode === 0 && !isNew) {
-    const turnCount = await incrementTurn();
+    const turnCount = await incrementTurn(agentName);
     console.log(`[${new Date().toLocaleTimeString()}] Turn count: ${turnCount}`);
 
     if (turnCount >= COMPACT_WARN_THRESHOLD && existing && !existing.compactWarned) {
-      await markCompactWarned();
+      await markCompactWarned(agentName);
       emitCompactEvent({ type: "warn", turnCount });
     }
   }
@@ -741,8 +768,8 @@ async function execClaude(name: string, prompt: string): Promise<RunResult> {
   return result;
 }
 
-export async function run(name: string, prompt: string): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt));
+export async function run(name: string, prompt: string, agentName?: string): Promise<RunResult> {
+  return enqueue(() => execClaude(name, prompt, agentName));
 }
 
 async function streamClaude(
@@ -887,8 +914,8 @@ function prefixUserMessageWithClock(prompt: string): string {
   }
 }
 
-export async function runUserMessage(name: string, prompt: string): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt));
+export async function runUserMessage(name: string, prompt: string, agentName?: string): Promise<RunResult> {
+  return run(name, prefixUserMessageWithClock(prompt), agentName);
 }
 
 /**
