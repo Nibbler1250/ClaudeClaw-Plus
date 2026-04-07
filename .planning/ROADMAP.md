@@ -399,3 +399,26 @@ Plans:
 
 Plans:
 - [ ] TBD (run /gsd:plan-phase 18 to break down)
+
+### Phase 19: Safe fresh-session feature (Discord/Telegram slash + Web UI button)
+
+**Goal:** Give users a one-tap "start a fresh session" action that **never destroys prior session state** — replacing today's `/reset` slash command which calls `unlink(session.json)`. Also fix `backupSession()` so it never overwrites existing backups.
+
+**Why blocking:**
+- Current `/reset` (Discord + Telegram) hard-deletes `session.json`, violating the "never delete session.json" rule and losing the conversation history irrecoverably.
+- Wizard testing for Phase 17 (and any future skill update) requires a fresh session to load updated skill files from disk, but there's no safe user-facing path. Today the only safe option is shell access + `backupSession()` — not viable for non-dev users.
+- `backupSession()` itself has a sharp edge: `nextIndex = max(existing) + 1`, but `rename` will silently overwrite if a target collides (e.g. after manual cleanup). Needs hardening.
+
+**Scope:**
+- **Helper:** `safeRotateSession()` — atomic rename to `session_<unix-timestamp>.backup` (or `session_<N>.backup` with collision-safe index), guaranteed never to overwrite. Replace all callers of `backupSession()` and `resetSession()`.
+- **Discord:** Replace `/reset` to call `safeRotateSession` instead of `unlink`. Reply with the backup filename so users know the rollback path.
+- **Telegram:** Same fix for `/reset` slash command.
+- **Web UI:** Add a "Fresh chat" button next to the chat input. POSTs to a new `/api/session/rotate` endpoint that calls `safeRotateSession`. Show a toast with the backup filename.
+- **Audit:** Grep all callers of `unlink(session.json)`, `unlink(sessionPath...)`, and `resetSession`. Anywhere outside `deleteAgent()` should be replaced.
+- **Tests:** rotation under collision (pre-existing `session_1..N.backup`), concurrent rotate attempts, agent vs global session paths.
+
+**Requirements:** TBD (derive during /gsd:plan-phase)
+**Depends on:** none (independent)
+
+Plans:
+- [ ] TBD (run /gsd:plan-phase 19 to break down)
