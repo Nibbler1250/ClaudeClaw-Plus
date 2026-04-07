@@ -375,7 +375,7 @@ Plans:
 
 **Requirements**: TBD (derive during /gsd:plan-phase)
 **Depends on:** Phase 16
-**Plans:** 1/5 plans executed
+**Plans:** 2/5 plans executed
 
 Plans:
 - [ ] TBD (run /gsd:plan-phase 17 to break down)

@@ -2,22 +2,34 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-current_plan: 17-02
+current_plan: 17-03
 status: in_progress
 last_updated: "2026-04-07T00:00:00.000Z"
 progress:
   total_phases: 16
   completed_phases: 12
   total_plans: 21
-  completed_plans: 24
+  completed_plans: 25
 ---
 
 # State: ClaudeClaw v2 Upgrade
 
 ## Current Position
 **Phase:** 17 — Multi-Job Agents / Wizard Workflow (In Progress)
-**Current Plan:** 17-02 (next)
-**Status:** 17-01 complete
+**Current Plan:** 17-03 (next)
+**Status:** 17-02 complete
+
+### 2026-04-07 — Phase 17 Plan 2 (17-02) Completion
+- Broadened `parseScheduleToCron` in `src/agents.ts` to handle 13 additional NL patterns
+- `parseHour`: named times (noon, midnight, morning, evening, night) + stricter am/pm range (1..12)
+- New presets: `twice daily` (9,21), `thrice daily` (9,13,17), `every weekend` (0,6)
+- `every N hours` parser (1..23) with `0 */N * * *` output
+- Multi-time-per-day parser: "at 7am and 7pm" / "at 9am, 1pm, 5pm" → comma-separated cron hours
+- Bug fix: tightened RAW_CRON_RE to cron-valid chars only (was false-matching "every day at 7 pm")
+- safeCron helper validates output via cronMatches before returning
+- 20 new tests, 65/65 in agents.test.ts; full suite 635/648 (13 pre-existing failures unchanged)
+- Commits: 2957a54 (RED), 20a7253 (GREEN)
+- Requirement CRON-01 complete
 
 ### 2026-04-07 — Phase 17 Plan 1 (17-01) Completion
 - Added multi-job CRUD primitives to `src/agents.ts`: validateJobLabel, agentJobsDir, addJob, updateJob, removeJob, listAgentJobs, deleteAgent
