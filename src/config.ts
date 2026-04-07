@@ -251,7 +251,9 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
       allowedUserIds: raw.telegram?.allowedUserIds ?? [],
     },
     discord: {
-      token: typeof raw.discord?.token === "string" ? raw.discord.token.trim() : "",
+      token: (typeof raw.discord?.token === "string" && raw.discord.token.trim())
+        || (process.env.DISCORD_TOKEN ?? "").trim()
+        || "",
       allowedUserIds: discordUserIds && discordUserIds.length > 0
         ? discordUserIds
         : Array.isArray(raw.discord?.allowedUserIds)
