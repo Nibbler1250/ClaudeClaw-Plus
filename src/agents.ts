@@ -37,6 +37,115 @@ export interface AgentCreateOpts {
   discordChannels?: string[];
   dataSources?: string;
   defaultPrompt?: string;
+  workflow?: string;
+}
+
+export interface AgentUpdatePatch {
+  workflow?: string;
+  personality?: string;
+  discordChannels?: string[];
+  dataSources?: string;
+}
+
+// ─── Section markers (Phase 17) ──────────────────────────────────────────────
+const WORKFLOW_START = "<!-- claudeclaw:workflow:start -->";
+const WORKFLOW_END = "<!-- claudeclaw:workflow:end -->";
+const PERSONALITY_START = "<!-- claudeclaw:personality:start -->";
+const PERSONALITY_END = "<!-- claudeclaw:personality:end -->";
+const DISCORD_START = "<!-- claudeclaw:discord:start -->";
+const DISCORD_END = "<!-- claudeclaw:discord:end -->";
+const DATASOURCES_START = "<!-- claudeclaw:datasources:start -->";
+const DATASOURCES_END = "<!-- claudeclaw:datasources:end -->";
+
+function replaceBetweenMarkers(
+  text: string,
+  start: string,
+  end: string,
+  replacement: string
+): string | null {
+  const i = text.indexOf(start);
+  if (i === -1) return null;
+  const j = text.indexOf(end, i + start.length);
+  if (j === -1) return null;
+  return text.slice(0, i + start.length) + "\n" + replacement + "\n" + text.slice(j);
+}
+
+function replaceLegacySection(
+  text: string,
+  heading: string,
+  newBody: string
+): string {
+  // Matches `## <heading>` block until next `## ` or EOF.
+  const re = new RegExp(`(^|\\n)## ${heading}\\s*\\n[\\s\\S]*?(?=\\n## |$)`, "");
+  const match = text.match(re);
+  if (!match) return text;
+  const replacement = `${match[1] ?? ""}## ${heading}\n\n${newBody}\n`;
+  return text.replace(re, replacement);
+}
+
+function insertSectionAfterPersonality(text: string, sectionMarkdown: string): string {
+  // Find Personality block, insert sectionMarkdown after its end (next `## ` or EOF).
+  const re = /(^|\n)## Personality\s*\n[\s\S]*?(?=\n## |$)/;
+  const match = text.match(re);
+  if (!match) {
+    // No Personality section — append at end.
+    return text.replace(/\n*$/, "\n\n") + sectionMarkdown + "\n";
+  }
+  const end = (match.index ?? 0) + match[0].length;
+  return text.slice(0, end) + "\n\n" + sectionMarkdown + text.slice(end);
+}
+
+export function applySoulPatch(soul: string, patch: AgentUpdatePatch): string {
+  let out = soul;
+
+  if (patch.personality !== undefined) {
+    const replaced = replaceBetweenMarkers(out, PERSONALITY_START, PERSONALITY_END, patch.personality);
+    if (replaced !== null) {
+      out = replaced;
+    } else {
+      out = replaceLegacySection(out, "Personality", patch.personality);
+    }
+  }
+
+  if (patch.workflow !== undefined) {
+    const replaced = replaceBetweenMarkers(out, WORKFLOW_START, WORKFLOW_END, patch.workflow);
+    if (replaced !== null) {
+      out = replaced;
+    } else {
+      const section = `## Workflow\n${WORKFLOW_START}\n${patch.workflow}\n${WORKFLOW_END}`;
+      out = insertSectionAfterPersonality(out, section);
+    }
+  }
+
+  return out;
+}
+
+export function applyClaudeMdPatch(claudeMd: string, patch: AgentUpdatePatch): string {
+  let out = claudeMd;
+
+  if (patch.discordChannels !== undefined) {
+    const body = patch.discordChannels.length > 0
+      ? patch.discordChannels.map((c) => `- ${c}`).join("\n")
+      : "_none specified_";
+    const replaced = replaceBetweenMarkers(out, DISCORD_START, DISCORD_END, body);
+    if (replaced !== null) {
+      out = replaced;
+    } else {
+      out = replaceLegacySection(out, "Discord Channels", body);
+    }
+  }
+
+  if (patch.dataSources !== undefined) {
+    const body = patch.dataSources.trim() || "_none specified_";
+    const replaced = replaceBetweenMarkers(out, DATASOURCES_START, DATASOURCES_END, body);
+    if (replaced !== null) {
+      out = replaced;
+    } else {
+      out = replaceLegacySection(out, "Data Sources", body);
+    }
+  }
+
+  return out;
 }
 
 export interface AgentContext {
@@ -250,14 +359,20 @@ function renderIdentity(name: string, role: string): string {
   ].join("\n");
 }
 
-function renderSoul(personality: string): string {
-  return [
+function renderSoul(personality: string, workflow?: string): string {
+  const lines: string[] = [
     `_You're not a chatbot. You're becoming someone._`,
     ``,
     `## Personality`,
-    ``,
+    PERSONALITY_START,
     personality,
+    PERSONALITY_END,
     ``,
+  ];
+  if (workflow && workflow.trim()) {
+    lines.push(`## Workflow`, WORKFLOW_START, workflow, WORKFLOW_END, ``);
+  }
+  lines.push(
     `## Core Truths`,
     ``,
     `**Be genuinely helpful, not performatively helpful.** Skip the filler — just help.`,
@@ -267,8 +382,9 @@ function renderSoul(personality: string): string {
     `**Be resourceful before asking.** Try to figure it out first.`,
     ``,
     `**Earn trust through competence.** Be careful with external actions, bold with internal ones.`,
-    ``,
-  ].join("\n");
+    ``
+  );
+  return lines.join("\n");
 }
 
 function renderClaudeMd(opts: AgentCreateOpts): string {
@@ -285,12 +401,14 @@ function renderClaudeMd(opts: AgentCreateOpts): string {
     opts.role,
     ``,
     `## Discord Channels`,
-    ``,
+    DISCORD_START,
     channels,
+    DISCORD_END,
     ``,
     `## Data Sources`,
-    ``,
+    DATASOURCES_START,
     sources,
+    DATASOURCES_END,
     ``,
   ].join("\n");
 }
@@ -472,7 +590,7 @@ export async function createAgent(opts: AgentCreateOpts): Promise<AgentContext> 
   const gitignorePath = join(dir, ".gitignore");
 
   await writeFile(identityPath, renderIdentity(opts.name, opts.role), "utf8");
-  await writeFile(soulPath, renderSoul(opts.personality), "utf8");
+  await writeFile(soulPath, renderSoul(opts.personality, opts.workflow), "utf8");
   await writeFile(claudeMdPath, renderClaudeMd(opts), "utf8");
   await ensureMemoryFile(opts.name);
   await writeFile(gitignorePath, "session.json\nMEMORY.md\n", "utf8");
@@ -518,6 +636,30 @@ export async function loadAgent(name: string): Promise<AgentContext> {
     memoryPath: join(dir, "MEMORY.md"),
     sessionPath: join(dir, "session.json"),
   };
+}
+
+/**
+ * UPDATE-02 INVARIANT: updateAgent NEVER reads, writes, stats, or unlinks
+ * agents/<name>/MEMORY.md, and NEVER touches agents/<name>/session.json.
+ * Only SOUL.md and CLAUDE.md may be modified, via whole-file string transforms.
+ */
+export async function updateAgent(name: string, patch: AgentUpdatePatch): Promise<void> {
+  const ctx = await loadAgent(name);
+  const touchesSoul = patch.workflow !== undefined || patch.personality !== undefined;
+  const touchesClaudeMd =
+    patch.discordChannels !== undefined || patch.dataSources !== undefined;
+
+  if (touchesSoul) {
+    const soul = await readFile(ctx.soulPath, "utf8");
+    const next = applySoulPatch(soul, patch);
+    if (next !== soul) await writeFile(ctx.soulPath, next, "utf8");
+  }
+
+  if (touchesClaudeMd) {
+    const claudeMd = await readFile(ctx.claudeMdPath, "utf8");
+    const next = applyClaudeMdPatch(claudeMd, patch);
+    if (next !== claudeMd) await writeFile(ctx.claudeMdPath, next, "utf8");
+  }
 }
 
 export async function listAgents(): Promise<string[]> {
