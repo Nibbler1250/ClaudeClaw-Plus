@@ -82,13 +82,66 @@ The wizard is stateful but stateless on the user side — when an acknowledgment
 - After the last question, before scaffolding, print a full "here's everything I have, confirm or amend" review block.
 - Persist wizard state to `/tmp/claudeclaw-agent-wizard.json` after EACH answer (not just at the end), so a network glitch / context reset doesn't lose progress.
 
+## GAP-17-04 — Wizard doesn't tell Claude "local cron, not remote schedule"
+
+**Severity:** Blocking (UX, confused Claude on first live test)
+**Status:** Open
+
+### Symptom
+After Reg was scaffolded on 2026-04-07, the user asked "can you force a run now". Claude replied: *"Hold up — I used the wrong skill. The schedule skill is for remote triggers (cloud-based agents). You want to run the local reg agent job on ClaudeClaw right now."* Claude had reached for the cloud-based `schedule` skill (Vercel remote triggers) because the wizard's "Scheduled tasks" section didn't say "this is a local cron job managed by claudeclaw's in-process cron loop in jobs.ts, NOT a cloud trigger".
+
+### Proposed fix
+Add an explicit callout at the top of the Scheduled Tasks section in `skills/create-agent/SKILL.md` and `skills/update-agent/SKILL.md`:
+
+> **IMPORTANT — Jobs are LOCAL cron.** Scheduled tasks here are managed by ClaudeClaw's in-process cron loop (`jobs.ts` → `start.ts:setInterval`). They are NOT the remote `schedule` skill (which uses cloud triggers). Do not invoke the `schedule` skill from this wizard. All job files live at `agents/<name>/jobs/<label>.md` with cron frontmatter.
+
+## GAP-17-05 — No manual "fire now" command for local jobs
+
+**Severity:** Blocking (operational, noticed during Reg UAT)
+**Status:** Open
+
+### Symptom
+After scaffolding Reg, the user wanted to fire the `daily-content-research` job immediately instead of waiting until 7pm. Claude scanned for `claudeclaw trigger`, `claudeclaw run`, etc. Nothing exists. `start.ts --trigger` is a one-shot startup mode, not a running-daemon RPC. The only way to fire a job today is (a) wait for cron, or (b) shell out to a direct `bun -e` that imports `runner.run()` and invokes the job prompt manually.
+
+### Why it matters
+- Every new agent requires a 1-minute-to-24-hour wait before you can see if it actually works
+- No way to re-run a failed job without editing the cron expression
+- No way to smoke-test a job during development
+
+### Proposed fix
+Add `claudeclaw fire <agent>:<label>` (or `claudeclaw run-job <agent> <label>`) CLI command that:
+- Loads the matching job from `agents/<agent>/jobs/<label>.md`
+- Calls `run(job.name, job.prompt, job.agent)` once (same code path as the cron loop)
+- Streams output to stdout; forwards to Discord/Telegram per the job's `notify` frontmatter
+- Respects the agent's session (uses `--resume` if the agent has a live session)
+
+Expose same functionality via Discord/Telegram slash command (`/fire reg:daily-content-research`) and Web UI button on each agent's job list.
+
+## GAP-17-06 — Slash command discovery not working from Web UI
+
+**Severity:** Blocking (UX, immediate friction)
+**Status:** Open
+
+### Symptom
+Live test on 2026-04-07: user typed `/claudeclaw:create-agent` in the web UI chat. Claude replied *"I don't have a `/claudeclaw:create-agent` command, but I can scaffold a new agent using the **create-agent** skill."*
+
+Claude Code IS finding the skill itself (from `~claw/.claude/skills/create-agent/SKILL.md` — symlinked to `/opt/claudeclaw/skills/create-agent`), but NOT the slash command (file at `/opt/claudeclaw/commands/claudeclaw/create-agent.md`). The symlink for commands was only created at the project level (`/home/claw/project/.claude/commands` → `/opt/claudeclaw/commands`), but Claude Code's slash command loader searches user-level `~/.claude/commands/` first.
+
+### Proposed fix
+- Create `~claw/.claude/commands/claudeclaw/` symlink (or copy) pointing at `/opt/claudeclaw/commands/claudeclaw/`
+- Verify discovery from both Web UI AND Discord/Telegram paths
+- Add a claudeclaw install/bootstrap step that wires both user-level AND project-level command/skill symlinks automatically on daemon first run, so deployments don't require manual symlink management
+
 ---
 
 ## Verification gate
 
 Phase 17 cannot be marked verified until:
-- [ ] GAP-17-01 deployed to server and a fresh wizard run successfully scaffolds an agent at `/home/claw/project/agents/<name>/` with `## Workflow` markers in SOUL.md and `agents/<name>/jobs/<label>.md` for each scheduled task
+- [x] GAP-17-01 deployed to server, fresh wizard run successfully scaffolds `agents/reg/` with `## Workflow` markers in SOUL.md and `jobs/daily-content-research.md` (verified 2026-04-07 ~19:00 BST)
 - [ ] GAP-17-02 fixed in `skills/create-agent/SKILL.md` (single-job workflow reuse) and re-tested
 - [ ] GAP-17-03 fixed (per-question echo + final review block + per-step temp-file persistence)
+- [ ] GAP-17-04 fixed (local cron vs remote schedule callout in wizard)
+- [ ] GAP-17-05 fixed (manual `fire` command — CLI + Discord/Telegram slash + Web UI button)
+- [ ] GAP-17-06 fixed (slash command discovery wired at user-level `~/.claude/commands/`)
 
 Plan 17-05's SUMMARY and the phase verification step (`gsd-verifier`) are blocked on these.
