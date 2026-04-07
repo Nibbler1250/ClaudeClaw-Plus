@@ -96,7 +96,7 @@ export function validateAgentName(name: string): { valid: boolean; error?: strin
 
 // ─── NL → cron ───────────────────────────────────────────────────────────────
 
-const RAW_CRON_RE = /^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)$/;
+const RAW_CRON_RE = /^([\d*,\-/]+)\s+([\d*,\-/]+)\s+([\d*,\-/]+)\s+([\d*,\-/]+)\s+([\d*,\-/]+)$/;
 
 const DAY_NAMES: Record<string, number> = {
   sunday: 0,
@@ -109,18 +109,36 @@ const DAY_NAMES: Record<string, number> = {
 };
 
 function parseHour(timeStr: string): number | null {
-  // Handles "9am", "9 am", "5pm", "12am", "12pm", "9", "09:00", "9:30"
-  const m = timeStr.trim().match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
+  // Handles "9am", "9 am", "5pm", "12am", "12pm", "9", "09:00", "9:30",
+  // plus named times: "noon", "midnight", "morning", "evening", "night"
+  const s = timeStr.trim().toLowerCase();
+  if (s === "noon") return 12;
+  if (s === "midnight") return 0;
+  if (s === "morning") return 9;
+  if (s === "evening") return 18;
+  if (s === "night") return 22;
+  const m = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/);
   if (!m) return null;
   let h = parseInt(m[1], 10);
   const ampm = m[3]?.toLowerCase();
   if (ampm === "am") {
+    if (h < 1 || h > 12) return null;
     if (h === 12) h = 0;
   } else if (ampm === "pm") {
+    if (h < 1 || h > 12) return null;
     if (h !== 12) h += 12;
   }
   if (h < 0 || h > 23) return null;
   return h;
+}
+
+function safeCron(cron: string): string | null {
+  try {
+    cronMatches(cron, new Date());
+    return cron;
+  } catch {
+    return null;
+  }
 }
 
 export function parseScheduleToCron(input: string): string | null {
@@ -145,12 +163,43 @@ export function parseScheduleToCron(input: string): string | null {
   }
   if (s === "weekly" || s === "every week") return "0 0 * * 0";
 
+  // Phase 17 presets — N-times-daily (hard-coded standard slots)
+  if (s === "twice daily") return safeCron("0 9,21 * * *");
+  if (s === "thrice daily") return safeCron("0 9,13,17 * * *");
+  if (s === "every weekend") return safeCron("0 0 * * 0,6");
+
   // every N minutes
   let m = s.match(/^every\s+(\d+)\s+minutes?$/);
   if (m) {
     const n = parseInt(m[1], 10);
     if (n > 0 && n < 60) return `*/${n} * * * *`;
     return null;
+  }
+
+  // every N hours (1..23)
+  m = s.match(/^every\s+(\d+)\s+hours?$/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (n >= 1 && n <= 23) return safeCron(`0 */${n} * * *`);
+    return null;
+  }
+
+  // Multi-time per day: "every day at 7am and 7pm" / "daily at 9am, 1pm, 5pm"
+  // Must come before single-time daily-at branch.
+  m = s.match(/^(?:daily|every day)\s+at\s+(.+)$/);
+  if (m) {
+    const raw = m[1];
+    if (/,| and /.test(raw)) {
+      const parts = raw.split(/\s*,\s*|\s+and\s+/).map((p) => p.trim()).filter(Boolean);
+      const hours: number[] = [];
+      for (const p of parts) {
+        const h = parseHour(p);
+        if (h === null) return null;
+        hours.push(h);
+      }
+      if (hours.length >= 2) return safeCron(`0 ${hours.join(",")} * * *`);
+    }
+    // single time — fall through to existing daily-at branch below
   }
 
   // every weekday at <time>
