@@ -375,10 +375,10 @@ Plans:
 
 **Requirements**: TBD (derive during /gsd:plan-phase)
 **Depends on:** Phase 16
-**Plans:** 4/5 plans executed
+**Plans:** 5/5 plans complete
 
 Plans:
-- [ ] TBD (run /gsd:plan-phase 17 to break down)
+- [x] TBD (run /gsd:plan-phase 17 to break down) (completed 2026-04-08)
 
 ### Phase 18: Per-job model override runtime wiring (milestone blocker) 🚧
 
