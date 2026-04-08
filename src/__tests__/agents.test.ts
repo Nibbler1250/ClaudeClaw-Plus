@@ -797,3 +797,184 @@ describe("Phase 17: updateAgent + MEMORY invariant", () => {
     expect(body).not.toMatch(/session\.json/);
   });
 });
+
+describe("Phase 17 gap-03: append mode for updateAgent", () => {
+  async function makeAgentWithWorkflow(suffix: string, workflow = "original workflow") {
+    const name = uniq(`ap-${suffix}`);
+    await createAgent({
+      name,
+      role: "tester",
+      personality: "calm and clear",
+      workflow,
+    } as any);
+    return name;
+  }
+
+  // ─── Back-compat: bare string still means replace ───────────────────────
+  it("bare string workflow still replaces (back-compat)", async () => {
+    const name = await makeAgentWithWorkflow("bc-wf");
+    await updateAgent(name, { workflow: "completely new" } as any);
+    const soul = await readFile(join(AGENTS_DIR, name, "SOUL.md"), "utf8");
+    expect(soul).toContain("completely new");
+    expect(soul).not.toContain("original workflow");
+  });
+
+  it("bare string personality still replaces (back-compat)", async () => {
+    const name = await makeAgentWithWorkflow("bc-p");
+    await updateAgent(name, { personality: "fierce" } as any);
+    const soul = await readFile(join(AGENTS_DIR, name, "SOUL.md"), "utf8");
+    expect(soul).toContain("fierce");
+    expect(soul).not.toContain("calm and clear");
+  });
+
+  it("bare string dataSources still replaces (back-compat)", async () => {
+    const name = await makeAgentWithWorkflow("bc-ds");
+    await updateAgent(name, { dataSources: "first sources" } as any);
+    await updateAgent(name, { dataSources: "second sources" } as any);
+    const cmd = await readFile(join(AGENTS_DIR, name, "CLAUDE.md"), "utf8");
+    expect(cmd).toContain("second sources");
+    expect(cmd).not.toContain("first sources");
+  });
+
+  it("discordChannels still accepts a bare string[] (unchanged shape)", async () => {
+    const name = await makeAgentWithWorkflow("bc-dc");
+    await updateAgent(name, { discordChannels: ["#a", "#b"] } as any);
+    const cmd = await readFile(join(AGENTS_DIR, name, "CLAUDE.md"), "utf8");
+    expect(cmd).toContain("#a");
+    expect(cmd).toContain("#b");
+  });
+
+  // ─── Append mode ──────────────────────────────────────────────────────
+  it("append mode for workflow concatenates inside markers (separated by blank line)", async () => {
+    const name = await makeAgentWithWorkflow("ap-wf", "step one");
+    await updateAgent(name, {
+      workflow: { value: "step two", mode: "append" },
+    } as any);
+    const soul = await readFile(join(AGENTS_DIR, name, "SOUL.md"), "utf8");
+    expect(soul).toContain("step one");
+    expect(soul).toContain("step two");
+    // both inside the workflow marker block, separated by blank line
+    const start = soul.indexOf("<!-- claudeclaw:workflow:start -->");
+    const end = soul.indexOf("<!-- claudeclaw:workflow:end -->");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const block = soul.slice(start, end);
+    expect(block).toContain("step one");
+    expect(block).toContain("step two");
+    expect(block).toMatch(/step one\n\nstep two/);
+  });
+
+  it("append mode for workflow on agent with NO existing workflow creates section without leading blank line", async () => {
+    const name = uniq("ap-nowf");
+    await createAgent({ name, role: "tester", personality: "calm" });
+    await updateAgent(name, {
+      workflow: { value: "first ever", mode: "append" },
+    } as any);
+    const soul = await readFile(join(AGENTS_DIR, name, "SOUL.md"), "utf8");
+    expect(soul).toContain("## Workflow");
+    expect(soul).toContain("first ever");
+    const start = soul.indexOf("<!-- claudeclaw:workflow:start -->");
+    const end = soul.indexOf("<!-- claudeclaw:workflow:end -->");
+    const block = soul.slice(start, end);
+    // no leading blank line — content sits right after start marker
+    expect(block).not.toMatch(/start -->\n\n\nfirst ever/);
+  });
+
+  it("explicit replace mode for workflow works", async () => {
+    const name = await makeAgentWithWorkflow("rp-wf", "old");
+    await updateAgent(name, {
+      workflow: { value: "rewrite", mode: "replace" },
+    } as any);
+    const soul = await readFile(join(AGENTS_DIR, name, "SOUL.md"), "utf8");
+    expect(soul).toContain("rewrite");
+    expect(soul).not.toContain("old");
+  });
+
+  it("append mode for personality concatenates inside markers", async () => {
+    const name = await makeAgentWithWorkflow("ap-p");
+    await updateAgent(name, {
+      personality: { value: "also fierce", mode: "append" },
+    } as any);
+    const soul = await readFile(join(AGENTS_DIR, name, "SOUL.md"), "utf8");
+    expect(soul).toContain("calm and clear");
+    expect(soul).toContain("also fierce");
+    const start = soul.indexOf("<!-- claudeclaw:personality:start -->");
+    const end = soul.indexOf("<!-- claudeclaw:personality:end -->");
+    const block = soul.slice(start, end);
+    expect(block).toMatch(/calm and clear\n\nalso fierce/);
+  });
+
+  it("explicit replace for personality works", async () => {
+    const name = await makeAgentWithWorkflow("rp-p");
+    await updateAgent(name, {
+      personality: { value: "totally new", mode: "replace" },
+    } as any);
+    const soul = await readFile(join(AGENTS_DIR, name, "SOUL.md"), "utf8");
+    expect(soul).toContain("totally new");
+    expect(soul).not.toContain("calm and clear");
+  });
+
+  it("append mode for dataSources concatenates inside markers", async () => {
+    const name = await makeAgentWithWorkflow("ap-ds");
+    await updateAgent(name, { dataSources: "vault://one" } as any);
+    await updateAgent(name, {
+      dataSources: { value: "vault://two", mode: "append" },
+    } as any);
+    const cmd = await readFile(join(AGENTS_DIR, name, "CLAUDE.md"), "utf8");
+    expect(cmd).toContain("vault://one");
+    expect(cmd).toContain("vault://two");
+    const start = cmd.indexOf("<!-- claudeclaw:datasources:start -->");
+    const end = cmd.indexOf("<!-- claudeclaw:datasources:end -->");
+    const block = cmd.slice(start, end);
+    expect(block).toMatch(/vault:\/\/one\n\nvault:\/\/two/);
+  });
+
+  it("append for dataSources on agent with NO existing block creates section", async () => {
+    const name = uniq("ap-nods");
+    await createAgent({ name, role: "tester", personality: "calm" });
+    const cmdPath = join(AGENTS_DIR, name, "CLAUDE.md");
+    // overwrite with a CLAUDE.md missing the datasources block
+    await writeFile(
+      cmdPath,
+      `# Agent: ${name}\n\n## Role\n\ntester\n\n## Discord Channels\n<!-- claudeclaw:discord:start -->\n_none specified_\n<!-- claudeclaw:discord:end -->\n`,
+      "utf8"
+    );
+    await updateAgent(name, {
+      dataSources: { value: "vault://first", mode: "append" },
+    } as any);
+    const cmd = await readFile(cmdPath, "utf8");
+    expect(cmd).toContain("vault://first");
+  });
+
+  it("explicit replace for dataSources works", async () => {
+    const name = await makeAgentWithWorkflow("rp-ds");
+    await updateAgent(name, { dataSources: "first" } as any);
+    await updateAgent(name, {
+      dataSources: { value: "rewrite", mode: "replace" },
+    } as any);
+    const cmd = await readFile(join(AGENTS_DIR, name, "CLAUDE.md"), "utf8");
+    expect(cmd).toContain("rewrite");
+    expect(cmd).not.toContain("first");
+  });
+
+  // ─── MEMORY.md invariant under append paths ───────────────────────────
+  it("append mode preserves MEMORY.md mtime (UPDATE-02 invariant)", async () => {
+    const name = await makeAgentWithWorkflow("mem-ap");
+    const memPath = join(AGENTS_DIR, name, "MEMORY.md");
+    await writeFile(memPath, "important state\n", "utf8");
+    const before = (await stat(memPath)).mtimeMs;
+    await new Promise((r) => setTimeout(r, 15));
+    await updateAgent(name, {
+      workflow: { value: "appended", mode: "append" },
+    } as any);
+    await updateAgent(name, {
+      personality: { value: "appended", mode: "append" },
+    } as any);
+    await updateAgent(name, {
+      dataSources: { value: "appended", mode: "append" },
+    } as any);
+    const after = (await stat(memPath)).mtimeMs;
+    expect(after).toBe(before);
+    expect(await readFile(memPath, "utf8")).toBe("important state\n");
+  });
+});
