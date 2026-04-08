@@ -71,32 +71,62 @@ For each option, ask the relevant follow-up question(s), then run the matching `
 
 > **IMPORTANT — Jobs are LOCAL cron.** The Add/Edit/Remove job options below operate on `agents/<name>/jobs/<label>.md` files which are scanned by `loadJobs()` and fired by ClaudeClaw's in-process cron loop. They are NOT the remote `schedule` skill. Do NOT invoke the `schedule` skill from this wizard.
 
+#### Mode selection (Options 1, 2, 7)
+
+Before collecting new content for Workflow / Personality / Data sources, ask:
+
+```
+How should this be applied?
+  a. Append        — add to the existing <section> (keeps everything already there) [DEFAULT]
+  b. Replace       — wipe and rewrite the entire block
+  c. Show current  — print the current content first, then ask again
+```
+
+If the user picks `a` or just hits enter → use `mode: "append"` (default — non-destructive).
+If `b` → use `mode: "replace"`.
+If `c` → read the current marker block from SOUL.md (Workflow/Personality) or CLAUDE.md (Data sources), print it back to the user, then re-prompt for the mode choice.
+
+To read current content for Show current:
+
+```bash
+bun -e '
+const { loadAgent } = await import(`${process.env.CLAUDECLAW_ROOT || "."}/src/agents.ts`);
+const ctx = await loadAgent("AGENT_NAME");
+const path = "SOUL_OR_CLAUDE_PATH"; // ctx.soulPath or ctx.claudeMdPath
+const text = await Bun.file(path).text();
+const start = "<!-- claudeclaw:workflow:start -->"; // or :personality: / :datasources:
+const end   = "<!-- claudeclaw:workflow:end -->";
+const i = text.indexOf(start), j = text.indexOf(end);
+console.log(i === -1 ? "(no existing block)" : text.slice(i + start.length, j).trim());
+'
+```
+
 #### Option 1 — Workflow
 
-Re-prompt: "What's the new workflow? (multi-line, will replace the existing block entirely)"
-Write to `/tmp/claudeclaw-update.json` then:
+Run the **mode selection** above, then re-prompt: "What's the new workflow? (multi-line)".
+Write to `/tmp/claudeclaw-update.json` as `{"value": "...", "mode": "append"|"replace"}` then:
 
 ```bash
 bun -e '
 import { readFileSync } from "fs";
 const { updateAgent } = await import(`${process.env.CLAUDECLAW_ROOT || "."}/src/agents.ts`);
-const { workflow } = JSON.parse(readFileSync("/tmp/claudeclaw-update.json", "utf8"));
-await updateAgent("AGENT_NAME", { workflow });
-console.log("workflow updated");
+const { value, mode } = JSON.parse(readFileSync("/tmp/claudeclaw-update.json", "utf8"));
+await updateAgent("AGENT_NAME", { workflow: { value, mode } });
+console.log("workflow updated (" + mode + ")");
 '
 ```
 
 #### Option 2 — Personality
 
-Same shape as Workflow:
+Run the **mode selection** above, then re-prompt for the new personality content:
 
 ```bash
 bun -e '
 import { readFileSync } from "fs";
 const { updateAgent } = await import(`${process.env.CLAUDECLAW_ROOT || "."}/src/agents.ts`);
-const { personality } = JSON.parse(readFileSync("/tmp/claudeclaw-update.json", "utf8"));
-await updateAgent("AGENT_NAME", { personality });
-console.log("personality updated");
+const { value, mode } = JSON.parse(readFileSync("/tmp/claudeclaw-update.json", "utf8"));
+await updateAgent("AGENT_NAME", { personality: { value, mode } });
+console.log("personality updated (" + mode + ")");
 '
 ```
 
@@ -158,13 +188,15 @@ console.log("channels updated");
 
 #### Option 7 — Data sources
 
+Run the **mode selection** above (default Append). Then collect the new data-sources content.
+
 ```bash
 bun -e '
 import { readFileSync } from "fs";
 const { updateAgent } = await import(`${process.env.CLAUDECLAW_ROOT || "."}/src/agents.ts`);
-const { dataSources } = JSON.parse(readFileSync("/tmp/claudeclaw-update.json", "utf8"));
-await updateAgent("AGENT_NAME", { dataSources });
-console.log("data sources updated");
+const { value, mode } = JSON.parse(readFileSync("/tmp/claudeclaw-update.json", "utf8"));
+await updateAgent("AGENT_NAME", { dataSources: { value, mode } });
+console.log("data sources updated (" + mode + ")");
 '
 ```
 
