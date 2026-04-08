@@ -881,13 +881,13 @@ describe("Phase 17 gap-03: append mode for updateAgent", () => {
   });
 
   it("explicit replace mode for workflow works", async () => {
-    const name = await makeAgentWithWorkflow("rp-wf", "old");
+    const name = await makeAgentWithWorkflow("rp-wf", "ancient-wf-content");
     await updateAgent(name, {
-      workflow: { value: "rewrite", mode: "replace" },
+      workflow: { value: "rewrite-content", mode: "replace" },
     } as any);
     const soul = await readFile(join(AGENTS_DIR, name, "SOUL.md"), "utf8");
-    expect(soul).toContain("rewrite");
-    expect(soul).not.toContain("old");
+    expect(soul).toContain("rewrite-content");
+    expect(soul).not.toContain("ancient-wf-content");
   });
 
   it("append mode for personality concatenates inside markers", async () => {

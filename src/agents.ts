@@ -40,11 +40,30 @@ export interface AgentCreateOpts {
   workflow?: string;
 }
 
+export type PatchField<T = string> = T | { value: T; mode: "append" | "replace" };
+
 export interface AgentUpdatePatch {
-  workflow?: string;
-  personality?: string;
+  workflow?: PatchField<string>;
+  personality?: PatchField<string>;
   discordChannels?: string[];
-  dataSources?: string;
+  dataSources?: PatchField<string>;
+}
+
+function normalizePatchField(
+  field: PatchField<string> | undefined
+): { value: string; mode: "append" | "replace" } | undefined {
+  if (field === undefined) return undefined;
+  if (typeof field === "string") return { value: field, mode: "replace" };
+  return { value: field.value, mode: field.mode ?? "replace" };
+}
+
+function readBetweenMarkers(text: string, start: string, end: string): string | null {
+  const i = text.indexOf(start);
+  if (i === -1) return null;
+  const j = text.indexOf(end, i + start.length);
+  if (j === -1) return null;
+  // strip exactly one leading + trailing newline written by replaceBetweenMarkers
+  return text.slice(i + start.length, j).replace(/^\n/, "").replace(/\n$/, "");
 }
 
 // ─── Section markers (Phase 17) ──────────────────────────────────────────────
@@ -98,21 +117,33 @@ function insertSectionAfterPersonality(text: string, sectionMarkdown: string): s
 export function applySoulPatch(soul: string, patch: AgentUpdatePatch): string {
   let out = soul;
 
-  if (patch.personality !== undefined) {
-    const replaced = replaceBetweenMarkers(out, PERSONALITY_START, PERSONALITY_END, patch.personality);
+  const personality = normalizePatchField(patch.personality);
+  if (personality) {
+    let value = personality.value;
+    if (personality.mode === "append") {
+      const current = readBetweenMarkers(out, PERSONALITY_START, PERSONALITY_END);
+      if (current && current.length > 0) value = `${current}\n\n${value}`;
+    }
+    const replaced = replaceBetweenMarkers(out, PERSONALITY_START, PERSONALITY_END, value);
     if (replaced !== null) {
       out = replaced;
     } else {
-      out = replaceLegacySection(out, "Personality", patch.personality);
+      out = replaceLegacySection(out, "Personality", value);
     }
   }
 
-  if (patch.workflow !== undefined) {
-    const replaced = replaceBetweenMarkers(out, WORKFLOW_START, WORKFLOW_END, patch.workflow);
+  const workflow = normalizePatchField(patch.workflow);
+  if (workflow) {
+    let value = workflow.value;
+    if (workflow.mode === "append") {
+      const current = readBetweenMarkers(out, WORKFLOW_START, WORKFLOW_END);
+      if (current && current.length > 0) value = `${current}\n\n${value}`;
+    }
+    const replaced = replaceBetweenMarkers(out, WORKFLOW_START, WORKFLOW_END, value);
     if (replaced !== null) {
       out = replaced;
     } else {
-      const section = `## Workflow\n${WORKFLOW_START}\n${patch.workflow}\n${WORKFLOW_END}`;
+      const section = `## Workflow\n${WORKFLOW_START}\n${value}\n${WORKFLOW_END}`;
       out = insertSectionAfterPersonality(out, section);
     }
   }
@@ -135,13 +166,25 @@ export function applyClaudeMdPatch(claudeMd: string, patch: AgentUpdatePatch): s
     }
   }
 
-  if (patch.dataSources !== undefined) {
-    const body = patch.dataSources.trim() || "_none specified_";
+  const dataSources = normalizePatchField(patch.dataSources);
+  if (dataSources) {
+    let value = dataSources.value;
+    if (dataSources.mode === "append") {
+      const current = readBetweenMarkers(out, DATASOURCES_START, DATASOURCES_END);
+      if (current && current.length > 0 && current !== "_none specified_") {
+        value = `${current}\n\n${value}`;
+      }
+    }
+    const body = value.trim() || "_none specified_";
     const replaced = replaceBetweenMarkers(out, DATASOURCES_START, DATASOURCES_END, body);
     if (replaced !== null) {
       out = replaced;
-    } else {
+    } else if (/\n## Data Sources\s*\n/.test(out) || /^## Data Sources\s*\n/.test(out)) {
       out = replaceLegacySection(out, "Data Sources", body);
+    } else {
+      // No section at all — append a new marked section at end.
+      const section = `## Data Sources\n${DATASOURCES_START}\n${body}\n${DATASOURCES_END}\n`;
+      out = out.replace(/\n*$/, "\n\n") + section;
     }
   }
 
