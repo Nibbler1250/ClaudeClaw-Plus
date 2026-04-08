@@ -3,21 +3,35 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 current_plan: 18-03
-status: in_progress
-last_updated: "2026-04-08T17:30:00.000Z"
+status: phase_complete
+last_updated: "2026-04-08T17:45:00.000Z"
 progress:
   total_phases: 18
-  completed_phases: 13
+  completed_phases: 14
   total_plans: 29
-  completed_plans: 33
+  completed_plans: 34
 ---
 
 # State: ClaudeClaw v2 Upgrade
 
 ## Current Position
-**Phase:** 18 — Per-Job Model Override Runtime Wiring (In Progress)
-**Current Plan:** 18-03
-**Status:** 18-01, 18-02 complete
+**Phase:** 18 — Per-Job Model Override Runtime Wiring (COMPLETE ✅)
+**Current Plan:** 18-03 (done)
+**Status:** Phase 18 complete — milestone v1.0 blocker cleared
+
+### 2026-04-08 — Phase 18 Plan 3 (18-03) Completion
+- Closed Phase 18 test coverage gap — milestone v1.0 blocker cleared
+- runner.test.ts: parameterized `test.each(["opus","sonnet","haiku","glm"])` for model-string matrix
+- runner.test.ts: `modelOverride wins when agentic.enabled=true` (closes Plan 01 deferred case 4)
+- runner.test.ts: `no-override + agentic.enabled=false uses settings.model` regression sanity (closes Plan 01 deferred case 5)
+- Settings spy via `spyOn(configMod, "getSettings")` — simpler than governance internals mock
+- New `src/__tests__/integration/model-override.test.ts` — 5 test cases walking full chain createAgent → addJob/writeJobFileRaw → loadJobs → resolveJobModel → run → runClaudeOnce spy
+- Integration uses unique-prefix pattern from agents.test.ts (no chdir — Bun module cache makes chdir unreliable after runner.ts loads)
+- `writeJobFileRaw` helper bypasses addJob validation to inject `model: opuz` typo; verified loadJobs filters it while valid sibling (`haiku`) still loads
+- End-to-end e2e case proves resolved model from resolveJobModel reaches runClaudeOnce primaryConfig via real `run()` call
+- All 8 Phase 18 requirements now have passing tests (MODEL-RT-01/02/03, MODEL-VAL-01/02, MODEL-UI-01/02, MODEL-TEST-01)
+- Full suite 741/754 (13 pre-existing failures unchanged, zero new regressions)
+- Commits: f7dcced (Task 1), 82a5bf6 (Task 2)
 
 ### 2026-04-08 — Phase 18 Plan 2 (18-02) Completion
 - Added agent-level `defaultModel` as middle fallback tier in model resolution cascade

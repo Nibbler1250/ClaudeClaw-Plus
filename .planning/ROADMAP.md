@@ -380,7 +380,7 @@ Plans:
 Plans:
 - [x] TBD (run /gsd:plan-phase 17 to break down) (completed 2026-04-08)
 
-### Phase 18: Per-job model override runtime wiring (milestone blocker) 🚧
+### Phase 18: Per-job model override runtime wiring (milestone blocker) ✅
 
 **Goal:** Plumb per-job `model` preference (declared in `agents/<name>/jobs/<label>.md` frontmatter during Phase 17) all the way through the runner so jobs actually execute on the requested model (e.g. Reg's digest-scan runs on sonnet, Reg's draft-writing runs on opus).
 
@@ -391,14 +391,16 @@ Plans:
 - Validation: reject unknown model strings at load time, not at runtime
 - Tests: each supported model string resolves correctly, overrides cascade agent → job, invalid strings error cleanly
 
-**Milestone status:** 🚧 **BLOCKS milestone v1.0 completion and next production deploy.** Phase 17 ships the data model for this, Phase 18 makes it functional. Both must land before Reg can reliably use Opus for research while Suzy stays on cheaper models.
+**Milestone status:** ✅ **COMPLETE — milestone v1.0 blocker cleared (2026-04-08).** Per-job model override fully wired end-to-end. Reg can now run digest-scan on sonnet and draft-writing on opus; Suzy can run on haiku via agent-level default.
 
-**Requirements**: TBD (derive during /gsd:plan-phase)
+**Requirements**: MODEL-RT-01, MODEL-RT-02, MODEL-RT-03, MODEL-VAL-01, MODEL-VAL-02, MODEL-UI-01, MODEL-UI-02, MODEL-TEST-01 — all complete
 **Depends on:** Phase 17
-**Plans:** 2/3 plans executed
+**Plans:** 3/3 plans executed
 
 Plans:
-- [ ] TBD (run /gsd:plan-phase 18 to break down)
+- [x] 18-01 Runtime wiring (RunOptions.modelOverride + loadJobs validation) (completed 2026-04-08)
+- [x] 18-02 Agent-level defaultModel middle tier (completed 2026-04-08)
+- [x] 18-03 Test coverage expansion + end-to-end integration (completed 2026-04-08)
 
 ### Phase 19: Safe fresh-session feature (Discord/Telegram slash + Web UI button)
 
