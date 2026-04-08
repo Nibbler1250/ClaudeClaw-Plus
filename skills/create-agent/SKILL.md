@@ -9,6 +9,19 @@ Wizard for scaffolding a new ClaudeClaw agent — a focused Claude persona with 
 
 You are guiding the user through creating a teammate. Be conversational, warm, and direct. **Ask one question at a time.** Wait for the answer before moving on. **DO NOT dump all questions at once.** This is a wizard, not a form.
 
+## Echo before asking
+
+At the start of EVERY question after Q1, repeat the previously captured value back to the user so they know it landed. Format: `Got it — <field>: "<value>". Next: <next question>`. For multi-line values (workflow, personality), echo a 1-line summary like `Got it — workflow captured (NN words). Next: ...`.
+
+## State persistence
+
+After EACH answer is captured, write the full in-progress wizard state to `/tmp/claudeclaw-agent-wizard.json` via a `bun -e` snippet. Do NOT wait until scaffold time. If the network glitches or context resets, the next session can resume by reading this file. The snippet:
+
+```js
+const fs = await import("fs/promises");
+await fs.writeFile("/tmp/claudeclaw-agent-wizard.json", JSON.stringify(state, null, 2));
+```
+
 ## Tone
 
 Match the vibe of `skills/create-skill/SKILL.md`: friendly, brief, opinionated. You're texting a friend who happens to be brilliant. No filler, no walls of text. Acknowledge each answer in a sentence or less, then move to the next question.
@@ -61,9 +74,15 @@ Free text.
 
 ### 7. Scheduled tasks (loop)
 
+> **IMPORTANT — Jobs are LOCAL cron.** Scheduled tasks here are managed by ClaudeClaw's in-process cron loop (`src/jobs.ts` → `src/commands/start.ts setInterval`). They are NOT the remote `schedule` skill (which uses cloud triggers like Vercel cron). Do NOT invoke the `schedule` skill from this wizard. All job files live at `agents/<name>/jobs/<label>.md` with `schedule:` frontmatter and are loaded by `loadJobs()` on the running daemon.
+
 Ask: "Want to add a scheduled task? (y/n)"
 
 If `n`, skip to scaffold. If `y`, run this loop until the user is done:
+
+**Single-job workflow reuse:** If the user provided a non-empty Workflow (Q4) AND this is the first scheduled task AND the user does not add a second task, do NOT ask for a trigger prompt for this job. Default the trigger prompt to the literal string `Run the workflow defined in SOUL.md`. Then ask: `Want to override the trigger prompt for this job? (y/n, default n)`. Only prompt for a custom trigger if the user answers `y`.
+
+Multi-job agents (2+ scheduled tasks) still need per-job trigger prompts as before — different jobs do different things.
 
 For each task:
 
@@ -81,9 +100,13 @@ For each task:
 
 Then: "Add another task? (y/n)" — loop or break out.
 
+## Review before scaffolding
+
+Print a complete review of every captured answer (name, role, personality summary, workflow word count, discord channels, data sources, and each scheduled task with its label/cron/trigger). Then ask: `Scaffold this agent? (y/n, or 'edit <field>' to amend)`. If the user types `edit <field>`, jump back to that question; if `y`, proceed; if `n`, abort and unlink the temp state file.
+
 ## Scaffold
 
-Once all answers are in, **write them to a temp JSON file** to keep escaping sane, then call the helpers in one shot. Mirror Phase 16's temp-file pattern.
+Once all answers are in and the user confirmed the review block, **write them to a temp JSON file** to keep escaping sane, then call the helpers in one shot. Mirror Phase 16's temp-file pattern.
 
 ```bash
 # 1. Write the collected wizard state (use the Write tool for the temp file).
