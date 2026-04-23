@@ -2,7 +2,10 @@ import { readdir } from "fs/promises";
 import { join } from "path";
 import { getJobsDir } from "./config";
 
+const AGENTS_DIR = join(process.cwd(), "agents");
+
 export interface Job {
+  /** Scheduler key. For standalone jobs this is the file stem. For agent-scoped jobs this is "agent/label". */
   name: string;
   schedule: string;
   prompt: string;
@@ -12,6 +15,12 @@ export interface Job {
   model?: string;
   /** When set, overrides the global session timeout for this job (in seconds). */
   timeoutSeconds?: number;
+  /** If set, this job is scoped to an agent. */
+  agent?: string;
+  /** Human-readable label for agent-scoped jobs (file stem). */
+  label?: string;
+  /** When false, the job is loaded but not scheduled. Defaults to true. */
+  enabled?: boolean;
 }
 
 function parseFrontmatterValue(raw: string): string {
@@ -62,29 +71,85 @@ function parseJobFile(name: string, content: string): Job | null {
   const timeoutParsed = timeoutRaw ? parseInt(timeoutRaw, 10) : NaN;
   const timeoutSeconds = Number.isFinite(timeoutParsed) && timeoutParsed > 0 ? timeoutParsed : undefined;
 
-  return { name, schedule, prompt, recurring, notify, model, timeoutSeconds };
+  const agentLine = lines.find((l) => l.startsWith("agent:"));
+  const agentRaw = agentLine ? parseFrontmatterValue(agentLine.replace("agent:", "")) : "";
+  const agent = agentRaw || undefined;
+
+  const labelLine = lines.find((l) => l.startsWith("label:"));
+  const labelRaw = labelLine ? parseFrontmatterValue(labelLine.replace("label:", "")) : "";
+  const label = labelRaw || undefined;
+
+  const enabledLine = lines.find((l) => l.startsWith("enabled:"));
+  const enabledRaw = enabledLine
+    ? parseFrontmatterValue(enabledLine.replace("enabled:", "")).toLowerCase()
+    : "";
+  const enabled =
+    enabledRaw === "false" || enabledRaw === "no" || enabledRaw === "0"
+      ? false
+      : undefined;
+
+  return { name, schedule, prompt, recurring, notify, model, timeoutSeconds, agent, label, enabled };
 }
 
 export async function loadJobs(): Promise<Job[]> {
   const jobs: Job[] = [];
-  let files: string[];
-  try {
-    files = await readdir(getJobsDir());
-  } catch {
-    return jobs;
-  }
 
-  for (const file of files) {
+  let flatFiles: string[] = [];
+  try {
+    flatFiles = await readdir(getJobsDir());
+  } catch {
+    /* missing dir is fine */
+  }
+  for (const file of flatFiles) {
     if (!file.endsWith(".md")) continue;
     const content = await Bun.file(join(getJobsDir(), file)).text();
     const job = parseJobFile(file.replace(/\.md$/, ""), content);
-    if (job) jobs.push(job);
+    if (!job) continue;
+    if (job.enabled !== false) jobs.push(job);
   }
+
+  // agents/ lives at project root (outside .claude/), so agent-managed jobs are writable by Claude Code.
+  let agentDirs: string[] = [];
+  try {
+    agentDirs = await readdir(AGENTS_DIR);
+  } catch {
+    return jobs;
+  }
+  for (const agentName of agentDirs) {
+    const agentJobsDir = join(AGENTS_DIR, agentName, "jobs");
+    let jobFiles: string[] = [];
+    try {
+      jobFiles = await readdir(agentJobsDir);
+    } catch {
+      continue;
+    }
+    for (const file of jobFiles) {
+      if (!file.endsWith(".md")) continue;
+      const labelFromFile = file.replace(/\.md$/, "");
+      const content = await Bun.file(join(agentJobsDir, file)).text();
+      const job = parseJobFile(`${agentName}/${labelFromFile}`, content);
+      if (!job) continue;
+      job.agent = agentName;
+      job.label = labelFromFile;
+      if (job.enabled !== false) jobs.push(job);
+    }
+  }
+
   return jobs;
 }
 
+function resolveJobPath(jobName: string): string {
+  const slash = jobName.indexOf("/");
+  if (slash > 0 && slash < jobName.length - 1) {
+    const agentName = jobName.slice(0, slash);
+    const label = jobName.slice(slash + 1);
+    return join(AGENTS_DIR, agentName, "jobs", `${label}.md`);
+  }
+  return join(getJobsDir(), `${jobName}.md`);
+}
+
 export async function clearJobSchedule(jobName: string): Promise<void> {
-  const path = join(getJobsDir(), `${jobName}.md`);
+  const path = resolveJobPath(jobName);
   const content = await Bun.file(path).text();
   const match = content.match(/^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/);
   if (!match) return;

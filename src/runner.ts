@@ -375,12 +375,19 @@ export async function compactCurrentSession(): Promise<{ success: boolean; messa
     : { success: false, message: `❌ Compact failed (${existing.sessionId.slice(0, 8)})` };
 }
 
-async function execClaude(name: string, prompt: string, threadId?: string, modelOverride?: string, timeoutMsOverride?: number): Promise<RunResult> {
+async function execClaude(
+  name: string,
+  prompt: string,
+  threadId?: string,
+  modelOverride?: string,
+  timeoutMsOverride?: number,
+  agentName?: string
+): Promise<RunResult> {
   await mkdir(LOGS_DIR, { recursive: true });
 
   const existing = threadId
     ? await getThreadSession(threadId)
-    : await getSession();
+    : await getSession(agentName);
   const isNew = !existing;
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const logFile = join(LOGS_DIR, `${name}-${timestamp}.log`);
@@ -488,8 +495,9 @@ async function execClaude(name: string, prompt: string, threadId?: string, model
         await createThreadSession(threadId, sessionId);
         console.log(`[${new Date().toLocaleTimeString()}] Thread session created: ${sessionId} (thread ${threadId.slice(0, 8)})`);
       } else {
-        await createSession(sessionId);
-        console.log(`[${new Date().toLocaleTimeString()}] Session created: ${sessionId}`);
+        await createSession(sessionId, agentName);
+        const label = agentName ? ` (agent ${agentName})` : "";
+        console.log(`[${new Date().toLocaleTimeString()}] Session created: ${sessionId}${label}`);
       }
     } catch (e) {
       console.error(`[${new Date().toLocaleTimeString()}] Failed to parse session from Claude output:`, e);
@@ -549,7 +557,7 @@ async function execClaude(name: string, prompt: string, threadId?: string, model
       });
 
       if (retryExec.exitCode === 0) {
-        const count = threadId ? await incrementThreadTurn(threadId) : await incrementTurn();
+        const count = threadId ? await incrementThreadTurn(threadId) : await incrementTurn(agentName);
         console.log(`[${new Date().toLocaleTimeString()}] Turn count: ${count} (after compact + retry)`);
       }
       return retryResult;
@@ -558,14 +566,15 @@ async function execClaude(name: string, prompt: string, threadId?: string, model
 
   // --- Turn tracking & compact warning ---
   if (exitCode === 0 && !isNew) {
-    const turnCount = threadId ? await incrementThreadTurn(threadId) : await incrementTurn();
-    console.log(`[${new Date().toLocaleTimeString()}] Turn count: ${turnCount}${threadId ? ` (thread ${threadId.slice(0, 8)})` : ""}`);
+    const turnCount = threadId ? await incrementThreadTurn(threadId) : await incrementTurn(agentName);
+    const turnLabel = threadId ? ` (thread ${threadId.slice(0, 8)})` : agentName ? ` (agent ${agentName})` : "";
+    console.log(`[${new Date().toLocaleTimeString()}] Turn count: ${turnCount}${turnLabel}`);
 
     if (turnCount >= COMPACT_WARN_THRESHOLD && existing && !existing.compactWarned) {
       if (threadId) {
         await markThreadCompactWarned(threadId);
       } else {
-        await markCompactWarned();
+        await markCompactWarned(agentName);
       }
       emitCompactEvent({ type: "warn", turnCount });
     }
@@ -574,8 +583,15 @@ async function execClaude(name: string, prompt: string, threadId?: string, model
   return result;
 }
 
-export async function run(name: string, prompt: string, threadId?: string, modelOverride?: string, timeoutMs?: number): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt, threadId, modelOverride, timeoutMs), threadId);
+export async function run(
+  name: string,
+  prompt: string,
+  threadId?: string,
+  modelOverride?: string,
+  timeoutMs?: number,
+  agentName?: string
+): Promise<RunResult> {
+  return enqueue(() => execClaude(name, prompt, threadId, modelOverride, timeoutMs, agentName), threadId);
 }
 
 async function streamClaude(
