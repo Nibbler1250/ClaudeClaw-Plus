@@ -2,6 +2,10 @@ import { join, isAbsolute } from "path";
 import { mkdir } from "fs/promises";
 import { existsSync } from "fs";
 import { normalizeTimezoneName, resolveTimezoneOffsetMinutes } from "./timezone";
+import { parseWatchdogConfig, type WatchdogConfig } from "./watchdog";
+
+/** Re-exported under the name used in the Settings interface. */
+export type WatchdogSettings = WatchdogConfig;
 
 const HEARTBEAT_DIR = join(process.cwd(), ".claude", "claudeclaw");
 const SETTINGS_FILE = join(HEARTBEAT_DIR, "settings.json");
@@ -72,6 +76,7 @@ const DEFAULT_SETTINGS: Settings = {
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   stt: { baseUrl: "", model: "" },
   sessionTimeoutMs: DEFAULT_SESSION_TIMEOUT_MS,
+  watchdog: { maxConsecutiveTimeouts: null, maxRuntimeSeconds: null },
 };
 
 export interface HeartbeatExcludeWindow {
@@ -126,8 +131,10 @@ export interface Settings {
   web: WebConfig;
   stt: SttConfig;
   sessionTimeoutMs: number;
+  watchdog: WatchdogSettings;
   jobsDir?: string;
 }
+
 
 export interface AgenticMode {
   name: string;
@@ -297,6 +304,7 @@ function parseSettings(
     sessionTimeoutMs: typeof raw.sessionTimeoutMs === "number" && raw.sessionTimeoutMs > 0
       ? raw.sessionTimeoutMs
       : DEFAULT_SESSION_TIMEOUT_MS,
+    watchdog: parseWatchdogConfig(raw.watchdog),
     ...(typeof raw.jobsDir === "string" && raw.jobsDir.trim() ? { jobsDir: raw.jobsDir.trim() } : {}),
   };
 }
