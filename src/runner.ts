@@ -13,6 +13,7 @@ import { buildClockPromptPrefix } from "./timezone";
 import { selectModel as governanceSelectModel, configureRouter as configureGovernanceRouter } from "./governance/model-router";
 import { recordInvocationStart, recordInvocationCompletion, recordInvocationFailure } from "./governance/usage-tracker";
 import { recordExecutionMetric, checkLimits, handleTrigger as watchdogHandleTrigger } from "./governance/watchdog";
+import { startSession as watchdogStart, recordResult as watchdogRecord, abortReason as watchdogAbortReason, clearSession as watchdogClear } from "./watchdog";
 import { getGovernanceClient, type GovernanceClient } from "./governance/client";
 import { loadMemory, loadMemoryInstructions, ensureMemoryFile, getMemoryPath } from "./memory";
 import { loadAgent } from "./agents";
@@ -512,6 +513,8 @@ async function execClaude(name: string, prompt: string, agentName?: string, opti
 
   // Initialize watchdog metrics
   await recordExecutionMetric({ invocationId, sessionId: invocationSessionId }, {});
+  // Minimal watchdog: start clock for resumed sessions (new sessions get startSession after JSON parse)
+  if (invocationSessionId) watchdogStart(invocationSessionId);
 
   // Determine which model to use based on agentic routing
   let primaryConfig: ModelConfig;
@@ -680,6 +683,7 @@ async function execClaude(name: string, prompt: string, agentName?: string, opti
       // Save the real session ID from Claude Code
       await createSession(sessionId, agentName);
       console.log(`[${new Date().toLocaleTimeString()}] Session created: ${sessionId}`);
+      watchdogStart(sessionId);
     } catch (e) {
       console.error(`[${new Date().toLocaleTimeString()}] Failed to parse session from Claude output:`, e);
     }
@@ -755,6 +759,24 @@ async function execClaude(name: string, prompt: string, agentName?: string, opti
       }
     } catch (e) {
       // Non-fatal
+    }
+  }
+
+  // --- Minimal watchdog: track consecutive timeouts (opt-in via settings.watchdog) ---
+  const trackingId = sessionId !== "unknown" ? sessionId : null;
+  if (trackingId) {
+    const { watchdog } = getSettings();
+    if (exitCode === 0) {
+      watchdogClear(trackingId);
+    } else {
+      watchdogRecord(trackingId, exitCode);
+      const reason = watchdogAbortReason(trackingId, watchdog);
+      if (reason) {
+        console.warn(`[${new Date().toLocaleTimeString()}] ${reason}`);
+        watchdogClear(trackingId);
+        return result;
+      }
+      if (exitCode !== 124) watchdogClear(trackingId);
     }
   }
 
