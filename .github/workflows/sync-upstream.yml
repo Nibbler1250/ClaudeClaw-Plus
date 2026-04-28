@@ -2,11 +2,11 @@ name: Sync Upstream
 
 on:
   schedule:
-    - cron: '0 7 * * *'  # 7am UTC daily
+    - cron: '0 7 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Dry run — check for new commits without merging'
+        description: 'Dry run - check for new commits without merging'
         type: boolean
         default: false
 
@@ -23,12 +23,13 @@ jobs:
     steps:
       - id: check
         run: |
-          if [[ "${{ github.event_name }}" == "schedule" || "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          EVENT="${{ github.event_name }}"
+          if [ "$EVENT" = "schedule" ] || [ "$EVENT" = "workflow_dispatch" ]; then
             echo "result=true" >> "$GITHUB_OUTPUT"
-            echo "Proceeding — triggered by ${{ github.event_name }}"
+            echo "Proceeding: triggered by $EVENT"
           else
             echo "result=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping — sync only runs on schedule or manual dispatch (got: ${{ github.event_name }})"
+            echo "Skipping: sync only runs on schedule or manual dispatch (got: $EVENT)"
           fi
 
   sync:
@@ -67,8 +68,7 @@ jobs:
 
       - name: Skip if dry run or no new commits
         if: steps.check.outputs.new_commits == '0' || inputs.dry_run == true
-        run: |
-          echo "Nothing to do (new_commits=${{ steps.check.outputs.new_commits }}, dry_run=${{ inputs.dry_run }})"
+        run: echo "Nothing to do (new_commits=${{ steps.check.outputs.new_commits }}, dry_run=${{ inputs.dry_run }})"
 
       - name: Create sync branch
         if: steps.check.outputs.new_commits != '0' && inputs.dry_run != true
@@ -87,12 +87,9 @@ jobs:
             echo "Merge succeeded with no conflicts."
           else
             echo "status=conflicts" >> "$GITHUB_OUTPUT"
-            echo "Merge has conflicts — committing for manual review."
+            echo "Merge has conflicts - committing for manual review."
             git add -A
-            git commit -m "sync: upstream merge with conflicts (manual resolution needed)
-
-Auto-merge from moazbuilds/claudeclaw:master failed.
-Resolve conflicts in this branch then merge to main."
+            git commit -m "sync: upstream merge with conflicts (manual resolution needed)"
           fi
 
       - name: Push sync branch
@@ -106,7 +103,7 @@ Resolve conflicts in this branch then merge to main."
         run: |
           gh pr create \
             --title "chore: sync upstream (${{ steps.check.outputs.new_commits }} new commits)" \
-            --body "$(printf 'Automated sync from [moazbuilds/claudeclaw:master](https://github.com/moazbuilds/claudeclaw).\n\nAuto-merge was **clean** — ready to merge.\n\n**New upstream commits:**\n\`\`\`\n%s\n\`\`\`' "$(git log origin/main..upstream/master --oneline)")" \
+            --body "Automated sync from moazbuilds/claudeclaw:master. Auto-merge was clean - ready to merge." \
             --head "${{ steps.branch.outputs.name }}" \
             --base main
 
@@ -116,7 +113,7 @@ Resolve conflicts in this branch then merge to main."
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh pr create \
-            --title "⚠️ chore: sync upstream — CONFLICTS need manual review" \
-            --body "$(printf 'Automated sync from [moazbuilds/claudeclaw:master](https://github.com/moazbuilds/claudeclaw).\n\n**Merge has conflicts** — manual resolution required before merging.\n\nTypical conflict files: `src/config.ts`, `src/runner.ts`\n\nStrategy: keep combined-branch structure, take upstream bug fixes.')" \
+            --title "chore: sync upstream - CONFLICTS need manual review" \
+            --body "Automated sync from moazbuilds/claudeclaw:master has merge conflicts. Resolve before merging. Typical files: src/config.ts, src/runner.ts" \
             --head "${{ steps.branch.outputs.name }}" \
             --base main
