@@ -128,6 +128,7 @@ export interface Settings {
   web: WebConfig;
   stt: SttConfig;
   watchdog: WatchdogSettings;
+  sessionTimeoutMs?: number;
   jobsDir?: string;
 }
 
@@ -298,6 +299,7 @@ function parseSettings(
       model: typeof raw.stt?.model === "string" ? raw.stt.model.trim() : "",
     },
     watchdog: parseWatchdogConfig(raw.watchdog),
+    ...(typeof raw.sessionTimeoutMs === "number" && raw.sessionTimeoutMs > 0 ? { sessionTimeoutMs: raw.sessionTimeoutMs } : {}),
     ...(typeof raw.jobsDir === "string" && raw.jobsDir.trim() ? { jobsDir: raw.jobsDir.trim() } : {}),
   };
 }
