@@ -755,10 +755,14 @@ export async function start(args: string[] = []) {
     for (const job of currentJobs) {
       if (cronMatches(job.schedule, now, currentSettings.timezoneOffsetMinutes)) {
         resolvePrompt(job.prompt)
+<<<<<<< HEAD
           .then(async (prompt) => {
             const modelOverride = await resolveJobModel(job);
             return run(job.name, prompt, job.agent, modelOverride ? { modelOverride } : undefined);
           })
+=======
+          .then((prompt) => run(job.name, prompt, job.name, job.model, job.timeoutSeconds ? job.timeoutSeconds * 1000 : undefined))
+>>>>>>> upstream/master
           .then((r) => {
             if (job.notify === false) return;
             if (job.notify === "error" && r.exitCode === 0) return;
