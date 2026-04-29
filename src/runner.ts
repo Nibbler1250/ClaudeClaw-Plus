@@ -238,14 +238,13 @@ export function agentDirKey(rawName: string, threadId: string): string {
 }
 
 // Returns the working directory for a named agent's Claude spawn.
-// Accepts an already-normalised key (from agentDirKey or safeAgentSlug) — does NOT
-// re-slug, so the threadId suffix is preserved. Verifies the result stays under agents/.
-export async function ensureAgentDir(key: string): Promise<string> {
-  if (!/^[a-z0-9_-]+$/.test(key)) {
-    throw new Error(`Agent key "${key}" contains unsafe characters`);
-  }
+// Works with any agent name — Discord-generated keys (from agentDirKey) or
+// raw filesystem directory names used by scheduled jobs. The only security
+// constraint is the resolve-under-agents/ check, which blocks path traversal
+// regardless of character set.
+export async function ensureAgentDir(name: string): Promise<string> {
   const agentsRoot = join(PROJECT_DIR, "agents");
-  const dir = join(agentsRoot, key);
+  const dir = join(agentsRoot, name);
   if (!resolve(dir).startsWith(resolve(agentsRoot) + sep)) {
     throw new Error(`Agent directory "${dir}" would escape the agents root — rejecting`);
   }
