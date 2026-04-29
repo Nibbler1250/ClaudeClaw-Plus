@@ -1,4 +1,4 @@
-import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession } from "../runner";
+import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, safeAgentSlug } from "../runner";
 import { getSettings, loadSettings } from "../config";
 import { resetSession, peekSession } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession } from "../sessionManager";
@@ -119,6 +119,17 @@ let readyGuildIds: Set<string> | null = null;
 
 // Track known thread channel IDs and their parent channel IDs for multi-session support
 const knownThreads = new Map<string, { parentId: string; agentName?: string }>();
+
+// Upsert knownThreads, preserving any existing agentName when a new one is not supplied.
+// Always use this instead of knownThreads.set() to avoid accidental data loss on recovery paths.
+function upsertThread(id: string, parentId: string, rawName?: string): void {
+  const existing = knownThreads.get(id);
+  let agentName: string | undefined;
+  if (rawName) {
+    try { agentName = safeAgentSlug(rawName); } catch { /* unsanitizable name — no agent scoping */ }
+  }
+  knownThreads.set(id, { parentId, agentName: agentName ?? existing?.agentName });
+}
 
 // --- Debug ---
 
@@ -246,9 +257,9 @@ async function rejoinThreads(token: string): Promise<void> {
       await discordApi(token, "DELETE", `/channels/${ts.threadId}/thread-members/@me`).catch(() => {});
       await discordApi(token, "PUT", `/channels/${ts.threadId}/thread-members/@me`);
       if (!knownThreads.has(ts.threadId)) {
-        const ch = await discordApi<{ parent_id?: string }>(token, "GET", `/channels/${ts.threadId}`);
+        const ch = await discordApi<{ parent_id?: string; name?: string }>(token, "GET", `/channels/${ts.threadId}`);
         if (ch.parent_id) {
-          knownThreads.set(ts.threadId, { parentId: ch.parent_id });
+          upsertThread(ts.threadId, ch.parent_id, ch.name);
         }
       }
       console.log(`[Discord] Rejoined thread: ${ts.threadId}`);
@@ -450,10 +461,10 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     const persisted = await peekThreadSession(channelId);
     if (persisted) {
       try {
-        const ch = await discordApi<{ parent_id?: string }>(config.token, "GET", `/channels/${channelId}`);
+        const ch = await discordApi<{ parent_id?: string; name?: string }>(config.token, "GET", `/channels/${channelId}`);
         if (ch.parent_id) {
-          knownThreads.set(channelId, { parentId: ch.parent_id });
-          debugLog(`Thread recovered from sessions.json: ${channelId} (parent: ${ch.parent_id})`);
+          upsertThread(channelId, ch.parent_id, ch.name);
+          debugLog(`Thread recovered from sessions.json: ${channelId} (parent: ${ch.parent_id} name: ${ch.name ?? "unknown"})`);
         }
       } catch (err) {
         debugLog(`Thread recovery failed for ${channelId}: ${err}`);
@@ -584,7 +595,7 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
                 auto_archive_duration: 4320, // 3 days
               },
             );
-            knownThreads.set(thread.id, { parentId: channelId, agentName: threadName });
+            upsertThread(thread.id, channelId, threadName);
             // Don't pre-create session — let Claude CLI create it on first message
             // The real UUID will be captured and saved by runner.ts
             await sendMessage(config.token, thread.id, `🧵 Thread **${threadName}** created with independent session. Start chatting!`);
@@ -732,7 +743,8 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
 
     if (interaction.data.name === "compact") {
       await respondToInteraction(interaction, { content: "⏳ Compacting session..." });
-      const result = await compactCurrentSession();
+      const compactThreadInfo = interaction.channel_id ? knownThreads.get(interaction.channel_id) : undefined;
+      const result = await compactCurrentSession(compactThreadInfo?.agentName);
       await fetch(
         `${DISCORD_API}/webhooks/${applicationId}/${interaction.token}/messages/@original`,
         {
@@ -1031,7 +1043,7 @@ function handleDispatch(token: string, eventName: string, data: any): void {
       if (data.threads) {
         console.log(`[Discord] GUILD_CREATE: ${data.threads.length} active threads in guild ${data.id}`);
         for (const thread of data.threads) {
-          knownThreads.set(thread.id, { parentId: thread.parent_id });
+          upsertThread(thread.id, thread.parent_id, thread.name);
           console.log(`[Discord]   thread: ${thread.id} name="${thread.name}" parent=${thread.parent_id}`);
         }
       } else {
@@ -1048,7 +1060,7 @@ function handleDispatch(token: string, eventName: string, data: any): void {
 
     case "THREAD_CREATE":
       if (data.id && data.parent_id) {
-        knownThreads.set(data.id, { parentId: data.parent_id, agentName: data.name ?? undefined });
+        upsertThread(data.id, data.parent_id, data.name);
         debugLog(`Thread tracked: ${data.id} (parent: ${data.parent_id} name: ${data.name ?? "unknown"})`);
         if (getSettings().discord.listenChannels.includes(data.parent_id)) {
           discordApi(token, "PUT", `/channels/${data.id}/thread-members/@me`).catch((err) =>
@@ -1077,8 +1089,7 @@ function handleDispatch(token: string, eventName: string, data: any): void {
           );
           debugLog(`Thread archived and cleaned up: ${data.id}`);
         } else {
-          const existing = knownThreads.get(data.id);
-          knownThreads.set(data.id, { parentId: data.parent_id, agentName: data.name ?? existing?.agentName });
+          upsertThread(data.id, data.parent_id, data.name);
         }
       }
       break;
@@ -1086,7 +1097,7 @@ function handleDispatch(token: string, eventName: string, data: any): void {
     case "THREAD_LIST_SYNC":
       if (data.threads) {
         for (const thread of data.threads) {
-          knownThreads.set(thread.id, { parentId: thread.parent_id, agentName: thread.name ?? undefined });
+          upsertThread(thread.id, thread.parent_id, thread.name);
         }
       }
       break;

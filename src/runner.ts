@@ -1,5 +1,5 @@
 import { mkdir, readFile, writeFile } from "fs/promises";
-import { join } from "path";
+import { join, resolve, sep } from "path";
 import { existsSync } from "fs";
 import { getSession, createSession, incrementTurn, markCompactWarned } from "./sessions";
 import {
@@ -209,10 +209,28 @@ async function runClaudeOnce(
 
 const PROJECT_DIR = process.cwd();
 
+// Converts a raw agent/thread display name to a safe filesystem segment.
+// Only [a-z0-9_-] characters are allowed; spaces and other separators become hyphens.
+// Exported so callers can show the canonical form in UI before creating the directory.
+export function safeAgentSlug(raw: string): string {
+  const slug = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+  if (!slug) throw new Error(`Agent name "${raw}" cannot be converted to a safe path segment`);
+  return slug;
+}
+
 // Returns the working directory for a named agent's Claude spawn.
-// The agent directory is created on first use so the spawn never fails on a missing cwd.
+// Sanitizes the name and verifies the result stays under PROJECT_DIR/agents/.
 export async function ensureAgentDir(agentName: string): Promise<string> {
-  const dir = join(PROJECT_DIR, "agents", agentName);
+  const agentsRoot = join(PROJECT_DIR, "agents");
+  const dir = join(agentsRoot, safeAgentSlug(agentName));
+  // Belt-and-suspenders: confirm we haven't escaped the agents/ root
+  if (!resolve(dir).startsWith(resolve(agentsRoot) + sep)) {
+    throw new Error(`Agent directory "${dir}" would escape the agents root — rejecting`);
+  }
   await mkdir(dir, { recursive: true });
   return dir;
 }
