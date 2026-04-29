@@ -1,4 +1,4 @@
-import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, safeAgentSlug } from "../runner";
+import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, compactCurrentThreadSession, safeAgentSlug } from "../runner";
 import { getSettings, loadSettings } from "../config";
 import { resetSession, peekSession } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession } from "../sessionManager";
@@ -121,12 +121,14 @@ let readyGuildIds: Set<string> | null = null;
 const knownThreads = new Map<string, { parentId: string; agentName?: string }>();
 
 // Upsert knownThreads, preserving any existing agentName when a new one is not supplied.
+// The agentName key is "<slug>-<threadId>" to guarantee uniqueness across threads whose
+// display names would otherwise map to the same slug.
 // Always use this instead of knownThreads.set() to avoid accidental data loss on recovery paths.
 function upsertThread(id: string, parentId: string, rawName?: string): void {
   const existing = knownThreads.get(id);
   let agentName: string | undefined;
   if (rawName) {
-    try { agentName = safeAgentSlug(rawName); } catch { /* unsanitizable name — no agent scoping */ }
+    try { agentName = `${safeAgentSlug(rawName)}-${id}`; } catch { /* unsanitizable — no agent scoping */ }
   }
   knownThreads.set(id, { parentId, agentName: agentName ?? existing?.agentName });
 }
@@ -743,8 +745,11 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
 
     if (interaction.data.name === "compact") {
       await respondToInteraction(interaction, { content: "⏳ Compacting session..." });
-      const compactThreadInfo = interaction.channel_id ? knownThreads.get(interaction.channel_id) : undefined;
-      const result = await compactCurrentSession(compactThreadInfo?.agentName);
+      const compactChannelId = interaction.channel_id;
+      const compactThreadInfo = compactChannelId ? knownThreads.get(compactChannelId) : undefined;
+      const result = compactChannelId && compactThreadInfo
+        ? await compactCurrentThreadSession(compactChannelId, compactThreadInfo.agentName)
+        : await compactCurrentSession();
       await fetch(
         `${DISCORD_API}/webhooks/${applicationId}/${interaction.token}/messages/@original`,
         {

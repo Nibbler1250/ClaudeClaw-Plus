@@ -407,6 +407,36 @@ export async function compactCurrentSession(agentName?: string): Promise<{ succe
     : { success: false, message: `❌ Compact failed (${existing.sessionId.slice(0, 8)})` };
 }
 
+// Compact a Discord thread session by threadId. Uses getThreadSession (not getSession)
+// because Discord threads have their own session store. agentName is used only for cwd isolation.
+export async function compactCurrentThreadSession(
+  threadId: string,
+  agentName?: string
+): Promise<{ success: boolean; message: string }> {
+  const existing = await getThreadSession(threadId);
+  if (!existing) return { success: false, message: "No active session to compact." };
+
+  const settings = getSettings();
+  const securityArgs = buildSecurityArgs(settings.security);
+  const baseEnv = cleanSpawnEnv();
+  const timeoutMs = settings.sessionTimeoutMs;
+
+  const compactCwd = agentName ? await ensureAgentDir(agentName) : undefined;
+  const ok = await runCompact(
+    existing.sessionId,
+    settings.model,
+    settings.api,
+    baseEnv,
+    securityArgs,
+    timeoutMs,
+    compactCwd
+  );
+
+  return ok
+    ? { success: true, message: `✅ Thread session compact complete (${existing.sessionId.slice(0, 8)})` }
+    : { success: false, message: `❌ Compact failed (${existing.sessionId.slice(0, 8)})` };
+}
+
 async function execClaude(
   name: string,
   prompt: string,
