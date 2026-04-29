@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from "fs/promises";
 import { join } from "path";
 import { existsSync } from "fs";
-import { getSession, createSession, incrementTurn, markCompactWarned } from "./sessions";
+import { getSession, createSession, incrementTurn, markCompactWarned, resetSession } from "./sessions";
 import {
   getThreadSession,
   createThreadSession,
@@ -109,6 +109,7 @@ export interface RunResult {
 }
 
 const RATE_LIMIT_PATTERN = /you.ve hit your limit|out of extra usage/i;
+const STALE_THINKING_PATTERN = /Invalid.*signature.*thinking|thinking.*block.*signature/i;
 
 // Serial queue — prevents concurrent --resume on the same session
 // Global queue for non-thread messages (backward compatible)
@@ -676,6 +677,13 @@ async function execClaude(name: string, prompt: string, agentName?: string, opti
 
   if (rateLimitMessage) {
     stdout = rateLimitMessage;
+  }
+
+  // Stale thinking block signatures cause exit 1 with an API 400 error.
+  // Auto-reset the session so the next invocation starts fresh.
+  if (!isNew && STALE_THINKING_PATTERN.test(rawStdout + stderr)) {
+    console.warn(`[${new Date().toLocaleTimeString()}] Stale thinking block signature — resetting session for ${agentName ?? "global"}`);
+    await resetSession(agentName);
   }
 
   // For new sessions, parse the JSON to extract session_id and result text
