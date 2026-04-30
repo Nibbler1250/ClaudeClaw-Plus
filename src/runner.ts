@@ -207,6 +207,85 @@ async function runClaudeOnce(
   }
 }
 
+// Runs claude with --output-format stream-json --verbose, reading NDJSON events as they
+// arrive rather than buffering the full stdout. This allows the parent process to remain
+// responsive while Claude orchestrates subagents via the Task tool — each subagent emits
+// events through the parent's stdout stream, so the process stays alive and producing
+// output until all agents finish. Returns the final result text and the session ID
+// captured from the stream/init event.
+async function runClaudeStream(
+  baseArgs: string[],
+  model: string,
+  api: string,
+  baseEnv: Record<string, string>,
+  timeoutMs: number = DEFAULT_SESSION_TIMEOUT_MS,
+  cwd?: string
+): Promise<{ rawStdout: string; stderr: string; exitCode: number; sessionId?: string }> {
+  const args = [...baseArgs];
+  const normalizedModel = model.trim().toLowerCase();
+  if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
+
+  const proc = Bun.spawn(args, {
+    stdout: "pipe",
+    stderr: "pipe",
+    env: buildChildEnv(baseEnv, model, api),
+    ...(cwd ? { cwd } : {}),
+  });
+
+  let sessionId: string | undefined;
+  let resultText = "";
+  let stderr = "";
+
+  const readStdout = async () => {
+    const reader = proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop() ?? "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const event = JSON.parse(trimmed) as Record<string, unknown>;
+          if ((event.type === "system" || event.type === "result") && typeof event.session_id === "string") {
+            sessionId = event.session_id;
+          }
+          if (event.type === "result" && typeof event.result === "string") {
+            resultText = event.result;
+          }
+        } catch {}
+      }
+    }
+  };
+
+  const readStderr = async () => {
+    stderr = await new Response(proc.stderr).text();
+  };
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    setTimeout(() => reject(new Error(`Claude session timed out after ${timeoutMs / 1000}s`)), timeoutMs);
+  });
+
+  try {
+    await Promise.race([
+      Promise.all([readStdout(), readStderr()]),
+      timeoutPromise,
+    ]);
+    await proc.exited;
+    return { rawStdout: resultText, stderr: stderr.trim(), exitCode: proc.exitCode ?? 1, sessionId };
+  } catch (err) {
+    try { proc.kill("SIGTERM"); } catch {}
+    setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${new Date().toLocaleTimeString()}] ${message}`);
+    return { rawStdout: "", stderr: message, exitCode: 124, sessionId };
+  }
+}
+
 const PROJECT_DIR = process.cwd();
 
 // Converts a raw agent/thread display name to a safe filesystem segment.
@@ -522,10 +601,12 @@ async function execClaude(
     `[${new Date().toLocaleTimeString()}] Running: ${name} (${isNew ? "new session" : `resume ${existing.sessionId.slice(0, 8)}`}, security: ${security.level})`
   );
 
-  // New session: use json output to capture Claude's session_id
-  // Resumed session: use text output with --resume
-  const outputFormat = isNew ? "json" : "text";
-  const args = ["claude", "-p", prompt, "--output-format", outputFormat, ...securityArgs];
+  // stream-json emits NDJSON events as Claude works, including during subagent (Task tool)
+  // orchestration. This keeps the process alive and producing output rather than silently
+  // blocking until all spawned agents finish. --verbose is required for stream-json in
+  // print (-p) mode. Session ID is captured from the system/init event; the final result
+  // text comes from the result event — no separate output format needed for new vs resumed.
+  const args = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", ...securityArgs];
 
   if (!isNew) {
     args.push("--resume", existing.sessionId);
@@ -558,7 +639,7 @@ async function execClaude(
   const baseEnv = cleanSpawnEnv();
   const spawnCwd = agentName ? await ensureAgentDir(agentName) : undefined;
 
-  let exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd);
+  let exec = await runClaudeStream(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd);
   const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
   let usedFallback = false;
 
@@ -566,7 +647,7 @@ async function execClaude(
     console.warn(
       `[${new Date().toLocaleTimeString()}] Claude limit reached; retrying with fallback${fallbackConfig.model ? ` (${fallbackConfig.model})` : ""}...`
     );
-    exec = await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, spawnCwd);
+    exec = await runClaudeStream(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, spawnCwd);
     usedFallback = true;
   }
 
@@ -581,25 +662,25 @@ async function execClaude(
     stdout = rateLimitMessage;
   }
 
-  // For new sessions, parse the JSON to extract session_id and result text
-  if (!rateLimitMessage && isNew && exitCode === 0) {
-    try {
-      const json = JSON.parse(rawStdout);
-      sessionId = json.session_id;
-      stdout = json.result ?? "";
-      // Save the real session ID from Claude Code
-      if (threadId) {
-        await createThreadSession(threadId, sessionId);
-        console.log(`[${new Date().toLocaleTimeString()}] Thread session created: ${sessionId} (thread ${threadId.slice(0, 8)})`);
-      } else {
-        await createSession(sessionId, agentName);
-        const label = agentName ? ` (agent ${agentName})` : "";
-        console.log(`[${new Date().toLocaleTimeString()}] Session created: ${sessionId}${label}`);
-      }
-      startSession(sessionId);
-    } catch (e) {
-      console.error(`[${new Date().toLocaleTimeString()}] Failed to parse session from Claude output:`, e);
+  // Surface stderr when the result event never arrived (abort, tool error, etc.)
+  if (!rateLimitMessage && exitCode !== 0 && !stdout && stderr) {
+    stdout = stderr;
+  }
+
+  // Capture session ID from stream events and persist for new sessions.
+  // Gate only on isNew + sessionId present — not on exitCode, so a session that timed
+  // out mid-run is still persisted and can be resumed on the next message.
+  if (!rateLimitMessage && isNew && exec.sessionId) {
+    sessionId = exec.sessionId;
+    if (threadId) {
+      await createThreadSession(threadId, sessionId);
+      console.log(`[${new Date().toLocaleTimeString()}] Thread session created: ${sessionId} (thread ${threadId.slice(0, 8)})`);
+    } else {
+      await createSession(sessionId, agentName);
+      const label = agentName ? ` (agent ${agentName})` : "";
+      console.log(`[${new Date().toLocaleTimeString()}] Session created: ${sessionId}${label}`);
     }
+    startSession(sessionId);
   }
 
   const result: RunResult = {
@@ -661,7 +742,7 @@ async function execClaude(
 
     if (compactOk) {
       console.log(`[${new Date().toLocaleTimeString()}] Retrying ${name} after compact...`);
-      const retryExec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd);
+      const retryExec = await runClaudeStream(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd);
       const retryResult: RunResult = {
         stdout: retryExec.rawStdout,
         stderr: retryExec.stderr,
