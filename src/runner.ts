@@ -251,10 +251,16 @@ export async function ensureAgentDir(name: string): Promise<string> {
     throw new Error(`Agent directory "${dir}" would escape the agents root — rejecting`);
   }
   await mkdir(dir, { recursive: true });
-  // Post-mkdir realpath check: resolves symlinks so a symlinked agent directory
-  // that points outside agents/ is caught even if it passed the lexical check.
-  const realDir = await realpath(dir);
+  // Post-mkdir realpath checks resolve symlinks at every level.
+  // We verify two things:
+  //   1. agents/ itself resolves inside PROJECT_DIR (catches a symlinked agents/ root)
+  //   2. agents/<name> resolves inside agents/ (catches a symlinked individual agent dir)
+  const realProjectDir = await realpath(PROJECT_DIR);
   const realRoot = await realpath(agentsRoot);
+  const realDir = await realpath(dir);
+  if (!realRoot.startsWith(realProjectDir + sep)) {
+    throw new Error(`agents/ root "${realRoot}" resolves outside the project directory via symlink — rejecting`);
+  }
   if (!realDir.startsWith(realRoot + sep)) {
     throw new Error(`Agent directory "${realDir}" resolves outside the agents root via symlink — rejecting`);
   }
