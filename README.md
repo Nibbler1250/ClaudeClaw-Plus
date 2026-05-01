@@ -181,9 +181,11 @@ Everything ClaudeClaw ships, Plus ships too:
 
 ## Contributing
 
-Big ideas welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide.
+**Scope matters here.** ClaudeClaw+ is for heavy, opinionated, and architecturally significant work. If your idea fits the lightweight upstream repo, it should go to [`moazbuilds/claudeclaw`](https://github.com/moazbuilds/claudeclaw) — that's still the right home for bug fixes, small improvements, and new integrations. Work submitted here that belongs upstream won't be merged; it'll be redirected back.
 
-Short version: open an issue or discussion first, then the PR. Large refactors fine. Opinionated changes fine. Multi-file stacks fine. Just talk first, code second.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full scope guide and how to decide where your contribution belongs.
+
+Short version for ClaudeClaw+: open an issue first, then the PR. Large refactors fine. New subsystems fine. Multi-file stacks fine. Just talk first, code second.
 
 ---
 

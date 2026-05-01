@@ -1,6 +1,25 @@
 # Contributing to ClaudeClaw+
 
-All ideas welcome. Big PRs, refactors, opinionated reorganisations, new features — bring them. The only rule is we talk first and code second.
+ClaudeClaw+ is the home for **heavy, opinionated, and architecturally significant work** that is out of scope for the lightweight upstream repo ([`moazbuilds/claudeclaw`](https://github.com/moazbuilds/claudeclaw)). If your idea fits comfortably in the upstream repo — contribute it there. Work submitted here that is actually lightweight or upstream-suitable won't be merged; it'll be redirected back upstream.
+
+Talk first, code second.
+
+---
+
+## Where does your contribution belong?
+
+Before opening anything, ask yourself:
+
+| This contribution is... | Contribute to |
+|---|---|
+| A bug fix, small improvement, or new integration | **[moazbuilds/claudeclaw](https://github.com/moazbuilds/claudeclaw)** |
+| A new adapter (Slack, WhatsApp, etc.) | **moazbuilds/claudeclaw** |
+| Lightweight and broadly useful | **moazbuilds/claudeclaw** |
+| A new subsystem (governance, orchestration, policy, memory) | **ClaudeClaw+** |
+| A large architectural change upstream wouldn't want | **ClaudeClaw+** |
+| Something that adds significant runtime weight or new dependencies | **ClaudeClaw+** |
+
+**If in doubt, open an issue here describing the idea.** We'll tell you quickly whether it fits ClaudeClaw+ or belongs upstream.
 
 ---
 
@@ -14,7 +33,7 @@ For small, obviously-scoped changes (typos, single-function fixes, docs updates)
 
 ## Scope expectations
 
-**Large, multi-file PRs are fine.** Multi-stage feature stacks are fine. We'd rather merge ambitious work than reject it for size.
+**Large, multi-file PRs are fine.** Multi-stage feature stacks are fine. We'd rather merge ambitious work than reject it for size — as long as it belongs here.
 
 If your change is the kind of thing that upstream would consider too heavy or opinionated for the lightweight core, that's exactly what ClaudeClaw+ is for. This is the right place.
 
