@@ -77,12 +77,14 @@ const DEFAULT_SETTINGS: Settings = {
     forwardToTelegram: true,
   },
   telegram: { token: "", allowedUserIds: [], listenChats: [] },
-  discord: { token: "", allowedUserIds: [], listenChannels: [] },
+  discord: { token: "", allowedUserIds: [], listenChannels: [], listenGuilds: [] },
+  slack: { botToken: "", appToken: "", allowedUserIds: [], listenChannels: [] },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   stt: { baseUrl: "", model: "" },
   sessionTimeoutMs: DEFAULT_SESSION_TIMEOUT_MS,
   watchdog: { maxConsecutiveTimeouts: null, maxRuntimeSeconds: null },
+  session: { autoRotate: false, maxMessages: 50, maxAgeHours: 24, summaryPath: "" },
   plugins: {},
 };
 
@@ -110,6 +112,14 @@ export interface DiscordConfig {
   token: string;
   allowedUserIds: string[]; // Discord snowflake IDs exceed Number.MAX_SAFE_INTEGER
   listenChannels: string[]; // Channel IDs where bot responds to all messages (no mention needed)
+  listenGuilds: string[]; // Guild IDs where bot responds to all messages in any channel/thread
+}
+
+export interface SlackConfig {
+  botToken: string;       // xoxb-... bot token
+  appToken: string;       // xapp-... Socket Mode token
+  allowedUserIds: string[];
+  listenChannels: string[]; // Channel IDs where bot responds without @mention
 }
 
 export type SecurityLevel =
@@ -134,12 +144,14 @@ export interface Settings {
   heartbeat: HeartbeatConfig;
   telegram: TelegramConfig;
   discord: DiscordConfig;
+  slack: SlackConfig;
   security: SecurityConfig;
   web: WebConfig;
   stt: SttConfig;
   sessionTimeoutMs: number;
   watchdog: WatchdogSettings;
   plugins: Record<string, PluginEntry>;
+  session: SessionConfig;
   jobsDir?: string;
 }
 
@@ -175,6 +187,17 @@ export interface SttConfig {
   baseUrl: string;
   /** Model name passed to the API (default: "Systran/faster-whisper-large-v3") */
   model: string;
+}
+
+export interface SessionConfig {
+  /** Automatically rotate the global session when a threshold is exceeded. Default: false. */
+  autoRotate: boolean;
+  /** Rotate after this many messages. Default: 50. */
+  maxMessages: number;
+  /** Rotate after this many hours. Default: 24. */
+  maxAgeHours: number;
+  /** Directory to write markdown summaries before rotation. Empty string disables summaries. */
+  summaryPath: string;
 }
 
 let cached: Settings | null = null;
@@ -290,6 +313,15 @@ function parseSettings(
       listenChannels: Array.isArray(raw.discord?.listenChannels)
         ? raw.discord.listenChannels.map(String)
         : [],
+      listenGuilds: Array.isArray(raw.discord?.listenGuilds)
+        ? raw.discord.listenGuilds.map(String)
+        : [],
+    },
+    slack: {
+      botToken: process.env.SLACK_BOT_TOKEN?.trim() || (typeof raw.slack?.botToken === "string" ? raw.slack.botToken.trim() : ""),
+      appToken: process.env.SLACK_APP_TOKEN?.trim() || (typeof raw.slack?.appToken === "string" ? raw.slack.appToken.trim() : ""),
+      allowedUserIds: Array.isArray(raw.slack?.allowedUserIds) ? raw.slack.allowedUserIds.map(String) : [],
+      listenChannels: Array.isArray(raw.slack?.listenChannels) ? raw.slack.listenChannels.map(String) : [],
     },
     security: {
       level,
@@ -314,6 +346,12 @@ function parseSettings(
       : DEFAULT_SESSION_TIMEOUT_MS,
     watchdog: parseWatchdogConfig(raw.watchdog),
     plugins: parsePlugins(raw.plugins),
+    session: {
+      autoRotate: raw.session?.autoRotate ?? false,
+      maxMessages: Number.isFinite(raw.session?.maxMessages) ? Number(raw.session.maxMessages) : 50,
+      maxAgeHours: Number.isFinite(raw.session?.maxAgeHours) ? Number(raw.session.maxAgeHours) : 24,
+      summaryPath: typeof raw.session?.summaryPath === "string" ? raw.session.summaryPath.trim() : "",
+    },
     ...(typeof raw.jobsDir === "string" && raw.jobsDir.trim() ? { jobsDir: raw.jobsDir.trim() } : {}),
   };
 }

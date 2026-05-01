@@ -11,6 +11,7 @@ export interface GlobalSession {
   lastUsedAt: string;
   turnCount: number;
   compactWarned: boolean;
+  messageCount?: number;
 }
 
 // Module-level cache is for the GLOBAL session only.
@@ -84,6 +85,14 @@ export async function incrementTurn(agentName?: string): Promise<number> {
   existing.turnCount += 1;
   await saveSession(existing, agentName);
   return existing.turnCount;
+}
+
+/** Increment the message counter for rotation tracking. Call once per actual Claude invocation, not on reads. */
+export async function incrementMessageCount(agentName?: string): Promise<void> {
+  const existing = await loadSession(agentName);
+  if (!existing) return;
+  existing.messageCount = (existing.messageCount ?? 0) + 1;
+  await saveSession(existing, agentName);
 }
 
 /** Mark that the compact warning has been sent for the current session. */

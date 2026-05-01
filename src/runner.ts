@@ -9,7 +9,10 @@ import {
   getFallbackSession,
   createFallbackSession,
   incrementFallbackTurn,
+  peekSession,
+  incrementMessageCount,
 } from "./sessions";
+import { needsRotation, rotateSession, loadLatestSummary } from "./rotation";
 import {
   getThreadSession,
   createThreadSession,
@@ -624,6 +627,18 @@ async function execClaude(
 ): Promise<RunResult> {
   await mkdir(LOGS_DIR, { recursive: true });
 
+  // Rotate the global session if thresholds are exceeded (thread/agent sessions are not rotated).
+  let rotationSummary: string | null = null;
+  if (!threadId && !agentName) {
+    const { session: sessionConfig } = getSettings();
+    if (sessionConfig.autoRotate) {
+      const peeked = await peekSession();
+      if (peeked && needsRotation(peeked, sessionConfig)) {
+        rotationSummary = await rotateSession(sessionConfig);
+      }
+    }
+  }
+
   const existing = threadId
     ? await getThreadSession(threadId)
     : await getSession(agentName);
@@ -691,6 +706,8 @@ async function execClaude(
   const appendParts: string[] = [
     "You are running inside ClaudeClaw.",
   ];
+
+  if (rotationSummary) appendParts.push(`Context from the previous session:\n\n${rotationSummary}`);
 
   try {
     const claudeMd = await Bun.file(PROJECT_CLAUDE_MD).text();
@@ -803,6 +820,8 @@ async function execClaude(
   ].join("\n");
 
   await Bun.write(logFile, output);
+  // Count this invocation for rotation tracking (global session only; agent sessions don't rotate).
+  if (!agentName && !threadId) await incrementMessageCount();
   console.log(`[${new Date().toLocaleTimeString()}] Done: ${name} → ${logFile}`);
 
   // --- Watchdog: track consecutive timeouts ---
@@ -902,6 +921,16 @@ async function streamClaude(
 ): Promise<void> {
   await mkdir(LOGS_DIR, { recursive: true });
 
+  // Rotate the global session if thresholds are exceeded (mirrors the check in execClaude).
+  let streamRotationSummary: string | null = null;
+  const { session: streamSessionConfig } = getSettings();
+  if (streamSessionConfig.autoRotate) {
+    const streamPeeked = await peekSession();
+    if (streamPeeked && needsRotation(streamPeeked, streamSessionConfig)) {
+      streamRotationSummary = await rotateSession(streamSessionConfig);
+    }
+  }
+
   const existing = await getSession();
   const { security, model, api } = getSettings();
   const securityArgs = buildSecurityArgs(security);
@@ -919,6 +948,8 @@ async function streamClaude(
   if (existing) args.push("--resume", existing.sessionId);
 
   const appendParts: string[] = ["You are running inside ClaudeClaw."];
+
+  if (streamRotationSummary) appendParts.push(`Context from the previous session:\n\n${streamRotationSummary}`);
 
   try {
     const claudeMd = await Bun.file(PROJECT_CLAUDE_MD).text();
@@ -1029,6 +1060,9 @@ async function streamClaude(
   // Plugins: agent_end
   if (streamPm) streamPm.emitAsync("agent_end", { messages: [] }, streamCtx);
 
+  // Count this invocation for rotation tracking.
+  await incrementMessageCount();
+
   console.log(`[${new Date().toLocaleTimeString()}] Done: ${name}`);
 }
 
@@ -1065,6 +1099,11 @@ export async function bootstrap(): Promise<void> {
   if (existing) return;
 
   console.log(`[${new Date().toLocaleTimeString()}] Bootstrapping new session...`);
-  await execClaude("bootstrap", "Wakeup, my friend!");
+  const { session: sessionConfig } = getSettings();
+  const summary = sessionConfig.summaryPath ? await loadLatestSummary(sessionConfig.summaryPath) : null;
+  const wakeupPrompt = summary
+    ? `Wakeup, my friend!\n\nContext from the previous session:\n\n${summary}`
+    : "Wakeup, my friend!";
+  await execClaude("bootstrap", wakeupPrompt);
   console.log(`[${new Date().toLocaleTimeString()}] Bootstrap complete — session is live.`);
 }
