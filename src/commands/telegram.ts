@@ -1,15 +1,20 @@
 import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession } from "../runner";
+import { extractErrorDetail } from "../messaging";
 import { getSettings, loadSettings } from "../config";
-import { resetSession, peekSession } from "../sessions";
+import { transcribeAudioToText } from "../whisper";
+import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt, listSkills } from "../skills";
 import { fireJob, parseFireArgs } from "./fire";
 import { mkdir } from "node:fs/promises";
 import { extname, join } from "node:path";
+<<<<<<< HEAD
 import { submitTelegramToGateway } from "../gateway";
+=======
+import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
+>>>>>>> upstream/master
 
 // --- Markdown → Telegram HTML conversion (ported from nanobot) ---
 
@@ -682,6 +687,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 
   if (command === "/reset") {
     await resetSession();
+    await resetFallbackSession();
     await sendMessage(config.token, chatId, "Global session reset. Next message starts fresh.", threadId);
     return;
   }
@@ -854,16 +860,24 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       }
 
       if (voicePath) {
-        try {
-          debugLog(`Voice file saved: path=${voicePath}`);
-          voiceTranscript = await transcribeAudioToText(voicePath, {
-            debug: telegramDebug,
-            log: (message) => debugLog(message),
-          });
-        } catch (err) {
-          console.error(`[Telegram] Failed to transcribe voice for ${label}: ${err instanceof Error ? err.message : err}`);
+        debugLog(`Voice file saved: path=${voicePath}`);
+        const { delegateTool } = getSettings().stt;
+        if (!delegateTool) {
+          try {
+            voiceTranscript = await transcribeAudioToText(voicePath);
+          } catch (err) {
+            console.error(`[Telegram] Failed to transcribe voice for ${label}: ${err instanceof Error ? err.message : err}`);
+          }
         }
       }
+    }
+
+    // Plugin wizard: intercept /plugin and /claudeclaw:plugin before Claude routing
+    const wizardCtx = { iface: "telegram" as const, scopeId: String(chatId) };
+    if ((command && isWizardTrigger(command)) || hasActiveWizard(wizardCtx)) {
+      const reply = await handleWizardInput(wizardCtx, text.trim());
+      await sendMessage(config.token, chatId, reply, threadId);
+      return;
     }
 
     // Skill routing: resolve slash commands to SKILL.md prompts
@@ -909,10 +923,19 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     }
     if (voiceTranscript) {
       promptParts.push(`Voice transcript: ${voiceTranscript}`);
-      promptParts.push("The user attached voice audio. Use the transcript as their spoken message.");
+    } else if (voicePath) {
+      const { delegateTool } = getSettings().stt;
+      if (delegateTool) {
+        promptParts.push(`Voice file path: ${voicePath}`);
+        promptParts.push(`The user sent a voice message. Transcribe it by calling \`${delegateTool}\` with the file path above, then respond to the transcribed text as their spoken message.`);
+      } else {
+        promptParts.push(
+          "The user attached voice audio, but it could not be transcribed. Respond and ask them to resend a clearer clip."
+        );
+      }
     } else if (hasVoice) {
       promptParts.push(
-        "The user attached voice audio, but it could not be transcribed. Respond and ask them to resend a clearer clip."
+        "The user attached voice audio, but downloading it failed. Respond and ask them to resend."
       );
     }
     if (documentInfo) {
@@ -926,6 +949,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         "The user attached a document, but downloading it failed. Respond and ask them to resend."
       );
     }
+<<<<<<< HEAD
     // Check per-adapter feature flag for gateway routing
     if (process.env.USE_GATEWAY_TELEGRAM === "true") {
       const gatewayResult = await submitTelegramToGateway(message);
@@ -935,6 +959,17 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       }
       // Gateway processed successfully - response handled by processor
       return;
+=======
+    const prefixedPrompt = promptParts.join("\n");
+    const result = await runUserMessage("telegram", prefixedPrompt);
+
+    if (result.exitCode !== 0) {
+      const isTimedOut = result.exitCode === 124;
+      const errorMsg = isTimedOut
+        ? `⏱ Request timed out — the subprocess took too long and was killed. Try again or split into smaller steps.`
+        : `Error (exit ${result.exitCode}): ${extractErrorDetail(result) || "Unknown error"}`;
+      await sendMessage(config.token, chatId, errorMsg, threadId);
+>>>>>>> upstream/master
     } else {
       // Legacy path - direct Claude invocation
       const prompt = promptParts.join("\n");
@@ -1049,8 +1084,13 @@ async function registerBotCommands(token: string): Promise<void> {
 
 let running = true;
 let isPolling = false;
+// Monotonically increasing counter. Each startPolling() call captures the
+// value at the time it starts. The poll loop checks it after every await so
+// a stale loop exits cleanly when stopPolling() or a subsequent startPolling()
+// increments the counter, even if a long-poll request is still in flight.
+let pollingGeneration = 0;
 
-async function poll(): Promise<void> {
+async function poll(generation: number): Promise<void> {
   const config = getSettings().telegram;
   let offset = 0;
   try {
@@ -1072,13 +1112,16 @@ async function poll(): Promise<void> {
   // Register available skills as bot command menu (non-blocking)
   registerBotCommands(config.token).catch(() => {});
 
-  while (running) {
+  while (running && pollingGeneration === generation) {
     try {
       const data = await callApi<{ ok: boolean; result: TelegramUpdate[] }>(
         config.token,
         "getUpdates",
         { offset, timeout: 30, allowed_updates: ["message", "my_chat_member", "callback_query"] }
       );
+
+      // Check generation after the in-flight long-poll request returns.
+      if (pollingGeneration !== generation) break;
 
       if (!data.ok || !data.result.length) continue;
 
@@ -1110,11 +1153,14 @@ async function poll(): Promise<void> {
         }
       }
     } catch (err) {
+      if (pollingGeneration !== generation) break;
       if (!running) break;
       console.error(`[Telegram] Poll error: ${err instanceof Error ? err.message : err}`);
       await Bun.sleep(5000);
     }
   }
+
+  if (pollingGeneration === generation) isPolling = false;
 }
 
 // --- Exports ---
@@ -1128,20 +1174,34 @@ process.on("SIGINT", () => { running = false; });
 /** Start polling in-process (called by start.ts when token is configured) */
 export function startPolling(debug = false): void {
   if (isPolling) return;
+  running = true;
   isPolling = true;
   telegramDebug = debug;
+  const gen = ++pollingGeneration;
   (async () => {
     await ensureProjectClaudeMd();
-    await poll();
+    await poll(gen);
   })().catch((err) => {
-    console.error(`[Telegram] Fatal: ${err}`);
-    isPolling = false;
+    if (pollingGeneration === gen) {
+      console.error(`[Telegram] Fatal: ${err}`);
+      isPolling = false;
+    }
   });
+}
+
+/** Stop polling in-process (called by start.ts when receiveEnabled is toggled off).
+ *  Increments the generation token so the in-flight long-poll loop exits as soon
+ *  as its current getUpdates call returns, even if running is briefly reset to true
+ *  by a concurrent startPolling() call. */
+export function stopPolling(): void {
+  pollingGeneration++;
+  running = false;
+  isPolling = false;
 }
 
 /** Standalone entry point (bun run src/index.ts telegram) */
 export async function telegram() {
   await loadSettings();
   await ensureProjectClaudeMd();
-  await poll();
+  await poll(++pollingGeneration);
 }
