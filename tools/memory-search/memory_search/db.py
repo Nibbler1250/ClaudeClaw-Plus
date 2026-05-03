@@ -277,7 +277,10 @@ def search(
             lo, hi = min(ranks), max(ranks)
             span = (hi - lo) or 1
             for rowid, rank in rows:
-                fts_scores[rowid] = (rank - lo) / span
+                # FTS5 BM25 rank is negative; lower = better match. Invert
+                # so the best chunk gets 1.0 and the worst 0.0, matching the
+                # vector cosine convention used downstream in the hybrid blend.
+                fts_scores[rowid] = 1.0 - (rank - lo) / span
     except sqlite3.OperationalError:
         # FTS5 throws on some queries (e.g. only stop-words); fall back to vector only.
         pass
