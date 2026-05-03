@@ -2,6 +2,8 @@ import { timingSafeEqual, randomUUID } from "crypto";
 import { htmlPage } from "./page/html";
 import { clampInt, json } from "./http";
 import { checkBearer } from "./auth";
+import { handleVoiceCallback } from "./voice-callback";
+import { handleSpawnHarness } from "./voice-spawn-harness";
 import type { StartWebUiOptions, WebServerHandle } from "./types";
 import { buildState, buildTechnicalInfo, sanitizeSettings } from "./services/state";
 import { readHeartbeatSettings, updateHeartbeatSettings } from "./services/settings";
@@ -339,7 +341,13 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
           const body = await req.json();
           const message = typeof body.message === "string" ? body.message.trim() : "";
           if (!message) return json({ ok: false, error: "message is required" }, 400);
-          const result = await runUserMessage("inject", message);
+          const sessionKey = typeof body.sessionKey === "string" && body.sessionKey.trim()
+            ? body.sessionKey.trim()
+            : "inject";
+          const modelOverride = typeof body.model === "string" && body.model.trim()
+            ? body.model.trim()
+            : undefined;
+          const result = await runUserMessage(sessionKey, message, undefined, undefined, modelOverride);
           const text = result.stdout.trim();
           const { telegram } = opts.getSnapshot().settings;
           if (text && telegram.token && telegram.allowedUserIds.length > 0) {
@@ -354,6 +362,14 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
         } catch (err) {
           return json({ ok: false, error: String(err) }, 500);
         }
+      }
+
+      if (url.pathname === "/api/voice-callback" && req.method === "POST") {
+        return handleVoiceCallback(req, opts.getSnapshot().settings);
+      }
+
+      if (url.pathname === "/api/voice-spawn-harness" && req.method === "POST") {
+        return handleSpawnHarness(req, opts.getSnapshot().settings);
       }
 
       if (url.pathname === "/api/chat" && req.method === "POST") {

@@ -1671,8 +1671,9 @@ function prefixUserMessageWithClock(prompt: string): string {
   }
 }
 
-export async function runUserMessage(name: string, prompt: string, threadId?: string, agentName?: string): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt), threadId, undefined, undefined, agentName);}
+export async function runUserMessage(name: string, prompt: string, threadId?: string, agentName?: string, modelOverride?: string): Promise<RunResult> {
+  return run(name, prefixUserMessageWithClock(prompt), threadId, modelOverride, undefined, agentName);
+}
 
 /**
  * Bootstrap the session: fires Claude with the system prompt so the
