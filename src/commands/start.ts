@@ -17,6 +17,7 @@ import { initializeJobSystem } from "../orchestrator/resumable-jobs";
 import type { Job } from "../jobs";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
 import { PluginManager, setPluginManager } from "../plugins";
+import { indexSessionsBackground } from "../memory";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
 const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
@@ -350,6 +351,18 @@ export async function start(args: string[] = []) {
     }
   } catch (err) {
     console.error(`[${new Date().toLocaleTimeString()}] ensureUserSymlinks failed:`, err);
+  }
+
+  // memory-search: incremental session re-index on boot (issue #19).
+  // Async fire-and-forget — must NOT block the Bun event loop on first boot
+  // (model download + indexing of N sessions could otherwise freeze Telegram /
+  // Discord polling for tens of seconds). Top-level try so failures here are
+  // never confused with symlink-installation failures.
+  try {
+    const memSettings = await loadSettings();
+    indexSessionsBackground(memSettings.memorySearch);
+  } catch (e) {
+    console.log(`[memory-search] background index could not be scheduled: ${(e as Error).message}`);
   }
 
   // Phase 17: migrate any Phase 16 single-job agents from flat dir into agents/<name>/jobs/default.md
