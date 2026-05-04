@@ -1,4 +1,5 @@
 .claude
 node_modules
 .codemachine
-AGENTS.md
+AGENTS.md__pycache__/
+*.pyc
