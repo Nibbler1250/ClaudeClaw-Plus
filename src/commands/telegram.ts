@@ -1220,6 +1220,53 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
     return;
   }
 
+  // Pending action buttons (pending:<id>:<value> pattern from pending.py)
+  const pendingMatch = data.match(/^pending:(\d+):(.+)$/);
+  if (pendingMatch) {
+    const actionId = pendingMatch[1];
+    const decision = pendingMatch[2];
+    const chatId = query.message?.chat.id ?? query.from.id;
+    let ackText = "⏳ Traitement...";
+    try {
+      const result = await new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => {
+        const { execFile } = require("child_process");
+        execFile(
+          "python3",
+          ["-c", `import sys; sys.path.insert(0, '/home/simon/agent/lib'); from pending import resolve_pending; ok = resolve_pending(${actionId}, '${decision}'); print('ok' if ok else 'not_found')`],
+          { timeout: 5000 },
+          (err: Error | null, stdout: string, stderr: string) => {
+            resolve({ code: err ? 1 : 0, stdout: stdout.trim(), stderr });
+          }
+        );
+      });
+      if (result.stdout === "ok") {
+        const decLower = decision.toLowerCase();
+        if (decLower === "skip") ackText = "⏸ Plus tard";
+        else if (decLower === "reject" || decLower === "cancel") ackText = "❌ Rejeté";
+        else ackText = "✅ Approuvé";
+      } else {
+        ackText = "⚠️ Action introuvable ou déjà traitée";
+      }
+      // Edit original message to show decision
+      if (query.message) {
+        const originalText = query.message.text ?? "";
+        await callApi(config.token, "editMessageText", {
+          chat_id: query.message.chat.id,
+          message_id: query.message.message_id,
+          text: `${originalText}\n\n› ${ackText}`,
+          reply_markup: JSON.stringify({ inline_keyboard: [] }),
+        }).catch(() => {});
+      }
+    } catch (err) {
+      ackText = "⚠️ Erreur";
+    }
+    await callApi(config.token, "answerCallbackQuery", {
+      callback_query_id: query.id,
+      text: ackText,
+    }).catch(() => {});
+    return;
+  }
+
   // Generic inline button press (btn:<id> pattern from [buttons: ...] directive)
   if (data.startsWith("btn:")) {
     const btnId = data.slice(4);
