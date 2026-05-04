@@ -73,3 +73,14 @@ If you change your core values, tell your human — it's your soul, and they sho
 
 _This is yours to evolve. As you learn who you are, update it._
 <!-- claudeclaw:managed:end -->
+
+## Development Workflow (contributor notes)
+
+**Before opening any PR, always run both version bump scripts:**
+
+```bash
+bun run bump:plugin-version
+bun run bump:marketplace-version
+```
+
+Both `plugin-version-guard` and `marketplace-version-guard` are required CI checks. They fail if `.claude-plugin/plugin.json` or `.claude-plugin/marketplace.json` still carry the same version as the merge base. Run the bumps, commit alongside your code changes, and push before creating the PR.
