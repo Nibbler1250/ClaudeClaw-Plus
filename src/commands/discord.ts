@@ -568,6 +568,10 @@ async function respondToInteraction(
 
 // --- Message handler ---
 
+// Pending forwards: when Discord delivers a forward with empty content, hold it briefly
+// so a follow-up text comment from the same user can absorb it as context.
+const pendingForwards = new Map<string, { snapshot: DiscordMessageSnapshot; timer: ReturnType<typeof setTimeout> }>();
+
 async function handleMessageCreate(token: string, message: DiscordMessage): Promise<void> {
   const config = getSettings().discord;
 
@@ -627,6 +631,33 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
 
   const hasForwardedContent = !!message.message_snapshots?.[0]?.message?.content;
   if (!content.trim() && !hasImage && !hasVoice && !hasText && !hasForwardedContent) return;
+
+  const forwardKey = `${channelId}:${userId}`;
+  const isForwardOnly = message.message_reference?.type === 1 && !content.trim() && !hasImage && !hasVoice && !hasText;
+
+  if (isForwardOnly && hasForwardedContent) {
+    // Pure forward with no accompanying text — hold it and wait for a follow-up comment
+    const existing = pendingForwards.get(forwardKey);
+    if (existing) clearTimeout(existing.timer);
+    const snapshot = message.message_snapshots![0].message;
+    const timer = setTimeout(() => {
+      pendingForwards.delete(forwardKey);
+      handleMessageCreate(token, message).catch((err) =>
+        console.error(`[Discord] Deferred forward error: ${err instanceof Error ? err.message : err}`)
+      );
+    }, 1500);
+    pendingForwards.set(forwardKey, { snapshot, timer });
+    return;
+  }
+
+  // If a pending forward exists for this user+channel, absorb it into this message as context
+  let coalescedSnapshot: DiscordMessageSnapshot | undefined;
+  const pending = pendingForwards.get(forwardKey);
+  if (pending && !isForwardOnly) {
+    clearTimeout(pending.timer);
+    pendingForwards.delete(forwardKey);
+    coalescedSnapshot = pending.snapshot;
+  }
 
   // Strip bot mention from content for cleaner prompt
   let cleanContent = content;
@@ -817,8 +848,8 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
 
     // Include context from replied-to or forwarded messages
     const isForward = message.message_reference?.type === 1;
-    const snapshot = message.message_snapshots?.[0]?.message;
-    if (isForward && snapshot) {
+    const snapshot = coalescedSnapshot ?? message.message_snapshots?.[0]?.message;
+    if ((isForward || coalescedSnapshot) && snapshot) {
       const fwdAuthor = snapshot.author ? snapshot.author.username : "unknown";
       const fwdAttachments = snapshot.attachments.length > 0
         ? ` [attachments: ${snapshot.attachments.map((a) => a.filename).join(", ")}]`
