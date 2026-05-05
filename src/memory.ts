@@ -111,9 +111,9 @@ export interface MemorySearchSettings {
   /** Hybrid blend, 1.0=semantic only, 0.0=FTS5 only. Default: 0.5. */
   alpha?: number;
   /**
-   * NYI — wired in a follow-up PR. Currently parsed but not enforced.
-   *
-   * Re-index after every N runner turns. Default: 10. 0 disables.
+   * Re-index session DB after every N runner turns. Default: 10. 0 disables.
+   * Wired in src/runner.ts after each successful turn; fire-and-forget so
+   * the runner never blocks on indexing.
    */
   reindexEveryNTurns?: number;
   /** Max seconds a search subprocess is allowed to run. Default: 60. */

@@ -30,7 +30,7 @@ import { recordInvocationStart, recordInvocationCompletion, recordInvocationFail
 import { recordExecutionMetric, checkLimits, handleTrigger as watchdogHandleTrigger } from "./governance/watchdog";
 import { startSession as watchdogStart, recordResult as watchdogRecord, abortReason as watchdogAbortReason, clearSession as watchdogClear } from "./watchdog";
 import { getGovernanceClient, type GovernanceClient } from "./governance/client";
-import { loadMemory, loadMemoryInstructions, ensureMemoryFile, getMemoryPath } from "./memory";
+import { loadMemory, loadMemoryInstructions, ensureMemoryFile, getMemoryPath, indexSessionsBackground } from "./memory";
 import { loadAgent } from "./agents";
 import { selectModel } from "./model-router";
 import { recordResult, abortReason, clearSession, startSession } from "./watchdog";
@@ -1435,6 +1435,15 @@ async function execClaude(
         await markCompactWarned(agentName);
       }
       emitCompactEvent({ type: "warn", turnCount });
+    }
+
+    // memory-search: periodic re-index every N turns (issue #19 follow-up).
+    // Default 10 turns; 0 disables. Fire-and-forget — never blocks the runner.
+    const memSettings = getSettings().memorySearch;
+    const reindexEvery = memSettings?.reindexEveryNTurns ?? 10;
+    if (reindexEvery > 0 && turnCount > 0 && turnCount % reindexEvery === 0) {
+      console.log(`[${new Date().toLocaleTimeString()}] memory-search: periodic re-index (turn ${turnCount})`);
+      indexSessionsBackground(memSettings);
     }
   }
 
