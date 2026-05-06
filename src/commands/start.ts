@@ -771,14 +771,14 @@ export async function start(args: string[] = []) {
     writeState(state);
   }
 
-  updateState();
-
   // In-memory retry state: resets on daemon restart (no stale debt across restarts).
   const jobRetryState = new Map<string, { failCount: number; retryAt: number }>();
 
   // Track each job's most recent outcome so state.json can expose lastResult/lastRanAt
   // for crash-recovery + status displays. Resets on daemon restart (in-memory only).
   const jobLastResult = new Map<string, { result: "ok" | "error" | "skipped"; ranAt: number }>();
+
+  updateState();
 
   function runJob(job: (typeof currentJobs)[0]) {
     const timeoutMs = job.timeoutSeconds ? job.timeoutSeconds * 1000 : undefined;
@@ -840,8 +840,8 @@ export async function start(args: string[] = []) {
   }
 
   setInterval(() => {
+    const now = new Date();
     if (!isRateLimited()) {
-      const now = new Date();
       for (const job of currentJobs) {
         // Fire pending retries before checking the cron schedule.
         const retryState = jobRetryState.get(job.name);
@@ -855,6 +855,16 @@ export async function start(args: string[] = []) {
         }
         if (cronMatches(job.schedule, now, currentSettings.timezoneOffsetMinutes)) {
           runJob(job);
+        }
+      }
+    } else {
+      const skippedAt = Date.now();
+      for (const job of currentJobs) {
+        const retryState = jobRetryState.get(job.name);
+        const retryDue = !!retryState && retryState.retryAt <= skippedAt;
+        const scheduleDue = cronMatches(job.schedule, now, currentSettings.timezoneOffsetMinutes);
+        if (retryDue || scheduleDue) {
+          jobLastResult.set(job.name, { result: "skipped", ranAt: skippedAt });
         }
       }
     }
