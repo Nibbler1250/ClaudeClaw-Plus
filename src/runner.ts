@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile, realpath } from "fs/promises";
 import { join, dirname, resolve, sep } from "path";
 import { execSync } from "child_process";
-import { existsSync, writeFileSync, mkdirSync } from "fs";
+import { existsSync, writeFileSync, mkdirSync, readFileSync } from "fs";
 import {
   getSession,
   createSession,
@@ -32,6 +32,7 @@ import { getPluginManager, type EventContext } from "./plugins";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
 const ACTIVE_RUNS_FILE = join(process.cwd(), ".claude/claudeclaw/active-runs");
+const PERMISSION_MODE_FILE = join(process.cwd(), ".claude/claudeclaw/permission-mode.json");
 // Resolve prompts relative to the claudeclaw installation, not the project dir
 const PROMPTS_DIR = join(import.meta.dir, "..", "prompts");
 const HEARTBEAT_PROMPT_FILE = join(PROMPTS_DIR, "heartbeat", "HEARTBEAT.md");
@@ -838,8 +839,37 @@ export async function ensureProjectClaudeMd(): Promise<void> {
   }
 }
 
+export type PermissionMode = "plan" | "acceptEdits" | "bypassPermissions";
+
+let cachedPermissionMode: PermissionMode | null = null;
+
+export function getPermissionMode(): PermissionMode {
+  if (cachedPermissionMode) return cachedPermissionMode;
+  try {
+    const raw = JSON.parse(readFileSync(PERMISSION_MODE_FILE, "utf8")) as { mode?: unknown };
+    if (raw.mode === "plan" || raw.mode === "acceptEdits" || raw.mode === "bypassPermissions") {
+      cachedPermissionMode = raw.mode;
+      return raw.mode;
+    }
+  } catch {}
+  return "bypassPermissions";
+}
+
+export function setPermissionMode(mode: PermissionMode): void {
+  cachedPermissionMode = mode;
+  try {
+    mkdirSync(dirname(PERMISSION_MODE_FILE), { recursive: true });
+    writeFileSync(PERMISSION_MODE_FILE, `${JSON.stringify({ mode }, null, 2)}\n`);
+  } catch (err) {
+    console.error("[runner] Failed to persist permission mode:", err);
+  }
+}
+
 function buildSecurityArgs(security: SecurityConfig): string[] {
-  const args: string[] = ["--dangerously-skip-permissions"];
+  const permissionMode = getPermissionMode();
+  const args: string[] = permissionMode === "bypassPermissions"
+    ? ["--dangerously-skip-permissions"]
+    : ["--permission-mode", permissionMode];
 
   switch (security.level) {
     case "locked":
