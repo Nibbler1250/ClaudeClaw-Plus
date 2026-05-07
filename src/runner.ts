@@ -510,7 +510,8 @@ async function runClaudeStream(
   timeoutMs: number = DEFAULT_SESSION_TIMEOUT_MS,
   cwd?: string,
   onChunk?: (text: string) => void,
-  onToolEvent?: (line: string) => void
+  onToolEvent?: (line: string) => void,
+  onToolCall?: (toolName: string) => void
 ): Promise<{ rawStdout: string; stderr: string; exitCode: number; sessionId?: string }> {
   const args = [...baseArgs];
   const normalizedModel = model.trim().toLowerCase();
@@ -556,7 +557,7 @@ async function runClaudeStream(
             resultText = event.result;
           }
           // Emit streaming callbacks if provided
-          if ((onChunk || onToolEvent) && event.type === "assistant" && (event.message as any)?.content) {
+          if ((onChunk || onToolEvent || onToolCall) && event.type === "assistant" && (event.message as any)?.content) {
             const msg = event.message as any;
             const msgId: string = msg.id ?? "";
             if (msgId !== streamLastMsgId) {
@@ -568,9 +569,12 @@ async function runClaudeStream(
             for (const block of msg.content) {
               if (block.type === "text" && typeof block.text === "string") {
                 full += block.text;
-              } else if (block.type === "tool_use" && onToolEvent) {
-                streamPendingToolCalls.set(block.id, block.name);
-                onToolEvent(`● ${formatToolCallSummary(block.name, block.input ?? {})}`);
+              } else if (block.type === "tool_use") {
+                if (onToolEvent) {
+                  streamPendingToolCalls.set(block.id, block.name);
+                  onToolEvent(`● ${formatToolCallSummary(block.name, block.input ?? {})}`);
+                }
+                if (onToolCall && block.name) onToolCall(block.name);
               }
             }
             if (onChunk && full.length > streamDelivered.length) {
@@ -1127,7 +1131,8 @@ async function execClaude(
   agentName?: string,
   timeoutCategory?: string,
   onChunk?: (text: string) => void,
-  onToolEvent?: (line: string) => void
+  onToolEvent?: (line: string) => void,
+  onToolCall?: (toolName: string) => void
 ): Promise<RunResult> {
   mainRunCount++;
   persistRunCount();
@@ -1315,7 +1320,7 @@ async function execClaude(
     }
   } catch {}
 
-  let exec = await runClaudeStream(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd, onChunk, onToolEvent);
+  let exec = await runClaudeStream(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd, onChunk, onToolEvent, onToolCall);
   const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
   let usedFallback = false;
 
@@ -1694,9 +1699,10 @@ export async function run(
   agentName?: string,
   timeoutCategory?: string,
   onChunk?: (text: string) => void,
-  onToolEvent?: (line: string) => void
+  onToolEvent?: (line: string) => void,
+  onToolCall?: (toolName: string) => void
 ): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt, threadId, modelOverride, timeoutMs, agentName, timeoutCategory, onChunk, onToolEvent), threadId);
+  return enqueue(() => execClaude(name, prompt, threadId, modelOverride, timeoutMs, agentName, timeoutCategory, onChunk, onToolEvent, onToolCall), threadId);
 }
 
 async function streamClaude(
@@ -1927,9 +1933,10 @@ export async function runUserMessage(
   threadId?: string,
   agentName?: string,
   onChunk?: (text: string) => void,
-  onToolEvent?: (line: string) => void
+  onToolEvent?: (line: string) => void,
+  onToolCall?: (toolName: string) => void
 ): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt), threadId, undefined, undefined, agentName, undefined, onChunk, onToolEvent);
+  return run(name, prefixUserMessageWithClock(prompt), threadId, undefined, undefined, agentName, undefined, onChunk, onToolEvent, onToolCall);
 }
 
 // Path where Claude Code stores session JSONL transcripts for this project
