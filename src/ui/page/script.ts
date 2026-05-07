@@ -941,6 +941,106 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
     const chatForm = $("chat-form");
     const chatInput = $("chat-input");
     const chatSend = $("chat-send");
+    const chatAttachBtn = $("chat-attach");
+    const chatFileInput = $("chat-file-input");
+    const chatAttachmentsEl = $("chat-attachments");
+
+    // Attachment state
+    var pendingAttachments = []; // Array of { name, type, data } where data is base64
+
+    function renderAttachmentChips() {
+      if (!chatAttachmentsEl) return;
+      if (pendingAttachments.length === 0) {
+        chatAttachmentsEl.hidden = true;
+        chatAttachmentsEl.innerHTML = "";
+        return;
+      }
+      chatAttachmentsEl.hidden = false;
+      chatAttachmentsEl.innerHTML = pendingAttachments.map(function(att, idx) {
+        return (
+          '<span class="attach-chip">' +
+            '<span class="attach-chip-name" title="' + escAttr(att.name) + '">' + esc(att.name) + '</span>' +
+            '<button class="attach-chip-remove" type="button" data-attach-index="' + idx + '" aria-label="Remove ' + escAttr(att.name) + '">×</button>' +
+          '</span>'
+        );
+      }).join("");
+    }
+
+    function readFileAsBase64(file) {
+      return new Promise(function(resolve, reject) {
+        var reader = new FileReader();
+        reader.onload = function(e) {
+          var result = e.target.result;
+          // Strip the data URL prefix: "data:<type>;base64,<data>"
+          var base64 = typeof result === "string" ? result.split(",")[1] || "" : "";
+          resolve(base64);
+        };
+        reader.onerror = function() { reject(new Error("Failed to read file")); };
+        reader.readAsDataURL(file);
+      });
+    }
+
+    if (chatAttachBtn && chatFileInput) {
+      chatAttachBtn.addEventListener("click", function() {
+        if (chatBusy) return;
+        chatFileInput.click();
+      });
+    }
+
+    if (chatFileInput) {
+      chatFileInput.addEventListener("change", async function() {
+        var files = chatFileInput.files;
+        if (!files || !files.length) return;
+        var warnEl = $("chat-attach-warn");
+        if (warnEl) warnEl.remove();
+
+        for (var i = 0; i < files.length; i++) {
+          var file = files[i];
+          if (pendingAttachments.length >= 5) {
+            var warn = document.createElement("div");
+            warn.id = "chat-attach-warn";
+            warn.className = "attach-warn";
+            warn.textContent = "Max 5 attachments allowed.";
+            if (chatAttachmentsEl && chatAttachmentsEl.parentNode) {
+              chatAttachmentsEl.parentNode.insertBefore(warn, chatAttachmentsEl.nextSibling);
+            }
+            break;
+          }
+          if (file.size > 10 * 1024 * 1024) {
+            var warnSize = document.createElement("div");
+            warnSize.id = "chat-attach-warn";
+            warnSize.className = "attach-warn";
+            warnSize.textContent = '"' + file.name + '" exceeds 10 MB limit.';
+            if (chatAttachmentsEl && chatAttachmentsEl.parentNode) {
+              chatAttachmentsEl.parentNode.insertBefore(warnSize, chatAttachmentsEl.nextSibling);
+            }
+            continue;
+          }
+          try {
+            var base64 = await readFileAsBase64(file);
+            pendingAttachments.push({ name: file.name, type: file.type || "application/octet-stream", data: base64 });
+          } catch (_) {}
+        }
+        // Reset so same file can be re-selected if removed
+        chatFileInput.value = "";
+        renderAttachmentChips();
+      });
+    }
+
+    // Remove chip on click (delegated)
+    if (chatAttachmentsEl) {
+      chatAttachmentsEl.addEventListener("click", function(event) {
+        var target = event.target;
+        if (!(target instanceof HTMLElement)) return;
+        var btn = target.closest("[data-attach-index]");
+        if (!btn || !(btn instanceof HTMLElement)) return;
+        var idx = parseInt(btn.getAttribute("data-attach-index") || "-1", 10);
+        if (idx >= 0 && idx < pendingAttachments.length) {
+          pendingAttachments.splice(idx, 1);
+          renderAttachmentChips();
+        }
+      });
+    }
 
     var CHAT_STORAGE_KEY = "claudeclaw.chat.history";
     let chatBusy = false;
@@ -1136,6 +1236,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
       var cancelBtn = $("chat-cancel");
       if (chatSend) chatSend.disabled = busy;
       if (cancelBtn) cancelBtn.hidden = !busy;
+      if (chatAttachBtn) chatAttachBtn.disabled = busy;
       if (busy) {
         chatStartedAt = Date.now();
         chatElapsedTimer = setInterval(function() {
@@ -1280,13 +1381,20 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
     async function sendChat() {
       if (chatBusy || !chatInput) return;
       var message = (chatInput.value || "").trim();
-      if (!message) return;
+      var attachmentsToSend = pendingAttachments.slice();
+      if (!message && attachmentsToSend.length === 0) return;
 
       chatInput.value = "";
       autoResizeChatInput();
+
+      // Clear pending attachments and hide chip area
+      pendingAttachments = [];
+      renderAttachmentChips();
+
       setChatBusy(true);
 
-      chatHistory.push({ role: "user", text: message });
+      var userText = message || ("(" + attachmentsToSend.length + " attachment" + (attachmentsToSend.length !== 1 ? "s" : "") + ")");
+      chatHistory.push({ role: "user", text: userText });
       var assistantIdx = chatHistory.length;
       chatHistory.push({ role: "assistant", text: "", streaming: true });
       renderChatHistory();
@@ -1297,7 +1405,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
         var res = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: message }),
+          body: JSON.stringify({ message: message, attachments: attachmentsToSend }),
           signal: chatAbortController.signal,
         });
 
