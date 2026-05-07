@@ -1669,9 +1669,10 @@ export async function runUserMessage(
   threadId?: string,
   agentName?: string,
   onChunk?: (text: string) => void,
-  onToolEvent?: (line: string) => void
+  onToolEvent?: (line: string) => void,
+  modelOverride?: string
 ): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt), threadId, undefined, undefined, agentName, undefined, onChunk, onToolEvent);
+  return run(name, prefixUserMessageWithClock(prompt), threadId, modelOverride, undefined, agentName, undefined, onChunk, onToolEvent);
 }
 
 // Path where Claude Code stores session JSONL transcripts for this project
