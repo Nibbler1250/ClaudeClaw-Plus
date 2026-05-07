@@ -80,7 +80,7 @@ const DEFAULT_SETTINGS: Settings = {
     forwardToTelegram: true,
     forwardToDiscord: true,
   },
-  telegram: { token: "", allowedUserIds: [], listenChats: [], receiveEnabled: true, dmIsolation: "shared" },
+  telegram: { token: "", allowedUserIds: [], listenChats: [], receiveEnabled: true, dmIsolation: "shared", streamToolCalls: false },
   discord: { token: "", allowedUserIds: [], listenChannels: [], listenGuilds: [], imageOutputRoots: [] },
   slack: { botToken: "", appToken: "", allowedUserIds: [], listenChannels: [] },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
@@ -121,6 +121,8 @@ export interface TelegramConfig {
    * - "perUser": each DM user gets their own isolated session.
    */
   dmIsolation: "shared" | "perUser";
+  /** When true, stream live tool-call progress indicator to Telegram while Claude processes. Default: false */
+  streamToolCalls?: boolean;
 }
 
 export interface DiscordConfig {
@@ -340,6 +342,7 @@ function parseSettings(
       listenChats: Array.isArray(raw.telegram?.listenChats) ? raw.telegram.listenChats.map(Number) : [],
       receiveEnabled: raw.telegram?.receiveEnabled !== false,
       dmIsolation: raw.telegram?.dmIsolation === "perUser" ? "perUser" : "shared",
+      streamToolCalls: raw.telegram?.streamToolCalls === true,
     },
     discord: {
       token: process.env.DISCORD_TOKEN?.trim() || (typeof raw.discord?.token === "string" ? raw.discord.token.trim() : ""),
