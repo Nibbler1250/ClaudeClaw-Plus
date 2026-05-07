@@ -1,4 +1,4 @@
-import { ensureProjectClaudeMd, run, runUserMessage, runFork, killActive, isMainBusy, compactCurrentSession, compactCurrentThreadSession, isRateLimited, getRateLimitResetAt } from "../runner";
+import { ensureProjectClaudeMd, run, runUserMessage, runFork, killActive, isMainBusy, compactCurrentSession, compactCurrentThreadSession, isRateLimited, getRateLimitResetAt, getPermissionMode, setPermissionMode, type PermissionMode } from "../runner";
 import { extractErrorDetail } from "../messaging";
 import { loadPendingResume } from "../pending-resume";
 import { getSettings, loadSettings } from "../config";
@@ -1051,6 +1051,50 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
+  if (command === "/mode") {
+    const arg = text.trim().slice("/mode".length).trim().toLowerCase();
+    const modeMap: Record<string, PermissionMode> = {
+      plan: "plan",
+      edit: "acceptEdits",
+      unrestricted: "bypassPermissions",
+    };
+    const modeLabels: Record<PermissionMode, string> = {
+      plan: "plan",
+      acceptEdits: "edit",
+      bypassPermissions: "unrestricted",
+    };
+
+    if (!arg) {
+      const current = getPermissionMode();
+      await sendMessage(
+        config.token,
+        chatId,
+        [
+          `Current mode: **${modeLabels[current]}**`,
+          "",
+          "Available modes:",
+          "- /mode plan - read-only planning",
+          "- /mode edit - auto-accept file edits",
+          "- /mode unrestricted - full permissions, no prompts",
+        ].join("\n"),
+        threadId
+      );
+      return;
+    }
+
+    const mode = modeMap[arg];
+    if (!mode) {
+      const safeArg = arg.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      await sendMessage(config.token, chatId, `Unknown mode: \`${safeArg}\`\n\nValid modes: plan, edit, unrestricted`, threadId);
+      return;
+    }
+
+    setPermissionMode(mode);
+    console.log(`[Telegram] Permission mode changed to ${modeLabels[mode]} by user ${userId ?? "unknown"}`);
+    await sendMessage(config.token, chatId, `Mode set to **${modeLabels[mode]}**. Takes effect on the next message.`, threadId);
+    return;
+  }
+
   // Secretary: detect reply to a bot alert message → treat as custom reply
   const replyToMsgId = message.reply_to_message?.message_id;
   if (replyToMsgId && text && botId && message.reply_to_message?.from?.id === botId) {
@@ -1133,7 +1177,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 
     // Skill routing: resolve slash commands to SKILL.md prompts
     let skillContext: string | null = null;
-    if (command && command !== "/start" && command !== "/reset" && command !== "/compact" && command !== "/status" && command !== "/context" && command !== "/kill" && command !== "/verbose" && command !== "/fork") {
+    if (command && command !== "/start" && command !== "/reset" && command !== "/compact" && command !== "/status" && command !== "/context" && command !== "/kill" && command !== "/verbose" && command !== "/fork" && command !== "/mode") {
       try {
         skillContext = await resolveSkillPrompt(command);
         if (skillContext) {
@@ -1447,6 +1491,7 @@ async function registerBotCommands(token: string): Promise<void> {
       { command: "kill", description: "Kill the currently running agent" },
       { command: "verbose", description: "Toggle tool call display in responses" },
       { command: "fork", description: "Run a parallel lightweight agent without blocking" },
+      { command: "mode", description: "Get or set Claude permission mode" },
     ];
     for (const skill of skills) {
       // Telegram commands: 1-32 chars, lowercase a-z, 0-9, underscores only
@@ -1469,7 +1514,7 @@ async function registerBotCommands(token: string): Promise<void> {
     } catch (regErr) {
       // Skill-generated commands may violate Telegram constraints; retry with built-in commands only
       console.warn(`[Telegram] Full command registration failed, retrying with built-in commands only: ${regErr instanceof Error ? regErr.message : regErr}`);
-      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context", "kill", "verbose", "fork"].includes(c.command));
+      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context", "kill", "verbose", "fork", "mode"].includes(c.command));
       await callApi(token, "setMyCommands", { commands: builtinOnly });
       console.log(`  Commands registered (built-in only): ${builtinOnly.length}`);
     }
