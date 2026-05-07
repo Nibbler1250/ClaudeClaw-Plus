@@ -35,6 +35,7 @@ import { loadAgent } from "./agents";
 import { selectModel } from "./model-router";
 import { recordResult, abortReason, clearSession, startSession } from "./watchdog";
 import { getPluginManager, type EventContext } from "./plugins";
+
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
 
 // Initialize governance router with agentic modes from settings
@@ -801,12 +802,12 @@ async function evaluateToolForExecution(
   };
 
   const decision = gc.evaluateToolRequest(request);
-  
+
   if (decision.action === "deny") {
     console.warn(`[policy] Tool ${toolName} denied: ${decision.reason}`);
     return { allowed: false, decision };
   }
-  
+
   if (decision.action === "require_approval") {
     console.warn(`[policy] Tool ${toolName} requires approval: ${decision.reason}`);
     // Enqueue for approval
@@ -816,7 +817,7 @@ async function evaluateToolForExecution(
     }
     return { allowed: false, decision };
   }
-  
+
   return { allowed: true, decision };
 }
 
@@ -893,6 +894,7 @@ export async function compactCurrentThreadSession(
     ? { success: true, message: `✅ Thread session compact complete (${existing.sessionId.slice(0, 8)})` }
     : { success: false, message: `❌ Compact failed (${existing.sessionId.slice(0, 8)})` };
 }
+
 async function execClaude(
   name: string,
   prompt: string,
@@ -981,6 +983,7 @@ async function execClaude(
   };
   const securityArgs = buildSecurityArgs(security);
   const timeoutMs = timeoutMsOverride ?? resolveTimeoutMs(timeoutCategory ?? name);
+
   console.log(
     `[${new Date().toLocaleTimeString()}] Running: ${name} (${isNew ? "new session" : `resume ${existing.sessionId.slice(0, 8)}`}, security: ${security.level}, timeout: ${timeoutMs / 60_000}m)`
   );
@@ -1447,7 +1450,8 @@ export async function run(
   agentName?: string,
   timeoutCategory?: string
 ): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt, threadId, modelOverride, timeoutMs, agentName, timeoutCategory), threadId);}
+  return enqueue(() => execClaude(name, prompt, threadId, modelOverride, timeoutMs, agentName, timeoutCategory), threadId);
+}
 
 async function streamClaude(
   name: string,
@@ -1672,7 +1676,8 @@ function prefixUserMessageWithClock(prompt: string): string {
 }
 
 export async function runUserMessage(name: string, prompt: string, threadId?: string, agentName?: string): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt), threadId, undefined, undefined, agentName);}
+  return run(name, prefixUserMessageWithClock(prompt), threadId, undefined, undefined, agentName);
+}
 
 /**
  * Bootstrap the session: fires Claude with the system prompt so the
