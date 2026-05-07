@@ -2,7 +2,6 @@ import { readdir } from "fs/promises";
 import { join } from "path";
 import { getJobsDir, getAgentsDir } from "./config";
 
-const JOBS_DIR = join(process.cwd(), ".claude", "claudeclaw", "jobs");
 const AGENTS_DIR = join(process.cwd(), "agents");
 
 export const VALID_MODEL_STRINGS: ReadonlySet<string> = new Set(["opus", "sonnet", "haiku", "glm"]);
@@ -34,9 +33,7 @@ export async function resolveJobModel(job: Job): Promise<string | undefined> {
   return undefined;
 }
 
-function ts(): string {
-  return new Date().toLocaleTimeString();
-}
+
 
 export interface Job {
   /** Scheduler key. For standalone jobs this is the file stem. For agent-scoped jobs this is "agent/label". */
@@ -151,12 +148,6 @@ export async function loadJobs(): Promise<Job[]> {
     const content = await Bun.file(join(getJobsDir(), file)).text();
     const job = parseJobFile(file.replace(/\.md$/, ""), content);
     if (!job) continue;
-    try {
-      validateModelString(job.model, `standalone/${job.label ?? job.name}`);
-    } catch (err) {
-      console.error(`[${ts()}] Skipping job ${job.name}: ${(err as Error).message}`);
-      continue;
-    }
     if (job.enabled !== false) jobs.push(job);
   }
 
@@ -185,14 +176,7 @@ export async function loadJobs(): Promise<Job[]> {
       // Directory location is authoritative.
       job.agent = agentName;
       job.label = labelFromFile;
-      try {
-        validateModelString(job.model, `${agentName}/${labelFromFile}`);
-      } catch (err) {
-        console.error(`[${ts()}] Skipping job ${agentName}:${labelFromFile}: ${(err as Error).message}`);
-        continue;
-      }
-      if (job.enabled === false) continue;
-      jobs.push(job);
+      if (job.enabled !== false) jobs.push(job);
     }
   }
 
@@ -236,6 +220,7 @@ export async function agentDirExists(agentName: string): Promise<boolean> {
     return false;
   }
 }
+
 
 function resolveJobPath(jobName: string): string {
   const slash = jobName.indexOf("/");

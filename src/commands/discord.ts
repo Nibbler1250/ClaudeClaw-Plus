@@ -1,5 +1,6 @@
 import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, compactCurrentThreadSession, agentDirKey } from "../runner";
 import { extractErrorDetail } from "../messaging";
+import { loadPendingResume } from "../pending-resume";
 import { getSettings, loadSettings, DEFAULT_IMAGE_OUTPUT_ROOT } from "../config";
 import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession } from "../sessionManager";
@@ -58,6 +59,12 @@ interface DiscordAttachment {
   flags?: number;
 }
 
+interface DiscordMessageSnapshot {
+  content: string;
+  attachments: DiscordAttachment[];
+  author?: DiscordUser;
+}
+
 interface DiscordMessage {
   id: string;
   channel_id: string;
@@ -67,6 +74,8 @@ interface DiscordMessage {
   attachments: DiscordAttachment[];
   mentions: DiscordUser[];
   referenced_message?: DiscordMessage | null;
+  message_reference?: { type?: number };
+  message_snapshots?: [{ message: DiscordMessageSnapshot }];
   flags?: number;
   type: number;
 }
@@ -819,6 +828,7 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     // Skill routing: detect slash commands and resolve to SKILL.md prompts
     const command = cleanContent.startsWith("/") ? cleanContent.trim().split(/\s+/, 1)[0].toLowerCase() : null;
 
+
     // /fire <agent>:<label> — manual fire, bypasses skill resolution
     if (command === "/fire") {
       const fireArgs = cleanContent.trim().slice("/fire".length).trim().split(/\s+/).filter(Boolean);
@@ -850,6 +860,7 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
       }
       return;
     }
+
 
     let skillContext: string | null = null;
     if (command) {
@@ -895,7 +906,25 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
       promptParts.push("The user attached a text file, but downloading it failed. Ask them to resend.");
     }
 
-    // Build the prompt for Claude
+    // Include context from replied-to or forwarded messages
+    const isForward = message.message_reference?.type === 1;
+    const snapshot = message.message_snapshots?.[0]?.message;
+    if (isForward && snapshot) {
+      const fwdAuthor = snapshot.author ? snapshot.author.username : "unknown";
+      const fwdAttachments = snapshot.attachments.length > 0
+        ? ` [attachments: ${snapshot.attachments.map((a) => a.filename).join(", ")}]`
+        : "";
+      promptParts.push(`[Forwarded message from ${fwdAuthor}]: ${snapshot.content}${fwdAttachments}`);
+    } else if (message.referenced_message) {
+      const ref = message.referenced_message;
+      const refAuthor = ref.author.username;
+      const refAttachments = ref.attachments.length > 0
+        ? ` [attachments: ${ref.attachments.map((a) => a.filename).join(", ")}]`
+        : "";
+      promptParts.push(`[In reply to ${refAuthor}]: ${ref.content}${refAttachments}`);
+    }
+
+    // Build the final prompt
     const prompt = promptParts.join("\n");
     debugLog(`Prompt: ${prompt.slice(0, 100)}...`);
 
@@ -1280,6 +1309,23 @@ function sendResume(token: string): void {
 // Non-recoverable close codes that should not trigger reconnection
 const FATAL_CLOSE_CODES = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
 
+async function runPendingResume(token: string): Promise<void> {
+  const resume = await loadPendingResume("discord");
+  if (!resume) return;
+  console.log(`[Discord] Running pending resume for channel ${resume.channelId}`);
+  const result = await runUserMessage("discord", resume.wakeUpPrompt, resume.sessionKey, resume.agentName);
+  if (result.exitCode !== 0) {
+    console.error(`[Discord] Pending resume failed (exit ${result.exitCode}): ${result.stderr || result.stdout}`);
+    return;
+  }
+  const output = result.stdout?.trim();
+  if (output) {
+    // Discord threads are channels — post to thread ID when present, else channel
+    const targetChannel = resume.threadId ?? resume.channelId;
+    await sendMessage(token, targetChannel, output);
+  }
+}
+
 function handleDispatch(token: string, eventName: string, data: any): void {
   debugLog(`Dispatch: ${eventName}`);
 
@@ -1295,6 +1341,9 @@ function handleDispatch(token: string, eventName: string, data: any): void {
       console.log(`[Discord] Ready as ${data.user.username} (${data.user.id})`);
       registerSlashCommands(token).catch((err) =>
         console.error(`[Discord] Failed to register slash commands: ${err}`),
+      );
+      runPendingResume(token).catch((err) =>
+        console.error(`[Discord] Pending resume failed: ${err instanceof Error ? err.message : err}`),
       );
       break;
 
