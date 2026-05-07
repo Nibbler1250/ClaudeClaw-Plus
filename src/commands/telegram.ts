@@ -236,7 +236,7 @@ function debugLog(message: string): void {
 }
 
 function normalizeTelegramText(text: string): string {
-  return text.replace(/[\u2010-\u2015\u2212]/g, "-");
+  return text.replace(/[‐-―−]/g, "-");
 }
 
 function getMessageTextAndEntities(message: TelegramMessage): {
@@ -387,6 +387,34 @@ async function sendTyping(token: string, chatId: number, threadId?: number): Pro
     chat_id: chatId,
     action: "typing",
     ...(threadId ? { message_thread_id: threadId } : {}),
+  }).catch(() => {});
+}
+
+async function sendMessageAndGetId(token: string, chatId: number, text: string, threadId?: number): Promise<number | null> {
+  try {
+    const resp = await callApi<{ ok: boolean; result: { message_id: number } }>(token, "sendMessage", {
+      chat_id: chatId,
+      text,
+      ...(threadId ? { message_thread_id: threadId } : {}),
+    });
+    return resp.result?.message_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function editProgressMessage(token: string, chatId: number, messageId: number, text: string): Promise<void> {
+  await callApi(token, "editMessageText", {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+  }).catch(() => {});
+}
+
+async function deleteProgressMessage(token: string, chatId: number, messageId: number): Promise<void> {
+  await callApi(token, "deleteMessage", {
+    chat_id: chatId,
+    message_id: messageId,
   }).catch(() => {});
 }
 
@@ -701,7 +729,7 @@ async function sendMessageWithButtons(
   buttonRows: string[][],
   threadId?: number
 ): Promise<void> {
-  const body = text.trim() || "\u200B"; // zero-width space when text is empty (buttons-only)
+  const body = text.trim() || "​"; // zero-width space when text is empty (buttons-only)
   const normalized = normalizeTelegramText(body).replace(/\[react:[^\]\r\n]+\]/gi, "");
   const html = markdownToTelegramHtml(normalized);
   const inline_keyboard = buttonRows.map((row) =>
@@ -1313,8 +1341,28 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       await sendMessage(config.token, chatId, "Claude is busy — try again in a moment, or use /fork for a quick parallel task.", threadId);
       return;
     } else {
+      let progressMsgId: number | null = null;
+      let progressOp: Promise<void> = Promise.resolve();
+      const onToolCall = config.streamToolCalls
+        ? (toolName: string) => {
+            const txt = `⚙️ ${toolName}…`;
+            progressOp = progressOp.then(async () => {
+              if (progressMsgId === null) {
+                progressMsgId = await sendMessageAndGetId(config.token, chatId, txt, threadId);
+              } else {
+                await editProgressMessage(config.token, chatId, progressMsgId, txt);
+              }
+            }).catch(() => {});
+          }
+        : undefined;
+
       const stream = makeStreamCallback(config.token, chatId, threadId, { verbose });
-      result = await runUserMessage("telegram", prefixedPrompt, sessionKey, undefined, stream.onChunk, stream.onToolEvent);
+      result = await runUserMessage("telegram", prefixedPrompt, sessionKey, undefined, stream.onChunk, stream.onToolEvent, onToolCall);
+      await progressOp;
+      if (progressMsgId !== null) {
+        await deleteProgressMessage(config.token, chatId, progressMsgId);
+        progressMsgId = null;
+      }
       const streamResult = await stream.waitForStreamMsg();
       streamMsgId = streamResult.msgId;
       hadToolLines = streamResult.hadToolLines;
