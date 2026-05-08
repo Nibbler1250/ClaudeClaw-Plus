@@ -82,6 +82,8 @@ jobs:
         if: steps.check.outputs.new_commits != '0' && inputs.dry_run != true
         id: merge
         run: |
+          # Enable the 'ours' merge driver so .gitattributes can protect Plus-specific files
+          git config merge.ours.driver true
           if git merge upstream/master --no-edit 2>&1; then
             echo "status=clean" >> "$GITHUB_OUTPUT"
             echo "Merge succeeded with no conflicts."
