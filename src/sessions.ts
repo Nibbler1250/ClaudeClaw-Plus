@@ -24,6 +24,7 @@ function sessionDirFor(agentName?: string): string {
   return HEARTBEAT_DIR;
 }
 
+
 function sessionPathFor(agentName?: string): string {
   if (agentName) return join(getAgentsDir(), agentName, "session.json");
   return SESSION_FILE;
@@ -57,7 +58,7 @@ export async function getSession(
   agentName?: string
 ): Promise<{ sessionId: string; turnCount: number; compactWarned: boolean } | null> {
   const existing = await loadSession(agentName);
-  if (existing && existing.sessionId) {
+  if (existing) {
     // Backfill missing fields from older session.json files
     if (typeof existing.turnCount !== "number") existing.turnCount = 0;
     if (typeof existing.compactWarned !== "boolean") existing.compactWarned = false;
