@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 /**
  * Tests for jobs.ts — Phase 17 multi-job loader extension.
  *
@@ -247,6 +248,11 @@ describe("Phase 18: loadJobs invalid model rejection", () => {
 });
 
 // ─── Integration tests (upstream sandbox-based) ──────────────────────────────
+=======
+import { describe, test, expect, beforeEach, afterAll } from "bun:test";
+import { mkdir, writeFile, rm } from "fs/promises";
+import { join } from "path";
+>>>>>>> upstream/master
 
 const TEST_ROOT = join(import.meta.dir, "../../test-sandbox-jobs");
 const LEGACY_JOBS_DIR = join(TEST_ROOT, ".claude", "claudeclaw", "jobs");
@@ -287,7 +293,13 @@ process.stdout.write(JSON.stringify(jobs));
   return JSON.parse(out || "[]");
 }
 
+<<<<<<< HEAD
 describe("loadJobs (sandbox integration)", () => {
+=======
+// ─── Integration tests ────────────────────────────────────────────────────
+
+describe("loadJobs", () => {
+>>>>>>> upstream/master
   beforeEach(resetSandbox);
 
   test("empty dirs → zero jobs, no throw", async () => {
@@ -375,7 +387,11 @@ describe("loadJobs (sandbox integration)", () => {
   });
 });
 
+<<<<<<< HEAD
 // ─── Unit: Job type and session path assertions ──────────────────────────────
+=======
+// ─── Unit: Job type and session path assertions ───────────────────────────
+>>>>>>> upstream/master
 
 describe("Job type", () => {
   test("includes agent, label, enabled fields", () => {
@@ -424,7 +440,11 @@ describe("sessions — agent-scoped paths", () => {
   });
 });
 
+<<<<<<< HEAD
 // ─── Unit: protection-bug validation (the core motivation) ───────────────────
+=======
+// ─── Unit: protection-bug validation (the core motivation) ───────────────
+>>>>>>> upstream/master
 
 describe("write-protection bug validation", () => {
   test("agent-scoped job path is outside .claude/ (key property)", () => {
