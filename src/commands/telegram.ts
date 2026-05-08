@@ -1,4 +1,4 @@
-import { ensureProjectClaudeMd, run, runUserMessage, runFork, killActive, isMainBusy, compactCurrentSession, compactCurrentThreadSession, isRateLimited, getRateLimitResetAt } from "../runner";
+import { ensureProjectClaudeMd, run, runUserMessage, runFork, killActive, isMainBusy, compactCurrentSession, compactCurrentThreadSession, isRateLimited, getRateLimitResetAt, getPermissionMode, setPermissionMode, type PermissionMode } from "../runner";
 import { extractErrorDetail } from "../messaging";
 import { loadPendingResume } from "../pending-resume";
 import { getSettings, loadSettings } from "../config";
@@ -420,6 +420,12 @@ async function sendDocumentToChat(
 
 // Chat IDs with verbose tool display enabled
 const verboseChats = new Set<number>();
+
+// Model overrides per chat ID
+const chatModels = new Map<number, string>();
+const MODEL_HAIKU = "claude-haiku-4-5-20251001";
+const MODEL_SONNET = "claude-sonnet-4-6";
+const MODEL_OPUS = "claude-opus-4-7";
 
 /**
  * Build a streaming callback using editMessageText.
@@ -1119,6 +1125,45 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
+  if (command === "/model") {
+    const currentModel = chatModels.get(chatId);
+    const settings = getSettings();
+    const defaultModel = settings.model || "default";
+    if (!currentModel) {
+      await sendMessage(config.token, chatId, `📊 Current model: **${defaultModel}** (default)\n\nAvailable:\n• /modelhaiku - Fastest, least capable\n• /modelsonnet - Balanced (default)\n• /modelopus - Most capable, slower\n• /modeldefault - Use config default`, threadId);
+    } else {
+      const modelName = currentModel === MODEL_HAIKU ? "Haiku" : currentModel === MODEL_SONNET ? "Sonnet" : currentModel === MODEL_OPUS ? "Opus" : currentModel;
+      await sendMessage(config.token, chatId, `📊 Current model: **${modelName}**\n\nAvailable:\n• /modelhaiku - Fastest, least capable\n• /modelsonnet - Balanced\n• /modelopus - Most capable, slower\n• /modeldefault - Use config default (${defaultModel})`, threadId);
+    }
+    return;
+  }
+
+  if (command === "/modelhaiku") {
+    chatModels.set(chatId, MODEL_HAIKU);
+    await sendMessage(config.token, chatId, "⚡ Switched to Haiku - fastest responses, less capable.", threadId);
+    return;
+  }
+
+  if (command === "/modelsonnet") {
+    chatModels.set(chatId, MODEL_SONNET);
+    await sendMessage(config.token, chatId, "⚖️ Switched to Sonnet - balanced speed and capability.", threadId);
+    return;
+  }
+
+  if (command === "/modelopus") {
+    chatModels.set(chatId, MODEL_OPUS);
+    await sendMessage(config.token, chatId, "🧠 Switched to Opus - most capable, slower responses.", threadId);
+    return;
+  }
+
+  if (command === "/modeldefault") {
+    chatModels.delete(chatId);
+    const settings = getSettings();
+    const defaultModel = settings.model || "default";
+    await sendMessage(config.token, chatId, `🔄 Reset to default model: ${defaultModel}`, threadId);
+    return;
+  }
+
   if (command === "/fork") {
     const forkPrompt = text.replace(/^\/fork\s*/i, "").trim();
     if (!forkPrompt) {
@@ -1140,6 +1185,50 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     } finally {
       clearInterval(typingInterval);
     }
+    return;
+  }
+
+  if (command === "/mode") {
+    const arg = text.trim().slice("/mode".length).trim().toLowerCase();
+    const modeMap: Record<string, PermissionMode> = {
+      plan: "plan",
+      edit: "acceptEdits",
+      unrestricted: "bypassPermissions",
+    };
+    const modeLabels: Record<PermissionMode, string> = {
+      plan: "plan",
+      acceptEdits: "edit",
+      bypassPermissions: "unrestricted",
+    };
+
+    if (!arg) {
+      const current = getPermissionMode();
+      await sendMessage(
+        config.token,
+        chatId,
+        [
+          `Current mode: **${modeLabels[current]}**`,
+          "",
+          "Available modes:",
+          "- /mode plan - read-only planning",
+          "- /mode edit - auto-accept file edits",
+          "- /mode unrestricted - full permissions, no prompts",
+        ].join("\n"),
+        threadId
+      );
+      return;
+    }
+
+    const mode = modeMap[arg];
+    if (!mode) {
+      const safeArg = arg.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      await sendMessage(config.token, chatId, `Unknown mode: \`${safeArg}\`\n\nValid modes: plan, edit, unrestricted`, threadId);
+      return;
+    }
+
+    setPermissionMode(mode);
+    console.log(`[Telegram] Permission mode changed to ${modeLabels[mode]} by user ${userId ?? "unknown"}`);
+    await sendMessage(config.token, chatId, `Mode set to **${modeLabels[mode]}**. Takes effect on the next message.`, threadId);
     return;
   }
 
@@ -1225,7 +1314,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 
     // Skill routing: resolve slash commands to SKILL.md prompts
     let skillContext: string | null = null;
-    if (command && command !== "/start" && command !== "/reset" && command !== "/compact" && command !== "/status" && command !== "/context" && command !== "/kill" && command !== "/verbose" && command !== "/fork") {
+    if (command && command !== "/start" && command !== "/reset" && command !== "/compact" && command !== "/status" && command !== "/context" && command !== "/kill" && command !== "/verbose" && command !== "/fork" && command !== "/mode") {
       try {
         skillContext = await resolveSkillPrompt(command);
         if (skillContext) {
@@ -1306,6 +1395,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     const prefixedPrompt = promptParts.join("\n");
     const busy = isMainBusy();
     const verbose = verboseChats.has(chatId);
+    const modelOverride = chatModels.get(chatId);
     let result;
     let streamMsgId: number | null = null;
     let hadToolLines = false;
@@ -1314,7 +1404,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       return;
     } else {
       const stream = makeStreamCallback(config.token, chatId, threadId, { verbose });
-      result = await runUserMessage("telegram", prefixedPrompt, sessionKey, undefined, stream.onChunk, stream.onToolEvent);
+      result = await runUserMessage("telegram", prefixedPrompt, sessionKey, undefined, stream.onChunk, stream.onToolEvent, modelOverride);
       const streamResult = await stream.waitForStreamMsg();
       streamMsgId = streamResult.msgId;
       hadToolLines = streamResult.hadToolLines;
@@ -1548,14 +1638,24 @@ async function registerBotCommands(token: string): Promise<void> {
   try {
     const skills = await listSkills();
     const commands = [
-      { command: "start", description: "Show welcome message" },
-      { command: "reset", description: "Reset session and start fresh" },
-      { command: "compact", description: "Compact session to reduce context size" },
-      { command: "status", description: "Show current session status" },
-      { command: "context", description: "Show context window usage" },
-      { command: "kill", description: "Kill the currently running agent" },
-      { command: "verbose", description: "Toggle tool call display in responses" },
-      { command: "fork", description: "Run a parallel lightweight agent without blocking" },
+      // Session management
+      { command: "start", description: "👋 Welcome message" },
+      { command: "status", description: "📊 Session info and stats" },
+      { command: "context", description: "📐 Context window usage" },
+      { command: "reset", description: "🔄 Start fresh session" },
+      { command: "compact", description: "🗜️ Reduce context size" },
+      // Model selection
+      { command: "model", description: "📊 Show current model and options" },
+      { command: "modelhaiku", description: "⚡ Switch to Haiku (fastest)" },
+      { command: "modelsonnet", description: "⚖️ Switch to Sonnet (balanced)" },
+      { command: "modelopus", description: "🧠 Switch to Opus (most capable)" },
+      { command: "modeldefault", description: "🔄 Reset to config default model" },
+      // Mode toggles
+      { command: "mode", description: "🔐 Get or set Claude permission mode" },
+      { command: "verbose", description: "🔧 Toggle tool call display" },
+      // Control
+      { command: "fork", description: "🍴 Run parallel task" },
+      { command: "kill", description: "⛔ Stop current agent" },
     ];
     for (const skill of skills) {
       // Telegram commands: 1-32 chars, lowercase a-z, 0-9, underscores only
@@ -1578,7 +1678,7 @@ async function registerBotCommands(token: string): Promise<void> {
     } catch (regErr) {
       // Skill-generated commands may violate Telegram constraints; retry with built-in commands only
       console.warn(`[Telegram] Full command registration failed, retrying with built-in commands only: ${regErr instanceof Error ? regErr.message : regErr}`);
-      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context", "kill", "verbose", "fork"].includes(c.command));
+      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context", "kill", "verbose", "fork", "mode", "model", "modelhaiku", "modelsonnet", "modelopus", "modeldefault"].includes(c.command));
       await callApi(token, "setMyCommands", { commands: builtinOnly });
       console.log(`  Commands registered (built-in only): ${builtinOnly.length}`);
     }
