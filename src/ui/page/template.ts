@@ -115,6 +115,7 @@ ${pageStyles}
     <nav class="tab-nav" role="tablist" aria-label="Main navigation">
       <button class="tab-btn tab-btn-active" id="tab-dashboard" type="button" role="tab" aria-selected="true" aria-controls="dashboard-panel">Dashboard</button>
       <button class="tab-btn" id="tab-chat" type="button" role="tab" aria-selected="false" aria-controls="chat-panel">Chat</button>
+      <button class="tab-btn" id="tab-usage" type="button" role="tab" aria-selected="false" aria-controls="usage-panel">Usage</button>
     </nav>
     <div id="dashboard-panel">
     <section class="hero">
@@ -183,6 +184,17 @@ ${pageStyles}
         </div>
       </form>
     </section>
+    </div>
+    <div id="usage-panel" hidden>
+      <section class="usage-section" id="usage-section">
+        <div class="usage-head">
+          <div class="usage-title">Session Usage</div>
+          <div class="usage-sub">Token consumption and estimated cost per session · refreshes every 60s</div>
+        </div>
+        <div class="usage-table-wrap" id="usage-table-wrap">
+          <div class="usage-loading">Loading usage data...</div>
+        </div>
+      </section>
     </div>
     <div id="chat-panel" class="chat-panel" hidden>
       <div class="chat-layout">
