@@ -12,11 +12,8 @@ import { resolveSkillPrompt } from "../skills";
 import { fireJob, parseFireArgs } from "./fire";
 import { mkdir } from "node:fs/promises";
 import { extname, join, basename, sep } from "node:path";
-<<<<<<< HEAD
 import { processEventWithFallback, setGatewayEnabled } from "../gateway";
 import { normalizeDiscordMessage, type NormalizedEvent } from "../gateway/normalizer";
-=======
->>>>>>> upstream/master
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
 
 // --- Discord API constants ---
@@ -920,7 +917,6 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     // Skill routing: detect slash commands and resolve to SKILL.md prompts
     const command = cleanContent.startsWith("/") ? cleanContent.trim().split(/\s+/, 1)[0].toLowerCase() : null;
 
-<<<<<<< HEAD
 
     // /fire <agent>:<label> — manual fire, bypasses skill resolution
     if (command === "/fire") {
@@ -954,9 +950,6 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
       return;
     }
 
-
-=======
->>>>>>> upstream/master
     let skillContext: string | null = null;
     if (command) {
       try {
@@ -1019,7 +1012,6 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
       promptParts.push(`[In reply to ${refAuthor}]: ${ref.content}${refAttachments}`);
     }
 
-<<<<<<< HEAD
     // Build the final prompt
     const prompt = promptParts.join("\n");
     debugLog(`Prompt: ${prompt.slice(0, 100)}...`);
@@ -1061,9 +1053,6 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     }
 
     const prefixedPrompt = prompt;
-=======
-    const prefixedPrompt = promptParts.join("\n");
->>>>>>> upstream/master
     // Guild channels (including threads) each get their own isolated session; DMs use the global session
     const sessionKey = isGuild ? channelId : undefined;
     const requestStartedAt = Date.now();

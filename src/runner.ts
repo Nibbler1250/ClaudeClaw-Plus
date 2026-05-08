@@ -1,26 +1,7 @@
 import { mkdir, readFile, writeFile, realpath } from "fs/promises";
 import { join, dirname, resolve, sep } from "path";
 import { execSync } from "child_process";
-<<<<<<< HEAD
-import { existsSync, writeFileSync, mkdirSync } from "fs";
-=======
 import { existsSync, writeFileSync, mkdirSync, readFileSync } from "fs";
-import {
-  getSession,
-  createSession,
-  resetSession,
-  incrementTurn,
-  markCompactWarned,
-  getFallbackSession,
-  createFallbackSession,
-  resetFallbackSession,
-  incrementFallbackTurn,
-  peekSession,
-  incrementMessageCount,
-  backupSession,
-} from "./sessions";
-import { needsRotation, rotateSession, loadLatestSummary } from "./rotation";
->>>>>>> upstream/master
 import {
   getSession,
   createSession,
@@ -42,11 +23,7 @@ import { needsRotation, rotateSession, loadLatestSummary } from "./rotation";imp
   incrementThreadTurn,
   markThreadCompactWarned,
 } from "./sessionManager";
-<<<<<<< HEAD
 import { getSettings, DEFAULT_SESSION_TIMEOUT_MS, type ModelConfig, type SecurityConfig, type AgenticMode } from "./config";
-=======
-import { getSettings, DEFAULT_SESSION_TIMEOUT_MS, type ModelConfig, type SecurityConfig } from "./config";
->>>>>>> upstream/master
 import { buildClockPromptPrefix } from "./timezone";
 import { selectModel as governanceSelectModel, configureRouter as configureGovernanceRouter } from "./governance/model-router";
 import { recordInvocationStart, recordInvocationCompletion, recordInvocationFailure } from "./governance/usage-tracker";
@@ -60,7 +37,6 @@ import { recordResult, abortReason, clearSession, startSession } from "./watchdo
 import { getPluginManager, type EventContext } from "./plugins";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
-<<<<<<< HEAD
 
 // Initialize governance router with agentic modes from settings
 let governanceInitialized = false;
@@ -72,10 +48,7 @@ function ensureGovernanceRouter(modes?: AgenticMode[], defaultMode?: string): vo
 }
 
 const ACTIVE_RUNS_FILE = join(process.cwd(), ".claude/claudeclaw/active-runs");
-=======
-const ACTIVE_RUNS_FILE = join(process.cwd(), ".claude/claudeclaw/active-runs");
 const PERMISSION_MODE_FILE = join(process.cwd(), ".claude/claudeclaw/permission-mode.json");
->>>>>>> upstream/master
 // Resolve prompts relative to the claudeclaw installation, not the project dir
 const PROMPTS_DIR = join(import.meta.dir, "..", "prompts");
 const HEARTBEAT_PROMPT_FILE = join(PROMPTS_DIR, "heartbeat", "HEARTBEAT.md");
@@ -290,10 +263,8 @@ export function wasRateLimitNotified(): boolean {
 export function markRateLimitNotified(): void {
   rateLimitNotified = true;
 }
-<<<<<<< HEAD
+
 const STALE_THINKING_PATTERN = /Invalid.*signature.*thinking|thinking.*block.*signature/i;
-=======
->>>>>>> upstream/master
 
 // Serial queue — prevents concurrent --resume on the same session
 // Global queue for non-thread messages (backward compatible)
@@ -423,47 +394,7 @@ function resolveTimeoutMs(name: string): number {
   }
   return minutes * 60_000;
 }
-<<<<<<< HEAD
-=======
 
-// Cap stdout/stderr to prevent unbounded memory growth.
-// 10 MB is far beyond any real Claude response; protects against runaway streams only.
-const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
-
-async function collectStream(stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<string> {
-  const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
-  let totalBytes = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (totalBytes < maxBytes) {
-        const space = maxBytes - totalBytes;
-        if (value.byteLength <= space) {
-          chunks.push(value);
-          totalBytes += value.byteLength;
-        } else {
-          chunks.push(value.subarray(0, space));
-          totalBytes = maxBytes;
-          // cap reached — keep draining without storing so the child process isn't blocked
-        }
-      }
-      // beyond cap: read and discard to keep the pipe flowing
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const merged = new Uint8Array(totalBytes);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder().decode(merged);
-}
-
->>>>>>> upstream/master
 
 // Cap stdout/stderr to prevent unbounded memory growth.
 // 10 MB is far beyond any real Claude response; protects against runaway streams only.
@@ -605,10 +536,6 @@ async function runClaudeStream(
   let streamLastMsgId = "";
   const streamPendingToolCalls = new Map<string, string>();
 
-<<<<<<< HEAD
-
-=======
->>>>>>> upstream/master
   const readStdout = async () => {
     const reader = proc.stdout.getReader();
     const decoder = new TextDecoder();
@@ -1096,7 +1023,6 @@ export async function compactCurrentSession(agentName?: string): Promise<{ succe
     : { success: false, message: `❌ Compact failed (${existing.sessionId.slice(0, 8)})` };
 }
 
-<<<<<<< HEAD
 /**
  * Policy-aware tool execution wrapper.
  * Evaluates tool requests against policy before allowing execution.
@@ -1192,9 +1118,6 @@ async function loadAgentPrompts(agentName: string): Promise<string> {
   return parts.join("\n\n");
 }
 
-
-=======
->>>>>>> upstream/master
 // Compact a Discord thread session by threadId. Uses getThreadSession (not getSession)
 // because Discord threads have their own session store. agentName is used only for cwd isolation.
 export async function compactCurrentThreadSession(
@@ -1264,7 +1187,6 @@ async function execClaude(
 
   const settings = getSettings();
   const { security, model, api, fallback, agentic, watchdog } = settings;
-<<<<<<< HEAD
 
   // Generate invocation ID for tracking
   const invocationId = crypto.randomUUID();
@@ -1274,8 +1196,6 @@ async function execClaude(
   await recordExecutionMetric({ invocationId, sessionId: invocationSessionId }, {});
   // Minimal watchdog: start clock for resumed sessions (new sessions get startSession after JSON parse)
   if (invocationSessionId) watchdogStart(invocationSessionId);
-=======
->>>>>>> upstream/master
 
   // Determine which model to use based on agentic routing
   let primaryConfig: ModelConfig;
@@ -1345,10 +1265,7 @@ async function execClaude(
   // Build the appended system prompt: CLAUDE.md + directory scoping
   // This is passed on EVERY invocation (not just new sessions) because
   // --append-system-prompt does not persist across --resume.
-<<<<<<< HEAD
   const memPath = getMemoryPath(agentName);
-=======
->>>>>>> upstream/master
   // Prompt files (IDENTITY.md, USER.md, SOUL.md) are already embedded in
   // CLAUDE.md by ensureProjectClaudeMd(), which runs before every call.
   const appendParts: string[] = [
@@ -1368,7 +1285,6 @@ async function execClaude(
   if (pm) {
     const pluginResult = await pm.emit("before_prompt_build", { prompt }, ctx);
     if (pluginResult?.appendSystemContext) appendParts.push(pluginResult.appendSystemContext);
-<<<<<<< HEAD
   }
 
   if (agentName) {
@@ -1388,8 +1304,6 @@ async function execClaude(
         console.error(`[${new Date().toLocaleTimeString()}] Failed to read project CLAUDE.md:`, e);
       }
     }
-=======
->>>>>>> upstream/master
   }
 
   // Load memory (put after static files for optimal prompt caching)
@@ -1409,7 +1323,6 @@ async function execClaude(
   const baseEnv = cleanSpawnEnv();
   const spawnCwd = agentName ? await ensureAgentDir(agentName) : undefined;
 
-<<<<<<< HEAD
   // Record invocation start
   const invocationContext = {
     sessionId: existing?.sessionId,
@@ -1432,8 +1345,6 @@ async function execClaude(
     }
   } catch {}
 
-=======
->>>>>>> upstream/master
   let exec = await runClaudeStream(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd, onChunk, onToolEvent);
   const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
   let usedFallback = false;
@@ -1615,7 +1526,6 @@ async function execClaude(
     exitCode,
   };
 
-<<<<<<< HEAD
   // Record successful completion
   await recordInvocationCompletion(invocationId, undefined, undefined);
 
@@ -1633,9 +1543,6 @@ async function execClaude(
     }
   }
 
-
-=======
->>>>>>> upstream/master
   // Plugins: agent_end — fire-and-forget, does not block response
   if (pm && exitCode === 0) {
     pm.emitAsync("agent_end", {
@@ -1662,7 +1569,6 @@ async function execClaude(
   if (!agentName && !threadId) await incrementMessageCount();
   console.log(`[${new Date().toLocaleTimeString()}] Done: ${name} → ${logFile}`);
 
-<<<<<<< HEAD
   // Fallback: append session log to MEMORY.md only if Claude didn't write it
   if (exitCode === 0 && stdout && name !== "bootstrap") {
     try {
@@ -1696,9 +1602,6 @@ async function execClaude(
     }
   }
 
-
-=======
->>>>>>> upstream/master
   // --- Watchdog: track consecutive timeouts ---
   // Skip tracking for unresolved session IDs ("unknown") to avoid cross-session
   // state collisions when a new session fails before its real ID is known.
@@ -1721,7 +1624,6 @@ async function execClaude(
 
   // --- Auto-compact on timeout (exit 124) ---
   if (COMPACT_TIMEOUT_ENABLED && exitCode === 124 && !isNew && existing && !recoveredFromStale) {
-<<<<<<< HEAD
     // Save memory before compact wipes context
     try {
       const memPath = getMemoryPath(agentName);
@@ -1735,9 +1637,6 @@ async function execClaude(
       console.warn(`[${new Date().toLocaleTimeString()}] Pre-compact memory save failed:`, e);
     }
 
-
-=======
->>>>>>> upstream/master
     emitCompactEvent({ type: "auto-compact-start" });
     const compactOk = await runCompact(
       existing.sessionId,
@@ -2055,16 +1954,10 @@ export async function runUserMessage(
   threadId?: string,
   agentName?: string,
   onChunk?: (text: string) => void,
-<<<<<<< HEAD
-  onToolEvent?: (line: string) => void
-): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt), threadId, undefined, undefined, agentName, undefined, onChunk, onToolEvent);
-=======
   onToolEvent?: (line: string) => void,
   modelOverride?: string
 ): Promise<RunResult> {
   return run(name, prefixUserMessageWithClock(prompt), threadId, modelOverride, undefined, agentName, undefined, onChunk, onToolEvent);
->>>>>>> upstream/master
 }
 
 // Path where Claude Code stores session JSONL transcripts for this project

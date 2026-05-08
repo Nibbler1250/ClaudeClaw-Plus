@@ -3,18 +3,12 @@ import { extractErrorDetail } from "../messaging";
 import { join } from "path";
 import { fileURLToPath } from "url";
 import { run, runUserMessage, streamUserMessage, bootstrap, ensureProjectClaudeMd, loadHeartbeatPromptTemplate, isRateLimited, getRateLimitResetAt, wasRateLimitNotified, markRateLimitNotified } from "../runner";
-<<<<<<< HEAD
 import { initGatewayProcessor } from "../event-processor";
 import { writeState, type StateData } from "../statusline";
 import { cronMatches, nextCronMatch } from "../cron";
 import { clearJobSchedule, loadJobs, resolveJobModel, snapshotJobFrontmatter } from "../jobs";
 import { migrateLegacyAgentJobs } from "../migrations";
 import { ensureUserSymlinks } from "../install";
-=======
-import { writeState, type StateData } from "../statusline";
-import { cronMatches, nextCronMatch } from "../cron";
-import { clearJobSchedule, loadJobs, snapshotJobFrontmatter } from "../jobs";
->>>>>>> upstream/master
 import { writePidFile, cleanupPidFile, checkExistingDaemon } from "../pid";
 import { initConfig, loadSettings, reloadSettings, resolvePrompt, type HeartbeatConfig, type Settings } from "../config";
 import { getDayAndMinuteAtOffset, buildClockPromptPrefix } from "../timezone";
@@ -23,10 +17,7 @@ import { initializeJobSystem } from "../orchestrator/resumable-jobs";
 import type { Job } from "../jobs";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
 import { PluginManager, setPluginManager } from "../plugins";
-<<<<<<< HEAD
 import { indexSessionsBackground } from "../memory";
-=======
->>>>>>> upstream/master
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
 const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
@@ -818,18 +809,12 @@ export async function start(args: string[] = []) {
         : undefined,
       jobs: currentJobs.map((job) => {
         const last = jobLastResult.get(job.name);
-<<<<<<< HEAD
-=======
         const retryState = jobRetryState.get(job.name);
->>>>>>> upstream/master
         return {
           name: job.name,
           nextAt: nextCronMatch(job.schedule, now, currentSettings.timezoneOffsetMinutes).getTime(),
           ...(last ? { lastResult: last.result, lastRanAt: last.ranAt } : {}),
-<<<<<<< HEAD
-=======
           ...(retryState ? { failCount: retryState.failCount, retryAt: retryState.retryAt } : {}),
->>>>>>> upstream/master
         };
       }),
       security: currentSettings.security.level,
@@ -859,22 +844,14 @@ export async function start(args: string[] = []) {
     snapshotJobFrontmatter(job.name)
       .then((restoreFrontmatter) =>
         resolvePrompt(job.prompt)
-<<<<<<< HEAD
           .then(async (prompt) => {
             const modelOverride = await resolveJobModel(job);
-=======
-          .then((prompt) => {
->>>>>>> upstream/master
             const clock = buildClockPromptPrefix(new Date(), currentSettings.timezoneOffsetMinutes);
             return run(
               job.name,
               `${clock}\n${prompt}`,
               job.agent ? `agent:${job.agent}` : job.name,
-<<<<<<< HEAD
               modelOverride ?? job.model,
-=======
-              job.model,
->>>>>>> upstream/master
               timeoutMs,
               job.agent,
               "job"

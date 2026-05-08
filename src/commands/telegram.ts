@@ -1,8 +1,4 @@
-<<<<<<< HEAD
-import { ensureProjectClaudeMd, run, runUserMessage, runFork, killActive, isMainBusy, compactCurrentSession, compactCurrentThreadSession, isRateLimited, getRateLimitResetAt } from "../runner";
-=======
 import { ensureProjectClaudeMd, run, runUserMessage, runFork, killActive, isMainBusy, compactCurrentSession, compactCurrentThreadSession, isRateLimited, getRateLimitResetAt, getPermissionMode, setPermissionMode, type PermissionMode } from "../runner";
->>>>>>> upstream/master
 import { extractErrorDetail } from "../messaging";
 import { loadPendingResume } from "../pending-resume";
 import { getSettings, loadSettings } from "../config";
@@ -16,10 +12,7 @@ import { resolveSkillPrompt, listSkills } from "../skills";
 import { fireJob, parseFireArgs } from "./fire";
 import { mkdir } from "node:fs/promises";
 import { extname, join } from "node:path";
-<<<<<<< HEAD
 import { submitTelegramToGateway } from "../gateway";
-=======
->>>>>>> upstream/master
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
 
 // --- Markdown → Telegram HTML conversion (ported from nanobot) ---
@@ -428,15 +421,12 @@ async function sendDocumentToChat(
 // Chat IDs with verbose tool display enabled
 const verboseChats = new Set<number>();
 
-<<<<<<< HEAD
-=======
 // Model overrides per chat ID
 const chatModels = new Map<number, string>();
 const MODEL_HAIKU = "claude-haiku-4-5-20251001";
 const MODEL_SONNET = "claude-sonnet-4-6";
 const MODEL_OPUS = "claude-opus-4-7";
 
->>>>>>> upstream/master
 /**
  * Build a streaming callback using editMessageText.
  * On first chunk: send a placeholder message to get message_id.
@@ -1135,8 +1125,6 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
-<<<<<<< HEAD
-=======
   if (command === "/model") {
     const currentModel = chatModels.get(chatId);
     const settings = getSettings();
@@ -1176,7 +1164,6 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
->>>>>>> upstream/master
   if (command === "/fork") {
     const forkPrompt = text.replace(/^\/fork\s*/i, "").trim();
     if (!forkPrompt) {
@@ -1201,8 +1188,6 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
-<<<<<<< HEAD
-=======
   if (command === "/mode") {
     const arg = text.trim().slice("/mode".length).trim().toLowerCase();
     const modeMap: Record<string, PermissionMode> = {
@@ -1247,7 +1232,6 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
->>>>>>> upstream/master
   // Secretary: detect reply to a bot alert message → treat as custom reply
   const replyToMsgId = message.reply_to_message?.message_id;
   if (replyToMsgId && text && botId && message.reply_to_message?.from?.id === botId) {
@@ -1330,11 +1314,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 
     // Skill routing: resolve slash commands to SKILL.md prompts
     let skillContext: string | null = null;
-<<<<<<< HEAD
-    if (command && command !== "/start" && command !== "/reset" && command !== "/compact" && command !== "/status" && command !== "/context" && command !== "/kill" && command !== "/verbose" && command !== "/fork") {
-=======
     if (command && command !== "/start" && command !== "/reset" && command !== "/compact" && command !== "/status" && command !== "/context" && command !== "/kill" && command !== "/verbose" && command !== "/fork" && command !== "/mode") {
->>>>>>> upstream/master
       try {
         skillContext = await resolveSkillPrompt(command);
         if (skillContext) {
@@ -1415,10 +1395,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     const prefixedPrompt = promptParts.join("\n");
     const busy = isMainBusy();
     const verbose = verboseChats.has(chatId);
-<<<<<<< HEAD
-=======
     const modelOverride = chatModels.get(chatId);
->>>>>>> upstream/master
     let result;
     let streamMsgId: number | null = null;
     let hadToolLines = false;
@@ -1427,11 +1404,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       return;
     } else {
       const stream = makeStreamCallback(config.token, chatId, threadId, { verbose });
-<<<<<<< HEAD
-      result = await runUserMessage("telegram", prefixedPrompt, sessionKey, undefined, stream.onChunk, stream.onToolEvent);
-=======
       result = await runUserMessage("telegram", prefixedPrompt, sessionKey, undefined, stream.onChunk, stream.onToolEvent, modelOverride);
->>>>>>> upstream/master
       const streamResult = await stream.waitForStreamMsg();
       streamMsgId = streamResult.msgId;
       hadToolLines = streamResult.hadToolLines;
@@ -1665,16 +1638,6 @@ async function registerBotCommands(token: string): Promise<void> {
   try {
     const skills = await listSkills();
     const commands = [
-<<<<<<< HEAD
-      { command: "start", description: "Show welcome message" },
-      { command: "reset", description: "Reset session and start fresh" },
-      { command: "compact", description: "Compact session to reduce context size" },
-      { command: "status", description: "Show current session status" },
-      { command: "context", description: "Show context window usage" },
-      { command: "kill", description: "Kill the currently running agent" },
-      { command: "verbose", description: "Toggle tool call display in responses" },
-      { command: "fork", description: "Run a parallel lightweight agent without blocking" },
-=======
       // Session management
       { command: "start", description: "👋 Welcome message" },
       { command: "status", description: "📊 Session info and stats" },
@@ -1693,7 +1656,6 @@ async function registerBotCommands(token: string): Promise<void> {
       // Control
       { command: "fork", description: "🍴 Run parallel task" },
       { command: "kill", description: "⛔ Stop current agent" },
->>>>>>> upstream/master
     ];
     for (const skill of skills) {
       // Telegram commands: 1-32 chars, lowercase a-z, 0-9, underscores only
@@ -1716,11 +1678,7 @@ async function registerBotCommands(token: string): Promise<void> {
     } catch (regErr) {
       // Skill-generated commands may violate Telegram constraints; retry with built-in commands only
       console.warn(`[Telegram] Full command registration failed, retrying with built-in commands only: ${regErr instanceof Error ? regErr.message : regErr}`);
-<<<<<<< HEAD
-      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context", "kill", "verbose", "fork"].includes(c.command));
-=======
       const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context", "kill", "verbose", "fork", "mode", "model", "modelhaiku", "modelsonnet", "modelopus", "modeldefault"].includes(c.command));
->>>>>>> upstream/master
       await callApi(token, "setMyCommands", { commands: builtinOnly });
       console.log(`  Commands registered (built-in only): ${builtinOnly.length}`);
     }

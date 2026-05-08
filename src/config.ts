@@ -4,10 +4,7 @@ import { existsSync } from "fs";
 import { normalizeTimezoneName, resolveTimezoneOffsetMinutes } from "./timezone";
 import { parseWatchdogConfig, type WatchdogConfig } from "./watchdog";
 import { parsePlugins, type PluginEntry } from "./plugins";
-<<<<<<< HEAD
 import { parseMemorySearchSettings, type MemorySearchSettings } from "./memory";
-=======
->>>>>>> upstream/master
 
 /** Re-exported under the name used in the Settings interface. */
 export type WatchdogSettings = WatchdogConfig;
@@ -94,10 +91,7 @@ const DEFAULT_SETTINGS: Settings = {
   watchdog: { maxConsecutiveTimeouts: null, maxRuntimeSeconds: null },
   session: { autoRotate: false, maxMessages: 50, maxAgeHours: 24, summaryPath: "" },
   plugins: {},
-<<<<<<< HEAD
   memorySearch: {},
-=======
->>>>>>> upstream/master
 };
 
 export interface HeartbeatExcludeWindow {
@@ -127,13 +121,10 @@ export interface TelegramConfig {
    * - "perUser": each DM user gets their own isolated session.
    */
   dmIsolation: "shared" | "perUser";
-<<<<<<< HEAD
-=======
   /** Local whisper.cpp model for voice transcription. Default: "base.en".
    *  Supported values: tiny, base, small, medium, large-v3, large-v3-turbo (with or without .en suffix).
    *  Ignored when stt.baseUrl is configured. */
   whisperModel?: string;
->>>>>>> upstream/master
 }
 
 export interface DiscordConfig {
@@ -195,10 +186,7 @@ export interface Settings {
   watchdog: WatchdogSettings;
   plugins: Record<string, PluginEntry>;
   session: SessionConfig;
-<<<<<<< HEAD
   memorySearch: MemorySearchSettings;
-=======
->>>>>>> upstream/master
   jobsDir?: string;
 }
 
@@ -356,12 +344,9 @@ function parseSettings(
       listenChats: Array.isArray(raw.telegram?.listenChats) ? raw.telegram.listenChats.map(Number) : [],
       receiveEnabled: raw.telegram?.receiveEnabled !== false,
       dmIsolation: raw.telegram?.dmIsolation === "perUser" ? "perUser" : "shared",
-<<<<<<< HEAD
-=======
       ...(typeof raw.telegram?.whisperModel === "string" && raw.telegram.whisperModel.trim()
         ? { whisperModel: raw.telegram.whisperModel.trim() }
         : {}),
->>>>>>> upstream/master
     },
     discord: {
       token: process.env.DISCORD_TOKEN?.trim() || (typeof raw.discord?.token === "string" ? raw.discord.token.trim() : ""),
@@ -423,10 +408,7 @@ function parseSettings(
     },
     watchdog: parseWatchdogConfig(raw.watchdog),
     plugins: parsePlugins(raw.plugins),
-<<<<<<< HEAD
     memorySearch: parseMemorySearchSettings(raw.memorySearch),
-=======
->>>>>>> upstream/master
     session: {
       autoRotate: raw.session?.autoRotate ?? false,
       maxMessages: Number.isFinite(raw.session?.maxMessages) ? Number(raw.session.maxMessages) : 50,
