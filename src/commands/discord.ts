@@ -572,7 +572,7 @@ async function respondToInteraction(
 // so a follow-up text comment from the same user can absorb it as context.
 const pendingForwards = new Map<string, { snapshot: DiscordMessageSnapshot; timer: ReturnType<typeof setTimeout> }>();
 
-async function handleMessageCreate(token: string, message: DiscordMessage): Promise<void> {
+async function handleMessageCreate(token: string, message: DiscordMessage, skipCoalesce = false): Promise<void> {
   const config = getSettings().discord;
 
   // Ignore bot messages
@@ -635,14 +635,14 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
   const forwardKey = `${channelId}:${userId}`;
   const isForwardOnly = message.message_reference?.type === 1 && !content.trim() && !hasImage && !hasVoice && !hasText;
 
-  if (isForwardOnly && hasForwardedContent) {
+  if (!skipCoalesce && isForwardOnly && hasForwardedContent) {
     // Pure forward with no accompanying text — hold it and wait for a follow-up comment
     const existing = pendingForwards.get(forwardKey);
     if (existing) clearTimeout(existing.timer);
     const snapshot = message.message_snapshots![0].message;
     const timer = setTimeout(() => {
       pendingForwards.delete(forwardKey);
-      handleMessageCreate(token, message).catch((err) =>
+      handleMessageCreate(token, message, true).catch((err) =>
         console.error(`[Discord] Deferred forward error: ${err instanceof Error ? err.message : err}`)
       );
     }, 1500);
