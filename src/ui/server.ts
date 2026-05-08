@@ -7,6 +7,7 @@ import { readHeartbeatSettings, updateHeartbeatSettings } from "./services/setti
 import { createQuickJob, deleteJob } from "./services/jobs";
 import { readLogs } from "./services/logs";
 import { listSessions, readSessionMessages, listAgents } from "./services/sessions";
+import { getSessionUsage } from "./services/usage";
 import { runUserMessage } from "../runner";
 import { tmpdir } from "os";
 import { randomUUID } from "crypto";
@@ -157,6 +158,15 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
       if (url.pathname === "/api/sessions" && req.method === "GET") {
         try {
           return json(await listSessions());
+        } catch (err) {
+          return json({ ok: false, error: String(err) });
+        }
+      }
+
+      if (url.pathname === "/api/usage" && req.method === "GET") {
+        try {
+          const channelNames = opts.getSnapshot().settings.discord?.channelNames;
+          return json(await getSessionUsage(channelNames));
         } catch (err) {
           return json({ ok: false, error: String(err) });
         }

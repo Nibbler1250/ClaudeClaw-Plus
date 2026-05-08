@@ -935,8 +935,10 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
     // ── Chat ──
     const tabDashboardBtn = $("tab-dashboard");
     const tabChatBtn = $("tab-chat");
+    const tabUsageBtn = $("tab-usage");
     const dashboardPanel = $("dashboard-panel");
     const chatPanel = $("chat-panel");
+    const usagePanel = $("usage-panel");
     const chatMessages = $("chat-messages");
     const chatForm = $("chat-form");
     const chatInput = $("chat-input");
@@ -1055,8 +1057,8 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
     })();
 
     function setActiveTab(tab) {
-      const allBtns = [tabDashboardBtn, tabChatBtn];
-      const allPanels = [dashboardPanel, chatPanel];
+      const allBtns = [tabDashboardBtn, tabChatBtn, tabUsageBtn];
+      const allPanels = [dashboardPanel, chatPanel, usagePanel];
       allBtns.forEach(b => { if (b) { b.classList.remove("tab-btn-active"); b.setAttribute("aria-selected", "false"); } });
       allPanels.forEach(p => { if (p) p.hidden = true; });
 
@@ -1064,6 +1066,11 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
         tabDashboardBtn && tabDashboardBtn.classList.add("tab-btn-active");
         tabDashboardBtn && tabDashboardBtn.setAttribute("aria-selected", "true");
         if (dashboardPanel) dashboardPanel.hidden = false;
+      } else if (tab === "usage") {
+        tabUsageBtn && tabUsageBtn.classList.add("tab-btn-active");
+        tabUsageBtn && tabUsageBtn.setAttribute("aria-selected", "true");
+        if (usagePanel) usagePanel.hidden = false;
+        fetchUsage();
       } else {
         tabChatBtn && tabChatBtn.classList.add("tab-btn-active");
         tabChatBtn && tabChatBtn.setAttribute("aria-selected", "true");
@@ -1074,6 +1081,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
 
     if (tabDashboardBtn) tabDashboardBtn.addEventListener("click", () => setActiveTab("dashboard"));
     if (tabChatBtn) tabChatBtn.addEventListener("click", function() { setActiveTab("chat"); loadSessions(); });
+    if (tabUsageBtn) tabUsageBtn.addEventListener("click", function() { setActiveTab("usage"); });
 
     // --- Session browser ---
 
@@ -1516,4 +1524,85 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
         var elapsedEl = chatMessages.querySelector(".chat-msg-elapsed");
         if (elapsedEl) elapsedEl.textContent = fmtElapsed(Date.now() - chatStartedAt);
       }
-    }, 1000);`;
+    }, 1000);
+
+    // --- Usage monitoring ---
+    var usageWrap = $("usage-table-wrap");
+
+    function fmtTokens(n) {
+      if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
+      if (n >= 1_000) return (n / 1_000).toFixed(1) + "K";
+      return String(n);
+    }
+
+    function fmtCost(usd) {
+      if (usd <= 0) return "$0.00";
+      if (usd < 0.01) return "<$0.01";
+      return "$" + usd.toFixed(2);
+    }
+
+    function fmtRelative(iso) {
+      if (!iso) return "—";
+      var delta = Date.now() - new Date(iso).getTime();
+      var s = Math.floor(delta / 1000);
+      if (s < 60) return s + "s ago";
+      var m = Math.floor(s / 60);
+      if (m < 60) return m + "m ago";
+      var h = Math.floor(m / 60);
+      if (h < 24) return h + "h ago";
+      return Math.floor(h / 24) + "d ago";
+    }
+
+    function renderUsageTable(sessions) {
+      if (!usageWrap) return;
+      if (!sessions || sessions.length === 0) {
+        usageWrap.innerHTML = '<div class="usage-loading">No active sessions found.</div>';
+        return;
+      }
+      var maxCost = sessions.reduce(function(m, s) { return Math.max(m, s.estimatedCostUsd); }, 0);
+      var rows = sessions.map(function(s) {
+        var barPct = maxCost > 0 ? Math.round((s.estimatedCostUsd / maxCost) * 100) : 0;
+        var channelIcon = s.channel === "discord" ? "🎮" : s.channel === "web" ? "🌐" : "❓";
+        return "<tr>" +
+          "<td class='usage-td usage-td-label'>" + channelIcon + " " + esc(s.label) + "</td>" +
+          "<td class='usage-td usage-td-num'>" + fmtTokens(s.inputTokens) + "</td>" +
+          "<td class='usage-td usage-td-num'>" + fmtTokens(s.outputTokens) + "</td>" +
+          "<td class='usage-td usage-td-num'>" + fmtTokens(s.cacheReadTokens) + "</td>" +
+          "<td class='usage-td usage-td-num'>" + s.cacheHitPct + "%</td>" +
+          "<td class='usage-td usage-td-cost'>" +
+            "<div class='usage-cost-wrap'>" +
+              "<div class='usage-cost-bar' style='width:" + barPct + "%'></div>" +
+              "<span class='usage-cost-label'>~" + fmtCost(s.estimatedCostUsd) + "</span>" +
+            "</div>" +
+          "</td>" +
+          "<td class='usage-td usage-td-num usage-td-turns'>" + s.turnCount + "</td>" +
+          "<td class='usage-td usage-td-age'>" + fmtRelative(s.lastUsedAt) + "</td>" +
+          "</tr>";
+      }).join("");
+      usageWrap.innerHTML =
+        "<table class='usage-table'>" +
+        "<thead><tr>" +
+        "<th class='usage-th'>Session</th>" +
+        "<th class='usage-th usage-th-num'>Input</th>" +
+        "<th class='usage-th usage-th-num'>Output</th>" +
+        "<th class='usage-th usage-th-num'>Cache Read</th>" +
+        "<th class='usage-th usage-th-num'>Cache Hit</th>" +
+        "<th class='usage-th'>Est. Cost</th>" +
+        "<th class='usage-th usage-th-num'>Turns</th>" +
+        "<th class='usage-th'>Last Active</th>" +
+        "</tr></thead>" +
+        "<tbody>" + rows + "</tbody>" +
+        "</table>";
+    }
+
+    function fetchUsage() {
+      fetch("/api/usage")
+        .then(function(r) { return r.json(); })
+        .then(function(data) { renderUsageTable(Array.isArray(data) ? data : []); })
+        .catch(function() {
+          if (usageWrap) usageWrap.innerHTML = '<div class="usage-loading">Failed to load usage data.</div>';
+        });
+    }
+
+    fetchUsage();
+    setInterval(fetchUsage, 60_000);`;

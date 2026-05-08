@@ -1631,4 +1631,66 @@ export const pageStyles = String.raw`    :root {
       color: #ffc276;
       padding: 2px 4px;
     }
+
+/* --- Usage section --- */
+.usage-section {
+  margin-top: 24px;
+  border: 1px solid #ffffff22;
+  border-radius: 16px;
+  background:
+    radial-gradient(120% 100% at 100% 0%, #7dc5ff1a, transparent 55%),
+    linear-gradient(180deg, #0e1a2a88 0%, #0a1220a8 100%);
+  backdrop-filter: blur(6px);
+  box-shadow: 0 14px 34px #00000045;
+  padding: 18px 20px;
+}
+.usage-head { margin-bottom: 14px; }
+.usage-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+.usage-sub { font-size: 11px; color: var(--fg-dim); margin-top: 2px; }
+.usage-loading { font-size: 12px; color: var(--fg-dim); padding: 8px 0; }
+.usage-table-wrap { overflow-x: auto; }
+.usage-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.usage-th {
+  text-align: left;
+  color: var(--fg-dim);
+  font-weight: 500;
+  padding: 4px 10px 8px 0;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.usage-th-num { text-align: right; }
+.usage-td {
+  padding: 7px 10px 7px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.usage-td-num, .usage-td-turns { text-align: right; color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+.usage-td-label { color: var(--fg); font-weight: 500; max-width: 160px; overflow: hidden; text-overflow: ellipsis; }
+.usage-td-age { color: var(--fg-dim); font-size: 11px; }
+.usage-td-cost { min-width: 120px; }
+.usage-cost-wrap { position: relative; height: 18px; display: flex; align-items: center; }
+.usage-cost-bar {
+  position: absolute; left: 0; top: 0; height: 100%;
+  background: rgba(99, 179, 237, 0.18);
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+.usage-cost-label { position: relative; padding-left: 6px; font-variant-numeric: tabular-nums; color: var(--fg); }
+
+@media (max-width: 640px) {
+  .tab-btn { padding: 0 12px; font-size: 10px; }
+  .usage-table th:nth-child(2), .usage-table td:nth-child(2),
+  .usage-table th:nth-child(3), .usage-table td:nth-child(3),
+  .usage-table th:nth-child(4), .usage-table td:nth-child(4),
+  .usage-table th:nth-child(5), .usage-table td:nth-child(5) { display: none; }
+  .usage-td-label { max-width: 110px; }
+  .usage-td-cost { min-width: 80px; }
+}
 `;
