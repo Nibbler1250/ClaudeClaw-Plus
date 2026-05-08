@@ -205,6 +205,13 @@ ${pageStyles}
           <div id="chat-messages" class="chat-messages"></div>
           <div class="chat-input-area">
             <form id="chat-form" class="chat-form">
+              <input
+                type="file"
+                id="chat-file-input"
+                multiple
+                style="display:none"
+                accept="text/plain,text/html,text/css,text/javascript,text/typescript,text/x-python,text/csv,text/xml,text/markdown,application/json,application/yaml,application/toml,image/jpeg,image/png,image/gif,image/webp,.js,.ts,.py,.json,.yaml,.yml,.md,.txt,.csv,.xml,.sh,.sql,.toml,.ini,.env,.log"
+              />
               <textarea
                 id="chat-input"
                 class="chat-input"
@@ -212,6 +219,8 @@ ${pageStyles}
                 rows="1"
                 autocomplete="off"
               ></textarea>
+              <div id="chat-attachments" class="chat-attachments" hidden></div>
+              <button id="chat-attach" class="chat-attach" type="button" title="Attach files">📎</button>
               <button id="chat-cancel" class="chat-cancel" type="button" hidden>Cancel</button>
               <button id="chat-send" class="chat-send" type="submit">Send</button>
             </form>

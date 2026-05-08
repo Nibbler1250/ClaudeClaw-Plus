@@ -1221,6 +1221,7 @@ export const pageStyles = String.raw`    :root {
     }
     .chat-form {
       display: flex;
+      flex-wrap: wrap;
       align-items: flex-end;
       gap: 8px;
       border: 1px solid #ffffff2e;
@@ -1548,4 +1549,86 @@ export const pageStyles = String.raw`    :root {
   .chat-layout { flex-direction: column; }
   .chat-sidebar { width: 100%; min-width: 100%; max-height: 180px; border-right: none; border-bottom: 1px solid var(--border); }
 }
+
+    /* ── File attachment UI ── */
+    .chat-attach {
+      flex-shrink: 0;
+      height: 34px;
+      width: 34px;
+      padding: 0;
+      border-radius: 999px;
+      border: 1px solid #ffffff2a;
+      background: #ffffff09;
+      color: #c8d8f0;
+      font-size: 15px;
+      line-height: 1;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: transform 0.16s ease, background 0.16s ease, border-color 0.16s ease, opacity 0.16s ease;
+    }
+    .chat-attach:hover {
+      transform: translateY(-1px);
+      background: #ffffff18;
+      border-color: #ffffff44;
+    }
+    .chat-attach:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      transform: none;
+    }
+    .chat-attachments {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding: 0 0 4px;
+      width: 100%;
+      flex-basis: 100%;
+      border-bottom: 1px solid #ffffff14;
+      margin-bottom: 2px;
+    }
+    .attach-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px 3px 10px;
+      border-radius: 999px;
+      background: #0e1e34cc;
+      border: 1px solid #ffffff22;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: #c8d8f0;
+      max-width: 220px;
+    }
+    .attach-chip-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 150px;
+    }
+    .attach-chip-remove {
+      flex-shrink: 0;
+      border: none;
+      background: transparent;
+      color: #8aaccc;
+      font-size: 14px;
+      line-height: 1;
+      padding: 0 2px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: color 0.14s ease;
+    }
+    .attach-chip-remove:hover {
+      color: #ff9b9b;
+    }
+    .attach-warn {
+      width: 100%;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 11px;
+      color: #ffc276;
+      padding: 2px 4px;
+    }
 `;
