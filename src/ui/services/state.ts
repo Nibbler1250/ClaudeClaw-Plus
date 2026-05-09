@@ -67,6 +67,11 @@ function redactSettings(raw: unknown): unknown {
   const s = raw as Record<string, unknown>;
   const out: Record<string, unknown> = { ...s };
   if ("apiToken" in out) out.apiToken = out.apiToken ? "[redacted]" : undefined;
+  if ("api" in out) out.api = out.api ? "[redacted]" : undefined;
+  if (out.fallback && typeof out.fallback === "object") {
+    const fb = out.fallback as Record<string, unknown>;
+    out.fallback = { ...fb, api: fb.api ? "[redacted]" : undefined };
+  }
   if (out.telegram && typeof out.telegram === "object") {
     const t = out.telegram as Record<string, unknown>;
     out.telegram = { ...t, token: t.token ? "[redacted]" : "" };

@@ -5,15 +5,56 @@ import { getSettings, loadSettings } from "../config";
 import { transcribeAudioToText } from "../whisper";
 import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { peekThreadSession, removeThreadSession } from "../sessionManager";
-import { readFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { readFile, mkdir } from "node:fs/promises";
+import { existsSync, realpathSync, statSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
+import { resolve, sep } from "node:path";
 import { resolveSkillPrompt, listSkills } from "../skills";
 import { fireJob, parseFireArgs } from "./fire";
-import { mkdir } from "node:fs/promises";
 import { extname, join } from "node:path";
 import { submitTelegramToGateway } from "../gateway";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
+
+// --- Outbox sandbox for send-file / voice directives ---
+
+let _outboxDir: string | null | undefined;
+
+function getOutboxDir(): string {
+  if (_outboxDir === undefined) {
+    try {
+      const dir = resolve(homedir(), ".claude", "agent", "outbox");
+      mkdirSync(dir, { recursive: true });
+      _outboxDir = realpathSync(dir);
+    } catch {
+      _outboxDir = null;
+    }
+  }
+  if (!_outboxDir) throw new Error("outbox dir unavailable");
+  return _outboxDir;
+}
+
+const MAX_SEND_FILE_BYTES = 20 * 1024 * 1024; // 20 MB Telegram limit
+const MAX_VOICE_BYTES = 50 * 1024 * 1024;     // 50 MB
+
+const ALLOWED_FILE_EXTENSIONS = new Set([".md", ".txt", ".json", ".log", ".csv", ".png", ".jpg", ".jpeg", ".pdf"]);
+const ALLOWED_VOICE_EXTENSIONS = new Set([".ogg", ".mp3", ".wav"]);
+
+function validateOutboxPath(raw: string, allowedExts: Set<string>, maxBytes: number): string {
+  const outboxDir = getOutboxDir();
+  const candidate = realpathSync(resolve(raw.trim()));
+  if (!candidate.startsWith(outboxDir + sep) && candidate !== outboxDir) {
+    throw new Error("path outside outbox dir");
+  }
+  const ext = candidate.slice(candidate.lastIndexOf(".")).toLowerCase();
+  if (!allowedExts.has(ext)) {
+    throw new Error(`extension ${ext} not allowed`);
+  }
+  const size = statSync(candidate).size;
+  if (size > maxBytes) {
+    throw new Error(`file exceeds size limit (${size} bytes)`);
+  }
+  return candidate;
+}
 
 // --- Markdown → Telegram HTML conversion (ported from nanobot) ---
 
@@ -575,8 +616,12 @@ function extractSendFileDirectives(text: string): {
   const filePaths: string[] = [];
   const cleanedText = text
     .replace(/\[send-file:([^\]\r\n]+)\]/gi, (_match, raw) => {
-      const candidate = String(raw).trim();
-      if (candidate) filePaths.push(candidate);
+      try {
+        const canonical = validateOutboxPath(String(raw), ALLOWED_FILE_EXTENSIONS, MAX_SEND_FILE_BYTES);
+        filePaths.push(canonical);
+      } catch (e) {
+        // Directive silently dropped — path refused for security reasons
+      }
       return "";
     })
     .replace(/[ \t]+\n/g, "\n")
@@ -585,14 +630,18 @@ function extractSendFileDirectives(text: string): {
   return { cleanedText, filePaths };
 }
 
-const VOICE_DIRECTIVE_RE = /\[voice:(\/[^\]\r\n]+)\]/gi;
+const VOICE_DIRECTIVE_RE = /\[voice:([^\]\r\n]+)\]/gi;
 
 function extractVoiceDirectives(text: string): { cleanedText: string; voicePaths: string[] } {
   const voicePaths: string[] = [];
   const cleanedText = text
-    .replace(VOICE_DIRECTIVE_RE, (_match, path) => {
-      const p = String(path).trim();
-      if (p && existsSync(p)) voicePaths.push(p);
+    .replace(VOICE_DIRECTIVE_RE, (_match, raw) => {
+      try {
+        const canonical = validateOutboxPath(String(raw), ALLOWED_VOICE_EXTENSIONS, MAX_VOICE_BYTES);
+        voicePaths.push(canonical);
+      } catch (e) {
+        // Directive silently dropped — path refused for security reasons
+      }
       return "";
     })
     .replace(/[ \t]+\n/g, "\n")
