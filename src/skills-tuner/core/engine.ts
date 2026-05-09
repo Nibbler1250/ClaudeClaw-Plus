@@ -110,7 +110,12 @@ export class Engine {
   }
 
   async applyProposal(proposalId: number, alternativeId: string): Promise<void> {
-    const record = this.proposals.readAll().find(r => r?.proposal?.id === proposalId && r.event === 'created');
+    const all = this.proposals.readAll();
+    const alreadyApplied = all.find(r => r?.proposal?.id === proposalId && r.event === 'applied');
+    if (alreadyApplied) throw new Error(`Proposal #${proposalId} already applied — cannot re-apply`);
+    const alreadyRefused = all.find(r => r?.proposal?.id === proposalId && r.event === 'refused');
+    if (alreadyRefused) throw new Error(`Proposal #${proposalId} already refused — cannot apply`);
+    const record = all.find(r => r?.proposal?.id === proposalId && r.event === 'created');
     if (!record) throw new Error(`Proposal #${proposalId} not found or not pending`);
     const proposal = record.proposal;
 
@@ -141,6 +146,7 @@ export class Engine {
       ts: new Date().toISOString(),
       alternative_id: alternativeId,
       commit_sha: commitSha,
+      applied_target_path: patch.target_path,
     });
     auditLog('apply_success', { proposal_id: proposalId, alternative_id: alternativeId, commit_sha: commitSha });
   }

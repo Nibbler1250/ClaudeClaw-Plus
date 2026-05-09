@@ -9,6 +9,7 @@ export interface ProposalRecord {
   ts: string;
   alternative_id?: string;
   commit_sha?: string;
+  applied_target_path?: string;  // actual path written (may differ from proposal.target_path for new_skill kind)
 }
 
 export const DEFAULT_PROPOSALS_PATH = join(homedir(), '.config', 'tuner', 'proposals.jsonl');
@@ -67,7 +68,9 @@ export class ProposalsStore {
       const ts = new Date(r.ts);
       if (ts < cutoff) continue;
       const sig = r.proposal.pattern_signature;
-      const target = r.proposal.target_path.replace(/^~/, homedir());
+      // Prefer the actual applied path (relevant for new_skill kind where proposal.target_path is a placeholder)
+      const targetRaw = r.applied_target_path ?? r.proposal.target_path;
+      const target = targetRaw.replace(/^~/, homedir());
       if (sig) {
         if (existsSync(target)) {
           const mtime = new Date(statSync(target).mtimeMs);
