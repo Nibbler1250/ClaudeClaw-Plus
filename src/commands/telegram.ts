@@ -17,11 +17,21 @@ import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wi
 
 // --- Outbox sandbox for send-file / voice directives ---
 
-const OUTBOX_DIR = (() => {
-  const dir = resolve(homedir(), ".claude", "agent", "outbox");
-  mkdirSync(dir, { recursive: true });
-  return realpathSync(dir);
-})();
+let _outboxDir: string | null | undefined;
+
+function getOutboxDir(): string {
+  if (_outboxDir === undefined) {
+    try {
+      const dir = resolve(homedir(), ".claude", "agent", "outbox");
+      mkdirSync(dir, { recursive: true });
+      _outboxDir = realpathSync(dir);
+    } catch {
+      _outboxDir = null;
+    }
+  }
+  if (!_outboxDir) throw new Error("outbox dir unavailable");
+  return _outboxDir;
+}
 
 const MAX_SEND_FILE_BYTES = 20 * 1024 * 1024; // 20 MB Telegram limit
 const MAX_VOICE_BYTES = 50 * 1024 * 1024;     // 50 MB
@@ -30,8 +40,9 @@ const ALLOWED_FILE_EXTENSIONS = new Set([".md", ".txt", ".json", ".log", ".csv",
 const ALLOWED_VOICE_EXTENSIONS = new Set([".ogg", ".mp3", ".wav"]);
 
 function validateOutboxPath(raw: string, allowedExts: Set<string>, maxBytes: number): string {
+  const outboxDir = getOutboxDir();
   const candidate = realpathSync(resolve(raw.trim()));
-  if (!candidate.startsWith(OUTBOX_DIR + sep) && candidate !== OUTBOX_DIR) {
+  if (!candidate.startsWith(outboxDir + sep) && candidate !== outboxDir) {
     throw new Error("path outside outbox dir");
   }
   const ext = candidate.slice(candidate.lastIndexOf(".")).toLowerCase();
