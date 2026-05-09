@@ -110,12 +110,7 @@ export class Engine {
   }
 
   async applyProposal(proposalId: number, alternativeId: string): Promise<void> {
-    const all = this.proposals.readAll();
-    const alreadyApplied = all.find(r => r?.proposal?.id === proposalId && r.event === 'applied');
-    if (alreadyApplied) throw new Error(`Proposal #${proposalId} already applied — cannot re-apply`);
-    const alreadyRefused = all.find(r => r?.proposal?.id === proposalId && r.event === 'refused');
-    if (alreadyRefused) throw new Error(`Proposal #${proposalId} already refused — cannot apply`);
-    const record = all.find(r => r?.proposal?.id === proposalId && r.event === 'created');
+    const record = this.proposals.readAll().find(r => r?.proposal?.id === proposalId && r.event === 'created');
     if (!record) throw new Error(`Proposal #${proposalId} not found or not pending`);
     const proposal = record.proposal;
 

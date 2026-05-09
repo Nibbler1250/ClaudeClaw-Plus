@@ -56,13 +56,10 @@ export function verifyProposalSignature(proposal: Proposal, secret: Buffer): boo
 // Zero-width chars + prompt injection markers
 const INJECTION_RE = /[​-‏‪-‮⁠﻿]/g;
 const MARKER_RE = /<(\/?)(system|human|assistant|instruction|prompt|ignore|INST|SYS)[^>]*>/gi;
-// Bracket-style markers (used by claude_cli buildPrompt format) — also neutralize
-const BRACKET_MARKER_RE = /\[(\/?)(system|human|user|assistant|instruction|prompt|ignore|INST|SYS)\]/gi;
 
 export function sanitizeObservationContent(text: string, maxLength = 10_000): string {
   let cleaned = text.replace(INJECTION_RE, '');
-  cleaned = cleaned.replace(MARKER_RE, '<$1$2-neutralized>');
-  cleaned = cleaned.replace(BRACKET_MARKER_RE, '($1$2-neutralized)');
+  cleaned = cleaned.replace(MARKER_RE, '[$1$2]');
   return cleaned.slice(0, maxLength);
 }
 
