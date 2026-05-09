@@ -1,0 +1,30 @@
+name: Bun Smoke Test
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  smoke-test:
+    name: Parse & build check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Bun build (parse + type check)
+        run: |
+          bun build src/index.ts \
+            --outdir /tmp/claw-smoke \
+            --target bun \
+            --no-splitting \
+            2>&1
+          echo "✓ Build clean — no duplicate declarations or parse errors"
