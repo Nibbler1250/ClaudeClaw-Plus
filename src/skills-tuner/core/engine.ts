@@ -17,7 +17,6 @@ export class SecurityError extends Error {
 
 export class Engine {
   private secret: Buffer;
-  private readonly _applying = new Set<number>(); // in-memory lock: prevents concurrent double-apply
 
   constructor(
     public readonly config: TunerConfig,
@@ -111,19 +110,6 @@ export class Engine {
   }
 
   async applyProposal(proposalId: number, alternativeId: string): Promise<void> {
-    // In-memory lock prevents concurrent double-apply from two simultaneous calls
-    if (this._applying.has(proposalId)) {
-      throw new Error(`Proposal #${proposalId} is already being applied — concurrent apply rejected`);
-    }
-    this._applying.add(proposalId);
-    try {
-      return await this._applyProposalInner(proposalId, alternativeId);
-    } finally {
-      this._applying.delete(proposalId);
-    }
-  }
-
-  private async _applyProposalInner(proposalId: number, alternativeId: string): Promise<void> {
     const all = this.proposals.readAll();
     const alreadyApplied = all.find(r => r?.proposal?.id === proposalId && r.event === 'applied');
     if (alreadyApplied) throw new Error(`Proposal #${proposalId} already applied — cannot re-apply`);
