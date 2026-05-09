@@ -415,7 +415,9 @@ export class SkillsSubject extends BaseSubject {
     const skills = await this.loadSkillsMap();
     const skillInfo = skills.get(skillName);
     const skillPath = skillInfo?.path ?? join(this.scanDirs[0]!, skillName + '.md');
-    const skillContent = skillInfo?.content ?? '(content not found)';
+    const rawSkillContent = skillInfo?.content ?? '(content not found)';
+    // Sanitize skill content before injecting into LLM prompt (prompt injection prevention)
+    const skillContent = sanitizeObservationContent(rawSkillContent, 10_000);
     const evidence = cluster.observations.slice(0, 6)
       .map(o => '- [' + o.signal_type + '] ' + sanitizeObservationContent(o.verbatim)).join('\n');
 
