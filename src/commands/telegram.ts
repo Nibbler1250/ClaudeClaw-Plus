@@ -619,14 +619,18 @@ function extractSendFileDirectives(text: string): {
   return { cleanedText, filePaths };
 }
 
-const VOICE_DIRECTIVE_RE = /\[voice:(\/[^\]\r\n]+)\]/gi;
+const VOICE_DIRECTIVE_RE = /\[voice:([^\]\r\n]+)\]/gi;
 
 function extractVoiceDirectives(text: string): { cleanedText: string; voicePaths: string[] } {
   const voicePaths: string[] = [];
   const cleanedText = text
-    .replace(VOICE_DIRECTIVE_RE, (_match, path) => {
-      const p = String(path).trim();
-      if (p && existsSync(p)) voicePaths.push(p);
+    .replace(VOICE_DIRECTIVE_RE, (_match, raw) => {
+      try {
+        const canonical = validateOutboxPath(String(raw), ALLOWED_VOICE_EXTENSIONS, MAX_VOICE_BYTES);
+        voicePaths.push(canonical);
+      } catch (e) {
+        // Directive silently dropped — path refused for security reasons
+      }
       return "";
     })
     .replace(/[ \t]+\n/g, "\n")
