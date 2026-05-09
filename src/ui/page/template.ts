@@ -115,11 +115,8 @@ ${pageStyles}
     <nav class="tab-nav" role="tablist" aria-label="Main navigation">
       <button class="tab-btn tab-btn-active" id="tab-dashboard" type="button" role="tab" aria-selected="true" aria-controls="dashboard-panel">Dashboard</button>
       <button class="tab-btn" id="tab-chat" type="button" role="tab" aria-selected="false" aria-controls="chat-panel">Chat</button>
-<<<<<<< HEAD
       <button class="tab-btn" id="tab-kanban" type="button" role="tab" aria-selected="false" aria-controls="kanban-panel">Kanban</button>
-=======
       <button class="tab-btn" id="tab-usage" type="button" role="tab" aria-selected="false" aria-controls="usage-panel">Usage</button>
->>>>>>> upstream/master
     </nav>
     <div id="dashboard-panel">
     <section class="hero">

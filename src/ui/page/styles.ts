@@ -1550,7 +1550,6 @@ export const pageStyles = String.raw`    :root {
   .chat-sidebar { width: 100%; min-width: 100%; max-height: 180px; border-right: none; border-bottom: 1px solid var(--border); }
 }
 
-<<<<<<< HEAD
 /* ── Tab nav ── */
 [hidden] { display: none !important; }
 .tab-nav {
@@ -1770,8 +1769,8 @@ export const pageStyles = String.raw`    :root {
   font-size: 13px;
   padding: 7px 16px;
 }
-.kanban-btn-secondary:hover { color: rgba(255,255,255,0.7); }`;
-=======
+.kanban-btn-secondary:hover { color: rgba(255,255,255,0.7); }
+
     /* ── File attachment UI ── */
     .chat-attach {
       flex-shrink: 0;
@@ -1916,4 +1915,3 @@ export const pageStyles = String.raw`    :root {
   .usage-td-cost { min-width: 80px; }
 }
 `;
->>>>>>> upstream/master
