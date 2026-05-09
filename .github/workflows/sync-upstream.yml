@@ -94,6 +94,32 @@ jobs:
             git commit -m "sync: upstream merge with conflicts (manual resolution needed)"
           fi
 
+      - uses: oven-sh/setup-bun@v2
+        if: steps.check.outputs.new_commits != '0' && inputs.dry_run != true
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        if: steps.check.outputs.new_commits != '0' && inputs.dry_run != true
+        run: bun install --frozen-lockfile
+
+      - name: Bun smoke test
+        if: steps.check.outputs.new_commits != '0' && inputs.dry_run != true
+        id: smoke
+        run: |
+          if bun build src/index.ts \
+               --outdir /tmp/claw-smoke \
+               --target bun \
+               --no-splitting \
+               2>&1; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+            echo "✓ Smoke test passed — no parse errors after merge"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            echo "✗ Smoke test FAILED — merge introduced a parse error (duplicate declaration, syntax error, etc.)"
+            echo "The PR will still be opened but is marked as BROKEN — do not merge until fixed."
+          fi
+
       - name: Push sync branch
         if: steps.check.outputs.new_commits != '0' && inputs.dry_run != true
         run: git push origin "${{ steps.branch.outputs.name }}" --force
@@ -113,15 +139,27 @@ jobs:
           echo "count=$EXISTING" >> "$GITHUB_OUTPUT"
           echo "Existing open PRs for this branch: $EXISTING"
 
-      - name: Open PR (clean merge)
-        if: steps.check.outputs.new_commits != '0' && inputs.dry_run != true && steps.merge.outputs.status == 'clean' && steps.existing_pr.outputs.count == '0'
+      - name: Open PR (clean merge, smoke passed)
+        if: steps.check.outputs.new_commits != '0' && inputs.dry_run != true && steps.merge.outputs.status == 'clean' && steps.smoke.outputs.status == 'pass' && steps.existing_pr.outputs.count == '0'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           gh pr create \
             --repo TerrysPOV/ClaudeClaw-Plus \
             --title "chore: sync upstream (${{ steps.check.outputs.new_commits }} new commits)" \
-            --body "Automated sync from moazbuilds/claudeclaw:master. Auto-merge was clean - ready to merge." \
+            --body "Automated sync from moazbuilds/claudeclaw:master. Merge clean, smoke test passed — ready to merge." \
+            --head "${{ steps.branch.outputs.name }}" \
+            --base main
+
+      - name: Open PR (clean merge, smoke FAILED)
+        if: steps.check.outputs.new_commits != '0' && inputs.dry_run != true && steps.merge.outputs.status == 'clean' && steps.smoke.outputs.status == 'fail' && steps.existing_pr.outputs.count == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh pr create \
+            --repo TerrysPOV/ClaudeClaw-Plus \
+            --title "chore: sync upstream (${{ steps.check.outputs.new_commits }} new commits) ⚠ SMOKE FAILED" \
+            --body "Automated sync from moazbuilds/claudeclaw:master. Merge was clean but **Bun smoke test failed** — likely a duplicate declaration or parse error introduced by the merge. Do NOT merge until fixed." \
             --head "${{ steps.branch.outputs.name }}" \
             --base main
 
@@ -130,9 +168,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
+          SMOKE="${{ steps.smoke.outputs.status }}"
+          SMOKE_NOTE=""
+          if [ "$SMOKE" = "fail" ]; then
+            SMOKE_NOTE=$'\n\n> ⚠ **Bun smoke test also failed** — the conflict resolution introduced a parse error. Fix both conflicts AND the smoke failure before merging.'
+          fi
           gh pr create \
             --repo TerrysPOV/ClaudeClaw-Plus \
             --title "chore: sync upstream - CONFLICTS need manual review" \
-            --body "Automated sync from moazbuilds/claudeclaw:master has merge conflicts. Resolve before merging." \
+            --body "Automated sync from moazbuilds/claudeclaw:master has merge conflicts. Resolve before merging.${SMOKE_NOTE}" \
             --head "${{ steps.branch.outputs.name }}" \
             --base main

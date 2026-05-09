@@ -419,95 +419,6 @@ async function uploadImageMessage(
   }
 }
 
-// Matches absolute image file paths embedded in reply text so they can be
-// sent as Discord file attachments instead of appearing as raw paths.
-const IMAGE_PATH_RE = /(?<![^\s])(\/[^\s]+\.(?:png|jpe?g|gif|webp))(?=\s|$)/gi;
-const PATH_SKEW_MS = 30_000;
-
-function extractImagePaths(
-  text: string,
-  allowedRoots: string[],
-  requestStartedAt: number,
-): { paths: string[]; cleanedText: string } {
-  const roots = allowedRoots.length > 0 ? allowedRoots : [DEFAULT_IMAGE_OUTPUT_ROOT];
-  const canonRoots = roots.map((r) => {
-    try { return realpathSync(r); } catch { return r; }
-  });
-  const paths: string[] = [];
-  const cleanedText = text
-    .replace(IMAGE_PATH_RE, (match, p1) => {
-      let resolved: string;
-      try {
-        resolved = realpathSync(p1);
-      } catch {
-        return match;
-      }
-      const confined = canonRoots.some((root) => resolved === root || resolved.startsWith(root + sep));
-      if (!confined) return match;
-      try {
-        const { mtimeMs } = statSync(resolved);
-        if (mtimeMs < requestStartedAt - PATH_SKEW_MS) return match;
-      } catch {
-        return match;
-      }
-      paths.push(resolved);
-      return "";
-    })
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-  return { paths, cleanedText };
-}
-
-async function sendMessageWithImages(
-  token: string,
-  channelId: string,
-  text: string,
-  imagePaths: string[],
-): Promise<void> {
-  const chunks = discordMessageChunks(text || "​");
-  const uploadText = chunks.pop() ?? "​";
-  for (const chunk of chunks) {
-    await discordApi(token, "POST", `/channels/${channelId}/messages`, { content: chunk });
-  }
-
-  await uploadImageMessage(token, channelId, uploadText, imagePaths);
-}
-
-async function uploadImageMessage(
-  token: string,
-  channelId: string,
-  text: string,
-  imagePaths: string[],
-  attempt = 0,
-): Promise<void> {
-  const form = new FormData();
-  form.append("payload_json", JSON.stringify({ content: text }));
-  for (let i = 0; i < imagePaths.length; i++) {
-    const file = Bun.file(imagePaths[i]);
-    form.append(`files[${i}]`, file, basename(imagePaths[i]));
-  }
-  const res = await fetch(`${DISCORD_API}/channels/${channelId}/messages`, {
-    method: "POST",
-    headers: { Authorization: `Bot ${token}` },
-    body: form,
-  });
-  if (res.status === 429) {
-    if (attempt >= 3) {
-      throw new Error(`Discord rate limit exceeded after 3 retries on ${channelId}`);
-    }
-    const data = (await res.json().catch(() => ({}))) as { retry_after?: number };
-    const delay = typeof data.retry_after === "number" && isFinite(data.retry_after)
-      ? Math.ceil(data.retry_after * 1000)
-      : 5_000;
-    await Bun.sleep(delay);
-    return uploadImageMessage(token, channelId, text, imagePaths, attempt + 1);
-  }
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`Discord image upload ${channelId}: ${res.status} ${errText}`);
-  }
-}
-
 // --- Thread rejoin helper ---
 async function rejoinThreads(token: string): Promise<void> {
   const threadSessions = await listThreadSessions();
@@ -709,7 +620,11 @@ async function respondToInteraction(
 
 // --- Message handler ---
 
-async function handleMessageCreate(token: string, message: DiscordMessage): Promise<void> {
+// Pending forwards: when Discord delivers a forward with empty content, hold it briefly
+// so a follow-up text comment from the same user can absorb it as context.
+const pendingForwards = new Map<string, { snapshot: DiscordMessageSnapshot; timer: ReturnType<typeof setTimeout> }>();
+
+async function handleMessageCreate(token: string, message: DiscordMessage, skipCoalesce = false): Promise<void> {
   const config = getSettings().discord;
 
   // Ignore bot messages
@@ -772,7 +687,35 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
   const hasVoice = voiceAttachments.length > 0;
   const hasText = textAttachments.length > 0;
 
-  if (!content.trim() && !hasImage && !hasVoice && !hasText) return;
+  const hasForwardedContent = !!message.message_snapshots?.[0]?.message?.content;
+  if (!content.trim() && !hasImage && !hasVoice && !hasText && !hasForwardedContent) return;
+
+  const forwardKey = `${channelId}:${userId}`;
+  const isForwardOnly = message.message_reference?.type === 1 && !content.trim() && !hasImage && !hasVoice && !hasText;
+
+  if (!skipCoalesce && isForwardOnly && hasForwardedContent) {
+    // Pure forward with no accompanying text — hold it and wait for a follow-up comment
+    const existing = pendingForwards.get(forwardKey);
+    if (existing) clearTimeout(existing.timer);
+    const snapshot = message.message_snapshots![0].message;
+    const timer = setTimeout(() => {
+      pendingForwards.delete(forwardKey);
+      handleMessageCreate(token, message, true).catch((err) =>
+        console.error(`[Discord] Deferred forward error: ${err instanceof Error ? err.message : err}`)
+      );
+    }, 1500);
+    pendingForwards.set(forwardKey, { snapshot, timer });
+    return;
+  }
+
+  // If a pending forward exists for this user+channel, absorb it into this message as context
+  let coalescedSnapshot: DiscordMessageSnapshot | undefined;
+  const pending = pendingForwards.get(forwardKey);
+  if (pending && !isForwardOnly) {
+    clearTimeout(pending.timer);
+    pendingForwards.delete(forwardKey);
+    coalescedSnapshot = pending.snapshot;
+  }
 
   // Strip bot mention from content for cleaner prompt
   let cleanContent = content;
@@ -996,8 +939,8 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
 
     // Include context from replied-to or forwarded messages
     const isForward = message.message_reference?.type === 1;
-    const snapshot = message.message_snapshots?.[0]?.message;
-    if (isForward && snapshot) {
+    const snapshot = coalescedSnapshot ?? message.message_snapshots?.[0]?.message;
+    if ((isForward || coalescedSnapshot) && snapshot) {
       const fwdAuthor = snapshot.author ? snapshot.author.username : "unknown";
       const fwdAttachments = snapshot.attachments.length > 0
         ? ` [attachments: ${snapshot.attachments.map((a) => a.filename).join(", ")}]`
