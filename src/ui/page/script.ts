@@ -988,14 +988,121 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
     // ── Chat ──
     const tabDashboardBtn = $("tab-dashboard");
     const tabChatBtn = $("tab-chat");
+<<<<<<< HEAD
     const tabKanbanBtn = $("tab-kanban");
     const dashboardPanel = $("dashboard-panel");
     const chatPanel = $("chat-panel");
     const kanbanPanel = $("kanban-panel");
+=======
+    const tabUsageBtn = $("tab-usage");
+    const dashboardPanel = $("dashboard-panel");
+    const chatPanel = $("chat-panel");
+    const usagePanel = $("usage-panel");
+>>>>>>> upstream/master
     const chatMessages = $("chat-messages");
     const chatForm = $("chat-form");
     const chatInput = $("chat-input");
     const chatSend = $("chat-send");
+    const chatAttachBtn = $("chat-attach");
+    const chatFileInput = $("chat-file-input");
+    const chatAttachmentsEl = $("chat-attachments");
+
+    // Attachment state
+    var pendingAttachments = []; // Array of { name, type, data } where data is base64
+
+    function renderAttachmentChips() {
+      if (!chatAttachmentsEl) return;
+      if (pendingAttachments.length === 0) {
+        chatAttachmentsEl.hidden = true;
+        chatAttachmentsEl.innerHTML = "";
+        return;
+      }
+      chatAttachmentsEl.hidden = false;
+      chatAttachmentsEl.innerHTML = pendingAttachments.map(function(att, idx) {
+        return (
+          '<span class="attach-chip">' +
+            '<span class="attach-chip-name" title="' + escAttr(att.name) + '">' + esc(att.name) + '</span>' +
+            '<button class="attach-chip-remove" type="button" data-attach-index="' + idx + '" aria-label="Remove ' + escAttr(att.name) + '">×</button>' +
+          '</span>'
+        );
+      }).join("");
+    }
+
+    function readFileAsBase64(file) {
+      return new Promise(function(resolve, reject) {
+        var reader = new FileReader();
+        reader.onload = function(e) {
+          var result = e.target.result;
+          // Strip the data URL prefix: "data:<type>;base64,<data>"
+          var base64 = typeof result === "string" ? result.split(",")[1] || "" : "";
+          resolve(base64);
+        };
+        reader.onerror = function() { reject(new Error("Failed to read file")); };
+        reader.readAsDataURL(file);
+      });
+    }
+
+    if (chatAttachBtn && chatFileInput) {
+      chatAttachBtn.addEventListener("click", function() {
+        if (chatBusy) return;
+        chatFileInput.click();
+      });
+    }
+
+    if (chatFileInput) {
+      chatFileInput.addEventListener("change", async function() {
+        var files = chatFileInput.files;
+        if (!files || !files.length) return;
+        var warnEl = $("chat-attach-warn");
+        if (warnEl) warnEl.remove();
+
+        for (var i = 0; i < files.length; i++) {
+          var file = files[i];
+          if (pendingAttachments.length >= 5) {
+            var warn = document.createElement("div");
+            warn.id = "chat-attach-warn";
+            warn.className = "attach-warn";
+            warn.textContent = "Max 5 attachments allowed.";
+            if (chatAttachmentsEl && chatAttachmentsEl.parentNode) {
+              chatAttachmentsEl.parentNode.insertBefore(warn, chatAttachmentsEl.nextSibling);
+            }
+            break;
+          }
+          if (file.size > 10 * 1024 * 1024) {
+            var warnSize = document.createElement("div");
+            warnSize.id = "chat-attach-warn";
+            warnSize.className = "attach-warn";
+            warnSize.textContent = '"' + file.name + '" exceeds 10 MB limit.';
+            if (chatAttachmentsEl && chatAttachmentsEl.parentNode) {
+              chatAttachmentsEl.parentNode.insertBefore(warnSize, chatAttachmentsEl.nextSibling);
+            }
+            continue;
+          }
+          try {
+            var base64 = await readFileAsBase64(file);
+            pendingAttachments.push({ name: file.name, type: file.type || "application/octet-stream", data: base64 });
+          } catch (_) {}
+        }
+        // Reset so same file can be re-selected if removed
+        chatFileInput.value = "";
+        renderAttachmentChips();
+      });
+    }
+
+    // Remove chip on click (delegated)
+    if (chatAttachmentsEl) {
+      chatAttachmentsEl.addEventListener("click", function(event) {
+        var target = event.target;
+        if (!(target instanceof HTMLElement)) return;
+        var btn = target.closest("[data-attach-index]");
+        if (!btn || !(btn instanceof HTMLElement)) return;
+        var idx = parseInt(btn.getAttribute("data-attach-index") || "-1", 10);
+        if (idx >= 0 && idx < pendingAttachments.length) {
+          pendingAttachments.splice(idx, 1);
+          renderAttachmentChips();
+        }
+      });
+    }
 
     var CHAT_STORAGE_KEY = "claudeclaw.chat.history";
     let chatBusy = false;
@@ -1010,8 +1117,13 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
     })();
 
     function setActiveTab(tab) {
+<<<<<<< HEAD
       const allBtns = [tabDashboardBtn, tabChatBtn, tabKanbanBtn];
       const allPanels = [dashboardPanel, chatPanel, kanbanPanel];
+=======
+      const allBtns = [tabDashboardBtn, tabChatBtn, tabUsageBtn];
+      const allPanels = [dashboardPanel, chatPanel, usagePanel];
+>>>>>>> upstream/master
       allBtns.forEach(b => { if (b) { b.classList.remove("tab-btn-active"); b.setAttribute("aria-selected", "false"); } });
       allPanels.forEach(p => { if (p) p.hidden = true; });
 
@@ -1019,11 +1131,19 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
         tabDashboardBtn && tabDashboardBtn.classList.add("tab-btn-active");
         tabDashboardBtn && tabDashboardBtn.setAttribute("aria-selected", "true");
         if (dashboardPanel) dashboardPanel.hidden = false;
+<<<<<<< HEAD
       } else if (tab === "kanban") {
         tabKanbanBtn && tabKanbanBtn.classList.add("tab-btn-active");
         tabKanbanBtn && tabKanbanBtn.setAttribute("aria-selected", "true");
         if (kanbanPanel) kanbanPanel.hidden = false;
         loadKanban();
+=======
+      } else if (tab === "usage") {
+        tabUsageBtn && tabUsageBtn.classList.add("tab-btn-active");
+        tabUsageBtn && tabUsageBtn.setAttribute("aria-selected", "true");
+        if (usagePanel) usagePanel.hidden = false;
+        fetchUsage();
+>>>>>>> upstream/master
       } else {
         tabChatBtn && tabChatBtn.classList.add("tab-btn-active");
         tabChatBtn && tabChatBtn.setAttribute("aria-selected", "true");
@@ -1034,7 +1154,11 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
 
     if (tabDashboardBtn) tabDashboardBtn.addEventListener("click", () => setActiveTab("dashboard"));
     if (tabChatBtn) tabChatBtn.addEventListener("click", function() { setActiveTab("chat"); loadSessions(); });
+<<<<<<< HEAD
     if (tabKanbanBtn) tabKanbanBtn.addEventListener("click", () => setActiveTab("kanban"));
+=======
+    if (tabUsageBtn) tabUsageBtn.addEventListener("click", function() { setActiveTab("usage"); });
+>>>>>>> upstream/master
 
     // --- Session browser ---
 
@@ -1197,6 +1321,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
       var cancelBtn = $("chat-cancel");
       if (chatSend) chatSend.disabled = busy;
       if (cancelBtn) cancelBtn.hidden = !busy;
+      if (chatAttachBtn) chatAttachBtn.disabled = busy;
       if (busy) {
         chatStartedAt = Date.now();
         chatElapsedTimer = setInterval(function() {
@@ -1341,13 +1466,20 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
     async function sendChat() {
       if (chatBusy || !chatInput) return;
       var message = (chatInput.value || "").trim();
-      if (!message) return;
+      var attachmentsToSend = pendingAttachments.slice();
+      if (!message && attachmentsToSend.length === 0) return;
 
       chatInput.value = "";
       autoResizeChatInput();
+
+      // Clear pending attachments and hide chip area
+      pendingAttachments = [];
+      renderAttachmentChips();
+
       setChatBusy(true);
 
-      chatHistory.push({ role: "user", text: message });
+      var userText = message || ("(" + attachmentsToSend.length + " attachment" + (attachmentsToSend.length !== 1 ? "s" : "") + ")");
+      chatHistory.push({ role: "user", text: userText });
       var assistantIdx = chatHistory.length;
       chatHistory.push({ role: "assistant", text: "", streaming: true });
       renderChatHistory();
@@ -1358,7 +1490,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
         var res = await mutatingFetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: message }),
+          body: JSON.stringify({ message: message, attachments: attachmentsToSend }),
           signal: chatAbortController.signal,
         });
 
@@ -1471,6 +1603,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
       }
     }, 1000);
 
+<<<<<<< HEAD
 // ── Kanban ───────────────────────────────────────────────────────────────────
 var kanbanData = { columns: { todo: [], in_progress: [], done: [] } };
 
@@ -1585,3 +1718,85 @@ if ($("kanban-input-title")) {
 
 loadKanban();
 setInterval(loadKanban, 10000);`;
+=======
+    // --- Usage monitoring ---
+    var usageWrap = $("usage-table-wrap");
+
+    function fmtTokens(n) {
+      if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
+      if (n >= 1_000) return (n / 1_000).toFixed(1) + "K";
+      return String(n);
+    }
+
+    function fmtCost(usd) {
+      if (usd <= 0) return "$0.00";
+      if (usd < 0.01) return "<$0.01";
+      return "$" + usd.toFixed(2);
+    }
+
+    function fmtRelative(iso) {
+      if (!iso) return "—";
+      var delta = Date.now() - new Date(iso).getTime();
+      var s = Math.floor(delta / 1000);
+      if (s < 60) return s + "s ago";
+      var m = Math.floor(s / 60);
+      if (m < 60) return m + "m ago";
+      var h = Math.floor(m / 60);
+      if (h < 24) return h + "h ago";
+      return Math.floor(h / 24) + "d ago";
+    }
+
+    function renderUsageTable(sessions) {
+      if (!usageWrap) return;
+      if (!sessions || sessions.length === 0) {
+        usageWrap.innerHTML = '<div class="usage-loading">No active sessions found.</div>';
+        return;
+      }
+      var maxCost = sessions.reduce(function(m, s) { return Math.max(m, s.estimatedCostUsd); }, 0);
+      var rows = sessions.map(function(s) {
+        var barPct = maxCost > 0 ? Math.round((s.estimatedCostUsd / maxCost) * 100) : 0;
+        var channelIcon = s.channel === "discord" ? "🎮" : s.channel === "web" ? "🌐" : "❓";
+        return "<tr>" +
+          "<td class='usage-td usage-td-label'>" + channelIcon + " " + esc(s.label) + "</td>" +
+          "<td class='usage-td usage-td-num'>" + fmtTokens(s.inputTokens) + "</td>" +
+          "<td class='usage-td usage-td-num'>" + fmtTokens(s.outputTokens) + "</td>" +
+          "<td class='usage-td usage-td-num'>" + fmtTokens(s.cacheReadTokens) + "</td>" +
+          "<td class='usage-td usage-td-num'>" + s.cacheHitPct + "%</td>" +
+          "<td class='usage-td usage-td-cost'>" +
+            "<div class='usage-cost-wrap'>" +
+              "<div class='usage-cost-bar' style='width:" + barPct + "%'></div>" +
+              "<span class='usage-cost-label'>~" + fmtCost(s.estimatedCostUsd) + "</span>" +
+            "</div>" +
+          "</td>" +
+          "<td class='usage-td usage-td-num usage-td-turns'>" + s.turnCount + "</td>" +
+          "<td class='usage-td usage-td-age'>" + fmtRelative(s.lastUsedAt) + "</td>" +
+          "</tr>";
+      }).join("");
+      usageWrap.innerHTML =
+        "<table class='usage-table'>" +
+        "<thead><tr>" +
+        "<th class='usage-th'>Session</th>" +
+        "<th class='usage-th usage-th-num'>Input</th>" +
+        "<th class='usage-th usage-th-num'>Output</th>" +
+        "<th class='usage-th usage-th-num'>Cache Read</th>" +
+        "<th class='usage-th usage-th-num'>Cache Hit</th>" +
+        "<th class='usage-th'>Est. Cost</th>" +
+        "<th class='usage-th usage-th-num'>Turns</th>" +
+        "<th class='usage-th'>Last Active</th>" +
+        "</tr></thead>" +
+        "<tbody>" + rows + "</tbody>" +
+        "</table>";
+    }
+
+    function fetchUsage() {
+      fetch("/api/usage")
+        .then(function(r) { return r.json(); })
+        .then(function(data) { renderUsageTable(Array.isArray(data) ? data : []); })
+        .catch(function() {
+          if (usageWrap) usageWrap.innerHTML = '<div class="usage-loading">Failed to load usage data.</div>';
+        });
+    }
+
+    fetchUsage();
+    setInterval(fetchUsage, 60_000);`;
+>>>>>>> upstream/master
