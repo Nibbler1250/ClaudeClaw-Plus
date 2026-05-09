@@ -121,6 +121,10 @@ export interface TelegramConfig {
    * - "perUser": each DM user gets their own isolated session.
    */
   dmIsolation: "shared" | "perUser";
+  /** Local whisper.cpp model for voice transcription. Default: "base.en".
+   *  Supported values: tiny, base, small, medium, large-v3, large-v3-turbo (with or without .en suffix).
+   *  Ignored when stt.baseUrl is configured. */
+  whisperModel?: string;
 }
 
 export interface DiscordConfig {
@@ -340,6 +344,9 @@ function parseSettings(
       listenChats: Array.isArray(raw.telegram?.listenChats) ? raw.telegram.listenChats.map(Number) : [],
       receiveEnabled: raw.telegram?.receiveEnabled !== false,
       dmIsolation: raw.telegram?.dmIsolation === "perUser" ? "perUser" : "shared",
+      ...(typeof raw.telegram?.whisperModel === "string" && raw.telegram.whisperModel.trim()
+        ? { whisperModel: raw.telegram.whisperModel.trim() }
+        : {}),
     },
     discord: {
       token: process.env.DISCORD_TOKEN?.trim() || (typeof raw.discord?.token === "string" ? raw.discord.token.trim() : ""),
