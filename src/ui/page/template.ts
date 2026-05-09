@@ -115,7 +115,11 @@ ${pageStyles}
     <nav class="tab-nav" role="tablist" aria-label="Main navigation">
       <button class="tab-btn tab-btn-active" id="tab-dashboard" type="button" role="tab" aria-selected="true" aria-controls="dashboard-panel">Dashboard</button>
       <button class="tab-btn" id="tab-chat" type="button" role="tab" aria-selected="false" aria-controls="chat-panel">Chat</button>
+<<<<<<< HEAD
       <button class="tab-btn" id="tab-kanban" type="button" role="tab" aria-selected="false" aria-controls="kanban-panel">Kanban</button>
+=======
+      <button class="tab-btn" id="tab-usage" type="button" role="tab" aria-selected="false" aria-controls="usage-panel">Usage</button>
+>>>>>>> upstream/master
     </nav>
     <div id="dashboard-panel">
     <section class="hero">
@@ -185,6 +189,17 @@ ${pageStyles}
       </form>
     </section>
     </div>
+    <div id="usage-panel" hidden>
+      <section class="usage-section" id="usage-section">
+        <div class="usage-head">
+          <div class="usage-title">Session Usage</div>
+          <div class="usage-sub">Token consumption and estimated cost per session · refreshes every 60s</div>
+        </div>
+        <div class="usage-table-wrap" id="usage-table-wrap">
+          <div class="usage-loading">Loading usage data...</div>
+        </div>
+      </section>
+    </div>
     <div id="chat-panel" class="chat-panel" hidden>
       <div class="chat-layout">
         <div class="chat-sidebar" id="chat-sidebar">
@@ -206,6 +221,13 @@ ${pageStyles}
           <div id="chat-messages" class="chat-messages"></div>
           <div class="chat-input-area">
             <form id="chat-form" class="chat-form">
+              <input
+                type="file"
+                id="chat-file-input"
+                multiple
+                style="display:none"
+                accept="text/plain,text/html,text/css,text/javascript,text/typescript,text/x-python,text/csv,text/xml,text/markdown,application/json,application/yaml,application/toml,image/jpeg,image/png,image/gif,image/webp,.js,.ts,.py,.json,.yaml,.yml,.md,.txt,.csv,.xml,.sh,.sql,.toml,.ini,.env,.log"
+              />
               <textarea
                 id="chat-input"
                 class="chat-input"
@@ -213,6 +235,8 @@ ${pageStyles}
                 rows="1"
                 autocomplete="off"
               ></textarea>
+              <div id="chat-attachments" class="chat-attachments" hidden></div>
+              <button id="chat-attach" class="chat-attach" type="button" title="Attach files">📎</button>
               <button id="chat-cancel" class="chat-cancel" type="button" hidden>Cancel</button>
               <button id="chat-send" class="chat-send" type="submit">Send</button>
             </form>

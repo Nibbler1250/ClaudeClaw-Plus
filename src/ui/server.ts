@@ -9,7 +9,9 @@ import { createQuickJob, deleteJob } from "./services/jobs";
 import { fireJob } from "../commands/fire";
 import { readLogs } from "./services/logs";
 import { listSessions, readSessionMessages, listAgents } from "./services/sessions";
+import { getSessionUsage } from "./services/usage";
 import { runUserMessage } from "../runner";
+<<<<<<< HEAD
 import { readKanban, writeKanban, type KanbanBoard } from "./services/kanban";
 
 // --- Security: CSRF Protection ---
@@ -110,6 +112,10 @@ function requireCsrf(req: Request): Response | null {
   }
   return null;
 }
+=======
+import { tmpdir } from "os";
+import { randomUUID } from "crypto";
+>>>>>>> upstream/master
 
 export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
   const server = Bun.serve({
@@ -312,6 +318,15 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
         }
       }
 
+      if (url.pathname === "/api/usage" && req.method === "GET") {
+        try {
+          const channelNames = opts.getSnapshot().settings.discord?.channelNames;
+          return json(await getSessionUsage(channelNames));
+        } catch (err) {
+          return json({ ok: false, error: String(err) });
+        }
+      }
+
       if (url.pathname === "/api/agents" && req.method === "GET") {
         try {
           return json(await listAgents());
@@ -363,7 +378,74 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
         try {
           const body = await req.json();
           const message = String(body?.message ?? "").trim();
-          if (!message) return json({ ok: false, error: "message required" });
+
+          interface Attachment {
+            name: string;
+            type: string;
+            data: string; // base64
+          }
+
+          const rawAttachments = Array.isArray(body?.attachments) ? (body.attachments as unknown[]) : [];
+
+          // Validate attachments
+          if (rawAttachments.length > 5) {
+            return json({ ok: false, error: "too many attachments (max 5)" }, 400);
+          }
+
+          const attachments: Attachment[] = [];
+          for (const raw of rawAttachments) {
+            if (!raw || typeof raw !== "object") continue;
+            const att = raw as Record<string, unknown>;
+            const name = String(att.name ?? "");
+            const type = String(att.type ?? "");
+            const data = String(att.data ?? "");
+            // base64 decoded size approximation
+            const decodedSize = data.length * 0.75;
+            if (decodedSize > 10 * 1024 * 1024) {
+              return json({ ok: false, error: `attachment "${name}" exceeds 10 MB limit` }, 400);
+            }
+            attachments.push({ name, type, data });
+          }
+
+          if (!message && attachments.length === 0) {
+            return json({ ok: false, error: "message required" });
+          }
+
+          const TEXT_EXTENSIONS = new Set([
+            "js", "ts", "py", "json", "yaml", "yml", "md", "txt", "csv",
+            "xml", "sh", "sql", "toml", "ini", "env", "log",
+          ]);
+
+          const tempImagePaths: string[] = [];
+          const attachmentBlocks: string[] = [];
+
+          for (const att of attachments) {
+            const ext = att.name.includes(".") ? att.name.split(".").pop()!.toLowerCase() : "";
+            if (att.type.startsWith("text/") || TEXT_EXTENSIONS.has(ext)) {
+              const content = Buffer.from(att.data, "base64").toString("utf-8");
+              attachmentBlocks.push(
+                `[Attached file: ${att.name}]\n\`\`\`${ext}\n${content}\n\`\`\``
+              );
+            } else if (att.type.startsWith("image/")) {
+              const uploadDir = `${tmpdir()}/claudeclaw-uploads`;
+              await import("fs/promises").then(({ mkdir }) => mkdir(uploadDir, { recursive: true })).catch(() => {});
+              const filePath = `${uploadDir}/${randomUUID()}.${ext || "bin"}`;
+              const buffer = Buffer.from(att.data, "base64");
+              await Bun.write(filePath, buffer);
+              tempImagePaths.push(filePath);
+              attachmentBlocks.push(
+                `[Attached image: ${att.name} — file saved at ${filePath}, you can read it with your Read tool]`
+              );
+            } else {
+              attachmentBlocks.push(
+                `[Attached file: ${att.name} — unsupported type, content not included]`
+              );
+            }
+          }
+
+          const enrichedMessage = attachmentBlocks.length > 0
+            ? attachmentBlocks.join("\n\n") + (message ? "\n\n" + message : "")
+            : message;
 
           const encoder = new TextEncoder();
           const onChat = opts.onChat;
@@ -374,7 +456,7 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
               };
               try {
                 await onChat(
-                  message,
+                  enrichedMessage,
                   (chunk) => send({ type: "chunk", text: chunk }),
                   () => send({ type: "unblock" }),
                   (ev) => send({ type: ev.type === "spawn" ? "agent_spawn" : "agent_done", id: ev.id, description: ev.description, result: ev.result })
@@ -385,6 +467,14 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
                 send({ type: "error", message: "An internal error occurred" });
               } finally {
                 controller.close();
+                // Fire-and-forget cleanup of temp image files
+                for (const p of tempImagePaths) {
+                  Bun.file(p).exists().then((exists) => {
+                    if (exists) {
+                      import("fs").then(({ unlink }) => unlink(p, () => {})).catch(() => {});
+                    }
+                  }).catch(() => {});
+                }
               }
             },
           });
