@@ -5,7 +5,7 @@ import { basename, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getSettings } from "./config";
 
-const WHISPER_MODEL = "base.en";
+const DEFAULT_WHISPER_MODEL = "base.en";
 const WHISPER_ROOT = join(process.cwd(), ".claude", "claudeclaw", "whisper");
 const BIN_DIR = join(WHISPER_ROOT, "bin");
 const LIB_DIR = join(WHISPER_ROOT, "lib");
@@ -14,7 +14,18 @@ const TMP_FOLDER = join(WHISPER_ROOT, "tmp");
 const OGG_MJS_CONVERTER = fileURLToPath(new URL("./ogg.mjs", import.meta.url));
 const PLUGIN_ROOT = fileURLToPath(new URL("..", import.meta.url));
 
-const MODEL_URL = `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-${WHISPER_MODEL}.bin`;
+function getWhisperModel(): string {
+  try {
+    const m = getSettings().telegram.whisperModel?.trim();
+    return m || DEFAULT_WHISPER_MODEL;
+  } catch {
+    return DEFAULT_WHISPER_MODEL;
+  }
+}
+
+function getModelUrl(model: string): string {
+  return `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-${model}.bin`;
+}
 
 interface BinarySource {
   url: string;
@@ -60,7 +71,7 @@ function getWhisperBinaryPath(): string {
 }
 
 function getModelPath(): string {
-  return join(MODEL_FOLDER, `ggml-${WHISPER_MODEL}.bin`);
+  return join(MODEL_FOLDER, `ggml-${getWhisperModel()}.bin`);
 }
 
 async function fileExists(path: string): Promise<boolean> {
@@ -221,18 +232,19 @@ async function downloadAndExtractBinary(): Promise<void> {
 }
 
 async function downloadModel(): Promise<void> {
+  const model = getWhisperModel();
   const modelPath = getModelPath();
   if (await fileExists(modelPath)) return;
 
   await mkdir(MODEL_FOLDER, { recursive: true });
-  console.log(`whisper: downloading model ${WHISPER_MODEL}...`);
-  await downloadFile(MODEL_URL, modelPath);
+  console.log(`whisper: downloading model ${model}...`);
+  await downloadFile(getModelUrl(model), modelPath);
   console.log("whisper: model ready");
 }
 
 async function prepareWhisperAssets(printOutput: boolean): Promise<void> {
   const startedAt = Date.now();
-  console.log(`whisper warmup: start root=${WHISPER_ROOT} model=${WHISPER_MODEL}`);
+  console.log(`whisper warmup: start root=${WHISPER_ROOT} model=${getWhisperModel()}`);
   await mkdir(WHISPER_ROOT, { recursive: true });
   await mkdir(TMP_FOLDER, { recursive: true });
 

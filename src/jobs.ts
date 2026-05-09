@@ -33,8 +33,6 @@ export async function resolveJobModel(job: Job): Promise<string | undefined> {
   return undefined;
 }
 
-
-
 export interface Job {
   /** Scheduler key. For standalone jobs this is the file stem. For agent-scoped jobs this is "agent/label". */
   name: string;
@@ -220,7 +218,6 @@ export async function agentDirExists(agentName: string): Promise<boolean> {
     return false;
   }
 }
-
 
 function resolveJobPath(jobName: string): string {
   const slash = jobName.indexOf("/");

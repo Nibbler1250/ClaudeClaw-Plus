@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile, realpath } from "fs/promises";
 import { join, dirname, resolve, sep } from "path";
 import { execSync } from "child_process";
-import { existsSync, writeFileSync, mkdirSync } from "fs";
+import { existsSync, writeFileSync, mkdirSync, readFileSync } from "fs";
 import {
   getSession,
   createSession,
@@ -48,6 +48,7 @@ function ensureGovernanceRouter(modes?: AgenticMode[], defaultMode?: string): vo
 }
 
 const ACTIVE_RUNS_FILE = join(process.cwd(), ".claude/claudeclaw/active-runs");
+const PERMISSION_MODE_FILE = join(process.cwd(), ".claude/claudeclaw/permission-mode.json");
 // Resolve prompts relative to the claudeclaw installation, not the project dir
 const PROMPTS_DIR = join(import.meta.dir, "..", "prompts");
 const HEARTBEAT_PROMPT_FILE = join(PROMPTS_DIR, "heartbeat", "HEARTBEAT.md");
@@ -262,6 +263,7 @@ export function wasRateLimitNotified(): boolean {
 export function markRateLimitNotified(): void {
   rateLimitNotified = true;
 }
+
 const STALE_THINKING_PATTERN = /Invalid.*signature.*thinking|thinking.*block.*signature/i;
 
 // Serial queue — prevents concurrent --resume on the same session
@@ -392,6 +394,7 @@ function resolveTimeoutMs(name: string): number {
   }
   return minutes * 60_000;
 }
+
 
 // Cap stdout/stderr to prevent unbounded memory growth.
 // 10 MB is far beyond any real Claude response; protects against runaway streams only.
@@ -532,7 +535,6 @@ async function runClaudeStream(
   let streamDelivered = "";
   let streamLastMsgId = "";
   const streamPendingToolCalls = new Map<string, string>();
-
 
   const readStdout = async () => {
     const reader = proc.stdout.getReader();
@@ -870,8 +872,37 @@ export async function ensureProjectClaudeMd(): Promise<void> {
   }
 }
 
+export type PermissionMode = "plan" | "acceptEdits" | "bypassPermissions";
+
+let cachedPermissionMode: PermissionMode | null = null;
+
+export function getPermissionMode(): PermissionMode {
+  if (cachedPermissionMode) return cachedPermissionMode;
+  try {
+    const raw = JSON.parse(readFileSync(PERMISSION_MODE_FILE, "utf8")) as { mode?: unknown };
+    if (raw.mode === "plan" || raw.mode === "acceptEdits" || raw.mode === "bypassPermissions") {
+      cachedPermissionMode = raw.mode;
+      return raw.mode;
+    }
+  } catch {}
+  return "bypassPermissions";
+}
+
+export function setPermissionMode(mode: PermissionMode): void {
+  cachedPermissionMode = mode;
+  try {
+    mkdirSync(dirname(PERMISSION_MODE_FILE), { recursive: true });
+    writeFileSync(PERMISSION_MODE_FILE, `${JSON.stringify({ mode }, null, 2)}\n`);
+  } catch (err) {
+    console.error("[runner] Failed to persist permission mode:", err);
+  }
+}
+
 function buildSecurityArgs(security: SecurityConfig): string[] {
-  const args: string[] = ["--dangerously-skip-permissions"];
+  const permissionMode = getPermissionMode();
+  const args: string[] = permissionMode === "bypassPermissions"
+    ? ["--dangerously-skip-permissions"]
+    : ["--permission-mode", permissionMode];
 
   switch (security.level) {
     case "locked":
@@ -1086,7 +1117,6 @@ async function loadAgentPrompts(agentName: string): Promise<string> {
   }
   return parts.join("\n\n");
 }
-
 
 // Compact a Discord thread session by threadId. Uses getThreadSession (not getSession)
 // because Discord threads have their own session store. agentName is used only for cwd isolation.
@@ -1513,7 +1543,6 @@ async function execClaude(
     }
   }
 
-
   // Plugins: agent_end — fire-and-forget, does not block response
   if (pm && exitCode === 0) {
     pm.emitAsync("agent_end", {
@@ -1573,7 +1602,6 @@ async function execClaude(
     }
   }
 
-
   // --- Watchdog: track consecutive timeouts ---
   // Skip tracking for unresolved session IDs ("unknown") to avoid cross-session
   // state collisions when a new session fails before its real ID is known.
@@ -1608,7 +1636,6 @@ async function execClaude(
     } catch (e) {
       console.warn(`[${new Date().toLocaleTimeString()}] Pre-compact memory save failed:`, e);
     }
-
 
     emitCompactEvent({ type: "auto-compact-start" });
     const compactOk = await runCompact(
@@ -1927,9 +1954,10 @@ export async function runUserMessage(
   threadId?: string,
   agentName?: string,
   onChunk?: (text: string) => void,
-  onToolEvent?: (line: string) => void
+  onToolEvent?: (line: string) => void,
+  modelOverride?: string
 ): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt), threadId, undefined, undefined, agentName, undefined, onChunk, onToolEvent);
+  return run(name, prefixUserMessageWithClock(prompt), threadId, modelOverride, undefined, agentName, undefined, onChunk, onToolEvent);
 }
 
 // Path where Claude Code stores session JSONL transcripts for this project

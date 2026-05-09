@@ -24,7 +24,6 @@ function sessionDirFor(agentName?: string): string {
   return HEARTBEAT_DIR;
 }
 
-
 function sessionPathFor(agentName?: string): string {
   if (agentName) return join(getAgentsDir(), agentName, "session.json");
   return SESSION_FILE;
