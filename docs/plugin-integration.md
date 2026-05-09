@@ -192,6 +192,16 @@ bridge.registerPluginTool("my-service", {
 
 ---
 
+## Per-subject git repositories in skills-tuner
+
+The skills-tuner plugin (#41) uses `engine.applyProposal()` to apply proposals. The engine routes each `applyProposal()` call to the subject's configured `git_repo` in `~/.config/tuner/config.yaml`.
+
+> Subjects can target different git repos. The MCP bridge plugin tools (#42) call back to `engine.applyProposal()` which routes to the subject's configured `git_repo`. This means an external Python plugin (Greg, archiviste) can apply proposals into its own repo, isolated from skills.
+
+Example: if `trader-ml-hp` subject has `git_repo: ~/Projects/momentum_trader_v7`, then tuner proposals for that subject commit into the trader repo — not the skills repo. Each subject has its own rollback path.
+
+---
+
 ## Running Tests
 
 ```bash
