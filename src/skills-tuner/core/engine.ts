@@ -146,7 +146,6 @@ export class Engine {
       ts: new Date().toISOString(),
       alternative_id: alternativeId,
       commit_sha: commitSha,
-      applied_target_path: patch.target_path,
     });
     auditLog('apply_success', { proposal_id: proposalId, alternative_id: alternativeId, commit_sha: commitSha });
   }
