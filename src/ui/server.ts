@@ -149,6 +149,8 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
       }
 
       if (url.pathname === "/api/settings/heartbeat" && req.method === "POST") {
+        const authErr = checkBearer(req, opts.getSnapshot().settings.apiToken);
+        if (authErr) return authErr;
         const csrfError = requireCsrf(req);
         if (csrfError) return csrfError;
         try {
@@ -233,6 +235,8 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
       }
 
       if (url.pathname === "/api/jobs/quick" && req.method === "POST") {
+        const authErr = checkBearer(req, opts.getSnapshot().settings.apiToken);
+        if (authErr) return authErr;
         const csrfError = requireCsrf(req);
         if (csrfError) return csrfError;
         try {
@@ -247,6 +251,8 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
       }
 
       if (url.pathname.startsWith("/api/jobs/") && req.method === "DELETE") {
+        const authErr = checkBearer(req, opts.getSnapshot().settings.apiToken);
+        if (authErr) return authErr;
         const csrfError = requireCsrf(req);
         if (csrfError) return csrfError;
         try {
@@ -274,6 +280,8 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
       }
 
       if (url.pathname === "/api/jobs/fire" && req.method === "POST") {
+        const authErr = checkBearer(req, opts.getSnapshot().settings.apiToken);
+        if (authErr) return authErr;
         const csrfError = requireCsrf(req);
         if (csrfError) return csrfError;
         try {
@@ -358,6 +366,8 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
 
       if (url.pathname === "/api/chat" && req.method === "POST") {
         if (!opts.onChat) return json({ ok: false, error: "chat not configured" });
+        const authErr = checkBearer(req, opts.getSnapshot().settings.apiToken);
+        if (authErr) return authErr;
         const csrfError = requireCsrf(req);
         if (csrfError) return csrfError;
         try {
@@ -408,6 +418,8 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
       }
 
       if (url.pathname === "/api/kanban" && req.method === "POST") {
+        const authErr = checkBearer(req, opts.getSnapshot().settings.apiToken);
+        if (authErr) return authErr;
         const csrfError = requireCsrf(req);
         if (csrfError) return csrfError;
         try {
