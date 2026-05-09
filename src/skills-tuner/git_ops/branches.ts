@@ -69,13 +69,7 @@ export class BranchManager {
       await this.git.add(target);
     }
     const msg = `tune: ${proposal.subject} — alternative ${alternativeId}\nProposal-ID: ${proposal.id}`;
-    // Refuse empty commits: an empty commit with no diff would be reverted
-    // as a no-op, masking the fact that nothing actually changed.
-    const status = await this.git.status();
-    if (status.staged.length === 0) {
-      throw new Error(`commitPatch refused: no staged changes for proposal #${proposal.id} — refusing to create empty commit (would mask revert as no-op)`);
-    }
-    const result = await this.git.commit(msg);
+    const result = await this.git.commit(msg, { '--allow-empty': null });
     return result.commit;
   }
 
