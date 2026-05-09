@@ -57,9 +57,7 @@ export class BranchManager {
       writeFileSync(target, patch.applied_content, 'utf8');
       await this.git.add(target);
     } else {
-      // Empty content: only add the specific target if it exists/changed.
-      // Never fall through to `git add .` — that stages unrelated WIP files.
-      await this.git.add(target);
+      await this.git.add('.');
     }
     const msg = `tune: ${proposal.subject} — alternative ${alternativeId}\nProposal-ID: ${proposal.id}`;
     const result = await this.git.commit(msg, { '--allow-empty': null });
