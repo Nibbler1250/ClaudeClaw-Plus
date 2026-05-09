@@ -988,17 +988,12 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
     // ── Chat ──
     const tabDashboardBtn = $("tab-dashboard");
     const tabChatBtn = $("tab-chat");
-<<<<<<< HEAD
     const tabKanbanBtn = $("tab-kanban");
-    const dashboardPanel = $("dashboard-panel");
-    const chatPanel = $("chat-panel");
-    const kanbanPanel = $("kanban-panel");
-=======
     const tabUsageBtn = $("tab-usage");
     const dashboardPanel = $("dashboard-panel");
     const chatPanel = $("chat-panel");
+    const kanbanPanel = $("kanban-panel");
     const usagePanel = $("usage-panel");
->>>>>>> upstream/master
     const chatMessages = $("chat-messages");
     const chatForm = $("chat-form");
     const chatInput = $("chat-input");
@@ -1117,13 +1112,8 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
     })();
 
     function setActiveTab(tab) {
-<<<<<<< HEAD
-      const allBtns = [tabDashboardBtn, tabChatBtn, tabKanbanBtn];
-      const allPanels = [dashboardPanel, chatPanel, kanbanPanel];
-=======
-      const allBtns = [tabDashboardBtn, tabChatBtn, tabUsageBtn];
-      const allPanels = [dashboardPanel, chatPanel, usagePanel];
->>>>>>> upstream/master
+      const allBtns = [tabDashboardBtn, tabChatBtn, tabKanbanBtn, tabUsageBtn];
+      const allPanels = [dashboardPanel, chatPanel, kanbanPanel, usagePanel];
       allBtns.forEach(b => { if (b) { b.classList.remove("tab-btn-active"); b.setAttribute("aria-selected", "false"); } });
       allPanels.forEach(p => { if (p) p.hidden = true; });
 
@@ -1131,19 +1121,16 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
         tabDashboardBtn && tabDashboardBtn.classList.add("tab-btn-active");
         tabDashboardBtn && tabDashboardBtn.setAttribute("aria-selected", "true");
         if (dashboardPanel) dashboardPanel.hidden = false;
-<<<<<<< HEAD
       } else if (tab === "kanban") {
         tabKanbanBtn && tabKanbanBtn.classList.add("tab-btn-active");
         tabKanbanBtn && tabKanbanBtn.setAttribute("aria-selected", "true");
         if (kanbanPanel) kanbanPanel.hidden = false;
         loadKanban();
-=======
       } else if (tab === "usage") {
         tabUsageBtn && tabUsageBtn.classList.add("tab-btn-active");
         tabUsageBtn && tabUsageBtn.setAttribute("aria-selected", "true");
         if (usagePanel) usagePanel.hidden = false;
         fetchUsage();
->>>>>>> upstream/master
       } else {
         tabChatBtn && tabChatBtn.classList.add("tab-btn-active");
         tabChatBtn && tabChatBtn.setAttribute("aria-selected", "true");
@@ -1154,11 +1141,8 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
 
     if (tabDashboardBtn) tabDashboardBtn.addEventListener("click", () => setActiveTab("dashboard"));
     if (tabChatBtn) tabChatBtn.addEventListener("click", function() { setActiveTab("chat"); loadSessions(); });
-<<<<<<< HEAD
     if (tabKanbanBtn) tabKanbanBtn.addEventListener("click", () => setActiveTab("kanban"));
-=======
     if (tabUsageBtn) tabUsageBtn.addEventListener("click", function() { setActiveTab("usage"); });
->>>>>>> upstream/master
 
     // --- Session browser ---
 
@@ -1603,7 +1587,6 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
       }
     }, 1000);
 
-<<<<<<< HEAD
 // ── Kanban ───────────────────────────────────────────────────────────────────
 var kanbanData = { columns: { todo: [], in_progress: [], done: [] } };
 
@@ -1717,8 +1700,8 @@ if ($("kanban-input-title")) {
 }
 
 loadKanban();
-setInterval(loadKanban, 10000);`;
-=======
+setInterval(loadKanban, 10000);
+
     // --- Usage monitoring ---
     var usageWrap = $("usage-table-wrap");
 
@@ -1799,4 +1782,3 @@ setInterval(loadKanban, 10000);`;
 
     fetchUsage();
     setInterval(fetchUsage, 60_000);`;
->>>>>>> upstream/master
