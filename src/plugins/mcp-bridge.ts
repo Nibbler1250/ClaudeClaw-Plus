@@ -62,6 +62,13 @@ export class PluginMcpBridge {
     this.audit("register", { fqn, pluginId, toolName: tool.name, description: tool.description });
   }
 
+  unregisterPlugin(pluginId: string): void {
+    for (const [fqn, entry] of this.tools) {
+      if (entry.plugin === pluginId) this.tools.delete(fqn);
+    }
+    this.audit("unregister", { pluginId });
+  }
+
   // ── Secret management ──────────────────────────────────────────────────
 
   loadOrCreateSecret(pluginId: string): Buffer {
@@ -195,7 +202,7 @@ export class PluginMcpBridge {
     return { type: "object", additionalProperties: true };
   }
 
-  private audit(event: string, payload: Record<string, unknown>): void {
+  audit(event: string, payload: Record<string, unknown>): void {
     try {
       const entry = JSON.stringify({ event, ts: new Date().toISOString(), ...payload }) + "\n";
       appendFileSync(this.auditPath, entry, { encoding: "utf8" });

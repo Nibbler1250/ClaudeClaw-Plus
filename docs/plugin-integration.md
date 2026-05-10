@@ -1,201 +1,224 @@
-# Plugin Tool Integration Guide
+# Plugin Integration Guide
 
-ClaudeClaw-Plus exposes a `PluginMcpBridge` that lets daemon plugins register tools and expose them to the MCP ecosystem. All registered tools are served via a stdio MCP server that any MCP client (Claude Desktop, etc.) can connect to.
+ClaudeClaw-Plus supports three tiers of plugin integration:
 
----
-
-## Architecture Overview
-
-```
-Plus daemon
-├── PluginManager (src/plugins.ts)
-│   └── lifecycle events (gateway_start, session_start, agent_end, …)
-└── PluginMcpBridge (src/plugins/mcp-bridge.ts)
-    ├── registerPluginTool(pluginId, tool)  ← plugin registration API
-    ├── McpServer (src/plugins/mcp-server.ts, stdio)
-    ├── HMAC-SHA256 signed inter-plugin calls
-    └── Append-only audit log (~/.config/plus/plugin-audit.jsonl)
-```
+| Tier | Style | Use case |
+|---|---|---|
+| 1 | In-process TypeScript | Skills-tuner, compiled-in features |
+| 2 | Subprocess JSON-RPC | ML backends (Optuna), Python scripts |
+| 3 | HTTP daemon | Greg/voice, Archiviste, cross-process tools |
 
 ---
 
-## Registering Tools from a Plugin
+## Tier 3 — HTTP Plugin (daemon-style)
 
-Plugins receive a `PluginApi` object at init time. Call `api.registerTool(tool)` to register an MCP-compatible tool:
+Daemon-style plugins register themselves over HTTP and serve tool calls via a callback URL. Plus communicates with them via HMAC-signed POST requests.
 
-```typescript
-import type { PluginInitFn } from "claudeclaw-plus/src/plugins.js";
-import { z } from "zod";
+### API endpoints (mounted when `--web` is active)
 
-const init: PluginInitFn = (api) => {
-  api.registerTool({
-    name: "pending",
-    description: "List pending tuner proposals",
-    schema: z.object({
-      subject: z.string().optional(),
-    }),
-    handler: async (args) => {
-      return engine.listPending(args.subject);
-    },
-  });
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `POST` | `/api/plugin/register` | Bearer bootstrap | Register plugin + tools |
+| `POST` | `/api/plugin/<n>/tools/<t>/invoke` | HMAC + timestamp | Invoke tool via callback |
+| `DELETE` | `/api/plugin/<n>` | Bootstrap or plugin token | Unregister |
+| `GET` | `/api/plugin/list` | None | List registered plugins + health |
+| `GET` | `/api/plugin/<n>/health` | None | Proxy to plugin health_url |
 
-  api.registerTool({
-    name: "apply",
-    description: "Apply a tuner proposal by ID",
-    schema: z.object({ id: z.string() }),
-    handler: async (args) => engine.apply(args.id),
-  });
-};
+### Security model
 
-export default init;
-```
+- **Bootstrap token**: 32-byte secret at `~/.config/plus/plugin-bootstrap.secret` (0600). Printed once at first start. Retrieve with `bun run src/plugins/cli.ts print-bootstrap-token`.
+- **Per-plugin token**: returned at registration time, used for HMAC signing on subsequent invocations. Store securely in the daemon process.
+- **HMAC**: `HMAC-SHA256(secret, "{ts}\n{body}")` where `ts` is ISO-8601 UTC, `body` is JSON-serialized. Sent in `X-Plus-Signature` header.
+- **Replay window**: 15 minutes (clock-skew tolerant). Requests outside this window are rejected.
+- **Callback allowlist**: by default, only `localhost` / `127.0.0.1` / `::1` are allowed as callback hosts.
 
-The tool is registered under the FQN `{pluginId}__{toolName}` (e.g. `skills-tuner__pending`).
+### Standard error format
 
----
-
-## Pattern: Archiviste Plugin
-
-```typescript
-const init: PluginInitFn = (api) => {
-  api.registerTool({
-    name: "search_docs",
-    description: "Full-text search across archived documents",
-    schema: z.object({
-      query: z.string(),
-      trusted_only: z.boolean().optional(),
-      limit: z.number().optional(),
-    }),
-    handler: async (args) => archiviste.search(args),
-  });
-
-  api.registerTool({
-    name: "index_doc",
-    description: "Index a new document into the archive",
-    schema: z.object({
-      path: z.string(),
-      tags: z.array(z.string()).optional(),
-    }),
-    handler: async (args) => archiviste.index(args.path, args.tags),
-  });
-};
-```
-
----
-
-## Pattern: Voice Plugin (Greg)
-
-```typescript
-const init: PluginInitFn = (api) => {
-  api.registerTool({
-    name: "play_tts",
-    description: "Synthesize and play text-to-speech audio",
-    schema: z.object({
-      text: z.string(),
-      voice: z.string().optional(),
-    }),
-    handler: async (args) => voice.playTts(args.text, args.voice),
-  });
-
-  api.registerTool({
-    name: "transcribe_audio",
-    description: "Transcribe an audio file to text using Whisper",
-    schema: z.object({ path: z.string() }),
-    handler: async (args) => voice.transcribe(args.path),
-  });
-};
-```
-
----
-
-## Security
-
-### Per-Plugin Secret
-
-Each plugin gets a 32-byte random secret stored at:
-```
-~/.config/plus/plugins/<pluginId>/.secret   (mode 0600)
-```
-
-The secret is auto-created on first use and hex-encoded on disk. It never leaves the local machine.
-
-### HMAC-SHA256 Signing
-
-Every `invokeTool` call is signed before reaching the handler:
-
-```typescript
-const sig = bridge.signCall(pluginId, args, Date.now());
-const ok  = bridge.verifyCall(pluginId, args, ts, sig);
-```
-
-Verification uses `timingSafeEqual` to prevent timing attacks.
-
-### Zod Validation
-
-All tool arguments are validated against the plugin-provided `schema` before the handler is called. Invalid args throw immediately and are logged to the audit log.
-
-### Audit Log
-
-Every `register`, `invoke`, `error` event is appended to:
-```
-~/.config/plus/plugin-audit.jsonl
-```
-
-Each line is a JSON object with `{ event, ts, fqn, pluginId, … }`. The file is append-only; never truncate it — it is an audit trail.
-
----
-
-## Starting the MCP Server
-
-### Standalone
-
-```bash
-bun run src/plugins/mcp-server.ts
-```
-
-The server listens on stdio and exposes all registered tools to any MCP client.
-
-### Claude Desktop Configuration
-
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or equivalent:
+All errors return JSON:
 
 ```json
 {
-  "mcpServers": {
-    "claudeclaw-plus": {
-      "command": "bun",
-      "args": ["run", "/home/simon/Projects/ClaudeClaw-Plus/src/plugins/mcp-server.ts"]
-    }
+  "error": {
+    "code": "invalid_signature",
+    "message": "HMAC verification failed",
+    "plugin": "greg-voice",
+    "request_id": "a1b2c3d4e5f6a7b8",
+    "ts": "2026-05-09T20:00:00.000Z"
   }
 }
 ```
 
+`request_id` is echoed from `X-Plus-Request-Id` if provided, or generated. Include it in bug reports for cross-process forensics.
+
 ---
 
-## Direct Bridge Access (Advanced)
+## Greg / Voice plugin — Python example
 
-If you need to register tools outside of the Plugin lifecycle, import the singleton directly:
+```python
+import os, json, hmac, hashlib, requests
+from flask import Flask, request, jsonify
 
-```typescript
-import { getMcpBridge } from "claudeclaw-plus/src/plugins/mcp-bridge.js";
-import { z } from "zod";
+# ── Registration ──────────────────────────────────────────────────────────────
 
-const bridge = getMcpBridge();
+PLUS_URL = "http://localhost:3000"
+BOOTSTRAP_SECRET_PATH = os.path.expanduser("~/.config/plus/plugin-bootstrap.secret")
 
-bridge.registerPluginTool("my-service", {
-  name: "status",
-  description: "Get service status",
-  schema: z.object({}),
-  handler: async () => ({ ok: true }),
-});
+manifest = {
+    "name": "greg-voice",
+    "version": "1.0.0",
+    "schema_version": 1,
+    "callback_url": "http://localhost:8765/plus-callback",
+    "health_url": "http://localhost:8765/health",
+    "tools": [
+        {
+            "name": "send_tts",
+            "description": "Play TTS in active call",
+            "schema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+        },
+        {
+            "name": "get_call_status",
+            "description": "Return current call status",
+            "schema": {"type": "object", "properties": {}},
+        },
+    ],
+    "capabilities": ["tools"],
+}
+
+bootstrap_token = open(BOOTSTRAP_SECRET_PATH, "rb").read().hex()
+resp = requests.post(
+    f"{PLUS_URL}/api/plugin/register",
+    headers={"Authorization": f"Bearer {bootstrap_token}"},
+    json=manifest,
+)
+resp.raise_for_status()
+data = resp.json()
+PLUGIN_TOKEN_HEX = data["plugin_token"]
+print(f"Registered {data['plugin_name']} — tools: {data['registered_tools']}")
+
+# ── Callback server ───────────────────────────────────────────────────────────
+
+app = Flask(__name__)
+
+def verify_plus_hmac(body_bytes: bytes, ts: str, sig: str) -> bool:
+    secret = bytes.fromhex(PLUGIN_TOKEN_HEX)
+    expected = hmac.new(secret, f"{ts}\n{body_bytes.decode()}".encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+@app.route("/plus-callback", methods=["POST"])
+def handle_callback():
+    ts = request.headers.get("X-Plus-Ts", "")
+    sig = request.headers.get("X-Plus-Signature", "")
+    body_bytes = request.get_data()
+    if not verify_plus_hmac(body_bytes, ts, sig):
+        return jsonify({"error": "invalid_signature"}), 401
+    payload = json.loads(body_bytes)
+    tool = payload["tool"]
+    args = payload.get("args", {})
+    if tool == "send_tts":
+        # ... your TTS logic here ...
+        return jsonify({"result": {"played": True, "text": args.get("text")}})
+    elif tool == "get_call_status":
+        return jsonify({"result": {"status": "idle"}})
+    return jsonify({"error": "unknown_tool"}), 400
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True})
+
+if __name__ == "__main__":
+    app.run(port=8765)
 ```
 
 ---
 
-## Running Tests
+## Archiviste plugin — Python example
 
-```bash
-bun test src/__tests__/plugins/mcp-bridge.test.ts
+```python
+import os, json, hmac, hashlib, requests
+from flask import Flask, request, jsonify
+
+PLUS_URL = "http://localhost:3000"
+BOOTSTRAP_SECRET_PATH = os.path.expanduser("~/.config/plus/plugin-bootstrap.secret")
+
+manifest = {
+    "name": "archiviste",
+    "version": "1.0.0",
+    "schema_version": 1,
+    "callback_url": "http://localhost:8766/plus-callback",
+    "health_url": "http://localhost:8766/health",
+    "tools": [
+        {
+            "name": "search",
+            "description": "Full-text search across archived documents",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "trusted_only": {"type": "boolean", "default": True},
+                },
+                "required": ["query"],
+            },
+        },
+    ],
+    "capabilities": ["tools"],
+}
+
+bootstrap_token = open(BOOTSTRAP_SECRET_PATH, "rb").read().hex()
+resp = requests.post(
+    f"{PLUS_URL}/api/plugin/register",
+    headers={"Authorization": f"Bearer {bootstrap_token}"},
+    json=manifest,
+)
+resp.raise_for_status()
+PLUGIN_TOKEN_HEX = resp.json()["plugin_token"]
+
+app = Flask(__name__)
+
+def verify_plus_hmac(body_bytes: bytes, ts: str, sig: str) -> bool:
+    secret = bytes.fromhex(PLUGIN_TOKEN_HEX)
+    expected = hmac.new(secret, f"{ts}\n{body_bytes.decode()}".encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+@app.route("/plus-callback", methods=["POST"])
+def handle_callback():
+    ts = request.headers.get("X-Plus-Ts", "")
+    sig = request.headers.get("X-Plus-Signature", "")
+    body_bytes = request.get_data()
+    if not verify_plus_hmac(body_bytes, ts, sig):
+        return jsonify({"error": "invalid_signature"}), 401
+    payload = json.loads(body_bytes)
+    tool = payload["tool"]
+    args = payload.get("args", {})
+    if tool == "search":
+        import subprocess
+        result = subprocess.check_output([
+            "python3",
+            os.path.expanduser("~/agent/scripts/archiviste-vectorize.py"),
+            "--search", args["query"],
+            *(["--trusted-only"] if args.get("trusted_only", True) else []),
+        ]).decode()
+        return jsonify({"result": {"hits": result}})
+    return jsonify({"error": "unknown_tool"}), 400
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True})
+
+if __name__ == "__main__":
+    app.run(port=8766)
 ```
 
-All 8+ assertions cover: registration, duplicates, zod validation, HMAC round-trips, audit log entries, and secret management.
+---
+
+## Deferred to follow-up PRs
+
+The following features are known gaps but explicitly deferred:
+
+| Feature | Rationale |
+|---|---|
+| Hash-chained audit log | Nice-to-have for tamper evidence; no concrete demand yet |
+| Strict capability enforcement | Currently declared but not enforced; no capability-based blocking needed at v0 |
+| TLS enforcement for non-localhost | All current use cases are local; add when cross-machine relay is needed |
+| Token rotation endpoint | Re-register replaces the plugin token; no separate endpoint needed at v0 |
+
+File issues on this repo to promote any of these.

@@ -1,0 +1,306 @@
+import { z } from 'zod';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { getMcpBridge } from './mcp-bridge.js';
+
+const PluginManifestSchema = z.object({
+  name: z.string().regex(/^[a-z][a-z0-9-]*$/, 'name must be lowercase kebab-case'),
+  version: z.string(),
+  schema_version: z.number().int().default(1),
+  callback_url: z.string().url(),
+  health_url: z.string().url().optional(),
+  tools: z.array(z.object({
+    name: z.string(),
+    description: z.string(),
+    schema: z.record(z.unknown()),
+  })),
+  capabilities: z.array(z.string()).default(['tools']),
+});
+
+const REPLAY_WINDOW_MS = 15 * 60 * 1000;
+const PLUGIN_INVOKE_TIMEOUT_MS = 30_000;
+
+interface RegisteredPlugin {
+  manifest: z.infer<typeof PluginManifestSchema>;
+  pluginToken: Buffer;
+  registeredAt: Date;
+  lastHealthCheck?: { ts: Date; healthy: boolean; status?: number; error?: string };
+}
+
+function json(body: unknown, status = 200): Response {
+  return Response.json(body, { status });
+}
+
+export class PluginHttpGateway {
+  private plugins = new Map<string, RegisteredPlugin>();
+  private bootstrapToken: Buffer;
+  private allowedCallbackHosts: Set<string>;
+
+  constructor(opts: { allowedHosts?: string[] } = {}) {
+    this.allowedCallbackHosts = new Set(['localhost', '127.0.0.1', '::1', ...(opts.allowedHosts ?? [])]);
+    this.bootstrapToken = this.loadOrCreateBootstrapToken();
+  }
+
+  /** Route an incoming Request. Returns Response if handled, null if not a plugin endpoint. */
+  async handleRequest(req: Request, url: URL): Promise<Response | null> {
+    const path = url.pathname;
+    const method = req.method;
+
+    if (path === '/api/plugin/register' && method === 'POST') return this.handleRegister(req);
+    if (path === '/api/plugin/list' && method === 'GET') return this.handleList(req);
+
+    // /api/plugin/:name/tools/:tool/invoke
+    const invokeM = path.match(/^\/api\/plugin\/([^/]+)\/tools\/([^/]+)\/invoke$/);
+    if (invokeM && method === 'POST') return this.handleInvoke(req, invokeM[1]!, invokeM[2]!);
+
+    // /api/plugin/:name/health
+    const healthM = path.match(/^\/api\/plugin\/([^/]+)\/health$/);
+    if (healthM && method === 'GET') return this.handleHealthCheck(req, healthM[1]!);
+
+    // /api/plugin/:name (DELETE)
+    const nameM = path.match(/^\/api\/plugin\/([^/]+)$/);
+    if (nameM && method === 'DELETE') return this.handleUnregister(req, nameM[1]!);
+
+    return null; // not a plugin endpoint
+  }
+
+  private requestId(req: Request): string {
+    return req.headers.get('x-plus-request-id') ?? randomBytes(8).toString('hex');
+  }
+
+  private errorBody(code: string, message: string, requestId: string, plugin?: string) {
+    return {
+      error: { code, message, plugin: plugin ?? null, request_id: requestId, ts: new Date().toISOString() },
+    };
+  }
+
+  private loadOrCreateBootstrapToken(): Buffer {
+    const path = join(homedir(), '.config', 'plus', 'plugin-bootstrap.secret');
+    mkdirSync(join(path, '..'), { recursive: true });
+    if (!existsSync(path)) {
+      writeFileSync(path, randomBytes(32));
+      chmodSync(path, 0o600);
+      console.error(`[plus-plugin-gateway] Bootstrap token initialized at ${path}. Use bun run src/plugins/cli.ts print-bootstrap-token to retrieve.`);
+    }
+    return readFileSync(path);
+  }
+
+  private async handleRegister(req: Request): Promise<Response> {
+    const requestId = this.requestId(req);
+    const authToken = (req.headers.get('authorization') ?? '').replace(/^Bearer\s+/, '');
+    if (!this.verifyBootstrap(authToken)) {
+      return json(this.errorBody('invalid_bootstrap', 'Invalid or missing Bearer token', requestId), 401);
+    }
+
+    let body: unknown;
+    try { body = await req.json(); } catch {
+      return json(this.errorBody('invalid_body', 'Could not parse JSON body', requestId), 400);
+    }
+
+    let manifest: z.infer<typeof PluginManifestSchema>;
+    try {
+      manifest = PluginManifestSchema.parse(body);
+    } catch (e) {
+      return json(this.errorBody('invalid_manifest', String(e), requestId), 400);
+    }
+
+    const callbackHost = new URL(manifest.callback_url).hostname;
+    if (!this.allowedCallbackHosts.has(callbackHost)) {
+      return json(this.errorBody('callback_host_not_allowed', `Host ${callbackHost} not in allowlist`, requestId, manifest.name), 400);
+    }
+
+    if (this.plugins.has(manifest.name)) {
+      // Clean up stale tools from bridge before re-registering
+      try { getMcpBridge().unregisterPlugin(manifest.name); } catch {}
+      this.plugins.delete(manifest.name);
+    }
+
+    const pluginToken = randomBytes(32);
+    const bridge = getMcpBridge();
+
+    for (const toolDef of manifest.tools) {
+      try {
+        bridge.registerPluginTool(manifest.name, {
+          name: toolDef.name,
+          description: toolDef.description,
+          schema: z.record(z.unknown()),
+          handler: async (args) => {
+            const invokeRequestId = randomBytes(8).toString('hex');
+            return this.invokeViaCallback(manifest.name, toolDef.name, args, pluginToken, manifest.callback_url, invokeRequestId);
+          },
+        });
+      } catch {
+        // graceful: skip duplicates, continue
+      }
+    }
+
+    this.plugins.set(manifest.name, { manifest, pluginToken, registeredAt: new Date() });
+    try { bridge.audit('http_plugin_registered', { plugin: manifest.name, tools_count: manifest.tools.length, request_id: requestId }); } catch {}
+
+    return json({
+      plugin_name: manifest.name,
+      plugin_token: pluginToken.toString('hex'),
+      registered_tools: manifest.tools.map(t => `${manifest.name}__${t.name}`),
+      capabilities_acknowledged: manifest.capabilities,
+      request_id: requestId,
+    });
+  }
+
+  private async handleInvoke(req: Request, name: string, tool: string): Promise<Response> {
+    const requestId = this.requestId(req);
+    const plugin = this.plugins.get(name);
+    if (!plugin) {
+      return json(this.errorBody('plugin_not_registered', `Plugin '${name}' not registered`, requestId, name), 404);
+    }
+
+    const ts = req.headers.get('x-plus-ts') ?? '';
+    const sig = req.headers.get('x-plus-signature') ?? '';
+    // Use raw body string for HMAC — re-serialization changes byte order (breaks Python default separators)
+    const rawBody = await req.text();
+    const bodyStr = rawBody || '{}';
+    let body: unknown;
+    try { body = JSON.parse(bodyStr); } catch { body = {}; }
+
+    if (!ts || !sig || !this.verifyHmac(plugin.pluginToken, bodyStr, ts, sig)) {
+      return json(this.errorBody('invalid_signature', 'HMAC verification failed', requestId, name), 401);
+    }
+
+    const tsMs = new Date(ts).getTime();
+    if (!Number.isFinite(tsMs) || Math.abs(Date.now() - tsMs) > REPLAY_WINDOW_MS) {
+      return json(this.errorBody('stale_or_future_timestamp', `ts outside ${REPLAY_WINDOW_MS / 1000}s window`, requestId, name), 401);
+    }
+
+    const fqn = `${name}__${tool}`;
+    try {
+      const result = await getMcpBridge().invokeTool(fqn, body);
+      return json({ result, request_id: requestId });
+    } catch (e) {
+      return json(this.errorBody('invoke_failed', e instanceof Error ? e.message : String(e), requestId, name), 502);
+    }
+  }
+
+  private async invokeViaCallback(pluginName: string, toolName: string, args: unknown, pluginToken: Buffer, callbackUrl: string, requestId: string): Promise<unknown> {
+    const ts = new Date().toISOString();
+    const body = JSON.stringify({ tool: toolName, args });
+    const signature = this.signHmac(pluginToken, body, ts);
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), PLUGIN_INVOKE_TIMEOUT_MS);
+    try {
+      const resp = await fetch(callbackUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Plus-Ts': ts,
+          'X-Plus-Signature': signature,
+          'X-Plus-Request-Id': requestId,
+        },
+        body,
+        signal: ctrl.signal,
+      });
+      if (!resp.ok) {
+        throw new Error(`Plugin ${pluginName} callback ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+      }
+      const result = await resp.json() as { result?: unknown; error?: unknown };
+      if (result.error) throw new Error(`Plugin error: ${JSON.stringify(result.error)}`);
+      return result.result;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async handleUnregister(req: Request, name: string): Promise<Response> {
+    const requestId = this.requestId(req);
+    const plugin = this.plugins.get(name);
+    if (!plugin) {
+      return json(this.errorBody('plugin_not_registered', `Plugin '${name}' not registered`, requestId, name), 404);
+    }
+    const authToken = (req.headers.get('authorization') ?? '').replace(/^Bearer\s+/, '');
+    const tokenBuf = Buffer.from(authToken, 'hex');
+    const validBootstrap = this.verifyBootstrap(authToken);
+    const validPlugin = tokenBuf.length === plugin.pluginToken.length && timingSafeEqual(tokenBuf, plugin.pluginToken);
+    if (!validBootstrap && !validPlugin) {
+      return json(this.errorBody('unauthorized', 'Bootstrap or plugin token required', requestId, name), 401);
+    }
+    this.plugins.delete(name);
+    try { getMcpBridge().unregisterPlugin(name); } catch {}
+    try { getMcpBridge().audit('http_plugin_unregistered', { plugin: name, request_id: requestId }); } catch {}
+    return json({ unregistered: name, request_id: requestId });
+  }
+
+  private async handleList(req: Request): Promise<Response> {
+    const requestId = this.requestId(req);
+    const list = [...this.plugins.values()].map(p => ({
+      name: p.manifest.name,
+      version: p.manifest.version,
+      schema_version: p.manifest.schema_version,
+      tools: p.manifest.tools.map(t => t.name),
+      capabilities: p.manifest.capabilities,
+      registered_at: p.registeredAt.toISOString(),
+      last_health_check: p.lastHealthCheck ?? null,
+    }));
+    return json({ plugins: list, request_id: requestId });
+  }
+
+  private async handleHealthCheck(req: Request, name: string): Promise<Response> {
+    const requestId = this.requestId(req);
+    const plugin = this.plugins.get(name);
+    if (!plugin) {
+      return json(this.errorBody('plugin_not_registered', `Plugin '${name}' not registered`, requestId, name), 404);
+    }
+    if (!plugin.manifest.health_url) {
+      return json({ name, healthy: true, note: 'No health_url declared — plugin assumed healthy', request_id: requestId });
+    }
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5_000);
+    try {
+      const r = await fetch(plugin.manifest.health_url, { signal: ctrl.signal });
+      const healthy = r.ok;
+      plugin.lastHealthCheck = { ts: new Date(), healthy, status: r.status };
+      return json({ name, healthy, status: r.status, request_id: requestId });
+    } catch (e) {
+      plugin.lastHealthCheck = { ts: new Date(), healthy: false, error: String(e) };
+      return json({ name, healthy: false, error: String(e), request_id: requestId });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // ── HMAC + bootstrap ──────────────────────────────────────────────────────
+
+  private verifyBootstrap(token: string): boolean {
+    try {
+      const tokenBuf = Buffer.from(token, 'hex');
+      if (tokenBuf.length !== this.bootstrapToken.length) return false;
+      return timingSafeEqual(tokenBuf, this.bootstrapToken);
+    } catch { return false; }
+  }
+
+  signHmac(secret: Buffer, body: string, ts: string): string {
+    return createHmac('sha256', secret).update(`${ts}\n${body}`).digest('hex');
+  }
+
+  verifyHmac(secret: Buffer, body: string, ts: string, sig: string): boolean {
+    try {
+      const expected = this.signHmac(secret, body, ts);
+      if (expected.length !== sig.length) return false;
+      return timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(sig, 'hex'));
+    } catch { return false; }
+  }
+
+  /** Expose for tests */
+  get pluginCount(): number { return this.plugins.size; }
+  hasPlugin(name: string): boolean { return this.plugins.has(name); }
+  getPluginToken(name: string): Buffer | undefined { return this.plugins.get(name)?.pluginToken; }
+}
+
+let _gateway: PluginHttpGateway | null = null;
+
+export function getHttpGateway(opts?: { allowedHosts?: string[] }): PluginHttpGateway {
+  if (!_gateway) _gateway = new PluginHttpGateway(opts);
+  return _gateway;
+}
+
+export function _resetHttpGateway(): void { _gateway = null; }
