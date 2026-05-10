@@ -1430,9 +1430,11 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         "The user attached a document, but downloading it failed. Respond and ask them to resend."
       );
     }
+    const prefixedPrompt = promptParts.join("\n");
+
     // Check per-adapter feature flag for gateway routing
     if (process.env.USE_GATEWAY_TELEGRAM === "true") {
-      const gatewayResult = await submitTelegramToGateway(message);
+      const gatewayResult = await submitTelegramToGateway(message, prefixedPrompt);
       if (!gatewayResult.success) {
         await sendMessage(config.token, chatId, `Gateway error: ${gatewayResult.error}`, threadId);
         return;
@@ -1440,8 +1442,6 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       // Gateway processed successfully - response handled by processor
       return;
     }
-
-    const prefixedPrompt = promptParts.join("\n");
     const busy = isMainBusy();
     const verbose = verboseChats.has(chatId);
     const modelOverride = chatModels.get(chatId);
