@@ -7,6 +7,7 @@ import { discord } from "./commands/discord";
 import { slack } from "./commands/slack";
 import { send } from "./commands/send";
 import { runFireCommand } from "./commands/fire";
+import { mcpServe } from "./commands/mcp-serve";
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -20,6 +21,7 @@ const HELP = [
   "  claudeclaw send <message>           Send a message to the active session",
   "  claudeclaw fire <agent>:<label>     Fire an agent job once, immediately",
   "  claudeclaw fire <agent> <label>     Same, alternate form",
+  "  claudeclaw mcp-serve                Start the MCP bridge server (stdio, spawned by claude CLI)",
   "  claudeclaw telegram                 Run Telegram adapter",
   "  claudeclaw discord                  Run Discord adapter",
   "  claudeclaw --stop                   Stop the daemon",
@@ -52,6 +54,8 @@ if (command === "--help" || command === "-h" || command === "help") {
   send(args.slice(1));
 } else if (command === "fire") {
   runFireCommand(args.slice(1)).then((code) => process.exit(code));
+} else if (command === "mcp-serve") {
+  mcpServe().catch((err) => { process.stderr.write(`[mcp-serve] Fatal: ${err}\n`); process.exit(1); });
 } else {
   start();
 }

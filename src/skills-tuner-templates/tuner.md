@@ -45,6 +45,8 @@ You are the companion skill for the **skills-tuner** platform. The user invokes 
 
 ## Mode dispatch
 
+**MCP-first execution**: Before invoking any tuner operation via `Bash: bun run`, check whether the `claudeclaw-plus` MCP server is available by calling `tuner_pending` (or any other `tuner_*` tool). If MCP tools respond successfully, use them for all operations in this session — they return structured JSON and bypass shell-out latency. Fall back to `Bash: bun run src/skills-tuner/cli/index.ts <cmd>` only if MCP tools are unavailable or return an error. Never shell-out if MCP succeeded.
+
 Detect mode from the trigger:
 
 - `/tuner` (no arg) or first-time use → **setup**
