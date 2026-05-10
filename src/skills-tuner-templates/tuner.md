@@ -12,6 +12,7 @@ triggers:
   - /tuner adjust
   - /tuner audit
   - /tuner optimize
+  - /tuner tune-prompt
   - /tuner report
   - tune this skill
   - tune the skill
@@ -51,6 +52,7 @@ Detect mode from the trigger:
 - `/tuner adjust [name]` or "tune this skill X" or "ajuste ce skill X" → **adjust**
 - `/tuner audit` or "audit le tuner" or "review tuner state" → **audit**
 - `/tuner optimize` or "reduce tuner cost" → **optimize**
+- `/tuner tune-prompt [subject]` or "review proposer prompt" → **tune-prompt**
 - `/tuner report` or "this looks like a tuner bug" or "ouvre une issue" → **report**
 
 If `~/.config/tuner/config.yaml` does not exist and mode is unclear, default to **setup**. If the verbatim is genuinely ambiguous (e.g. just "tune-moi"), ask the user which mode applies before doing anything.
@@ -382,6 +384,25 @@ For option 10 — Git repo:
 
 For each other option, walk through the change, show the diff, ask confirmation, write to config.
 
+For option **D** — Subject-wide knobs:
+
+Present each knob one at a time (current value → proposed new value):
+
+| Knob | Config path | Tuning hint |
+|------|-------------|-------------|
+| `models.proposer_default` | global | Sonnet for routine patches; Opus for high-stakes |
+| `models.proposer_high_stakes` | global | Opus when risk_tier ≥ high |
+| `subjects.<name>.proposer` | subject | Per-subject override (e.g. voice → haiku for latency) |
+| `subjects.<name>.proposer_for_create` | subject | Opus for new-entity generation (cost/quality tradeoff) |
+| `detection.confidence_floor` | global | Raise 0.65→0.75 for noise; lower if missing real signal |
+| `detection.max_proposals_per_run` | global | Lower 5→2 for expensive subjects; caps LLM spend |
+| `subjects.<name>.scan_dirs` | subject | Add/remove monitored paths; drift detector picks up changes |
+| `subjects.<name>.emotional_patterns` | subject | Custom regexes that boost signal weight (domain words) |
+| `subjects.<name>.auto_merge` | subject | `false` high-risk; `[patch, frontmatter]` low-risk; `true` trivial |
+| Scheduling (`*/N` cron) | external | 15m active subjects; daily for slow-burn |
+
+After knobs chosen: regenerate the relevant config section, dry-run if possible (`tuner cron-run --dry --since 24h`), commit config change.
+
 ### Step 4 — Validate + commit config
 
 Run `tuner doctor` to validate.
@@ -566,6 +587,49 @@ End optimize.
 
 ---
 
+## Mode: tune-prompt
+
+Goal: audit a subject's LLM proposer prompt(s) against the v2 diagnose-first checklist and surface concrete patches for any missing properties.
+
+### Step 1 — Identify target
+
+Accept `<subject>` arg; default to `skills`. Locate the implementation:
+- Native subject: `src/subjects/<subject>.ts`
+- Plugin: `src/subjects/external_process.ts` (check the callout config for the plugin path)
+
+### Step 2 — Extract proposer prompt(s)
+
+Find `llmPropose` and `llmProposeNewSkill` (or equivalent) functions. Extract the system prompt string(s) passed to the LLM client.
+
+### Step 3 — Apply v2 checklist
+
+For each prompt, verify all 6 properties are present:
+
+- [ ] **Named-taxonomy diagnosis step** — LLM must classify signals against a named failure-mode list before proposing
+- [ ] **Cosmetic-variant ban** — explicit instruction to reject whitespace/header/copy-only variants
+- [ ] **Specific-label requirement** — labels describe the *change* ("Disambiguate target device"), not the *form* ("Concise version")
+- [ ] **Tradeoff = improvement + new risk** — both halves required, not just "what improves"
+- [ ] **First-char-`[` constraint** — LLM reply must start with `[` (no prose preamble)
+- [ ] **Language hint** — `language` from subject config piped into the prompt
+
+For `skills` (native), the canonical taxonomy is:
+`wrong-trigger | vague-instructions | missing-edge-case | wrong-tool-selection | ambiguous-output | over-eager-activation | under-specified-scope | format-mismatch`
+
+For other subjects, propose 4–8 failure modes specific to that subject's domain (e.g. cron: `wrong-schedule | missed-dependency | stale-success-rate | schedule-conflict`).
+
+### Step 4 — Show diff + propose
+
+For each missing property, surface a concrete patch on the prompt string. Show before/after as a unified diff. Require user approval before touching any file.
+
+### Step 5 — Validate + commit
+
+Once approved: edit the file. Run `bun test tests/unit/proposer_prompt_v2.test.ts` if that file exists; otherwise `bun test`. Commit with:
+`fix(<subject>): adopt diagnose-first proposer prompt`
+
+End tune-prompt.
+
+---
+
 ## Mode: report
 
 Goal: when something is genuinely broken in the framework (not user skill content), help draft an upstream issue with sanitized context.
@@ -649,6 +713,20 @@ Before posting, check audit.jsonl for `upstream_issue_filed` events:
 - Last 30 days total → if ≥5, require explicit confirmation
 
 End report.
+
+---
+
+## Subject types reference
+
+Quick reference for tuning new subjects. One row per archetype:
+
+| Subject type | Example | Cadence | Risk tier | proposer | auto_merge | Notable knobs |
+|---|---|---|---|---|---|---|
+| **Skills (native)** | `skills` | `*/15` cron | low | sonnet | `[patch, frontmatter]` | `scan_dirs`, `emotional_patterns`, `proposer_for_create` |
+| **Voice/intent (native)** | hypothetical `voice` | event-driven | medium | haiku | false | low latency, content-hash dedup, intent confidence threshold |
+| **Cron/scheduled tasks** | hypothetical `cron-jobs` | daily | medium | sonnet | false | frequency drift detection, success rate per job, schedule conflict detection |
+| **Trading/ML hyperparams** | hypothetical `trader-ml-hp` | weekly | **critical** | opus | **never** | per-subject git_repo, validation set, performance regression gate |
+| **External plugin (subprocess)** | `ExternalProcessSubject` | per cron | inherited | inherited | inherited | stdio JSON-RPC contract, timeout, restart policy |
 
 ---
 
