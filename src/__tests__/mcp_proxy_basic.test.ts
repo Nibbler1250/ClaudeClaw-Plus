@@ -88,21 +88,17 @@ describe("McpServerProcess", () => {
 
   // ── Test 4 — crash triggers restart hook ──────────────────────────────────
 
-  it("process crash triggers the onCrash hook with server name", async () => {
-    let crashedName = "";
-    const proc = new McpServerProcess("crash-test", makeServerConfig(), {
-      onCrash: (name) => { crashedName = name; },
+  it("intentional stop() sets status to stopped and does not trigger crash hook", async () => {
+    let crashCalled = false;
+    const proc = new McpServerProcess("stop-test", makeServerConfig(), {
+      onCrash: () => { crashCalled = true; },
     });
-    try {
-      await proc.start();
-      // Kill the underlying process to trigger a crash
-      await proc.stop();
-      // stop() sets status to crashed and triggers the close handler
-      // verify crash state
-      expect(["crashed", "restarting", "failed", "starting"]).toContain(proc.status);
-    } finally {
-      try { await proc.stop(); } catch {}
-    }
+    await proc.start();
+    expect(proc.status).toBe("up");
+    await proc.stop();
+    expect(proc.status).toBe("stopped");
+    // Intentional shutdown must not fire the crash hook or schedule a restart
+    expect(crashCalled).toBe(false);
   });
 
   // ── Test 5 — allowedTools filter ─────────────────────────────────────────

@@ -110,16 +110,13 @@ describe("mcp-proxy security", () => {
   // ── Test 3 — stderr doesn't pollute response ──────────────────────────────
 
   it("MCP server stderr goes to log file, not HTTP response body", async () => {
-    // Even if the server emits stderr, the JSON response should still be valid
     const resp = await invokeViaTool("test-server__echo",
       { arguments: { message: "stderr-test" }, mode: "direct" },
       proxyToken,
     );
-    // Response must be valid JSON with a result field
-    if (resp && resp.status === 200) {
-      const data = await resp.json() as { result?: unknown };
-      expect(data).toHaveProperty("result");
-    }
+    expect(resp?.status).toBe(200);
+    const data = await resp!.json() as { result?: unknown };
+    expect(data).toHaveProperty("result");
   });
 
   // ── Test 4 — path traversal args pass through without validation ──────────
@@ -129,10 +126,9 @@ describe("mcp-proxy security", () => {
       { arguments: { message: "../../etc/passwd" }, mode: "direct" },
       proxyToken,
     );
-    if (resp && resp.status === 200) {
-      const data = await resp.json() as { result?: { echo?: string } };
-      // Server echoes back exactly what we sent — proxy doesn't sanitize
-      expect(data.result).toMatchObject({ echo: "../../etc/passwd" });
-    }
+    expect(resp?.status).toBe(200);
+    const data = await resp!.json() as { result?: { echo?: string } };
+    // Server echoes back exactly what we sent — proxy doesn't sanitize
+    expect(data.result).toMatchObject({ echo: "../../etc/passwd" });
   });
 });

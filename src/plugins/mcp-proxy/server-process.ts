@@ -17,7 +17,7 @@ export interface ServerTool {
   inputSchema: Record<string, unknown>;
 }
 
-type ServerStatus = "starting" | "up" | "crashed" | "restarting" | "failed";
+type ServerStatus = "starting" | "up" | "crashed" | "restarting" | "failed" | "stopped";
 
 const BACKOFF_MS = [1_000, 5_000, 30_000, 60_000];
 const CRASH_WINDOW_MS = 5 * 60 * 1_000;
@@ -39,6 +39,8 @@ export class McpServerProcess {
   private crashTimestamps: number[] = [];
   private crashCount = 0;
   private restartHook?: (name: string, reason: string) => void;
+  private stopping = false;
+  private restartTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(name: string, config: McpServerConfig, opts?: {
     onCrash?: (name: string, reason: string) => void;
@@ -118,6 +120,12 @@ export class McpServerProcess {
   }
 
   async stop(): Promise<void> {
+    this.stopping = true;
+    if (this.restartTimer !== null) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
+    this.status = "stopped";
     try {
       await this.client?.close();
     } catch {}
@@ -126,11 +134,10 @@ export class McpServerProcess {
     } catch {}
     this.client = null;
     this.transport = null;
-    this.status = "crashed";
   }
 
   private _handleCrash(reason: string): void {
-    if (this.status === "failed") return;
+    if (this.stopping || this.status === "failed" || this.status === "stopped") return;
     this.status = "crashed";
     this.crashCount++;
     const now = Date.now();
@@ -145,7 +152,10 @@ export class McpServerProcess {
 
     const backoff = BACKOFF_MS[Math.min(this.crashCount - 1, BACKOFF_MS.length - 1)] ?? 60_000;
     this.status = "restarting";
-    setTimeout(() => this._doRestart(), backoff);
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      this._doRestart();
+    }, backoff);
   }
 
   private async _doRestart(): Promise<void> {
