@@ -70,6 +70,11 @@ Tell the user in 3 sentences:
 
 Ask if they want to proceed (yes/no). If no, exit gracefully.
 
+<<<<<<< HEAD
+=======
+**Drift detection**: Each cron tick, the tuner computes a state hash per subject. Changes to scan_dirs files, plugin registrations, etc. are detected and surfaced in the next `/tuner audit` run. Subjects opt-in by implementing `currentStateHash()` — default is no-op (empty string).
+
+>>>>>>> origin/feat/tuner-skills-subject
 ### Step 2 — Detect the git repo
 
 Scan candidate locations:
@@ -99,6 +104,58 @@ If user picks `other` → ask path → init if needed.
 
 Save the choice as `storage.git_repo` in config.
 
+<<<<<<< HEAD
+=======
+### Step 2.5 — Scan for legacy flat skills and offer migration
+
+After confirming the git repo, scan the skills directory for legacy flat `.md` files:
+
+```bash
+find "$scan_dir" -maxdepth 1 -name "*.md" ! -name "*.bak"
+# vs
+find "$scan_dir" -maxdepth 2 -name "SKILL.md"
+```
+
+Show a summary:
+
+```
+🔍 Skills format scan:
+  ✅ canslim-screener/SKILL.md  (Anthropic directory format)
+  ✅ ftd-detector/SKILL.md      (Anthropic directory format)
+  ⚠️  find-trading-edge.md      (legacy flat format)
+  ⚠️  daily-brief.md            (legacy flat format)
+  ⚠️  archiviste.md             (legacy flat format)
+
+3 legacy skills detected. Migrate to Anthropic directory format now? [yes/no/later]
+```
+
+If **yes**: for each flat skill in order:
+1. Read frontmatter + body
+2. Strip tuner-specific fields (`triggers`, `risk_tier`, `auto_merge`, `auto_merge_default`) from frontmatter
+3. Move stripped fields to `~/.config/tuner/config.yaml` under `subjects.skills.overrides.<name>`
+4. Create `<scan_dir>/<name>/SKILL.md` with cleaned frontmatter + body
+5. Backup original flat file as `<name>.md.pre-migration-<timestamp>.bak`
+6. Delete original flat file
+7. Git commit: `migrate: convert <name> to Anthropic SKILL.md format`
+
+Show progress for each skill:
+```
+Migrating find-trading-edge.md → find-trading-edge/SKILL.md... ✅
+Migrating daily-brief.md       → daily-brief/SKILL.md...       ✅
+Migrating archiviste.md        → archiviste/SKILL.md...         ✅
+
+Migration complete. Backups at:
+  ~/agent/skills/find-trading-edge.md.pre-migration-1746000000.bak
+  ...
+
+Config.yaml updated with extracted triggers and risk tiers. Run `tuner doctor` to verify.
+```
+
+If **no** or **later**: skip. Show: "You can migrate later with `/tuner setup` or `/tuner adjust <name>` → option 1."
+
+If **all skills already in directory format**: show "✅ All skills already in Anthropic directory format."
+
+>>>>>>> origin/feat/tuner-skills-subject
 ### Step 3 — Pattern adjustment
 
 Based on the dominant language detected in step 2:
@@ -176,14 +233,37 @@ End setup.
 
 Goal: when the user creates a new skill (via Claude Code native skill flow or manually), this mode complements that by registering the skill with the tuner.
 
+<<<<<<< HEAD
 ### Step 1 — Read the new skill
 
 Detect which skill the user just created:
 - Check `git status` of `storage.git_repo` for new `.md` files
+=======
+**Note:** The skills-tuner supports two formats:
+- **Directory format** (Anthropic standard, recommended): `<scan_dir>/<name>/SKILL.md` with frontmatter `name:` and `description:` only.
+- **Flat format** (legacy): `<scan_dir>/<name>.md` with full frontmatter including `triggers:`.
+
+For new skills, always prefer the directory format. Triggers and risk configuration belong in `~/.config/tuner/config.yaml` under `subjects.skills.overrides`, not in the skill file frontmatter.
+
+### Step 1 — Choose format
+
+Ask: "Format for this new skill: directory (recommended, Anthropic standard) or flat .md (legacy)?"
+
+- **directory** → scaffold `<scan_dir>/<name>/SKILL.md`
+- **flat** → create `<scan_dir>/<name>.md` (only if user specifically requests for compatibility)
+
+If directory: ask "Bundle helper scripts? (scaffolds an empty `scripts/` subdirectory)" — yes/no.
+
+### Step 2 — Read or identify the new skill
+
+Detect which skill the user just created:
+- Check `git status` of `storage.git_repo` for new `.md` or `SKILL.md` files
+>>>>>>> origin/feat/tuner-skills-subject
 - Or ask: "Which skill did you just create? (path or name)"
 
 Read its frontmatter and content.
 
+<<<<<<< HEAD
 ### Step 2 — Suggest triggers
 
 If `triggers:` is empty or weak (1-2 generic words):
@@ -194,6 +274,53 @@ If `triggers:` is empty or weak (1-2 generic words):
 4. Edit the frontmatter to add the triggers.
 
 ### Step 3 — Suggest risk_tier
+=======
+### Step 3 — Frontmatter focus: name + description
+
+The Anthropic standard requires only two frontmatter fields for discovery:
+
+```yaml
+---
+name: <skill-name>
+description: <what the skill does and when to use it — used by Claude Code skill matcher>
+---
+```
+
+The `description` is the most important field: Claude Code uses it to automatically discover and load relevant skills. It should start with what the skill does and when to use it (e.g. "Checks service health and system status. Use when asked about infrastructure, services, or system monitoring.").
+
+If the skill file already has `triggers:` or `risk_tier:` in frontmatter: inform the user that these fields are deprecated in the Anthropic format and should move to config.yaml (see Step 4).
+
+### Step 4 — Tuner-specific config in config.yaml (not frontmatter)
+
+If the user wants to configure triggers, risk_tier, or auto_merge for this skill, add them to `~/.config/tuner/config.yaml` under `subjects.skills.overrides`:
+
+```yaml
+subjects:
+  skills:
+    overrides:
+      <skill-name>:
+        triggers:
+          - /my-trigger
+          - my keyword
+        risk_tier: medium        # low | medium | high | critical
+        auto_merge_default: false
+    scan_dirs:
+      - <ensure the new skill parent dir is listed>
+```
+
+Show the proposed config block and ask confirmation before writing.
+
+### Step 5 — Suggest triggers (for config, not frontmatter)
+
+If no triggers are configured yet:
+
+1. Sample 5-10 verbatims that would plausibly invoke this skill, based on its name and description.
+2. Show suggestions as a config.yaml `overrides` block (not frontmatter).
+3. Ask user to accept/edit/reject.
+4. Write to config.yaml under `subjects.skills.overrides.<name>.triggers`.
+
+### Step 6 — Suggest risk_tier (for config)
+>>>>>>> origin/feat/tuner-skills-subject
 
 Based on the skill domain:
 
@@ -202,6 +329,7 @@ Based on the skill domain:
 - Network/API calls, sending messages, financial operations → `high`
 - Self-modification of the tuner itself → `critical`
 
+<<<<<<< HEAD
 Show recommendation, ask confirmation.
 
 ### Step 4 — Update tuner config
@@ -217,6 +345,11 @@ subjects:
 ```
 
 ### Step 5 — Domain-specific pattern hints
+=======
+Show recommendation, ask confirmation. Write to `subjects.skills.overrides.<name>.risk_tier` in config.
+
+### Step 7 — Domain-specific pattern hints
+>>>>>>> origin/feat/tuner-skills-subject
 
 If the skill is in a specialized domain, suggest adding domain words to `_EMOTIONAL_PATTERNS`:
 
@@ -227,7 +360,10 @@ If the skill is in a specialized domain, suggest adding domain words to `_EMOTIO
 User confirms before adding.
 
 End create.
+<<<<<<< HEAD
 
+=======
+>>>>>>> origin/feat/tuner-skills-subject
 ---
 
 ## Mode: adjust
@@ -247,10 +383,36 @@ Display:
 - Recent activity from `audit.jsonl` (proposals, approvals, refusals last 30d)
 - Any pending proposals for this target
 
+<<<<<<< HEAD
+=======
+### Step 2.5 — Check format and offer migration (for individual skills)
+
+If the target is an individual skill (not a whole subject), check its format:
+
+```bash
+# If SKILL.md inside a directory → directory format ✅
+# If *.md at the top of scan_dir → flat format ⚠️
+```
+
+If flat format, show **before** the adjustment menu:
+
+```
+⚠️  daily-brief is in legacy flat format.
+  Migrate to Anthropic directory format (daily-brief/SKILL.md)? [yes/no]
+```
+
+If **yes**: run migration (same process as setup Step 2.5):
+- Strip tuner fields to config, create directory, backup original, git commit
+- Reload skill state, proceed to adjustment menu on the migrated skill
+
+If **no**: continue with adjustment menu as-is (flat format still supported).
+
+>>>>>>> origin/feat/tuner-skills-subject
 ### Step 3 — Offer adjustment menu
 
 ```
 What would you like to adjust?
+<<<<<<< HEAD
   1. Triggers
   2. Risk tier
   3. Auto-merge policy
@@ -262,6 +424,28 @@ What would you like to adjust?
 ```
 
 For each, walk through the change, show the diff, ask confirmation, write to config.
+=======
+  1. Migrate to Anthropic directory format (recommended) [only shown for legacy flat skills]
+  2. Triggers
+  3. Risk tier
+  4. Auto-merge policy
+  5. Proposer model (Sonnet ↔ Opus ↔ Haiku ↔ ML backend)
+  6. Scan directories
+  7. Emotional/negative/positive patterns
+  8. Cool-down period for this skill
+  9. Disable / enable
+  10. Git repo (where this subject's proposals are committed)
+```
+
+For option 10 — Git repo:
+- Show current value: `subjects.<name>.git_repo` or "(using storage.git_repo default)".
+- Prompt: "New git repo path for <subject> (or blank to use storage default):"
+- Validate: `git -C <path> rev-parse --is-inside-work-tree` or offer `git init`.
+- Write `subjects.<name>.git_repo: <path>` to config.yaml (or remove key to revert to default).
+- Confirm change and run `tuner doctor`.
+
+For each other option, walk through the change, show the diff, ask confirmation, write to config.
+>>>>>>> origin/feat/tuner-skills-subject
 
 ### Step 4 — Validate + commit config
 
@@ -322,13 +506,81 @@ Markdown report sectioned per subject:
 - Self-modify events: 1 (2026-04-15: simplified setup mode)
 ```
 
+<<<<<<< HEAD
 ### Step 5 — Compare vs reflection baseline
+=======
+### Step 4.5 — Format compliance
+
+Scan each `scan_dir` for flat `.md` files and directory-format `SKILL.md` files. Add a section to the report:
+
+```
+## Format compliance
+- 12 skills total
+- 9 directory format (Anthropic standard) ✅
+- 3 legacy flat format ⚠️
+  - daily-brief.md
+  - archiviste.md
+  - claudeclaw-digest.md
+
+Run /tuner adjust <name> to migrate individually, or /tuner setup to migrate all.
+```
+
+If all skills are in directory format: `✅ All 12 skills in Anthropic directory format.`
+
+### Step 4.6 — Subject git topology
+
+Read `~/.config/tuner/config.yaml`. For each enabled subject, show:
+
+```
+## Subject git topology
+
+| Subject       | Repo                              | Status |
+|---------------|-----------------------------------|--------|
+| skills        | ~/agent/skills                    | ok git |
+| voice         | ~/agent/voice-config              | ok git |
+| trader-ml-hp  | ~/Projects/momentum_trader_v7     | ok git |
+| archiviste    | (uses storage.git_repo default)   | ok git |
+```
+
+For each subject:
+- Run `git -C <resolved_path> rev-parse --is-inside-work-tree` to verify.
+- If no `git_repo` in subject config: label as "(uses storage.git_repo default)".
+- If subject `scan_dirs` are outside the subject's `git_repo`: flag with warning (proposals would commit outside scan surface).
+
+If any subject uses `storage.git_repo` as default: suggest per-subject isolation via `/tuner adjust <subject>`.
+
+### Step 5 — Drift detection summary
+
+Read `~/.config/tuner/state-hashes.jsonl` and recent `audit.jsonl` entries (last 30 days).
+
+For each enabled subject, find the most recent `subject_state_drift_detected` event:
+
+```
+## Subject state drift
+
+| Subject       | Last drift detected     | Action             |
+|---------------|-------------------------|--------------------|
+| skills        | none in last 30d        | stable             |
+| voice         | 2026-05-09 03:00        | scan_dirs changed since last audit |
+| trader-ml-hp  | 2026-05-08 03:00        | strategies/ updated since last audit |
+| archiviste    | none                    | stable             |
+```
+
+For each subject with recent drift, suggest:
+> State changed since last audit for `<subject>`. Run `/tuner adjust <subject>` to review and refresh.
+
+### Step 6 — Compare vs reflection baseline
+>>>>>>> origin/feat/tuner-skills-subject
 
 Read `reflection-baseline.md` — the user answers from setup. For each "what I wish improved" item:
 - Did the tuner detect related patterns? (search audit log for matching keywords)
 - Show: "Goal '<verbatim>' → 0 / 3 / 12 related proposals so far. Try `/tuner adjust` to refine triggers if 0."
 
+<<<<<<< HEAD
 ### Step 6 — Suggested next actions
+=======
+### Step 7 — Suggested next actions
+>>>>>>> origin/feat/tuner-skills-subject
 
 Based on metrics, output 1-3 concrete suggestions:
 - "Approval rate on `voice` is 100% — enable auto_merge?"

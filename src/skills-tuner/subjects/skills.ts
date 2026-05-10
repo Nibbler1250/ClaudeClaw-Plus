@@ -1,6 +1,7 @@
-import { writeFile, copyFile, mkdir } from 'node:fs/promises';
-import { existsSync, statSync } from 'node:fs';
-import { join, dirname, basename, resolve } from 'node:path';
+import { writeFile, copyFile, mkdir, readdir } from 'node:fs/promises';
+import { existsSync, statSync, readdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { join, dirname, basename, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { createReadStream } from 'node:fs';
@@ -28,12 +29,29 @@ export const DEFAULT_EMOTIONAL_PATTERNS: RegExp[] = [
 
 export const ORPHAN_SKILL = ORPHAN_SUBJECT;
 
+export interface SkillEntry {
+  path: string;
+  dirPath: string | null;           // set for directory format, null for flat
+  format: 'flat' | 'directory';
+  frontmatter: Record<string, unknown>;
+  content: string;
+  triggers: string[];               // resolved: config overrides > frontmatter > name
+}
+
+export interface SkillOverride {
+  triggers?: string[];
+  risk_tier?: string;
+  auto_merge_default?: boolean;
+}
+
 export interface SkillsSubjectConfig {
   llm?: LLMClient;
   scanDirs?: string[];
   emotionalPatterns?: RegExp[];
   negativePatterns?: RegExp[];
   positivePatterns?: RegExp[];
+  // Skills-tuner-specific metadata for Anthropic-format skills (no frontmatter pollution)
+  overrides?: Record<string, SkillOverride>;
 }
 
 function combineRegex(patterns: RegExp[]): RegExp {
@@ -62,7 +80,8 @@ export class SkillsSubject extends BaseSubject {
   private readonly negRe: RegExp;
   private readonly posRe: RegExp;
   private readonly emotRe: RegExp;
-  private skillsCache: Map<string, { path: string; frontmatter: Record<string, unknown>; content: string; triggers: string[] }> | null = null;
+  private readonly overrides: Record<string, SkillOverride>;
+  private skillsCache: Map<string, SkillEntry> | null = null;
 
   constructor(opts: SkillsSubjectConfig = {}) {
     super();
@@ -71,6 +90,7 @@ export class SkillsSubject extends BaseSubject {
     this.negRe = combineRegex(opts.negativePatterns ?? DEFAULT_NEGATIVE_PATTERNS);
     this.posRe = combineRegex(opts.positivePatterns ?? DEFAULT_POSITIVE_PATTERNS);
     this.emotRe = combineRegex(opts.emotionalPatterns ?? DEFAULT_EMOTIONAL_PATTERNS);
+    this.overrides = opts.overrides ?? {};
   }
 
   async collectObservations(since: Date): Promise<Observation[]> {
@@ -141,7 +161,6 @@ export class SkillsSubject extends BaseSubject {
       });
     }
 
-    // sort by frequency descending
     clusters.sort((a, b) => b.frequency - a.frequency);
     return clusters;
   }
@@ -162,23 +181,34 @@ export class SkillsSubject extends BaseSubject {
     const allowed = this.scanDirs.map(d => resolve(expandHome(d)));
 
     if (CREATE_KINDS.has(proposal.kind as never)) {
-      const slug = alt.label.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '') || 'new-skill';
-      let target = resolve(expandHome(this.scanDirs[0]!), slug + '.md');
-      if (existsSync(target)) {
+      const slug = (alt.label.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/, '') || 'new-skill');
+      const baseDir = resolve(expandHome(this.scanDirs[0]!));
+
+      // Default to directory format (Anthropic standard)
+      let actualDir = resolve(baseDir, slug);
+      let target = join(actualDir, 'SKILL.md');
+
+      // Collision: append timestamp
+      if (existsSync(actualDir)) {
         const ts = Math.floor(Date.now() / 1000);
-        target = target.replace(/\.md$/, '-' + ts + '.md');
+        actualDir = actualDir + '-' + ts;
+        target = join(actualDir, 'SKILL.md');
       }
-      if (!allowed.some(d => target.startsWith(d + '/') || target === d)) {
-        throw new Error('Target ' + target + ' outside scan_dirs');
+
+      // Path containment guard
+      const targetReal = resolve(target);
+      if (!allowed.some(d => targetReal === d || targetReal.startsWith(d + sep) || targetReal.startsWith(d + '/'))) {
+        throw new Error('Target ' + targetReal + ' outside scan_dirs');
       }
-      await mkdir(dirname(target), { recursive: true });
+
+      await mkdir(actualDir, { recursive: true });
       await writeFile(target, alt.diff_or_content, 'utf8');
       this.skillsCache = null;
       return { target_path: target, kind: proposal.kind, applied_content: alt.diff_or_content };
     }
 
     const target = resolve(expandHome(proposal.target_path));
-    if (!allowed.some(d => target.startsWith(d + '/') || target === d)) {
+    if (!allowed.some(d => target.startsWith(d + sep) || target.startsWith(d + '/') || target === d)) {
       throw new Error('Target ' + target + ' outside scan_dirs');
     }
     if (!existsSync(target)) {
@@ -197,9 +227,13 @@ export class SkillsSubject extends BaseSubject {
         return { valid: false, reason: 'Created skill missing frontmatter' };
       }
       const fm = content.split('---')[1] ?? '';
-      if (!fm.includes('triggers:')) {
-        return { valid: false, reason: 'Created skill missing triggers: in frontmatter (anti-loop guard)' };
+      if (!fm.includes('name:')) {
+        return { valid: false, reason: 'Created skill missing name: in frontmatter (Anthropic format requires name)' };
       }
+      if (!fm.includes('description:')) {
+        return { valid: false, reason: 'Created skill missing description: in frontmatter (Anthropic format requires description for discovery)' };
+      }
+      // Note: triggers: is optional — configure in ~/.config/tuner/config.yaml under subjects.skills.overrides
     }
     return { valid: true };
   }
@@ -237,20 +271,58 @@ export class SkillsSubject extends BaseSubject {
 
   // ── Private helpers ──
 
-  private async loadSkillsMap() {
+  private async loadSkillsMap(): Promise<Map<string, SkillEntry>> {
     if (this.skillsCache) return this.skillsCache;
-    const map = new Map<string, { path: string; frontmatter: Record<string, unknown>; content: string; triggers: string[] }>();
+    const map = new Map<string, SkillEntry>();
+
     for (const dir of this.scanDirs) {
       const expanded = dir.replace(/^~/, homedir());
       if (!existsSync(expanded)) continue;
-      const files = await this.scanMdFiles(expanded);
-      for (const file of files) {
-        const { frontmatter, body } = await this.loadFrontmatter(file);
-        const name = (frontmatter['name'] as string | undefined) ?? basename(file, '.md');
-        const triggers = this.parseTriggers(frontmatter, name);
-        map.set(name, { path: file, frontmatter, content: body, triggers });
+
+      let entries;
+      try {
+        entries = await readdir(expanded, { withFileTypes: true });
+      } catch { continue; }
+
+      // Pass 1: directory format (Anthropic standard — higher priority)
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const skillMdPath = join(expanded, entry.name, 'SKILL.md');
+        if (!existsSync(skillMdPath)) continue;
+        const { frontmatter, body } = await this.loadFrontmatter(skillMdPath);
+        const name = (frontmatter['name'] as string | undefined) ?? entry.name;
+        const configOverride = this.overrides[name]?.triggers;
+        const triggers = Array.isArray(configOverride) ? configOverride : this.parseTriggers(frontmatter, name);
+        map.set(name, {
+          path: skillMdPath,
+          dirPath: join(expanded, entry.name),
+          format: 'directory',
+          frontmatter,
+          content: body,
+          triggers,
+        });
+      }
+
+      // Pass 2: flat format — skipped if directory format already loaded for same name
+      for (const entry of entries) {
+        if (entry.isDirectory() || !entry.name.endsWith('.md') || entry.name.includes('.bak')) continue;
+        const filePath = join(expanded, entry.name);
+        const { frontmatter, body } = await this.loadFrontmatter(filePath);
+        const name = (frontmatter['name'] as string | undefined) ?? entry.name.replace(/\.md$/, '');
+        if (map.has(name)) continue; // directory format wins
+        const configOverride = this.overrides[name]?.triggers;
+        const triggers = Array.isArray(configOverride) ? configOverride : this.parseTriggers(frontmatter, name);
+        map.set(name, {
+          path: filePath,
+          dirPath: null,
+          format: 'flat',
+          frontmatter,
+          content: body,
+          triggers,
+        });
       }
     }
+
     this.skillsCache = map;
     return map;
   }
@@ -275,22 +347,18 @@ export class SkillsSubject extends BaseSubject {
   private async findSessionFiles(since: Date): Promise<string[]> {
     const files: string[] = [];
 
-    // Scan ~/.claude/projects for session jsonl files
     const home = homedir();
     const projectsDir = join(home, '.claude', 'projects');
     if (existsSync(projectsDir)) {
-      const { readdir } = await import('node:fs/promises');
       try {
         const projects = await readdir(projectsDir, { withFileTypes: true });
         for (const project of projects) {
           if (!project.isDirectory()) continue;
           const projectPath = join(projectsDir, project.name);
-          // Direct jsonl files
           const direct = await readdir(projectPath).catch(() => [] as string[]);
           for (const f of direct) {
             if (f.endsWith('.jsonl')) files.push(join(projectPath, f));
           }
-          // Sessions subdir
           const sessionsPath = join(projectPath, 'sessions');
           if (existsSync(sessionsPath)) {
             const sesFiles = await readdir(sessionsPath).catch(() => [] as string[]);
@@ -313,7 +381,7 @@ export class SkillsSubject extends BaseSubject {
       .slice(0, 50);
   }
 
-  private async scanSession(filePath: string, skills: Map<string, { triggers: string[]; path: string; frontmatter: Record<string, unknown>; content: string }>, since: Date): Promise<Observation[]> {
+  private async scanSession(filePath: string, skills: Map<string, SkillEntry>, since: Date): Promise<Observation[]> {
     const observations: Observation[] = [];
     const messages: Array<Record<string, unknown>> = [];
 
@@ -416,7 +484,6 @@ export class SkillsSubject extends BaseSubject {
     const skillInfo = skills.get(skillName);
     const skillPath = skillInfo?.path ?? join(this.scanDirs[0]!, skillName + '.md');
     const rawSkillContent = skillInfo?.content ?? '(content not found)';
-    // Sanitize skill content before injecting into LLM prompt (prompt injection prevention)
     const skillContent = sanitizeObservationContent(rawSkillContent, 10_000);
     const evidence = cluster.observations.slice(0, 6)
       .map(o => '- [' + o.signal_type + '] ' + sanitizeObservationContent(o.verbatim)).join('\n');
@@ -438,8 +505,8 @@ export class SkillsSubject extends BaseSubject {
   }
 
   private async llmProposeNewSkill(evidence: string, cluster: Cluster) {
-    const system = 'You are an expert in AI agent design. Some frustration signals don\'t match any existing skill — a skill is likely missing. Propose 3 alternatives for a new skill. Reply ONLY with a JSON array of 3 objects: [{"id":"A","label":"...","diff_or_content":"...","tradeoff":"..."},...]. Content must include YAML frontmatter (name, triggers) + markdown body.';
-    const user = 'Unattributed signals (' + cluster.frequency + ' occurrences):\n' + evidence + '\n\nIdentify the implicit need and propose 3 skill templates.';
+    const system = 'Generate a Claude Code skill in the Anthropic standard directory format. The output should be the contents of SKILL.md (a single markdown file with frontmatter name: and description:, body in markdown). The description should be discoverable — start with what the skill does and when to use it, since Claude Code skill matcher uses descriptions to choose which skills to load. Do NOT include triggers: or risk_tier: in the frontmatter — those go in the user config. Reply ONLY with a JSON array of 3 objects: [{"id":"A","label":"...","diff_or_content":"...","tradeoff":"..."},...]';
+    const user = 'Unattributed signals (' + cluster.frequency + ' occurrences):\n' + evidence + '\n\nIdentify the implicit need and propose 3 skill templates in Anthropic directory format (SKILL.md content).';
     const raw = await this.llm!.call('proposer', system, [{ role: 'user', content: user }], 4000);
     const data = JSON.parse(stripFences(raw)) as Array<{ id: string; label: string; diff_or_content: string; tradeoff?: string }>;
     return data.slice(0, 3).map(a => ({ id: a.id, label: a.label, diff_or_content: a.diff_or_content, tradeoff: a.tradeoff ?? '' }));
@@ -454,18 +521,18 @@ export class SkillsSubject extends BaseSubject {
   }
 
   private fallbackNewSkillAlternatives() {
+    // Anthropic standard format: name + description in frontmatter, no triggers (go in config)
     return [
-      { id: 'A', label: 'new-skill', diff_or_content: '---\nname: new-skill\ntriggers: new-skill\n---\n\n# New Skill\n\nDescribe the skill here.\n', tradeoff: 'Minimal starting point' },
-      { id: 'B', label: 'system-monitor', diff_or_content: '---\nname: system-monitor\ntriggers: status, check, health, monitor\n---\n\n# System Monitor\n\nCheck the state of services.\n', tradeoff: 'Useful if signals relate to infra' },
-      { id: 'C', label: 'assistant-context', diff_or_content: '---\nname: assistant-context\ntriggers: help, context, remember\n---\n\n# Assistant Context\n\nContext about the assistant.\n', tradeoff: 'Useful if signals relate to general assistance' },
+      { id: 'A', label: 'new-skill', diff_or_content: '---\nname: new-skill\ndescription: Describe what this skill does and when to use it. This description is used by Claude Code skill matcher.\n---\n\n# New Skill\n\nDescribe the skill here.\n', tradeoff: 'Minimal Anthropic-format starting point' },
+      { id: 'B', label: 'system-monitor', diff_or_content: '---\nname: system-monitor\ndescription: Check the state of services, disk usage, and system health. Use when asked about infrastructure status.\n---\n\n# System Monitor\n\nCheck the state of services.\n', tradeoff: 'Useful if signals relate to infra' },
+      { id: 'C', label: 'assistant-context', diff_or_content: '---\nname: assistant-context\ndescription: Provides context about the assistant persona, preferences, and collaboration style. Use for onboarding or preference discussions.\n---\n\n# Assistant Context\n\nContext about the assistant.\n', tradeoff: 'Useful if signals relate to general assistance' },
     ];
   }
 
-  private fallbackAlternatives(skillName: string, skillInfo: { path: string; frontmatter: any; content: string } | undefined) {
-    // Reconstruct frontmatter block to ensure all alternatives keep triggers/name (anti-data-loss)
+  private fallbackAlternatives(skillName: string, skillInfo: SkillEntry | undefined) {
     const fm = skillInfo?.frontmatter ?? {};
-    const triggersList = Array.isArray(fm.triggers) ? fm.triggers : (fm.triggers ? [fm.triggers] : [skillName]);
-    const fmBlock = '---\nname: ' + (fm.name ?? skillName) + '\ntriggers: ' + JSON.stringify(triggersList) + (fm.description ? '\ndescription: ' + JSON.stringify(fm.description) : '') + '\n---\n\n';
+    const triggersList = Array.isArray(fm['triggers']) ? fm['triggers'] : (fm['triggers'] ? [fm['triggers']] : [skillName]);
+    const fmBlock = '---\nname: ' + (fm['name'] ?? skillName) + (fm['description'] ? '\ndescription: ' + JSON.stringify(fm['description']) : '') + (triggersList.length > 0 && fm['triggers'] ? '\ntriggers: ' + JSON.stringify(triggersList) : '') + '\n---\n\n';
     const body = skillInfo?.content ?? '';
     return [
       { id: 'A', label: 'Concise version', diff_or_content: fmBlock + '# ' + skillName + '\n\n' + body.slice(0, 500).trim() + '\n', tradeoff: 'Reduces noise, keeps the essentials' },
@@ -473,4 +540,125 @@ export class SkillsSubject extends BaseSubject {
       { id: 'C', label: 'With explicit triggers (verbose)', diff_or_content: fmBlock + body, tradeoff: 'Frontmatter normalized; body unchanged' },
     ];
   }
+
+  // ── Migration helpers ──
+
+  /** List skills that are still in legacy flat format — migration candidates. */
+  async listMigrationCandidates(): Promise<string[]> {
+    const skills = await this.loadSkillsMap();
+    return [...skills.values()]
+      .filter(s => s.format === 'flat')
+      .map(s => (s.frontmatter['name'] as string | undefined) ?? basename(s.path, '.md'));
+  }
+
+  /**
+   * Convert a flat skill file to Anthropic directory format (<name>/SKILL.md).
+   * Strips tuner-specific fields (triggers, risk_tier, auto_merge*) from frontmatter.
+   * Returns the stripped fields so the caller can persist them to config.yaml.
+   * Backs up the original flat file with a .pre-migration-<ts>.bak suffix before removing it.
+   */
+  async migrateSkillToDirectory(skillName: string): Promise<Record<string, unknown>> {
+    // Validate skillName before any FS operations
+    if (/[/\\]/.test(skillName) || skillName === '..' || skillName === '.') {
+      throw new Error('Invalid skill name for migration: ' + skillName);
+    }
+
+    const skills = await this.loadSkillsMap();
+    const skill = skills.get(skillName);
+    if (!skill) throw new Error('Skill ' + skillName + ' not found');
+    if (skill.format === 'directory') return {};  // already migrated
+
+    const flatPath = skill.path;
+    const baseDir = dirname(flatPath);
+    const newDir = join(baseDir, skillName);
+    const newPath = join(newDir, 'SKILL.md');
+
+    // Path containment: newDir must be inside an allowed scanDir
+    const allowed = this.scanDirs.map(d => resolve(d.replace(/^~/, homedir())));
+    const newDirReal = resolve(newDir);
+    if (!allowed.some(d => newDirReal === d || newDirReal.startsWith(d + sep) || newDirReal.startsWith(d + '/'))) {
+      throw new Error('Migration target ' + newDirReal + ' outside scan_dirs');
+    }
+
+    if (existsSync(newDir)) {
+      throw new Error('Cannot migrate: ' + newDir + ' already exists');
+    }
+
+    const TUNER_FIELDS = ['triggers', 'trigger', 'risk_tier', 'auto_merge', 'auto_merge_default'];
+    const cleanedFrontmatter: Record<string, unknown> = {};
+    const movedToConfig: Record<string, unknown> = {};
+
+    for (const [k, v] of Object.entries(skill.frontmatter)) {
+      if (TUNER_FIELDS.includes(k)) {
+        movedToConfig[k] = v;
+      } else {
+        cleanedFrontmatter[k] = v;
+      }
+    }
+
+    // Serialize cleaned frontmatter to YAML (simple key: value, arrays as JSON for safety)
+    const fmLines = Object.entries(cleanedFrontmatter).map(([k, v]) => {
+      if (typeof v === 'string' && !v.includes('\n') && !v.includes(':') && !v.includes('"')) {
+        return k + ': ' + v;
+      }
+      return k + ': ' + JSON.stringify(v);
+    });
+    const newContent = '---\n' + fmLines.join('\n') + '\n---\n\n' + skill.content;
+
+    // Write backup BEFORE making any changes (if write fails later, original is intact)
+    const backupPath = flatPath + '.pre-migration-' + Date.now() + '.bak';
+    await copyFile(flatPath, backupPath);
+
+    // Create directory and write SKILL.md
+    await mkdir(newDir, { recursive: true });
+    await writeFile(newPath, newContent, 'utf8');
+
+    // Remove original flat file — backup already safe
+    const { unlink } = await import('node:fs/promises');
+    await unlink(flatPath);
+
+    this.skillsCache = null;
+    return movedToConfig;
+  }
+
+  currentStateHash(): string {
+    const items: string[] = [];
+    for (const dir of this.scanDirs) {
+      const expanded = dir.replace(/^~/, homedir());
+      if (!existsSync(expanded)) continue;
+      const entries = walkSkillFiles(expanded);
+      for (const e of entries) {
+        items.push(`${e.relPath}\t${e.mtimeMs}\t${e.size}`);
+      }
+    }
+    items.sort();
+    return createHash('sha256').update(items.join('\n')).digest('hex');
+  }
+}
+
+function walkSkillFiles(dir: string): Array<{ relPath: string; mtimeMs: number; size: number }> {
+  const result: Array<{ relPath: string; mtimeMs: number; size: number }> = [];
+  function recurse(current: string, prefix: string) {
+    let names: string[];
+    try { names = readdirSync(current); } catch { return; }
+    for (const name of names) {
+      if (typeof name !== 'string') continue;
+      const full = join(current, name);
+      const rel = prefix ? join(prefix, name) : name;
+      let isDir = false;
+      try {
+        isDir = statSync(full).isDirectory();
+      } catch { continue; }
+      if (isDir) {
+        recurse(full, rel);
+      } else if (name.endsWith('.md') && !name.includes('.bak')) {
+        try {
+          const st = statSync(full);
+          result.push({ relPath: rel, mtimeMs: st.mtimeMs, size: st.size });
+        } catch { /* skip unreadable */ }
+      }
+    }
+  }
+  recurse(dir, '');
+  return result;
 }
