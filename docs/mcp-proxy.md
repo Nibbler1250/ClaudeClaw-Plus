@@ -157,10 +157,21 @@ contract. The mcp-proxy plugin (~200 LOC of TypeScript + `server-process.ts`) is
 and can be lifted into any of these runtimes by mapping their plugin lifecycle to the manifest
 contract.
 
-## Next plugin candidate: archiviste
+## Next plugin candidates
 
-After mcp-proxy, the archiviste retrieval system is the natural next integration:
-- Today: Python scripts + cron, invoked async via `spawn_archiviste` (~30s)
-- Future: archiviste becomes a Plus HTTP plugin (Flask daemon on localhost:5050)
-  registering directly with the gateway — search calls become sync at ~200ms
-- See `~/agent/archiviste/daemon.py` for the implementation.
+### Archiviste (shipped in this PR)
+
+The archiviste retrieval daemon is already a Plus HTTP plugin (`daemon.py`, localhost:5050):
+- Registers at startup via `/api/plugin/register` with tools `archiviste_search`, `archiviste_index_status`, `archiviste_rebuild_index`
+- Search latency: ~200ms (sync gateway call) vs ~30s (prior async spawn path)
+- Systemd unit at `~/agent/archiviste/systemd/archiviste-daemon.service`
+
+### Voice-agent migration (follow-up PR)
+
+Existing voice-driven agents using the `mcp_invoke` helper (POST `/api/inject` → Claude → MCP)
+can switch to a `mcp_proxy_invoke` helper (POST `/api/plugin/<server>/tools/<tool>/invoke` → warm pool)
+in a follow-up PR. Expected latency drop: ~3000ms → ~200ms for deterministic tool calls (home
+automation, search). The migration is a 3-line helper addition plus call-site rewrites.
+
+Out of scope of the mcp-proxy infrastructure PR by design — infrastructure first, then migrate
+consumers progressively to validate the new path under real load.
