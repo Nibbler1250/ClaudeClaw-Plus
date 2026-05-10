@@ -18,7 +18,7 @@ export function makeSetupTool(): PluginTool {
     description: "First-run setup: checks/installs the /tuner skill and default config. Idempotent.",
     schema: z.object({
       dry: z.boolean().optional().describe("If true, only check state without writing anything."),
-    }),
+    }).strict(),
     handler: async ({ dry }) => {
       const home = homedir();
       const steps: SetupStep[] = [];

@@ -8,12 +8,12 @@ export function makeRevertTool(bundle: EngineBundle): PluginTool {
     description: "Revert a previously applied proposal by undoing its git commit.",
     schema: z.object({
       id: z.number().int().describe("Proposal ID to revert."),
-    }),
+    }).strict(),
     handler: async ({ id }) => {
       const records = bundle.proposals.readAll();
-      const applied = records.find((r) => r.proposal.id === id && r.event === "applied");
+      const applied = records.find((r) => r.proposal?.id === id && r.event === "applied");
       if (!applied) throw new Error(`No applied record found for proposal #${id}`);
-      const commitSha = (applied as { commit_sha?: string }).commit_sha ?? "";
+      const commitSha = applied.commit_sha ?? "";
       await bundle.engine.revertProposal(id);
       return { reverted: true, commit_sha: commitSha };
     },

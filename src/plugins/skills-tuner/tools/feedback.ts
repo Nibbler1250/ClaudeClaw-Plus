@@ -11,7 +11,7 @@ export function makeFeedbackTool(bundle: EngineBundle): PluginTool {
     schema: z.object({
       id: z.number().int().describe("Proposal ID."),
       preferred: z.enum(["yes", "yes-but", "no"]).describe("Feedback sentiment."),
-    }),
+    }).strict(),
     handler: ({ id, preferred }) => {
       const all = bundle.proposals.readAll();
       const record = all.find((r) => r?.proposal?.id === id);

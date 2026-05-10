@@ -9,17 +9,15 @@ export function makeApplyTool(bundle: EngineBundle): PluginTool {
     schema: z.object({
       id: z.number().int().describe("Proposal ID to apply."),
       alternative_id: z.enum(["A", "B", "C"]).describe("Alternative to apply."),
-    }),
+    }).strict(),
     handler: async ({ id, alternative_id }) => {
       await bundle.engine.applyProposal(id, alternative_id);
       const records = bundle.proposals.readAll();
-      const applied = records.findLast(
-        (r) => r.proposal.id === id && r.event === "applied",
-      );
+      const applied = records.findLast((r) => r.proposal?.id === id && r.event === "applied");
       return {
         applied: true,
-        commit_sha: (applied as { commit_sha?: string } | undefined)?.commit_sha ?? "",
-        path: (applied as { applied_target_path?: string } | undefined)?.applied_target_path ?? "",
+        commit_sha: applied?.commit_sha ?? "",
+        path: applied?.applied_target_path ?? "",
       };
     },
   };

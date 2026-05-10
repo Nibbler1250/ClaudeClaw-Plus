@@ -9,7 +9,7 @@ export function makeSkipTool(bundle: EngineBundle): PluginTool {
     schema: z.object({
       id: z.number().int().describe("Proposal ID to skip."),
       reason: z.string().optional().describe("Optional reason for skipping."),
-    }),
+    }).strict(),
     handler: async ({ id, reason }) => {
       await bundle.engine.refuseProposal(id, reason ?? "skip");
       return { skipped: true };
