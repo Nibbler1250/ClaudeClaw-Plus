@@ -117,6 +117,11 @@ export class Engine {
 
     const maxPerRun = this.config.detection.max_proposals_per_run;
     const refusedSigs = this.refused.activeSignatures();
+    // Defense-in-depth: also block patterns that appear as event:refused in the
+    // proposals log even if refused.jsonl is empty/corrupt. Without this, a
+    // single refusal that fails to populate refused.jsonl (e.g. migration bug,
+    // manual edit) makes the engine re-propose the same pattern indefinitely.
+    const recordedRefusedSigs = this.proposals.refusedSignatures({ subject: subjectName });
     const appliedSigs = this.proposals.appliedSignatures({ withinDays: 30 });
     const pendingSigs = this.proposals.pendingSignatures({ subject: subjectName });
 
@@ -133,6 +138,7 @@ export class Engine {
 
       // Dedup checks (anti-spam — bug fix 2351440)
       if (refusedSigs.has(rawProposal.pattern_signature)) continue;
+      if (recordedRefusedSigs.has(rawProposal.pattern_signature)) continue;
       if (appliedSigs.has(rawProposal.pattern_signature)) continue;
       if (pendingSigs.has(rawProposal.pattern_signature)) continue;
 

@@ -467,6 +467,13 @@ export class SkillsSubject extends BaseSubject {
       ? await this.llmProposeNewSkill(evidence, cluster).catch(() => this.fallbackNewSkillAlternatives())
       : this.fallbackNewSkillAlternatives();
 
+    // pattern_signature must be stable across days so refused proposals
+    // remain deduped. Hash the first observations' verbatim so distinct
+    // orphan needs (different verbatims) get distinct signatures, but the
+    // same orphan need on different days collapses to one signature.
+    const orphanContentHash = createHash('sha256')
+      .update(cluster.observations.slice(0, 5).map(o => o.verbatim).join('|'))
+      .digest('hex').slice(0, 16);
     return {
       id: 0,
       cluster_id: cluster.id,
@@ -474,7 +481,7 @@ export class SkillsSubject extends BaseSubject {
       kind: 'new_skill',
       target_path: targetPath,
       alternatives,
-      pattern_signature: cluster.id + ':new_skill',
+      pattern_signature: 'skills:' + ORPHAN_SKILL + ':new_skill:' + orphanContentHash,
       created_at: new Date(),
     };
   }
@@ -499,7 +506,10 @@ export class SkillsSubject extends BaseSubject {
       kind: 'patch',
       target_path: skillPath,
       alternatives,
-      pattern_signature: cluster.id + ':' + skillPath + ':patch',
+      // Stable across days: same skillPath + same kind = same signature.
+      // Previously included cluster.id which embeds the date (skills-foo-20260509),
+      // making refused dedup fail every midnight.
+      pattern_signature: 'skills:' + skillPath + ':patch',
       created_at: new Date(),
     };
   }
