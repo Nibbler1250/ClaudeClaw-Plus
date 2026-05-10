@@ -8,7 +8,7 @@ export function makeStatsTool(bundle: EngineBundle): PluginTool {
     description: "Show proposal statistics: total records, counts by event type, and breakdown by subject.",
     schema: z.object({}).strict(),
     handler: () => {
-      const all = bundle.proposals.readAll();
+      const all = bundle.proposals.readAll().filter((r) => r?.proposal);
       const counts = { created: 0, applied: 0, refused: 0 };
       const bySubject: Record<string, { created: number; applied: number; refused: number }> = {};
       for (const r of all) {

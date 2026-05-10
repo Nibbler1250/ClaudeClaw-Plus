@@ -8,7 +8,7 @@ export function makePendingTool(bundle: EngineBundle): PluginTool {
     description: "List pending tuner proposals across all subjects.",
     schema: z.object({}).strict(),
     handler: () => {
-      const all = bundle.proposals.readAll();
+      const all = bundle.proposals.readAll().filter((r) => r?.proposal);
       const resolved = new Set(
         all.filter((r) => r.event !== "created").map((r) => r.proposal.pattern_signature),
       );
