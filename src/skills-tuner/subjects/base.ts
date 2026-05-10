@@ -9,7 +9,16 @@ export abstract class BaseSubject extends TunableSubject {
     const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
     if (!match) return { frontmatter: {}, body: content };
     const yaml = await import('js-yaml');
-    const parsed = yaml.load(match[1]!);
+    let parsed: unknown = {};
+    try {
+      parsed = yaml.load(match[1]!);
+    } catch (err) {
+      // Malformed YAML frontmatter — log + treat as no frontmatter so scan continues.
+      // Real-world skills authored by humans regularly have minor YAML mistakes
+      // (unquoted strings, bad indent); one bad file should not kill the whole scan.
+      console.warn(`[skills-tuner] Malformed YAML frontmatter in ${filePath}: ${(err as Error).message ?? err}`);
+      parsed = {};
+    }
     return {
       frontmatter: (parsed != null && typeof parsed === 'object' ? parsed : {}) as Record<string, unknown>,
       body: match[2]!,
