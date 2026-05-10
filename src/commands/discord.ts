@@ -14,6 +14,8 @@ import { mkdir } from "node:fs/promises";
 import { extname, join, basename, sep } from "node:path";
 import { processEventWithFallback, setGatewayEnabled } from "../gateway";
 import { normalizeDiscordMessage, type NormalizedEvent } from "../gateway/normalizer";
+import type { EventRecord } from "../event-log";
+import type { GatewayRunResult } from "../event-processor";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
 
 // --- Discord API constants ---
@@ -1145,13 +1147,12 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
         return;
       }
 
-      // Deliver response back to Discord
+      // Legacy fallback case: gateway was disabled, the inline legacyHandler ran.
+      // Deliver its stdout immediately. When the gateway is enabled, the response
+      // is delivered asynchronously by deliverGatewayReply via the event processor.
       if (gatewayResult.legacyResult?.stdout) {
         const responseText = gatewayResult.legacyResult.stdout || "Done.";
         await sendMessage(config.token, channelId, responseText);
-      } else {
-        // Gateway path - response will be delivered asynchronously via the event processor
-        await sendMessage(config.token, channelId, "Processing your request...");
       }
       return;
     }
@@ -1751,6 +1752,71 @@ function connectGateway(token: string, url?: string): void {
   ws.onerror = () => {
     // onclose will fire after onerror, reconnection handled there
   };
+}
+
+// --- Gateway delivery ---
+
+/**
+ * Deliver the agent's reply for a gateway-routed inbound Discord event.
+ *
+ * Registered as the Discord gateway delivery hook in start.ts:initDiscord and
+ * invoked by event-processor.ts's gateway onEvent after the agent finishes.
+ * Mirrors the legacy non-gateway delivery path's directive handling (reaction,
+ * image attachments) but without streaming, since the gateway runs the agent
+ * synchronously and only the final stdout is available.
+ */
+export async function deliverGatewayReply(
+  token: string,
+  event: EventRecord,
+  result: GatewayRunResult
+): Promise<void> {
+  const normalizedEvent = (event.payload as any)?.normalizedEvent;
+  if (!normalizedEvent) {
+    console.error(`[gateway-delivery:discord] event ${event.id} has no normalizedEvent`);
+    return;
+  }
+
+  const rawChannelId = String(normalizedEvent.channelId ?? "");
+  // Discord channelId format: "discord:dm:<channelId>" or "discord:guild:<guildId>:<channelId>"
+  const match = rawChannelId.match(/^discord:(?:dm:(\d+)|guild:\d+:(\d+))$/);
+  if (!match) {
+    console.error(`[gateway-delivery:discord] cannot parse channelId from "${rawChannelId}"`);
+    return;
+  }
+  const channelId = match[1] || match[2];
+
+  const sourceMessageId = normalizedEvent.sourceEventId ? String(normalizedEvent.sourceEventId) : null;
+  const label = `channel ${channelId}`;
+
+  if (result.exitCode !== 0) {
+    const errorMsg = `Error (exit ${result.exitCode}): ${extractErrorDetail(result) || "Unknown error"}`;
+    await sendMessage(token, channelId, errorMsg);
+    return;
+  }
+
+  const { cleanedText, reactionEmoji } = extractReactionDirective(result.stdout || "");
+
+  if (reactionEmoji && sourceMessageId) {
+    await sendReaction(token, channelId, sourceMessageId, reactionEmoji).catch((err) => {
+      console.error(`[gateway-delivery:discord] reaction failed for ${label}: ${err instanceof Error ? err.message : err}`);
+    });
+  }
+
+  const settings = getSettings();
+  // Use the inbound event's timestamp as the lower bound for "images generated during this request" —
+  // ingest time is strictly before the agent ran, so any image created during the run will pass.
+  const requestStartedAt = new Date(event.timestamp).getTime();
+  const { paths: imagePaths, cleanedText: finalText } = extractImagePaths(
+    cleanedText || "",
+    settings.discord.imageOutputRoots,
+    requestStartedAt,
+  );
+
+  if (imagePaths.length > 0) {
+    await sendMessageWithImages(token, channelId, finalText || "(empty response)", imagePaths);
+  } else {
+    await sendMessage(token, channelId, finalText || "(empty response)");
+  }
 }
 
 // --- Exports ---

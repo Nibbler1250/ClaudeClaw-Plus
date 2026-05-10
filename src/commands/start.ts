@@ -490,18 +490,21 @@ export async function start(args: string[] = []) {
 
   async function initDiscord(token: string) {
     if (token && token !== discordToken) {
-      const { startGateway, sendMessageToUser, stopGateway } = await import("./discord");
+      const { startGateway, sendMessageToUser, stopGateway, deliverGatewayReply } = await import("./discord");
       if (discordToken) stopGateway();
       startGateway(debugFlag);
       discordStopGateway = stopGateway;
       discordSendToUser = (userId, text) => sendMessageToUser(token, userId, text);
       discordToken = token;
+      // Register the outbound delivery hook so gateway-routed events get a reply.
+      registerGatewayDelivery("discord", (event, result) => deliverGatewayReply(token, event, result));
       console.log(`[${ts()}] Discord: enabled`);
     } else if (!token && discordToken) {
       if (discordStopGateway) discordStopGateway();
       discordStopGateway = null;
       discordSendToUser = null;
       discordToken = "";
+      unregisterGatewayDelivery("discord");
       console.log(`[${ts()}] Discord: disabled`);
     }
   }
