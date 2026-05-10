@@ -305,6 +305,10 @@ tuner setup                            # first-run wizard
 
 `cron-run` is the core scheduled entry point (typically `*/15` cron). Designed to detach from the scheduler — long LLM calls do not block subsequent cron ticks.
 
+### Bridge-canonical access policy
+
+New code consuming the tuner inside a Claude Code session, a Plus plugin, or a daemon adapter MUST go through the MCP bridge (`claudeclaw-plus` server, `tuner_*` tools). The CLI remains available for: (a) cron-driven cycles, (b) `tuner setup` first-run wizard, (c) debugging. Direct imports of `bootstrapEngine` or engine internals from outside the skills-tuner plugin are not part of the supported API surface.
+
 ---
 
 ## 7. Telegram integration
