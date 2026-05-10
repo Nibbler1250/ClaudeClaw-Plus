@@ -55,6 +55,26 @@ export class Engine {
     const since = opts.since ?? new Date(Date.now() - windowDays * 86_400_000);
     const totals = { proposed: 0, autoApplied: 0 };
 
+    // Pre-pass: frontmatter maintenance on all subjects that support it
+    const prePassSubjects: TunableSubject[] = opts.subjectName
+      ? [this.registry.getSubject(opts.subjectName)].filter((s): s is TunableSubject => s != null)
+      : this.registry.enabledSubjects(this.config);
+    for (const subject of prePassSubjects) {
+      if (typeof (subject as unknown as { runFrontmatterMaintenance?: () => unknown }).runFrontmatterMaintenance === 'function') {
+        try {
+          const report = await (subject as unknown as { runFrontmatterMaintenance: () => Promise<{ total: number; autoFixed: number; violations: unknown[] }> }).runFrontmatterMaintenance();
+          auditLog('frontmatter_compliance_summary', {
+            subject: subject.name,
+            total: report.total,
+            auto_fixed: report.autoFixed,
+            violations: report.violations.length,
+          });
+        } catch (e) {
+          console.warn(`[Engine] frontmatter maintenance failed for ${subject.name}:`, (e as Error).message?.slice(0, 200));
+        }
+      }
+    }
+
     const subjects: TunableSubject[] = opts.subjectName
       ? [this.registry.getSubject(opts.subjectName)].filter((s): s is TunableSubject => s != null)
       : this.registry.enabledSubjects(this.config);

@@ -462,7 +462,24 @@ Markdown report sectioned per subject:
 - Self-modify events: 1 (2026-04-15: simplified setup mode)
 ```
 
-### Step 4.5 — Format compliance
+### Step 4.5 — Format compliance + frontmatter health
+
+**Automatic frontmatter validation runs on every cron tick** (`runFrontmatterMaintenance` pre-pass in `Engine.runCycle`). Five rules are enforced:
+
+| Rule | Severity | Auto-fix |
+|------|----------|----------|
+| `name` field present | error | yes — uses dirname |
+| `name` matches dirname | error | yes — renames to dirname |
+| `description` field present | error | yes — extracted from heading + first paragraph |
+| `description` length >= 30 chars | warning | no — surfaces as proposal |
+| No legacy tuner fields (`trigger`, `triggers`, `risk_tier`, `auto_merge`, `auto_merge_default`) | error | yes — moved to config overrides |
+
+Each auto-fix creates a `.pre-autofix-<ts>.bak` backup before writing. Audit events `frontmatter_autofixed` (per fix) and `frontmatter_compliance_summary` (per cycle) are emitted to `audit.jsonl`. Non-autofixable violations (description too short) generate `frontmatter-fix` proposals with stable `pattern_signature: skills:<path>:frontmatter-fix`.
+
+To review recent frontmatter activity, check `audit.jsonl` for `frontmatter_*` events:
+```bash
+grep '"event":"frontmatter_' ~/.config/tuner/audit.jsonl | tail -20
+```
 
 Scan each `scan_dir` for flat `.md` files and directory-format `SKILL.md` files. Add a section to the report:
 
