@@ -3,6 +3,21 @@ import { ORPHAN_SUBJECT } from './types.js';
 
 export type RiskTier = 'low' | 'medium' | 'high' | 'critical';
 
+export interface FrontmatterIssue {
+  skill: string;
+  path: string;
+  rule: 'missing-name' | 'name-mismatch' | 'missing-description' | 'description-too-short' | 'legacy-tuner-field';
+  severity: 'error' | 'warning';
+  autofixable: boolean;
+  details?: string;
+}
+
+export interface FrontmatterMaintenanceReport {
+  total: number;
+  autoFixed: number;
+  violations: FrontmatterIssue[];
+}
+
 export abstract class TunableSubject {
   abstract readonly name: string;
   readonly risk_tier: RiskTier = 'low';
@@ -37,6 +52,13 @@ export abstract class TunableSubject {
   currentStateHash(): string {
     return '';
   }
+
+  /**
+   * Walk all managed skills, validate frontmatter, auto-fix safe violations,
+   * and return a summary report. Subjects that manage skill files should
+   * override this to participate in the per-cycle pre-pass.
+   */
+  runFrontmatterMaintenance?(): Promise<FrontmatterMaintenanceReport>;
 }
 
 export abstract class Adapter {

@@ -1,4 +1,4 @@
-import { writeFile, copyFile, mkdir, readdir } from 'node:fs/promises';
+import { writeFile, copyFile, mkdir, readdir, readFile } from 'node:fs/promises';
 import { existsSync, statSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, dirname, basename, resolve, sep } from 'node:path';
@@ -6,8 +6,9 @@ import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { createReadStream } from 'node:fs';
 import { BaseSubject } from './base.js';
-import { sanitizeObservationContent } from '../core/security.js';
+import { sanitizeObservationContent, auditLog } from '../core/security.js';
 import { ORPHAN_SUBJECT, CREATE_KINDS } from '../core/interfaces.js';
+import type { FrontmatterIssue, FrontmatterMaintenanceReport } from '../core/interfaces.js';
 import type { Cluster, Observation, Patch, Proposal, UnsignedProposal, ValidationResult } from '../core/types.js';
 import type { LLMClient } from '../core/llm.js';
 
@@ -130,61 +131,101 @@ export class SkillsSubject extends BaseSubject {
   }
 
   async detectProblems(observations: Observation[]): Promise<Cluster[]> {
-    if (observations.length === 0) return [];
-
-    const bySkill = new Map<string, Observation[]>();
-    for (const obs of observations) {
-      const skillName = (obs.metadata?.['skill_name'] as string | undefined) ?? 'unknown';
-      const list = bySkill.get(skillName) ?? [];
-      list.push(obs);
-      bySkill.set(skillName, list);
-    }
-
     const clusters: Cluster[] = [];
-    const now = new Date().toISOString().slice(0, 10).replace(/-/g, '');
 
-    for (const [skillName, obsList] of bySkill) {
-      if (skillName === ORPHAN_SKILL) {
-        if (obsList.length >= this.orphan_min_observations) {
-          clusters.push({
-            id: 'skills-' + ORPHAN_SKILL + '-' + now,
-            subject: 'skills',
-            observations: obsList,
-            frequency: obsList.length,
-            success_rate: 0,
-            sentiment: 'negative',
-            subjects_touched: [ORPHAN_SKILL],
-          });
-        }
-        continue;
+    if (observations.length > 0) {
+      const bySkill = new Map<string, Observation[]>();
+      for (const obs of observations) {
+        const skillName = (obs.metadata?.['skill_name'] as string | undefined) ?? 'unknown';
+        const list = bySkill.get(skillName) ?? [];
+        list.push(obs);
+        bySkill.set(skillName, list);
       }
 
-      const neg = obsList.filter(o => o.signal_type !== 'positive_feedback');
-      const pos = obsList.filter(o => o.signal_type === 'positive_feedback');
-      const total = obsList.length;
-      const successRate = total > 0 ? pos.length / total : 0;
-      const frequency = neg.length;
+      const now = new Date().toISOString().slice(0, 10).replace(/-/g, '');
 
-      if (frequency < 2) continue;
-      if (successRate > 0.8) continue;
+      for (const [skillName, obsList] of bySkill) {
+        if (skillName === ORPHAN_SKILL) {
+          if (obsList.length >= this.orphan_min_observations) {
+            clusters.push({
+              id: 'skills-' + ORPHAN_SKILL + '-' + now,
+              subject: 'skills',
+              observations: obsList,
+              frequency: obsList.length,
+              success_rate: 0,
+              sentiment: 'negative',
+              subjects_touched: [ORPHAN_SKILL],
+            });
+          }
+          continue;
+        }
 
+        const neg = obsList.filter(o => o.signal_type !== 'positive_feedback');
+        const pos = obsList.filter(o => o.signal_type === 'positive_feedback');
+        const total = obsList.length;
+        const successRate = total > 0 ? pos.length / total : 0;
+        const frequency = neg.length;
+
+        if (frequency < 2) continue;
+        if (successRate > 0.8) continue;
+
+        clusters.push({
+          id: 'skills-' + skillName + '-' + now,
+          subject: 'skills',
+          observations: obsList,
+          frequency,
+          success_rate: successRate,
+          sentiment: successRate < 0.3 ? 'negative' : 'neutral',
+          subjects_touched: [skillName],
+        });
+      }
+
+      clusters.sort((a, b) => b.frequency - a.frequency);
+    }
+
+    // Yield synthetic clusters for non-autofixable frontmatter violations
+    // (autofixable ones are handled in runFrontmatterMaintenance pre-pass)
+    const skills = await this.loadSkillsMap();
+    for (const skill of skills.values()) {
+      const issues = this.validateFrontmatter(skill);
+      const unsafe = issues.filter(i => !i.autofixable);
+      if (unsafe.length === 0) continue;
+      const skillName = (skill.frontmatter['name'] as string | undefined) ??
+        (skill.format === 'directory' ? basename(dirname(skill.path)) : basename(skill.path, '.md'));
+      // Encode frontmatter issue info in synthetic observation metadata
+      const syntheticObs: Observation = {
+        session_id: 'frontmatter-maintenance',
+        observed_at: new Date(),
+        signal_type: 'correction',
+        verbatim: 'frontmatter-fix:' + unsafe.map(i => i.rule).join(','),
+        metadata: {
+          skill_name: skillName,
+          frontmatter_issues: JSON.stringify(unsafe),
+          skill_path: skill.path,
+          cluster_kind: 'frontmatter-fix',
+        },
+      };
       clusters.push({
-        id: 'skills-' + skillName + '-' + now,
+        id: 'frontmatter-' + skillName,
         subject: 'skills',
-        observations: obsList,
-        frequency,
-        success_rate: successRate,
-        sentiment: successRate < 0.3 ? 'negative' : 'neutral',
+        observations: [syntheticObs],
+        frequency: unsafe.length,
+        success_rate: 0,
+        sentiment: 'negative',
         subjects_touched: [skillName],
       });
     }
 
-    clusters.sort((a, b) => b.frequency - a.frequency);
     return clusters;
   }
 
   async proposeChange(cluster: Cluster): Promise<UnsignedProposal> {
     const skillName = cluster.subjects_touched[0] ?? 'unknown';
+    // Detect frontmatter-fix synthetic cluster by inspecting first observation metadata
+    const firstObsMeta = cluster.observations[0]?.metadata;
+    if (firstObsMeta?.['cluster_kind'] === 'frontmatter-fix') {
+      return this.proposeFrontmatterFix(cluster, skillName);
+    }
     if (skillName === ORPHAN_SKILL) {
       return this.proposeNewSkill(cluster);
     }
@@ -222,6 +263,10 @@ export class SkillsSubject extends BaseSubject {
       await mkdir(actualDir, { recursive: true });
       await writeFile(target, alt.diff_or_content, 'utf8');
       this.skillsCache = null;
+
+      // Post-write frontmatter validation + auto-fix
+      await this.postWriteFrontmatterFix(target);
+
       return { target_path: target, kind: proposal.kind, applied_content: alt.diff_or_content };
     }
 
@@ -235,7 +280,36 @@ export class SkillsSubject extends BaseSubject {
     await copyFile(target, target + '.bak');
     await writeFile(target, alt.diff_or_content, 'utf8');
     this.skillsCache = null;
+
+    // Post-write frontmatter validation + auto-fix
+    await this.postWriteFrontmatterFix(target);
+
     return { target_path: target, kind: proposal.kind, applied_content: alt.diff_or_content };
+  }
+
+  /**
+   * After writing a SKILL.md file, load it as a SkillEntry, validate frontmatter,
+   * and auto-fix safe violations inline.
+   */
+  private async postWriteFrontmatterFix(filePath: string): Promise<void> {
+    try {
+      const { frontmatter, body } = await this.loadFrontmatter(filePath);
+      const isDir = filePath.endsWith('SKILL.md');
+      const skill: SkillEntry = {
+        path: filePath,
+        dirPath: isDir ? dirname(filePath) : null,
+        format: isDir ? 'directory' : 'flat',
+        frontmatter,
+        content: body,
+        triggers: [],
+      };
+      const issues = this.validateFrontmatter(skill);
+      if (issues.length > 0) {
+        await this.autoFixFrontmatter(skill, issues);
+      }
+    } catch {
+      // Post-write fix is best-effort — never fail the apply
+    }
   }
 
   async validate(patch: Patch): Promise<ValidationResult> {
@@ -477,12 +551,83 @@ export class SkillsSubject extends BaseSubject {
     return new Date();
   }
 
+  private async proposeFrontmatterFix(cluster: Cluster, skillName: string): Promise<UnsignedProposal> {
+    const obsMeta = cluster.observations[0]?.metadata ?? {};
+    let issues: FrontmatterIssue[] = [];
+    try {
+      issues = JSON.parse(obsMeta['frontmatter_issues'] as string ?? '[]') as FrontmatterIssue[];
+    } catch { issues = []; }
+    const skillPath = (obsMeta['skill_path'] as string | undefined) ?? join(this.scanDirs[0]!.replace(/^~/, homedir()), skillName, 'SKILL.md');
+
+    // Stable pattern_signature: skills:<absolute_path>:frontmatter-fix
+    const patternSignature = 'skills:' + skillPath + ':frontmatter-fix';
+
+    let alternatives: Array<{ id: string; label: string; diff_or_content: string; tradeoff: string }>;
+
+    if (this.llm) {
+      try {
+        const issueList = issues.map(i => `- ${i.rule}: ${i.details ?? ''}`).join('\n');
+        // Read current skill content for context
+        let currentContent = '';
+        try { currentContent = await readFile(skillPath, 'utf8'); } catch { /* skip */ }
+        const system =
+          'You are fixing frontmatter compliance issues in a Claude Code skill (SKILL.md). ' +
+          'The violations listed are non-autofixable and require human judgment (e.g. writing a better description). ' +
+          'Propose 3 concrete alternatives that resolve the violations while preserving the skill body. ' +
+          'Each diff_or_content must be the COMPLETE revised SKILL.md content. ' +
+          'Reply ONLY with a JSON array of 3 objects: [{"id":"A","label":"...","diff_or_content":"...","tradeoff":"..."}, ...]. ' +
+          'The VERY FIRST character of your reply MUST be "[". ' +
+          'Write label and tradeoff in ' + this.language + '.';
+        const user =
+          'Skill: ' + skillName + '\n' +
+          'Violations:\n' + issueList + '\n\n' +
+          'Current content:\n```\n' + currentContent.slice(0, 3000) + '\n```\n\n' +
+          'Propose 3 alternatives that fix the violations.';
+        const raw = await this.llm.call('proposer', system, [{ role: 'user', content: user }], 4000);
+        const data = JSON.parse(extractJsonArray(raw)) as Array<{ id: string; label: string; diff_or_content: string; tradeoff?: string }>;
+        alternatives = data.slice(0, 3).map(a => ({ id: a.id, label: a.label, diff_or_content: a.diff_or_content, tradeoff: a.tradeoff ?? '' }));
+      } catch {
+        alternatives = this.fallbackFrontmatterAlternatives(skillName, issues);
+      }
+    } else {
+      alternatives = this.fallbackFrontmatterAlternatives(skillName, issues);
+    }
+
+    return {
+      id: 0,
+      cluster_id: cluster.id,
+      subject: 'skills',
+      kind: 'frontmatter-fix',
+      target_path: skillPath,
+      alternatives,
+      pattern_signature: patternSignature,
+      created_at: new Date(),
+    };
+  }
+
+  private fallbackFrontmatterAlternatives(
+    skillName: string,
+    issues: FrontmatterIssue[],
+  ): Array<{ id: string; label: string; diff_or_content: string; tradeoff: string }> {
+    const issueDesc = issues.map(i => i.rule).join(', ');
+    const placeholder =
+      '---\nname: ' + skillName + '\ndescription: Describe what this skill does and when to use it (at least 30 characters).\n---\n\n# ' + skillName + '\n\nAdd skill content here.\n';
+    return [
+      { id: 'A', label: 'Add minimal compliant description', diff_or_content: placeholder, tradeoff: 'Fixes ' + issueDesc + '; description is a placeholder' },
+      { id: 'B', label: 'Same — placeholder description variant 2', diff_or_content: placeholder, tradeoff: 'Fixes ' + issueDesc + '; customize description' },
+      { id: 'C', label: 'Same — placeholder description variant 3', diff_or_content: placeholder, tradeoff: 'Fixes ' + issueDesc + '; customize description' },
+    ];
+  }
+
   private async proposeNewSkill(cluster: Cluster): Promise<UnsignedProposal> {
     const evidence = cluster.observations.slice(0, 6).map(o => '- ' + sanitizeObservationContent(o.verbatim)).join('\n');
     const targetPath = join(this.scanDirs[0]!.replace(/^~/, homedir()), ORPHAN_SKILL + '.md');
 
     const alternatives = this.llm
-      ? await this.llmProposeNewSkill(evidence, cluster).catch(() => this.fallbackNewSkillAlternatives())
+      ? await this.llmProposeNewSkill(evidence, cluster).catch(err => {
+          console.warn('[skills-tuner] llmProposeNewSkill failed, using fallback:', (err as Error).message?.slice(0, 200));
+          return this.fallbackNewSkillAlternatives();
+        })
       : this.fallbackNewSkillAlternatives();
 
     // pattern_signature must be stable across days so refused proposals
@@ -514,7 +659,10 @@ export class SkillsSubject extends BaseSubject {
       .map(o => '- [' + o.signal_type + '] ' + sanitizeObservationContent(o.verbatim)).join('\n');
 
     const alternatives = this.llm
-      ? await this.llmPropose(skillName, skillContent, evidence, cluster).catch(() => this.fallbackAlternatives(skillName, skillInfo))
+      ? await this.llmPropose(skillName, skillContent, evidence, cluster).catch(err => {
+          console.warn('[skills-tuner] llmPropose failed, using fallback:', (err as Error).message?.slice(0, 200));
+          return this.fallbackAlternatives(skillName, skillInfo);
+        })
       : this.fallbackAlternatives(skillName, skillInfo);
 
     return {
@@ -604,6 +752,305 @@ export class SkillsSubject extends BaseSubject {
     ];
   }
 
+  // ── Frontmatter validation + auto-fix ──
+
+  private static readonly LEGACY_TUNER_FIELDS = ['trigger', 'triggers', 'risk_tier', 'auto_merge', 'auto_merge_default'];
+
+  /**
+   * Validate frontmatter for the 5 compliance rules.
+   * Reads from the skill's path on disk.
+   */
+  validateFrontmatter(skill: SkillEntry): FrontmatterIssue[] {
+    const issues: FrontmatterIssue[] = [];
+    const fm = skill.frontmatter;
+    const skillName = (fm['name'] as string | undefined) ?? basename(dirname(skill.path));
+    const dirName = skill.format === 'directory'
+      ? basename(dirname(skill.path))
+      : basename(skill.path, '.md');
+
+    // Rule 1: name field present
+    if (!fm['name']) {
+      issues.push({
+        skill: dirName,
+        path: skill.path,
+        rule: 'missing-name',
+        severity: 'error',
+        autofixable: true,
+        details: `name field missing; will use dirname "${dirName}"`,
+      });
+    }
+
+    // Rule 2: name matches dirname (only for directory format)
+    if (skill.format === 'directory' && fm['name'] && fm['name'] !== dirName) {
+      issues.push({
+        skill: dirName,
+        path: skill.path,
+        rule: 'name-mismatch',
+        severity: 'error',
+        autofixable: true,
+        details: `name "${fm['name']}" does not match dirname "${dirName}"`,
+      });
+    }
+
+    // Rule 3: description field present
+    if (!fm['description']) {
+      issues.push({
+        skill: skillName,
+        path: skill.path,
+        rule: 'missing-description',
+        severity: 'error',
+        autofixable: true,
+        details: 'description field missing',
+      });
+    }
+
+    // Rule 4: description length >= 30 chars
+    if (fm['description'] && typeof fm['description'] === 'string' && fm['description'].length < 30) {
+      issues.push({
+        skill: skillName,
+        path: skill.path,
+        rule: 'description-too-short',
+        severity: 'warning',
+        autofixable: false,
+        details: `description is ${fm['description'].length} chars (minimum 30)`,
+      });
+    }
+
+    // Rule 5: no legacy tuner fields in frontmatter
+    for (const field of SkillsSubject.LEGACY_TUNER_FIELDS) {
+      if (field in fm) {
+        issues.push({
+          skill: skillName,
+          path: skill.path,
+          rule: 'legacy-tuner-field',
+          severity: 'error',
+          autofixable: true,
+          details: `legacy field "${field}" should be moved to config overrides`,
+        });
+      }
+    }
+
+    return issues;
+  }
+
+  /**
+   * Apply safe (autofixable) fixes to a skill's frontmatter.
+   * Creates a .pre-autofix-<ts>.bak backup before any write.
+   * Returns fixed issues and remaining (non-autofixable) issues.
+   */
+  async autoFixFrontmatter(
+    skill: SkillEntry,
+    issues: FrontmatterIssue[],
+  ): Promise<{ fixed: FrontmatterIssue[]; remaining: FrontmatterIssue[] }> {
+    const fixable = issues.filter(i => i.autofixable);
+    const remaining = issues.filter(i => !i.autofixable);
+
+    if (fixable.length === 0) return { fixed: [], remaining };
+
+    // Path containment guard
+    const expandHome = (p: string) => p.replace(/^~/, homedir());
+    const allowed = this.scanDirs.map(d => resolve(expandHome(d)));
+    const targetReal = resolve(skill.path);
+    if (!allowed.some(d => targetReal === d || targetReal.startsWith(d + sep) || targetReal.startsWith(d + '/'))) {
+      throw new Error('autoFixFrontmatter: target ' + targetReal + ' outside scan_dirs');
+    }
+
+    // Read current content
+    const currentContent = await readFile(skill.path, 'utf8');
+
+    // Create backup
+    const ts = Date.now();
+    const backupPath = skill.path + '.pre-autofix-' + ts + '.bak';
+    await copyFile(skill.path, backupPath);
+
+    // Parse frontmatter
+    const match = currentContent.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
+    const yaml = await import('js-yaml');
+    let fm: Record<string, unknown> = {};
+    let body = currentContent;
+    if (match) {
+      try { fm = (yaml.load(match[1]!) as Record<string, unknown>) ?? {}; } catch { fm = {}; }
+      body = match[2]!;
+    }
+
+    const dirName = skill.format === 'directory'
+      ? basename(dirname(skill.path))
+      : basename(skill.path, '.md');
+
+    const movedToConfig: Record<string, unknown> = {};
+    const fixed: FrontmatterIssue[] = [];
+
+    for (const issue of fixable) {
+      if (issue.rule === 'missing-name') {
+        fm['name'] = dirName;
+        fixed.push(issue);
+        auditLog('frontmatter_autofixed', { skill: issue.skill, path: issue.path, rule: issue.rule, value: dirName });
+      } else if (issue.rule === 'name-mismatch') {
+        fm['name'] = dirName;
+        fixed.push(issue);
+        auditLog('frontmatter_autofixed', { skill: issue.skill, path: issue.path, rule: issue.rule, value: dirName });
+      } else if (issue.rule === 'missing-description') {
+        // Extract from first heading + first paragraph of body
+        const generated = this.extractDescriptionFromBody(body);
+        if (generated) {
+          fm['description'] = generated;
+          fixed.push(issue);
+          auditLog('frontmatter_autofixed', { skill: issue.skill, path: issue.path, rule: issue.rule, value: generated });
+        } else {
+          // Cannot extract — leave in remaining for proposal
+          remaining.push(issue);
+        }
+      } else if (issue.rule === 'legacy-tuner-field') {
+        // Collect all legacy fields from this skill for config
+        for (const field of SkillsSubject.LEGACY_TUNER_FIELDS) {
+          if (field in fm) {
+            movedToConfig[field] = fm[field];
+            delete fm[field];
+          }
+        }
+        // Push all legacy field issues as fixed (they all get handled in one pass)
+        for (const legacyIssue of fixable.filter(i => i.rule === 'legacy-tuner-field')) {
+          if (!fixed.includes(legacyIssue)) {
+            fixed.push(legacyIssue);
+            auditLog('frontmatter_autofixed', { skill: legacyIssue.skill, path: legacyIssue.path, rule: 'legacy-tuner-field', field: legacyIssue.details });
+          }
+        }
+        // Write moved fields to config overrides atomically
+        if (Object.keys(movedToConfig).length > 0) {
+          await this.writeLegacyFieldsToConfig(dirName, movedToConfig);
+        }
+      }
+    }
+
+    // Re-serialize frontmatter
+    const fmLines = Object.entries(fm).map(([k, v]) => {
+      if (typeof v === 'string' && !v.includes('\n') && !v.includes(':') && !v.includes('"')) {
+        return k + ': ' + v;
+      }
+      return k + ': ' + JSON.stringify(v);
+    });
+    const newContent = '---\n' + fmLines.join('\n') + '\n---\n\n' + body;
+    await writeFile(skill.path, newContent, 'utf8');
+
+    return { fixed, remaining };
+  }
+
+  /**
+   * Extract a description from the skill body using the first heading + first paragraph.
+   */
+  private extractDescriptionFromBody(body: string): string | null {
+    const lines = body.split('\n').map(l => l.trim()).filter(Boolean);
+    const headingLine = lines.find(l => l.startsWith('#'));
+    const heading = headingLine ? headingLine.replace(/^#+\s*/, '').trim() : null;
+
+    // Find first non-heading paragraph
+    let paragraph: string | null = null;
+    let inSkipZone = false;
+    for (const line of lines) {
+      if (line.startsWith('#')) { inSkipZone = false; continue; }
+      if (!inSkipZone && line.length > 20) { paragraph = line; break; }
+    }
+
+    if (heading && paragraph) {
+      return (heading + '. ' + paragraph).slice(0, 250);
+    }
+    if (heading && heading.length >= 10) {
+      return heading.slice(0, 250);
+    }
+    if (paragraph && paragraph.length >= 10) {
+      return paragraph.slice(0, 250);
+    }
+    return null;
+  }
+
+  /**
+   * Write legacy fields from frontmatter to config overrides atomically.
+   * Uses the in-memory overrides if no config file exists (test-friendly).
+   */
+  private async writeLegacyFieldsToConfig(skillName: string, fields: Record<string, unknown>): Promise<void> {
+    // Validate skillName
+    if (/[/\\]/.test(skillName) || skillName === '..' || skillName === '.') return;
+
+    const configPath = join(homedir(), '.config', 'tuner', 'config.yaml');
+    try {
+      const yaml = await import('js-yaml');
+      let config: Record<string, unknown> = {};
+      if (existsSync(configPath)) {
+        const raw = await readFile(configPath, 'utf8');
+        config = (yaml.load(raw) as Record<string, unknown>) ?? {};
+      }
+
+      // Ensure subjects.skills.overrides.<skillName> exists
+      if (!config['subjects']) config['subjects'] = {};
+      const subjects = config['subjects'] as Record<string, unknown>;
+      if (!subjects['skills']) subjects['skills'] = {};
+      const skillsCfg = subjects['skills'] as Record<string, unknown>;
+      if (!skillsCfg['overrides']) skillsCfg['overrides'] = {};
+      const overrides = skillsCfg['overrides'] as Record<string, unknown>;
+      if (!overrides[skillName]) overrides[skillName] = {};
+      const skillOverride = overrides[skillName] as Record<string, unknown>;
+
+      // Map frontmatter field names to config field names
+      const fieldMap: Record<string, string> = {
+        'triggers': 'triggers',
+        'trigger': 'triggers',
+        'risk_tier': 'risk_tier',
+        'auto_merge': 'auto_merge_default',
+        'auto_merge_default': 'auto_merge_default',
+      };
+      for (const [k, v] of Object.entries(fields)) {
+        const mapped = fieldMap[k] ?? k;
+        skillOverride[mapped] = v;
+      }
+
+      // Atomic write: write to temp then rename
+      const { mkdirSync } = await import('node:fs');
+      const { rename } = await import('node:fs/promises');
+      mkdirSync(dirname(configPath), { recursive: true });
+      const tmpPath = configPath + '.tmp-' + Date.now();
+      await writeFile(tmpPath, yaml.dump(config), 'utf8');
+      await rename(tmpPath, configPath);
+    } catch {
+      // Config write is best-effort — don't fail the autofix
+    }
+  }
+
+  /**
+   * Walk all skills, validate frontmatter, auto-fix safe violations,
+   * and return a compliance summary.
+   */
+  async runFrontmatterMaintenance(): Promise<FrontmatterMaintenanceReport> {
+    const skills = await this.loadSkillsMap();
+    let autoFixed = 0;
+    const allViolations: FrontmatterIssue[] = [];
+
+    for (const skill of skills.values()) {
+      const issues = this.validateFrontmatter(skill);
+      if (issues.length === 0) continue;
+
+      const { fixed, remaining } = await this.autoFixFrontmatter(skill, issues);
+      autoFixed += fixed.length;
+      allViolations.push(...remaining);
+    }
+
+    // Invalidate cache since files may have changed
+    if (autoFixed > 0) this.skillsCache = null;
+
+    const report: FrontmatterMaintenanceReport = {
+      total: skills.size,
+      autoFixed,
+      violations: allViolations,
+    };
+
+    auditLog('frontmatter_compliance_summary', {
+      total: report.total,
+      auto_fixed: autoFixed,
+      violations: allViolations.length,
+    });
+
+    return report;
+  }
+
   // ── Migration helpers ──
 
   /** List skills that are still in legacy flat format — migration candidates. */
@@ -681,6 +1128,10 @@ export class SkillsSubject extends BaseSubject {
     await unlink(flatPath);
 
     this.skillsCache = null;
+
+    // Post-write frontmatter validation + auto-fix on migrated skill
+    await this.postWriteFrontmatterFix(newPath);
+
     return movedToConfig;
   }
 

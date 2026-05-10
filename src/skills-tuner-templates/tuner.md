@@ -72,11 +72,8 @@ Tell the user in 3 sentences:
 
 Ask if they want to proceed (yes/no). If no, exit gracefully.
 
-<<<<<<< HEAD
-=======
 **Drift detection**: Each cron tick, the tuner computes a state hash per subject. Changes to scan_dirs files, plugin registrations, etc. are detected and surfaced in the next `/tuner audit` run. Subjects opt-in by implementing `currentStateHash()` — default is no-op (empty string).
 
->>>>>>> origin/feat/tuner-skills-subject
 ### Step 2 — Detect the git repo
 
 Scan candidate locations:
@@ -106,8 +103,6 @@ If user picks `other` → ask path → init if needed.
 
 Save the choice as `storage.git_repo` in config.
 
-<<<<<<< HEAD
-=======
 ### Step 2.5 — Scan for legacy flat skills and offer migration
 
 After confirming the git repo, scan the skills directory for legacy flat `.md` files:
@@ -157,7 +152,6 @@ If **no** or **later**: skip. Show: "You can migrate later with `/tuner setup` o
 
 If **all skills already in directory format**: show "✅ All skills already in Anthropic directory format."
 
->>>>>>> origin/feat/tuner-skills-subject
 ### Step 3 — Pattern adjustment
 
 Based on the dominant language detected in step 2:
@@ -235,12 +229,6 @@ End setup.
 
 Goal: when the user creates a new skill (via Claude Code native skill flow or manually), this mode complements that by registering the skill with the tuner.
 
-<<<<<<< HEAD
-### Step 1 — Read the new skill
-
-Detect which skill the user just created:
-- Check `git status` of `storage.git_repo` for new `.md` files
-=======
 **Note:** The skills-tuner supports two formats:
 - **Directory format** (Anthropic standard, recommended): `<scan_dir>/<name>/SKILL.md` with frontmatter `name:` and `description:` only.
 - **Flat format** (legacy): `<scan_dir>/<name>.md` with full frontmatter including `triggers:`.
@@ -260,23 +248,10 @@ If directory: ask "Bundle helper scripts? (scaffolds an empty `scripts/` subdire
 
 Detect which skill the user just created:
 - Check `git status` of `storage.git_repo` for new `.md` or `SKILL.md` files
->>>>>>> origin/feat/tuner-skills-subject
 - Or ask: "Which skill did you just create? (path or name)"
 
 Read its frontmatter and content.
 
-<<<<<<< HEAD
-### Step 2 — Suggest triggers
-
-If `triggers:` is empty or weak (1-2 generic words):
-
-1. Sample 5-10 verbatims that would plausibly invoke this skill, based on its content.
-2. Show suggestions inline.
-3. Ask user to accept/edit/reject.
-4. Edit the frontmatter to add the triggers.
-
-### Step 3 — Suggest risk_tier
-=======
 ### Step 3 — Frontmatter focus: name + description
 
 The Anthropic standard requires only two frontmatter fields for discovery:
@@ -322,7 +297,6 @@ If no triggers are configured yet:
 4. Write to config.yaml under `subjects.skills.overrides.<name>.triggers`.
 
 ### Step 6 — Suggest risk_tier (for config)
->>>>>>> origin/feat/tuner-skills-subject
 
 Based on the skill domain:
 
@@ -331,27 +305,9 @@ Based on the skill domain:
 - Network/API calls, sending messages, financial operations → `high`
 - Self-modification of the tuner itself → `critical`
 
-<<<<<<< HEAD
-Show recommendation, ask confirmation.
-
-### Step 4 — Update tuner config
-
-Add or update the subject entry in `~/.config/tuner/config.yaml`:
-
-```yaml
-subjects:
-  skills:
-    auto_merge: <inherited from setup risk philosophy>
-    scan_dirs:
-      - <ensure the new skill parent dir is listed>
-```
-
-### Step 5 — Domain-specific pattern hints
-=======
 Show recommendation, ask confirmation. Write to `subjects.skills.overrides.<name>.risk_tier` in config.
 
 ### Step 7 — Domain-specific pattern hints
->>>>>>> origin/feat/tuner-skills-subject
 
 If the skill is in a specialized domain, suggest adding domain words to `_EMOTIONAL_PATTERNS`:
 
@@ -362,10 +318,6 @@ If the skill is in a specialized domain, suggest adding domain words to `_EMOTIO
 User confirms before adding.
 
 End create.
-<<<<<<< HEAD
-
-=======
->>>>>>> origin/feat/tuner-skills-subject
 ---
 
 ## Mode: adjust
@@ -385,8 +337,6 @@ Display:
 - Recent activity from `audit.jsonl` (proposals, approvals, refusals last 30d)
 - Any pending proposals for this target
 
-<<<<<<< HEAD
-=======
 ### Step 2.5 — Check format and offer migration (for individual skills)
 
 If the target is an individual skill (not a whole subject), check its format:
@@ -409,24 +359,10 @@ If **yes**: run migration (same process as setup Step 2.5):
 
 If **no**: continue with adjustment menu as-is (flat format still supported).
 
->>>>>>> origin/feat/tuner-skills-subject
 ### Step 3 — Offer adjustment menu
 
 ```
 What would you like to adjust?
-<<<<<<< HEAD
-  1. Triggers
-  2. Risk tier
-  3. Auto-merge policy
-  4. Proposer model (Sonnet ↔ Opus ↔ Haiku ↔ ML backend)
-  5. Scan directories
-  6. Emotional/negative/positive patterns
-  7. Cool-down period for this skill
-  8. Disable / enable
-```
-
-For each, walk through the change, show the diff, ask confirmation, write to config.
-=======
   1. Migrate to Anthropic directory format (recommended) [only shown for legacy flat skills]
   2. Triggers
   3. Risk tier
@@ -447,7 +383,6 @@ For option 10 — Git repo:
 - Confirm change and run `tuner doctor`.
 
 For each other option, walk through the change, show the diff, ask confirmation, write to config.
->>>>>>> origin/feat/tuner-skills-subject
 
 For option **D** — Subject-wide knobs:
 
@@ -527,10 +462,24 @@ Markdown report sectioned per subject:
 - Self-modify events: 1 (2026-04-15: simplified setup mode)
 ```
 
-<<<<<<< HEAD
-### Step 5 — Compare vs reflection baseline
-=======
-### Step 4.5 — Format compliance
+### Step 4.5 — Format compliance + frontmatter health
+
+**Automatic frontmatter validation runs on every cron tick** (`runFrontmatterMaintenance` pre-pass in `Engine.runCycle`). Five rules are enforced:
+
+| Rule | Severity | Auto-fix |
+|------|----------|----------|
+| `name` field present | error | yes — uses dirname |
+| `name` matches dirname | error | yes — renames to dirname |
+| `description` field present | error | yes — extracted from heading + first paragraph |
+| `description` length >= 30 chars | warning | no — surfaces as proposal |
+| No legacy tuner fields (`trigger`, `triggers`, `risk_tier`, `auto_merge`, `auto_merge_default`) | error | yes — moved to config overrides |
+
+Each auto-fix creates a `.pre-autofix-<ts>.bak` backup before writing. Audit events `frontmatter_autofixed` (per fix) and `frontmatter_compliance_summary` (per cycle) are emitted to `audit.jsonl`. Non-autofixable violations (description too short) generate `frontmatter-fix` proposals with stable `pattern_signature: skills:<path>:frontmatter-fix`.
+
+To review recent frontmatter activity, check `audit.jsonl` for `frontmatter_*` events:
+```bash
+grep '"event":"frontmatter_' ~/.config/tuner/audit.jsonl | tail -20
+```
 
 Scan each `scan_dir` for flat `.md` files and directory-format `SKILL.md` files. Add a section to the report:
 
@@ -591,17 +540,12 @@ For each subject with recent drift, suggest:
 > State changed since last audit for `<subject>`. Run `/tuner adjust <subject>` to review and refresh.
 
 ### Step 6 — Compare vs reflection baseline
->>>>>>> origin/feat/tuner-skills-subject
 
 Read `reflection-baseline.md` — the user answers from setup. For each "what I wish improved" item:
 - Did the tuner detect related patterns? (search audit log for matching keywords)
 - Show: "Goal '<verbatim>' → 0 / 3 / 12 related proposals so far. Try `/tuner adjust` to refine triggers if 0."
 
-<<<<<<< HEAD
-### Step 6 — Suggested next actions
-=======
 ### Step 7 — Suggested next actions
->>>>>>> origin/feat/tuner-skills-subject
 
 Based on metrics, output 1-3 concrete suggestions:
 - "Approval rate on `voice` is 100% — enable auto_merge?"
