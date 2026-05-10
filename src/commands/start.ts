@@ -18,6 +18,7 @@ import type { Job } from "../jobs";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
 import { PluginManager, setPluginManager } from "../plugins";
 import { indexSessionsBackground } from "../memory";
+import { getMcpProxyPlugin } from "../plugins/mcp-proxy/index.js";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
 const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
@@ -397,6 +398,7 @@ export async function start(args: string[] = []) {
   }
 
   async function shutdown() {
+    await getMcpProxyPlugin().stop();
     await pluginManager.stopServices();
     setPluginManager(null);
     if (discordStopGateway) discordStopGateway();
@@ -507,6 +509,18 @@ export async function start(args: string[] = []) {
     await pluginManager.startServices();
     await pluginManager.emit("gateway_start", {}, { workspaceDir: process.cwd() });
   }
+
+  // Start mcp-proxy plugin (warm-pooled MCP server connections)
+  getMcpProxyPlugin({
+    reasonedInvokeFn: async (fqn, args) => {
+      const prompt = `Use tool \`${fqn}\` with these arguments: ${JSON.stringify(args)}. Return ONLY the raw JSON result of the tool, no prose, no markdown.`;
+      const result = await runUserMessage("inject", prompt);
+      const text = result.stdout.trim().replace(/^```[a-z]*\n?/, "").replace(/\n?```$/, "").trim();
+      try { return JSON.parse(text); } catch { return text; }
+    },
+  }).start().catch((err) => {
+    console.error("[mcp-proxy] Startup error (non-fatal):", err instanceof Error ? err.message : String(err));
+  });
 
   function isAddrInUse(err: unknown): boolean {
     if (!err || typeof err !== "object") return false;

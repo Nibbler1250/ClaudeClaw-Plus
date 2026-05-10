@@ -210,6 +210,23 @@ if __name__ == "__main__":
 
 ---
 
+## mcp-proxy: fast path for non-Claude consumers
+
+For non-Claude daemon-resident integrations (voice agents, retrieval systems, automation
+bridges), the inject path is too slow (~3000ms per call). The `mcp-proxy` plugin provides
+a warm-pooled fast path: long-lived stdio connections to configured MCP servers, exposed
+as `/api/plugin/mcp-proxy/tools/{server}__{tool}/invoke`.
+
+| Path | Latency | Auth | Audit |
+|---|---|---|---|
+| Direct API call | ~50ms | None | None |
+| `/api/inject` (Claude in loop) | ~3000ms | Bearer apiToken | No |
+| mcp-proxy (this release) | ~200ms | HMAC plugin token | Yes |
+
+See `docs/mcp-proxy.md` for configuration and routing mode details.
+
+---
+
 ## Deferred to follow-up PRs
 
 The following features are known gaps but explicitly deferred:
