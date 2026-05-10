@@ -5,6 +5,7 @@ import { ProposalsStore, DEFAULT_PROPOSALS_PATH } from '../storage/proposals.js'
 import { RefusedStore, DEFAULT_REFUSED_PATH } from '../storage/refused.js';
 import { BranchManager } from '../git_ops/branches.js';
 import { SkillsSubject, type SkillOverride } from '../subjects/skills.js';
+import { makeLLMClient, type LLMClient } from '../core/llm.js';
 import type { TunerConfig } from '../core/config.js';
 
 export interface EngineBundle {
@@ -31,16 +32,28 @@ export function bootstrapEngine(config: TunerConfig): EngineBundle {
   const branches = new BranchManager(gitRepo);
   const engine = new Engine(config, registry, proposals, refused, branches);
 
-  registerNativeSubjects(registry, config);
+  // Build the LLM client once and share across subjects. If construction fails
+  // (no API key + no claude CLI fallback), log the reason and continue without
+  // an LLM so the engine falls through to static fallback alternatives instead
+  // of hard-failing the whole cycle.
+  let llm: LLMClient | undefined;
+  try {
+    llm = makeLLMClient(config);
+  } catch (err) {
+    console.warn('[skills-tuner] LLM client unavailable, proposals will use static fallback:', (err as Error).message);
+  }
+
+  registerNativeSubjects(registry, config, llm);
 
   return { engine, registry, proposals, refused, branches };
 }
 
-function registerNativeSubjects(registry: Registry, config: TunerConfig): void {
+function registerNativeSubjects(registry: Registry, config: TunerConfig, llm: LLMClient | undefined): void {
   const skillsCfg = config.subjects['skills'];
   if (skillsCfg && skillsCfg.enabled !== false) {
     const scanDirs = (skillsCfg.scan_dirs ?? []).map(d => d.replace(/^~/, homedir()));
     const overrides = (skillsCfg.overrides ?? {}) as Record<string, SkillOverride>;
-    registry.registerSubject(new SkillsSubject({ scanDirs, overrides }));
+    const language = config.proposer?.language_preference ?? 'en';
+    registry.registerSubject(new SkillsSubject({ scanDirs, overrides, language, llm }));
   }
 }

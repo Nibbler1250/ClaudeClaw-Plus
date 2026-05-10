@@ -41,7 +41,7 @@ function proposalCanonical(proposal: UnsignedProposal | Proposal): Buffer {
       tradeoff: a.tradeoff,
     })),
     cluster_id: proposal.cluster_id,
-    created_at: proposal.created_at.toISOString(),
+    created_at: (proposal.created_at instanceof Date ? proposal.created_at : new Date(proposal.created_at)).toISOString(),
     id: proposal.id,
     kind: proposal.kind,
     pattern_signature: proposal.pattern_signature,
