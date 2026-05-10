@@ -50,6 +50,8 @@ export interface SkillsSubjectConfig {
   emotionalPatterns?: RegExp[];
   negativePatterns?: RegExp[];
   positivePatterns?: RegExp[];
+  /** Language hint for LLM-generated labels and tradeoffs. e.g. 'fr-quebec', 'en'. Defaults to 'en'. */
+  language?: string;
   // Skills-tuner-specific metadata for Anthropic-format skills (no frontmatter pollution)
   overrides?: Record<string, SkillOverride>;
 }
@@ -67,6 +69,20 @@ function stripFences(text: string): string {
   return text.trim();
 }
 
+/**
+ * Robustly extract a JSON array from an LLM response that may contain prose,
+ * markdown, or fenced code blocks before/after the JSON. Picks the substring
+ * from the first "[" to the last "]" so JSON.parse gets a clean array even if
+ * the model prepended a chain-of-thought or diagnosis.
+ */
+function extractJsonArray(text: string): string {
+  const stripped = stripFences(text);
+  const start = stripped.indexOf('[');
+  const end = stripped.lastIndexOf(']');
+  if (start === -1 || end === -1 || end <= start) return stripped;
+  return stripped.slice(start, end + 1);
+}
+
 
 export class SkillsSubject extends BaseSubject {
   readonly name = 'skills';
@@ -81,6 +97,7 @@ export class SkillsSubject extends BaseSubject {
   private readonly posRe: RegExp;
   private readonly emotRe: RegExp;
   private readonly overrides: Record<string, SkillOverride>;
+  private readonly language: string;
   private skillsCache: Map<string, SkillEntry> | null = null;
 
   constructor(opts: SkillsSubjectConfig = {}) {
@@ -91,6 +108,7 @@ export class SkillsSubject extends BaseSubject {
     this.posRe = combineRegex(opts.positivePatterns ?? DEFAULT_POSITIVE_PATTERNS);
     this.emotRe = combineRegex(opts.emotionalPatterns ?? DEFAULT_EMOTIONAL_PATTERNS);
     this.overrides = opts.overrides ?? {};
+    this.language = opts.language ?? 'en';
   }
 
   async collectObservations(since: Date): Promise<Observation[]> {
@@ -515,18 +533,53 @@ export class SkillsSubject extends BaseSubject {
   }
 
   private async llmProposeNewSkill(evidence: string, cluster: Cluster) {
-    const system = 'Generate a Claude Code skill in the Anthropic standard directory format. The output should be the contents of SKILL.md (a single markdown file with frontmatter name: and description:, body in markdown). The description should be discoverable — start with what the skill does and when to use it, since Claude Code skill matcher uses descriptions to choose which skills to load. Do NOT include triggers: or risk_tier: in the frontmatter — those go in the user config. Reply ONLY with a JSON array of 3 objects: [{"id":"A","label":"...","diff_or_content":"...","tradeoff":"..."},...]';
-    const user = 'Unattributed signals (' + cluster.frequency + ' occurrences):\n' + evidence + '\n\nIdentify the implicit need and propose 3 skill templates in Anthropic directory format (SKILL.md content).';
+    const system =
+      "You are creating a NEW Claude Code skill (SKILL.md) in Anthropic directory format because the user is repeatedly hitting a need that no existing skill covers.\n" +
+      "\n" +
+      "Procedure:\n" +
+      "1. Read the unattributed signals and identify the implicit recurring need (one short sentence — what the user keeps trying to do).\n" +
+      "2. Propose 3 distinct skill templates that address the need. Each must take a DIFFERENT angle (e.g. one minimal/declarative, one with explicit step-by-step instructions, one with structured output schema).\n" +
+      "3. Each label must describe the skill's behavior (e.g. 'Schedule + emit reminder at fixed time'), not its shape ('Concise version').\n" +
+      "4. Each tradeoff must state the strength + the concrete cost or risk (e.g. 'Less brittle but requires explicit time argument').\n" +
+      "\n" +
+      "Constraints:\n" +
+      "- Frontmatter MUST contain only 'name' and 'description' fields. Do NOT include triggers, risk_tier, schedule, or other custom fields — those live in the user config.\n" +
+      "- 'description' must start with what the skill does and when to use it (the skill matcher reads descriptions to pick which skills to load).\n" +
+      "- diff_or_content must be the COMPLETE SKILL.md contents.\n" +
+      "- Reply ONLY with a JSON array of 3 objects: [{\"id\":\"A\",\"label\":\"...\",\"diff_or_content\":\"...\",\"tradeoff\":\"...\"}, ...]. The VERY FIRST character of your reply MUST be \"[\" — no prose or markdown before the array.\n" +
+      "- Write 'label' and 'tradeoff' in " + this.language + ".";
+    const user =
+      "Unattributed user signals (" + cluster.frequency + " occurrences, sentiment=" + cluster.sentiment + "):\n" +
+      evidence + "\n\n" +
+      "Identify the implicit need (one sentence), then propose 3 skill templates that take different angles.";
     const raw = await this.llm!.call('proposer', system, [{ role: 'user', content: user }], 4000);
-    const data = JSON.parse(stripFences(raw)) as Array<{ id: string; label: string; diff_or_content: string; tradeoff?: string }>;
+    const data = JSON.parse(extractJsonArray(raw)) as Array<{ id: string; label: string; diff_or_content: string; tradeoff?: string }>;
     return data.slice(0, 3).map(a => ({ id: a.id, label: a.label, diff_or_content: a.diff_or_content, tradeoff: a.tradeoff ?? '' }));
   }
 
   private async llmPropose(skillName: string, skillContent: string, evidence: string, cluster: Cluster) {
-    const system = 'You are an expert in prompt improvement for AI agents. Propose 3 concrete alternatives to improve a markdown skill file. Reply ONLY with a JSON array: [{"id":"A","label":"...","diff_or_content":"...","tradeoff":"..."},...]. Each diff_or_content must be the COMPLETE revised skill.';
-    const user = 'Skill: ' + skillName + '\n\nCurrent content:\n```\n' + skillContent.slice(0, 3000) + '\n```\n\nNegative signals (' + cluster.frequency + ' occurrences):\n' + evidence + '\n\nPropose 3 improvement alternatives.';
+    const system =
+      "You are improving a Claude Code skill (markdown with YAML frontmatter) using user feedback. Goal: address the SPECIFIC failure mode shown in the signals — not generic refactoring.\n" +
+      "\n" +
+      "Procedure:\n" +
+      "1. Diagnose the failure pattern from the signals. Pick one of: wrong-trigger, vague-instructions, missing-edge-case, wrong-tool-selection, ambiguous-output, over-eager-activation, under-specified-scope, format-mismatch.\n" +
+      "2. Propose 3 alternatives that EACH address the diagnosis with a DIFFERENT strategy. Reject cosmetic-only variants (whitespace, header reordering, copy with minor tweaks).\n" +
+      "3. Each label must describe the change ('Disambiguate target device before action'), not the form ('Concise version').\n" +
+      "4. Each tradeoff must explicitly state what becomes better and what new risk this introduces (e.g. 'Reduces over-eager triggers but adds an extra disambiguation turn').\n" +
+      "\n" +
+      "Constraints:\n" +
+      "- Preserve YAML frontmatter (name, description, etc.) unless the diagnosis requires editing it.\n" +
+      "- diff_or_content must be the COMPLETE revised skill content (full file ready to write to disk).\n" +
+      "- Reply ONLY with a JSON array of 3 objects: [{\"id\":\"A\",\"label\":\"...\",\"diff_or_content\":\"...\",\"tradeoff\":\"...\"}, ...]. The VERY FIRST character of your reply MUST be \"[\" — no prose, no diagnosis text, no markdown before the array. Embed the diagnosis inside each label or tradeoff, not as a preamble.\n" +
+      "- Write 'label' and 'tradeoff' in " + this.language + ".";
+    const user =
+      "Skill name: " + skillName + "\n" +
+      "Negative user signals (frequency=" + cluster.frequency + ", sentiment=" + cluster.sentiment + "):\n" +
+      evidence + "\n\n" +
+      "Current skill content:\n```\n" + skillContent.slice(0, 3000) + "\n```\n\n" +
+      "First, identify the failure pattern in one sentence. Then propose 3 behavior-changing alternatives.";
     const raw = await this.llm!.call('proposer', system, [{ role: 'user', content: user }], 4000);
-    const data = JSON.parse(stripFences(raw)) as Array<{ id: string; label: string; diff_or_content: string; tradeoff?: string }>;
+    const data = JSON.parse(extractJsonArray(raw)) as Array<{ id: string; label: string; diff_or_content: string; tradeoff?: string }>;
     return data.slice(0, 3).map(a => ({ id: a.id, label: a.label, diff_or_content: a.diff_or_content, tradeoff: a.tradeoff ?? '' }));
   }
 
