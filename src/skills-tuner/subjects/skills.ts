@@ -1,5 +1,5 @@
 import { writeFile, copyFile, mkdir, readdir, readFile } from 'node:fs/promises';
-import { existsSync, statSync, readdirSync } from 'node:fs';
+import { existsSync, statSync, readdirSync, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, dirname, basename, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
@@ -276,6 +276,11 @@ export class SkillsSubject extends BaseSubject {
     }
     if (!existsSync(target)) {
       throw new Error('Target ' + target + ' does not exist for kind=' + proposal.kind);
+    }
+    // Symlink guard: resolve symlinks and re-check containment to prevent symlink escape attacks
+    const realTarget = realpathSync(target);
+    if (!allowed.some(d => realTarget === d || realTarget.startsWith(d + sep) || realTarget.startsWith(d + '/'))) {
+      throw new Error('Target ' + realTarget + ' symlink resolves outside scan_dirs');
     }
     await copyFile(target, target + '.bak');
     await writeFile(target, alt.diff_or_content, 'utf8');

@@ -23,7 +23,7 @@ export function makeCronRunTool(bundle: EngineBundle): PluginTool {
       since: z.string().optional().describe("Time window, e.g. '24h', '7d'. Defaults to '24h'."),
       dry: z.boolean().optional().describe("If true, propose but do not apply anything."),
       subject: z.string().optional().describe("Run only this subject name."),
-    }),
+    }).strict(),
     handler: async ({ since, dry, subject }) => {
       const sinceMs = parseDuration(since ?? "24h");
       const sinceDate = new Date(Date.now() - sinceMs);
