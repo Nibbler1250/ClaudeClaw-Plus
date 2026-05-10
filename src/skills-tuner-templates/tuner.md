@@ -694,10 +694,14 @@ For other subjects, propose 4–8 failure modes specific to that subject's domai
 
 For each missing property, surface a concrete patch on the prompt string. Show before/after as a unified diff. Require user approval before touching any file.
 
+**Cross-reference before writing new helpers.** If your patch needs a helper function (LLM call wrapper, JSON extractor, error handler, etc.), first search the existing codebase for an equivalent: `grep -rn "spawn.*claude\|_call_llm\|extractJsonArray" src/ examples/`. Mirror the existing API contract — especially CLI invocations, since wrong flags may be silently caught upstream and route to fallback. Concrete example: `claude` does NOT accept `--max-tokens` (the TS-side `ClaudeCliBackend` was bitten by this). Use `--print --model X --append-system-prompt SYSTEM` with the user prompt on stdin. Don't reinvent — port.
+
 ### Step 5 — Validate + commit
 
 Once approved: edit the file. Run `bun test tests/unit/proposer_prompt_v2.test.ts` if that file exists; otherwise `bun test`. Commit with:
 `fix(<subject>): adopt diagnose-first proposer prompt`
+
+**Commit hygiene.** Do NOT add `Co-Authored-By: Claude ...` or any AI/model attribution to the commit message — this repo's convention is human-authored commits only. The body should list which checklist properties were missing and the gist of the patch (e.g. "added named-taxonomy diagnosis step + explicit cosmetic-variant ban"). No emojis unless the user explicitly asked.
 
 End tune-prompt.
 
