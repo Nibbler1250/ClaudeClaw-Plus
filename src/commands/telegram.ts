@@ -14,6 +14,8 @@ import { fireJob, parseFireArgs } from "./fire";
 import { extname, join } from "node:path";
 import { submitTelegramToGateway } from "../gateway";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
+import type { EventRecord } from "../event-log";
+import type { GatewayRunResult } from "../event-processor";
 
 // --- Outbox sandbox for send-file / voice directives ---
 
@@ -1817,6 +1819,96 @@ async function poll(generation: number): Promise<void> {
   }
 
   if (pollingGeneration === generation) isPolling = false;
+}
+
+// --- Gateway delivery ---
+
+/**
+ * Deliver the agent's reply for a gateway-routed inbound Telegram event.
+ *
+ * Registered as the Telegram gateway delivery hook in start.ts:initTelegram and
+ * invoked by event-processor.ts's gateway onEvent after the agent finishes.
+ * Mirrors the legacy non-gateway delivery path's directive pipeline
+ * (reaction → voice → file → buttons), minus streaming concerns — the gateway
+ * runs the agent synchronously and only the final stdout is available.
+ */
+export async function deliverGatewayReply(
+  token: string,
+  event: EventRecord,
+  result: GatewayRunResult
+): Promise<void> {
+  const normalizedEvent = (event.payload as any)?.normalizedEvent;
+  if (!normalizedEvent) {
+    console.error(`[gateway-delivery:telegram] event ${event.id} has no normalizedEvent`);
+    return;
+  }
+
+  const channelId = String(normalizedEvent.channelId ?? "");
+  const chatMatch = channelId.match(/^telegram:(-?\d+)$/);
+  if (!chatMatch) {
+    console.error(`[gateway-delivery:telegram] cannot parse chatId from "${channelId}"`);
+    return;
+  }
+  const chatId = Number(chatMatch[1]);
+
+  const threadIdRaw = normalizedEvent.threadId;
+  const threadId = threadIdRaw && threadIdRaw !== "default" && /^-?\d+$/.test(String(threadIdRaw))
+    ? Number(threadIdRaw)
+    : undefined;
+
+  const sourceMessageId = normalizedEvent.sourceEventId && /^-?\d+$/.test(String(normalizedEvent.sourceEventId))
+    ? Number(normalizedEvent.sourceEventId)
+    : null;
+
+  const label = `chat ${chatId}`;
+
+  if (result.exitCode !== 0) {
+    const isTimedOut = result.exitCode === 124;
+    const errorMsg = isTimedOut
+      ? `⏱ Request timed out — the subprocess took too long and was killed. Try again or split into smaller steps.`
+      : `Error (exit ${result.exitCode}): ${extractErrorDetail(result) || "Unknown error"}`;
+    await sendMessage(token, chatId, errorMsg, threadId);
+    return;
+  }
+
+  const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(result.stdout || "");
+  const hadVoiceDirective = /\[voice:\/[^\]\r\n]+\]/i.test(afterReact);
+  const { cleanedText: afterVoice, voicePaths } = extractVoiceDirectives(afterReact);
+  const { cleanedText: afterFile, filePaths } = extractSendFileDirectives(afterVoice);
+  const { cleanedText, buttonRows } = extractButtonsDirective(afterFile);
+
+  if (reactionEmoji && sourceMessageId !== null) {
+    await sendReaction(token, chatId, sourceMessageId, reactionEmoji).catch((err) => {
+      console.error(`[gateway-delivery:telegram] reaction failed for ${label}: ${err instanceof Error ? err.message : err}`);
+    });
+  }
+
+  for (const vp of voicePaths) {
+    try {
+      await sendVoiceMessage(token, chatId, vp, threadId);
+    } catch (err) {
+      console.error(`[gateway-delivery:telegram] voice send failed for ${label}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  if (buttonRows) {
+    await sendMessageWithButtons(token, chatId, cleanedText, buttonRows, threadId);
+  } else if (cleanedText) {
+    await sendMessage(token, chatId, cleanedText, threadId);
+  }
+
+  for (const fp of filePaths) {
+    try {
+      await sendDocumentToChat(token, chatId, fp, threadId);
+    } catch (err) {
+      console.error(`[gateway-delivery:telegram] document send failed for ${label}: ${err instanceof Error ? err.message : err}`);
+      await sendMessage(token, chatId, `Failed to send file: ${fp.split("/").pop()}`, threadId);
+    }
+  }
+
+  if (!cleanedText && !buttonRows && filePaths.length === 0 && voicePaths.length === 0 && !hadVoiceDirective) {
+    await sendMessage(token, chatId, "(empty response)", threadId);
+  }
 }
 
 // --- Exports ---

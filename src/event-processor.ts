@@ -69,6 +69,33 @@ let processorConfig: ProcessorConfig | null = null;
 let isProcessing = false;
 let lastProcessedSeq = 0;
 
+// Gateway outbound delivery.
+//
+// The gateway path serializes inbound platform messages against a single persistent
+// session — in-order processing with dedup via the durable event log, opposed to the
+// legacy fork-per-message path that races concurrent messages from the same user.
+// When a per-adapter gateway flag (e.g. USE_GATEWAY_TELEGRAM) is set, the adapter
+// hands the inbound to its submit*ToGateway helper and returns; this processor's
+// onEvent runs the agent.
+//
+// Adapters register an outbound delivery callback here so the agent's reply reaches
+// the chat. Invocation happens inside the serial onEvent, preserving inbound order.
+//
+// Delivery failures log but do NOT fail/retry the event: a retry would re-run the
+// agent (expensive) and would either block the queue head or risk double-send if a
+// first delivery partially landed. Delivery health needs separate monitoring.
+export type GatewayRunResult = { exitCode: number; stdout: string; stderr: string };
+export type GatewayDeliveryFn = (event: EventRecord, result: GatewayRunResult) => Promise<void>;
+const gatewayDeliveryHooks = new Map<string, GatewayDeliveryFn>();
+
+export function registerGatewayDelivery(source: string, fn: GatewayDeliveryFn): void {
+  gatewayDeliveryHooks.set(source, fn);
+}
+
+export function unregisterGatewayDelivery(source: string): void {
+  gatewayDeliveryHooks.delete(source);
+}
+
 /**
  * Initialize the event processor.
  * Loads or creates dedupe state.
@@ -469,6 +496,17 @@ export async function initGatewayProcessor(
 
         const source = event.source || normalizedEvent.channel;
         const result = await processFn(source, prompt);
+
+        // Dispatch outbound delivery for this source. See the block comment above
+        // gatewayDeliveryHooks for queue-ordering and no-retry rationale.
+        const deliveryHook = gatewayDeliveryHooks.get(source);
+        if (deliveryHook) {
+          try {
+            await deliveryHook(event, result);
+          } catch (err) {
+            console.error(`[gateway-delivery] ${source} delivery failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
 
         return {
           success: result.exitCode === 0,
