@@ -98,20 +98,10 @@ program
   .option('--subject <name>', 'run only this subject')
   .action(async (opts) => {
     const { loadConfig } = await import('../core/config.js');
-    const { Engine } = await import('../core/engine.js');
-    const { Registry } = await import('../core/registry.js');
-    const { ProposalsStore, DEFAULT_PROPOSALS_PATH } = await import('../storage/proposals.js');
-    const { RefusedStore, DEFAULT_REFUSED_PATH } = await import('../storage/refused.js');
-    const { BranchManager } = await import('../git_ops/branches.js');
+    const { bootstrapEngine } = await import('./bootstrap.js');
 
     const config = loadConfig();
-    const registry = new Registry();
-    const proposals = new ProposalsStore(config.storage.proposals_jsonl ?? DEFAULT_PROPOSALS_PATH);
-    const refused = new RefusedStore(config.storage.refused_jsonl ?? DEFAULT_REFUSED_PATH);
-    const gitRepo = config.storage.git_repo;
-    if (!gitRepo) throw new Error('storage.git_repo must be set in config');
-    const branches = new BranchManager(gitRepo);
-    const engine = new Engine(config, registry, proposals, refused, branches);
+    const { engine } = bootstrapEngine(config);
 
     const sinceMs = parseDuration(opts.since);
     const since = new Date(Date.now() - sinceMs);
@@ -148,20 +138,10 @@ program
   .description('Apply alternative (alt = alternative ID)')
   .action(async (id: string, alt: string) => {
     const { loadConfig } = await import('../core/config.js');
-    const { Engine } = await import('../core/engine.js');
-    const { Registry } = await import('../core/registry.js');
-    const { ProposalsStore, DEFAULT_PROPOSALS_PATH } = await import('../storage/proposals.js');
-    const { RefusedStore, DEFAULT_REFUSED_PATH } = await import('../storage/refused.js');
-    const { BranchManager } = await import('../git_ops/branches.js');
+    const { bootstrapEngine } = await import('./bootstrap.js');
 
     const config = loadConfig();
-    const registry = new Registry();
-    const proposals = new ProposalsStore(config.storage.proposals_jsonl ?? DEFAULT_PROPOSALS_PATH);
-    const refused = new RefusedStore(config.storage.refused_jsonl ?? DEFAULT_REFUSED_PATH);
-    const gitRepo = config.storage.git_repo;
-    if (!gitRepo) throw new Error('storage.git_repo must be set in config');
-    const branches = new BranchManager(gitRepo);
-    const engine = new Engine(config, registry, proposals, refused, branches);
+    const { engine } = bootstrapEngine(config);
 
     const proposalId = parseInt(id, 10);
     if (isNaN(proposalId)) { console.error('id must be a number'); process.exit(1); }
@@ -175,20 +155,10 @@ program
   .description('Skip (refuse) a proposal')
   .action(async (id: string) => {
     const { loadConfig } = await import('../core/config.js');
-    const { Engine } = await import('../core/engine.js');
-    const { Registry } = await import('../core/registry.js');
-    const { ProposalsStore, DEFAULT_PROPOSALS_PATH } = await import('../storage/proposals.js');
-    const { RefusedStore, DEFAULT_REFUSED_PATH } = await import('../storage/refused.js');
-    const { BranchManager } = await import('../git_ops/branches.js');
+    const { bootstrapEngine } = await import('./bootstrap.js');
 
     const config = loadConfig();
-    const registry = new Registry();
-    const proposals = new ProposalsStore(config.storage.proposals_jsonl ?? DEFAULT_PROPOSALS_PATH);
-    const refused = new RefusedStore(config.storage.refused_jsonl ?? DEFAULT_REFUSED_PATH);
-    const gitRepo = config.storage.git_repo;
-    if (!gitRepo) throw new Error('storage.git_repo must be set in config');
-    const branches = new BranchManager(gitRepo);
-    const engine = new Engine(config, registry, proposals, refused, branches);
+    const { engine } = bootstrapEngine(config);
 
     const proposalId = parseInt(id, 10);
     if (isNaN(proposalId)) { console.error('id must be a number'); process.exit(1); }
@@ -202,20 +172,10 @@ program
   .description('Revert an applied proposal')
   .action(async (id: string) => {
     const { loadConfig } = await import('../core/config.js');
-    const { Engine } = await import('../core/engine.js');
-    const { Registry } = await import('../core/registry.js');
-    const { ProposalsStore, DEFAULT_PROPOSALS_PATH } = await import('../storage/proposals.js');
-    const { RefusedStore, DEFAULT_REFUSED_PATH } = await import('../storage/refused.js');
-    const { BranchManager } = await import('../git_ops/branches.js');
+    const { bootstrapEngine } = await import('./bootstrap.js');
 
     const config = loadConfig();
-    const registry = new Registry();
-    const proposals = new ProposalsStore(config.storage.proposals_jsonl ?? DEFAULT_PROPOSALS_PATH);
-    const refused = new RefusedStore(config.storage.refused_jsonl ?? DEFAULT_REFUSED_PATH);
-    const gitRepo = config.storage.git_repo;
-    if (!gitRepo) throw new Error('storage.git_repo must be set in config');
-    const branches = new BranchManager(gitRepo);
-    const engine = new Engine(config, registry, proposals, refused, branches);
+    const { engine } = bootstrapEngine(config);
 
     const proposalId = parseInt(id, 10);
     if (isNaN(proposalId)) { console.error('id must be a number'); process.exit(1); }
