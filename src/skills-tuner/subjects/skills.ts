@@ -537,8 +537,8 @@ export class SkillsSubject extends BaseSubject {
       "You are creating a NEW Claude Code skill (SKILL.md) in Anthropic directory format because the user is repeatedly hitting a need that no existing skill covers.\n" +
       "\n" +
       "Procedure:\n" +
-      "1. Read the unattributed signals and identify the implicit recurring need (one short sentence — what the user keeps trying to do).\n" +
-      "2. Propose 3 distinct skill templates that address the need. Each must take a DIFFERENT angle (e.g. one minimal/declarative, one with explicit step-by-step instructions, one with structured output schema).\n" +
+      "1. Classify the unmet need into exactly one category: recurring-workflow-gap | missing-tool-integration | context-accumulation-need | automation-gap | output-format-need | discovery-shortcut. State the category and the implicit need in one sentence.\n" +
+      "2. Propose 3 distinct skill templates that address the gap classification. Each must take a structurally DIFFERENT angle (e.g. one minimal/declarative, one with explicit step-by-step instructions, one with structured output schema). Reject cosmetic variants — \"shorter version of A\" or header-only changes do NOT count as different angles.\n" +
       "3. Each label must describe the skill's behavior (e.g. 'Schedule + emit reminder at fixed time'), not its shape ('Concise version').\n" +
       "4. Each tradeoff must state the strength + the concrete cost or risk (e.g. 'Less brittle but requires explicit time argument').\n" +
       "\n" +
