@@ -546,12 +546,12 @@ export class SkillsSubject extends BaseSubject {
       "- Frontmatter MUST contain only 'name' and 'description' fields. Do NOT include triggers, risk_tier, schedule, or other custom fields — those live in the user config.\n" +
       "- 'description' must start with what the skill does and when to use it (the skill matcher reads descriptions to pick which skills to load).\n" +
       "- diff_or_content must be the COMPLETE SKILL.md contents.\n" +
-      "- Reply ONLY with a JSON array of 3 objects: [{\"id\":\"A\",\"label\":\"...\",\"diff_or_content\":\"...\",\"tradeoff\":\"...\"}, ...]. The VERY FIRST character of your reply MUST be \"[\" — no prose or markdown before the array.\n" +
+      "- Reply ONLY with a JSON array of 3 objects: [{\"id\":\"A\",\"label\":\"...\",\"diff_or_content\":\"...\",\"tradeoff\":\"...\"}, ...]. The VERY FIRST character of your reply MUST be \"[\" — no prose or markdown before the array. Embed the gap classification inside the first alternative's label or tradeoff, not as a preamble.\n" +
       "- Write 'label' and 'tradeoff' in " + this.language + ".";
     const user =
       "Unattributed user signals (" + cluster.frequency + " occurrences, sentiment=" + cluster.sentiment + "):\n" +
       evidence + "\n\n" +
-      "Identify the implicit need (one sentence), then propose 3 skill templates that take different angles.";
+      "Identify the implicit need and embed it in the first alternative's label or tradeoff. Propose 3 skill templates that take different angles.";
     const raw = await this.llm!.call('proposer', system, [{ role: 'user', content: user }], 4000);
     const data = JSON.parse(extractJsonArray(raw)) as Array<{ id: string; label: string; diff_or_content: string; tradeoff?: string }>;
     return data.slice(0, 3).map(a => ({ id: a.id, label: a.label, diff_or_content: a.diff_or_content, tradeoff: a.tradeoff ?? '' }));
