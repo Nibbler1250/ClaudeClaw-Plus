@@ -5,7 +5,20 @@ import { join, dirname } from 'node:path';
 import type { Proposal, UnsignedProposal } from './types.js';
 
 export const SECRET_PATH = join(homedir(), '.config', 'tuner', '.secret');
-export const AUDIT_PATH = join(homedir(), '.config', 'tuner', 'audit.jsonl');
+export const DEFAULT_AUDIT_PATH = join(homedir(), '.config', 'tuner', 'audit.jsonl');
+
+/**
+ * Resolved audit log path. Reads TUNER_AUDIT_PATH env at call time so tests
+ * can override per-process without leaking entries into the user's production
+ * audit log. Default falls back to ~/.config/tuner/audit.jsonl.
+ */
+export function getAuditPath(): string {
+  return process.env['TUNER_AUDIT_PATH'] ?? DEFAULT_AUDIT_PATH;
+}
+
+// Back-compat: keep AUDIT_PATH symbol resolved at module import. For dynamic
+// override (tests, multi-tenant) use getAuditPath() instead.
+export const AUDIT_PATH = getAuditPath();
 
 export function initSecret(): void {
   mkdirSync(dirname(SECRET_PATH), { recursive: true });
@@ -67,7 +80,8 @@ export function sanitizeObservationContent(text: string, maxLength = 10_000): st
 }
 
 export function auditLog(event: string, payload: Record<string, unknown>): void {
-  mkdirSync(dirname(AUDIT_PATH), { recursive: true });
+  const auditPath = getAuditPath();
+  mkdirSync(dirname(auditPath), { recursive: true });
   const entry = { ts: new Date().toISOString(), event, ...payload };
-  appendFileSync(AUDIT_PATH, JSON.stringify(entry) + '\n');
+  appendFileSync(auditPath, JSON.stringify(entry) + '\n');
 }

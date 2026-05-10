@@ -18,6 +18,7 @@ import { join, dirname } from 'node:path';
 import { loadSecret, computeProposalSignature } from '../core/security.js';
 import type { ProposalRecord } from '../storage/proposals.js';
 import type { Proposal } from '../core/types.js';
+import { RefusedStore, DEFAULT_REFUSED_PATH } from '../storage/refused.js';
 
 export const DEFAULT_PROPOSALS_PATH = join(homedir(), '.config', 'tuner', 'proposals.jsonl');
 
@@ -142,7 +143,24 @@ export function migrateRecord(
     events.push({ event: 'refused', ts: refusedTs, proposal });
   }
 
-  return { events };
+  // Surface the refusal so the caller can populate refused.jsonl.
+  // Without this, the dedup index stays empty and every subsequent run
+  // re-proposes the same patterns the user already rejected.
+  const refusal: { signature: string; subject: string; refusedAt: string; reason: string } | null =
+    (status === 'refused' || status === 'skipped' || status === 'reverted')
+      ? {
+          signature: proposal.pattern_signature,
+          subject: proposal.subject,
+          refusedAt: typeof obj.feedback_at === 'string'
+            ? new Date(obj.feedback_at as string).toISOString()
+            : typeof obj.applied_at === 'string'
+              ? new Date(obj.applied_at as string).toISOString()
+              : createdTs,
+          reason: typeof obj.feedback === 'string' ? (obj.feedback as string) : `migrated:${status}`,
+        }
+      : null;
+
+  return { events, refusal };
 }
 
 // ── Main entrypoint ────────────────────────────────────────────────────────────
@@ -181,6 +199,7 @@ if (import.meta.main) {
 
   const secret = loadSecret();
   const outputLines: string[] = [];
+  const refusalsToReindex: { signature: string; subject: string; refusedAt: string; reason: string }[] = [];
   let legacyCount = 0;
   let createdCount = 0;
   let appliedCount = 0;
@@ -211,13 +230,14 @@ if (import.meta.main) {
 
     // Legacy flat record
     legacyCount++;
-    const { events } = migrateRecord(parsed, secret);
+    const { events, refusal } = migrateRecord(parsed, secret);
     for (const ev of events) {
       outputLines.push(JSON.stringify(ev));
       if (ev.event === 'created') createdCount++;
       else if (ev.event === 'applied') appliedCount++;
       else if (ev.event === 'refused') refusedCount++;
     }
+    if (refusal) refusalsToReindex.push(refusal);
   }
 
   const summary = `Migrated ${legacyCount} legacy records -> ${outputLines.length} lines (${createdCount} created, ${appliedCount} applied, ${refusedCount} refused)`;
@@ -239,6 +259,28 @@ if (import.meta.main) {
   mkdirSync(dirname(proposalsPath), { recursive: true });
   writeFileSync(proposalsPath, outputLines.join('\n') + '\n');
 
+  // Populate refused.jsonl so the dedup index actually contains the refusals
+  // we just translated. The legacy Python store either used a different schema
+  // (`ttl_until` instead of `expires_at`) or wasn't populated at all — either
+  // way, without this step the engine re-proposes patterns the user already
+  // rejected. Each refusal keeps its original timestamp; expiry is computed
+  // as 30 days after the original refusal date so prior cool-offs are honored.
+  let refusedIndexed = 0;
+  if (refusalsToReindex.length > 0) {
+    const refusedStore = new RefusedStore(DEFAULT_REFUSED_PATH);
+    const seen = new Set<string>();
+    for (const r of refusalsToReindex) {
+      if (!r.signature || seen.has(r.signature)) continue;
+      seen.add(r.signature);
+      const expiresAt = new Date(new Date(r.refusedAt).getTime() + 30 * 86_400_000).toISOString();
+      refusedStore.addWithExpiry(r.signature, r.subject, r.reason, r.refusedAt, expiresAt);
+      refusedIndexed++;
+    }
+  }
+
   console.log(summary);
   console.log(`Written to: ${proposalsPath}`);
+  if (refusedIndexed > 0) {
+    console.log(`Refused index populated with ${refusedIndexed} unique pattern signature(s) at: ${DEFAULT_REFUSED_PATH}`);
+  }
 }

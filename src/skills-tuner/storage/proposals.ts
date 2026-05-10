@@ -82,6 +82,25 @@ export class ProposalsStore {
     return sigs;
   }
 
+  /**
+   * Pattern signatures that have been refused at least once and recorded
+   * in the proposals log. Defense-in-depth: even if refused.jsonl is empty
+   * (e.g. corrupted, manually wiped, or migrated from a Python store that
+   * skipped populating it), proposals previously refused remain blocked.
+   * Refusals expressed solely here have no TTL — they remain blocked until
+   * the proposals log itself is rotated or the engine consumer overrides.
+   */
+  refusedSignatures(opts?: { subject?: string }): Set<string> {
+    const sigs = new Set<string>();
+    for (const r of this.readAll()) {
+      if (r.event !== 'refused') continue;
+      if (opts?.subject && r.proposal.subject !== opts.subject) continue;
+      const sig = r.proposal.pattern_signature;
+      if (sig) sigs.add(sig);
+    }
+    return sigs;
+  }
+
   signatureRefused(sig: string, refusedSigs: Set<string>): boolean {
     return refusedSigs.has(sig);
   }
