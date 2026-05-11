@@ -129,16 +129,22 @@ export class McpServerProcess {
     }
     this.lastInvocationAt = new Date();
 
-    const timer = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`Tool call ${tool} timed out after ${timeoutMs}ms`)), timeoutMs),
-    );
+    let timeoutHandle: ReturnType<typeof setTimeout>;
+    const timer = new Promise<never>((_, reject) => {
+      timeoutHandle = setTimeout(() => reject(new Error(`Tool call ${tool} timed out after ${timeoutMs}ms`)), timeoutMs);
+    });
 
     const call = this.client.callTool({
       name: tool,
       arguments: args as Record<string, unknown>,
     });
 
-    const result = await Promise.race([call, timer]);
+    let result: Awaited<typeof call>;
+    try {
+      result = await Promise.race([call, timer]);
+    } finally {
+      clearTimeout(timeoutHandle!);
+    }
     const content = (result as { content?: Array<{ text?: string }> }).content?.[0];
     const text = content?.text ?? "";
     try {

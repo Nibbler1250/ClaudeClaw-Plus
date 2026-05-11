@@ -91,8 +91,9 @@ export class McpProxyPlugin {
                 }
                 const result = await proc.call(tool.name, args);
                 const resultStr = JSON.stringify(result);
-                if (resultStr.length > MAX_RESULT_BYTES) {
-                  throw new Error(`Tool result exceeds ${MAX_RESULT_BYTES} bytes (got ${resultStr.length})`);
+                const resultBytes = Buffer.byteLength(resultStr, "utf8");
+                if (resultBytes > MAX_RESULT_BYTES) {
+                  throw new Error(`Tool result exceeds ${MAX_RESULT_BYTES} bytes (got ${resultBytes})`);
                 }
                 return result;
               },
