@@ -227,3 +227,6 @@ export function getMcpBridge(): PluginMcpBridge {
 export function _resetMcpBridge(): void {
   _bridge = null;
 }
+
+/** Set bridge singleton — only for testing */
+export function _setMcpBridge(b: PluginMcpBridge | null): void { _bridge = b; }

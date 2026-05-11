@@ -185,10 +185,15 @@ export class PluginHttpGateway {
     }
 
     const fqn = `${name}__${tool}`;
+    const bridge = getMcpBridge();
+    // Gateway-level audit carries request_id through the invoke lifecycle
+    try { bridge.audit('gateway_invoke', { fqn, request_id: requestId, plugin: name, phase: 'start' }); } catch {}
     try {
-      const result = await getMcpBridge().invokeTool(fqn, body);
+      const result = await bridge.invokeTool(fqn, body);
+      try { bridge.audit('gateway_invoke', { fqn, request_id: requestId, plugin: name, phase: 'end', success: true }); } catch {}
       return json({ result, request_id: requestId });
     } catch (e) {
+      try { bridge.audit('gateway_invoke', { fqn, request_id: requestId, plugin: name, phase: 'end', success: false }); } catch {}
       return json(this.errorBody('invoke_failed', e instanceof Error ? e.message : String(e), requestId, name), 502);
     }
   }
