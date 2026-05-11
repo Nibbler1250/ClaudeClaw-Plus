@@ -21,12 +21,15 @@ const PluginManifestSchema = z.object({
 
 const REPLAY_WINDOW_MS = 15 * 60 * 1000;
 const PLUGIN_INVOKE_TIMEOUT_MS = 30_000;
+const MAX_BODY_BYTES = Number(process.env.PLUS_PLUGIN_MAX_BODY_BYTES ?? 1_048_576);
 
 interface RegisteredPlugin {
   manifest: z.infer<typeof PluginManifestSchema>;
   pluginToken: Buffer;
   registeredAt: Date;
   lastHealthCheck?: { ts: Date; healthy: boolean; status?: number; error?: string };
+  // Set for daemon-internal plugins that don't use a callback URL
+  inProcessHealthFn?: () => Promise<Record<string, unknown>>;
 }
 
 function json(body: unknown, status = 200): Response {
@@ -155,6 +158,11 @@ export class PluginHttpGateway {
       return json(this.errorBody('plugin_not_registered', `Plugin '${name}' not registered`, requestId, name), 404);
     }
 
+    const contentLength = Number(req.headers.get('content-length') ?? 0);
+    if (contentLength > MAX_BODY_BYTES) {
+      return json(this.errorBody('body_too_large', `Request body exceeds ${MAX_BODY_BYTES} bytes`, requestId, name), 413);
+    }
+
     const ts = req.headers.get('x-plus-ts') ?? '';
     const sig = req.headers.get('x-plus-signature') ?? '';
     // Use raw body string for HMAC — re-serialization changes byte order (breaks Python default separators)
@@ -250,6 +258,14 @@ export class PluginHttpGateway {
     if (!plugin) {
       return json(this.errorBody('plugin_not_registered', `Plugin '${name}' not registered`, requestId, name), 404);
     }
+    if (plugin.inProcessHealthFn) {
+      try {
+        const health = await plugin.inProcessHealthFn();
+        return json({ name, healthy: true, ...health, request_id: requestId });
+      } catch (e) {
+        return json({ name, healthy: false, error: String(e), request_id: requestId });
+      }
+    }
     if (!plugin.manifest.health_url) {
       return json({ name, healthy: true, note: 'No health_url declared — plugin assumed healthy', request_id: requestId });
     }
@@ -288,6 +304,45 @@ export class PluginHttpGateway {
       if (expected.length !== sig.length) return false;
       return timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(sig, 'hex'));
     } catch { return false; }
+  }
+
+  /**
+   * Register a daemon-internal plugin that handles its own tool invocations via the
+   * PluginMcpBridge (no HTTP callback required). Returns the plugin token for callers.
+   *
+   * Tools must be pre-registered on getMcpBridge() before calling this. The gateway
+   * handles auth (HMAC with the returned token) and routes invocations to the bridge.
+   */
+  registerInProcess(name: string, opts: {
+    version: string;
+    tools: { name: string; description: string; schema: Record<string, unknown> }[];
+    healthFn?: () => Promise<Record<string, unknown>>;
+  }): Buffer {
+    if (this.plugins.has(name)) {
+      try { getMcpBridge().unregisterPlugin(name); } catch {}
+      this.plugins.delete(name);
+    }
+
+    const pluginToken = randomBytes(32);
+    const syntheticManifest = {
+      name,
+      version: opts.version,
+      schema_version: 1,
+      callback_url: 'http://localhost:0/noop',
+      health_url: undefined,
+      tools: opts.tools,
+      capabilities: ['tools'] as string[],
+    };
+
+    this.plugins.set(name, {
+      manifest: syntheticManifest as z.infer<typeof PluginManifestSchema>,
+      pluginToken,
+      registeredAt: new Date(),
+      inProcessHealthFn: opts.healthFn,
+    });
+
+    try { getMcpBridge().audit('in_process_plugin_registered', { plugin: name, tools_count: opts.tools.length }); } catch {}
+    return pluginToken;
   }
 
   /** Expose for tests */

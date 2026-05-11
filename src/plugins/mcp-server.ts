@@ -8,7 +8,7 @@
  *   { "mcpServers": { "claudeclaw-plus": { "command": "bun", "args": ["run", "/path/to/mcp-server.ts"] } } }
  */
 
-import { Server } from "@modelcontextprotocol/sdk/server";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
