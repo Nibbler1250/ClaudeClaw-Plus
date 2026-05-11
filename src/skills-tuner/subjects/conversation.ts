@@ -317,36 +317,45 @@ export class ConversationSubject extends TunableSubject {
       const description = proposal.description || '';
       let appliedContent = '';
 
+      // skills repo is a distinct git repo (~/agent/skills)
+      // Create on a tune/proposal-{id} branch, not directly on master
+      const branchName = `tune/proposal-${proposal.id}`;
+      execSync(`git -C "${skillsDir}" checkout -b "${branchName}" 2>/dev/null || git -C "${skillsDir}" checkout "${branchName}"`);
+
       // Example patterns to detect
       if (description.includes('trader-status') || description.includes('status trader')) {
         const skillPath = join(skillsDir, 'trader-status.md');
         const skillContent = `---
 name: trader-status
-description: Get current trading status, momentum PnL, position summary, IBKR connection status
+description: Retourne le statut courant du trader — momentum PnL, positions ouvertes, connexion IBKR, dernière stratégie
 triggers:
   - status trader
   - trader status
   - /trader
+  - /trader-status
   - pnl
-  - position
+  - position ouverte
 needs_tools: []
 returns: "{status: string, pnl: number, positions: [], ibkr_connected: boolean}"
 ---
 
 # Trader Status — Quick Dashboard
 
-Retourne le statut courant du trading :
-- Momentum trader status (running/error)
-- PnL jour (+ détail positions)
+Retourne en 1-2 sec :
+- Momentum/Swing trader status (running/error)
+- PnL jour (+ détail positions ouvertes)
 - Connexion IBKR (UP/DOWN)
 - Prochaine stratégie
 
-Rapide — 1-2 sec max.
+Script : python3 ~/agent/scripts/trader-status.py
 `;
         await writeFile(skillPath, skillContent, 'utf8');
-        execSync(`cd "${skillsDir}" && git add trader-status.md && git commit -m "feat(skill): trader-status shortcut" 2>/dev/null || true`);
-        appliedContent = `✅ Created skill: ~/agent/skills/trader-status.md`;
+        execSync(`git -C "${skillsDir}" add trader-status.md && git -C "${skillsDir}" commit -m "feat(skill): trader-status shortcut — auto-created by ConversationSubject"`);
+        appliedContent = `✅ Created skill: ~/agent/skills/trader-status.md (branch ${branchName})`;
       }
+
+      // Return to master after creating the branch
+      execSync(`git -C "${skillsDir}" checkout master 2>/dev/null || true`);
 
       return {
         target_path: skillsDir,
