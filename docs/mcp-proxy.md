@@ -94,7 +94,9 @@ See `mcp-proxy.json.example` in the repo root for a full template.
 **URL**: `POST http://localhost:4632/api/plugin/mcp-proxy/tools/{server}__{tool}/invoke`
 
 **Auth**: HMAC with the mcp-proxy plugin token (stored at `~/.config/claudeclaw/mcp-proxy.token`).
-The token is written at daemon startup.
+The token is written at daemon startup. Two required headers per call:
+- `x-plus-ts`: ISO 8601 UTC timestamp (e.g. `2026-05-11T12:34:56.000Z`)
+- `x-plus-signature`: `HMAC-SHA256(token, "<ts>\n<body>")` hex-encoded — the timestamp is prepended to the raw body before signing
 
 **Body**:
 ```json
@@ -102,6 +104,24 @@ The token is written at daemon startup.
   "arguments": { "device_id": "42", "command": "on" },
   "mode": "direct"
 }
+```
+
+**Example curl** (Python helper for HMAC):
+```bash
+TOKEN=$(cat ~/.config/claudeclaw/mcp-proxy.token)
+BODY='{"arguments":{"device_id":"42","command":"on"},"mode":"direct"}'
+TS=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+SIG=$(python3 -c "
+import hmac, hashlib, sys
+token = bytes.fromhex('$TOKEN')
+msg = ('$TS' + '\n' + sys.argv[1]).encode()
+print(hmac.new(token, msg, hashlib.sha256).hexdigest())
+" "$BODY")
+curl -s -X POST http://localhost:4632/api/plugin/mcp-proxy/tools/home-automation__device_command/invoke \
+  -H "Content-Type: application/json" \
+  -H "x-plus-ts: $TS" \
+  -H "x-plus-signature: $SIG" \
+  -d "$BODY"
 ```
 
 **Response**:

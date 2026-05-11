@@ -28,9 +28,22 @@ Daemon-style plugins register themselves over HTTP and serve tool calls via a ca
 
 - **Bootstrap token**: 32-byte secret at `~/.config/plus/plugin-bootstrap.secret` (0600). Printed once at first start. Retrieve with `bun run src/plugins/cli.ts print-bootstrap-token`.
 - **Per-plugin token**: returned at registration time, used for HMAC signing on subsequent invocations. Store securely in the daemon process.
-- **HMAC**: `HMAC-SHA256(secret, "{ts}\n{body}")` where `ts` is ISO-8601 UTC, `body` is JSON-serialized. Sent in `X-Plus-Signature` header.
-- **Replay window**: 15 minutes (clock-skew tolerant). Requests outside this window are rejected.
+- **HMAC**: `HMAC-SHA256(secret, "{ts}\n{body}")` where `ts` is ISO-8601 UTC, `body` is JSON-serialized raw. Sent in headers `x-plus-ts` (the timestamp string) and `x-plus-signature` (hex-encoded digest).
+- **Replay window**: 15 minutes, bidirectional (`Math.abs(now - ts) > 900_000ms` rejected as `stale_or_future_timestamp`).
 - **Callback allowlist**: by default, only `localhost` / `127.0.0.1` / `::1` are allowed as callback hosts.
+
+### Authentication contract
+
+Every `/invoke` call must include:
+- Header `x-plus-ts`: ISO 8601 UTC timestamp (e.g. `2026-05-11T12:34:56.000Z`)
+- Header `x-plus-signature`: hex-encoded SHA-256 HMAC of `<ts>\n<body>` using the per-plugin token returned at register time
+
+Reference implementations:
+- TypeScript: `` createHmac('sha256', token).update(`${ts}\n${body}`).digest('hex') ``
+- Python: `hmac.new(token_bytes, (ts + "\n" + body).encode(), hashlib.sha256).hexdigest()`
+
+The body is signed **raw** — do not re-serialize the JSON between signing and sending, or
+byte-order differences (e.g. Python default separators vs JS) will break verification.
 
 ### Standard error format
 
