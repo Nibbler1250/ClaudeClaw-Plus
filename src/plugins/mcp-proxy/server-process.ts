@@ -168,6 +168,7 @@ export class McpServerProcess {
   }
 
   private async _doRestart(): Promise<void> {
+    if (this.stopping) return; // stop() may have been called while restart timer was queued
     try {
       const oldClient = this.client;
       const oldTransport = this.transport;
