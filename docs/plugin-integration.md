@@ -6,7 +6,7 @@ ClaudeClaw-Plus supports three tiers of plugin integration:
 |---|---|---|
 | 1 | In-process TypeScript | Skills-tuner, compiled-in features |
 | 2 | Subprocess JSON-RPC | ML backends (Optuna), Python scripts |
-| 3 | HTTP daemon | Greg/voice, Archiviste, cross-process tools |
+| 3 | HTTP daemon | voice-driven agent, retrieval daemon, cross-process tools |
 
 ---
 
@@ -54,7 +54,7 @@ All errors return JSON:
   "error": {
     "code": "invalid_signature",
     "message": "HMAC verification failed",
-    "plugin": "greg-voice",
+    "plugin": "voice-agent",
     "request_id": "a1b2c3d4e5f6a7b8",
     "ts": "2026-05-09T20:00:00.000Z"
   }
@@ -65,7 +65,7 @@ All errors return JSON:
 
 ---
 
-## Greg / Voice plugin — Python example
+## Voice agent plugin — Python example
 
 ```python
 import os, json, hmac, hashlib, requests
@@ -77,7 +77,7 @@ PLUS_URL = "http://localhost:3000"
 BOOTSTRAP_SECRET_PATH = os.path.expanduser("~/.config/plus/plugin-bootstrap.secret")
 
 manifest = {
-    "name": "greg-voice",
+    "name": "voice-agent",
     "version": "1.0.0",
     "schema_version": 1,
     "callback_url": "http://localhost:8765/plus-callback",
@@ -154,7 +154,7 @@ PLUS_URL = "http://localhost:3000"
 BOOTSTRAP_SECRET_PATH = os.path.expanduser("~/.config/plus/plugin-bootstrap.secret")
 
 manifest = {
-    "name": "archiviste",
+    "name": "retrieval-daemon",
     "version": "1.0.0",
     "schema_version": 1,
     "callback_url": "http://localhost:8766/plus-callback",
@@ -206,7 +206,7 @@ def handle_callback():
         import subprocess
         result = subprocess.check_output([
             "python3",
-            os.path.expanduser("~/agent/scripts/archiviste-vectorize.py"),
+            os.path.expanduser("<retrieval-daemon>/vectorize.py"),
             "--search", args["query"],
             *(["--trusted-only"] if args.get("trusted_only", True) else []),
         ]).decode()
