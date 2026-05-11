@@ -169,3 +169,29 @@ describe("McpServerProcess", () => {
     }
   });
 });
+
+describe("McpServerProcess — startup failure cleanup (zombie prevention)", () => {
+  it("closes transport when listTools throws during start()", async () => {
+    // Spawn a server that exits immediately so client.connect/listTools will fail
+    const proc = new McpServerProcess("crash-test", {
+      command: "node",
+      args: ["-e", "process.exit(1)"],  // immediate exit
+      enabled: true,
+    });
+
+    let threw = false;
+    try {
+      await proc.start();
+    } catch {
+      threw = true;
+    }
+
+    expect(threw).toBe(true);
+    expect(proc.status).toBe("failed");
+    // Transport should be cleared so a subsequent stop() is a no-op
+    // (no zombie subprocess waiting for cleanup)
+    await proc.stop();  // must not throw
+    expect(proc.status).toBe("stopped");
+  });
+});
+

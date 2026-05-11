@@ -83,9 +83,21 @@ export class McpServerProcess {
     this.transport.onclose = () => { if (this.generation === gen) this._handleCrash("transport closed"); };
     this.transport.onerror = (err) => { if (this.generation === gen) this._handleCrash(`transport error: ${err.message}`); };
 
-    await this.client.connect(this.transport);
-
-    const { tools } = await this.client.listTools();
+    // Cleanup guarantee: if connect/listTools throws, kill the spawned subprocess
+    // before propagating. Prevents zombie MCP servers across daemon restarts when
+    // upstream servers are flaky at startup.
+    let tools: Awaited<ReturnType<Client["listTools"]>>["tools"];
+    try {
+      await this.client.connect(this.transport);
+      ({ tools } = await this.client.listTools());
+    } catch (err) {
+      this.status = "failed";
+      try { await this.client?.close(); } catch {}
+      try { await this.transport?.close(); } catch {}
+      this.client = undefined;
+      this.transport = undefined;
+      throw err;
+    }
     const allowed = this.config.allowedTools;
     this.tools = tools
       .filter((t) => !allowed || allowed.includes(t.name))
