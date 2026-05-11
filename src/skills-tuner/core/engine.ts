@@ -239,15 +239,23 @@ export class Engine {
       throw new Error(`Validation failed: ${validation.reason ?? 'unknown'}`);
     }
 
-    await branches.createProposalBranch(proposalId);
-    const commitSha = await branches.commitPatch(patch, proposal, alternativeId);
+    // System-resource patches (e.g. crontab) live outside any git repo — skip
+    // branch/commit and rely on audit log only.
+    const SYSTEM_TARGETS = new Set(['crontab']);
+    const isSystemPatch = SYSTEM_TARGETS.has(patch.target_path);
+
+    let commitSha = '';
+    if (!isSystemPatch) {
+      await branches.createProposalBranch(proposalId);
+      commitSha = await branches.commitPatch(patch, proposal, alternativeId);
+    }
 
     this.proposals.append({
       proposal,
       event: 'applied',
       ts: new Date().toISOString(),
       alternative_id: alternativeId,
-      commit_sha: commitSha,
+      commit_sha: commitSha || undefined,
       applied_target_path: patch.target_path,
     });
     auditLog('apply_success', { proposal_id: proposalId, alternative_id: alternativeId, commit_sha: commitSha, repo_path: branches.repoPath });

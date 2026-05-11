@@ -27,14 +27,15 @@ export class BranchManager {
       await this.git.checkout(name);
       return name;
     }
-    // Always branch from baseBranch (not the current HEAD) so successive
-    // auto-merged proposals don't stack on each other.
-    if (!branches.all.includes(baseBranch)) {
+    // Auto-detect base branch: try requested name, then common fallbacks.
+    const candidates = [baseBranch, 'master', 'main'];
+    const resolved = candidates.find(b => branches.all.includes(b));
+    if (!resolved) {
       throw new Error(
-        `Base branch '${baseBranch}' not found in repo. Cannot create proposal branch — refusing to branch from current HEAD which would let proposals stack on each other. Set baseBranch explicitly if your repo doesn't use 'main'.`
+        `Base branch '${baseBranch}' not found in repo (tried: ${candidates.join(', ')}). Cannot create proposal branch — refusing to branch from current HEAD which would let proposals stack on each other.`
       );
     }
-    await this.git.checkout(baseBranch);
+    await this.git.checkout(resolved);
     await this.git.checkoutLocalBranch(name);
     return name;
   }
