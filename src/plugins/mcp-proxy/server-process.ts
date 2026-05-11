@@ -148,10 +148,14 @@ export class McpServerProcess {
     const now = Date.now();
     this.crashTimestamps = [...this.crashTimestamps, now].filter((t) => now - t < CRASH_WINDOW_MS);
 
-    this.restartHook?.(this.name, reason);
-
     if (this.crashTimestamps.length >= MAX_CRASHES_IN_WINDOW) {
       this.status = "failed";
+    }
+
+    // Fire hook AFTER status is finalized so callers see "failed" vs "crashed" correctly
+    this.restartHook?.(this.name, reason);
+
+    if (this.status === "failed") {
       return;
     }
 
