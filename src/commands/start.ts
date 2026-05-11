@@ -1,4 +1,6 @@
 import { writeFile, unlink, mkdir } from "fs/promises";
+import { existsSync } from "fs";
+import { homedir } from "os";
 import { extractErrorDetail } from "../messaging";
 import { join } from "path";
 import { fileURLToPath } from "url";
@@ -513,17 +515,22 @@ export async function start(args: string[] = []) {
     await pluginManager.emit("gateway_start", {}, { workspaceDir: process.cwd() });
   }
 
-  // Start mcp-proxy plugin (warm-pooled MCP server connections)
-  mcpProxyStarted = getMcpProxyPlugin({
-    reasonedInvokeFn: async (fqn, args) => {
-      const prompt = `Use tool \`${fqn}\` with these arguments: ${JSON.stringify(args)}. Return ONLY the raw JSON result of the tool, no prose, no markdown.`;
-      const result = await runUserMessage("inject", prompt);
-      const text = result.stdout.trim().replace(/^```[a-z]*\n?/, "").replace(/\n?```$/, "").trim();
-      try { return JSON.parse(text); } catch { return text; }
-    },
-  }).start().catch((err) => {
-    console.error("[mcp-proxy] Startup error (non-fatal):", err instanceof Error ? err.message : String(err));
-  });
+  // Start mcp-proxy plugin only when a config file is present — avoids opening
+  // an HTTP gateway on deployments that don't use external MCP plugins.
+  const mcpProxyConfigPath = join(homedir(), ".config", "claudeclaw", "mcp-proxy.json");
+  const mcpProxyAltConfigPath = join(homedir(), ".config", "claude", "mcp.json");
+  if (existsSync(mcpProxyConfigPath) || existsSync(mcpProxyAltConfigPath)) {
+    mcpProxyStarted = getMcpProxyPlugin({
+      reasonedInvokeFn: async (fqn, args) => {
+        const prompt = `Use tool \`${fqn}\` with these arguments: ${JSON.stringify(args)}. Return ONLY the raw JSON result of the tool, no prose, no markdown.`;
+        const result = await runUserMessage("inject", prompt);
+        const text = result.stdout.trim().replace(/^```[a-z]*\n?/, "").replace(/\n?```$/, "").trim();
+        try { return JSON.parse(text); } catch { return text; }
+      },
+    }).start().catch((err) => {
+      console.error("[mcp-proxy] Startup error (non-fatal):", err instanceof Error ? err.message : String(err));
+    });
+  }
 
   function isAddrInUse(err: unknown): boolean {
     if (!err || typeof err !== "object") return false;
