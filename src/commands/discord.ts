@@ -130,6 +130,10 @@ let readyGuildIds: Set<string> | null = null;
 // Track known thread channel IDs and their parent channel IDs for multi-session support
 const knownThreads = new Map<string, { parentId: string; agentName?: string }>();
 
+function isDiscordThreadType(type: number | undefined): boolean {
+  return type === 10 || type === 11 || type === 12;
+}
+
 // Upsert knownThreads, preserving any existing agentName when a new one is not supplied.
 // The agentName key is "<slug>-<threadId>" to guarantee uniqueness across threads whose
 // display names would otherwise map to the same slug.
@@ -385,36 +389,49 @@ async function rejoinThreads(
   }
 
   // GUILD_CREATE path
-  const config = getSettings().discord;
-  const listenInfra = infra.filter((ts) =>
-    config.listenChannels.includes(knownThreads.get(ts.threadId)?.parentId ?? ""),
-  );
   console.log(
-    `[Discord][REJOIN] trigger=GUILD_CREATE threads=${listenInfra.length} session=${sessionShort}`,
+    `[Discord][REJOIN] trigger=GUILD_CREATE sessions=${infra.length} session=${sessionShort}`,
   );
+  let rejoinedCount = 0;
+  let skippedNonThreads = 0;
 
   for (const ts of infra) {
     const isMember = memberThreadIds?.has(ts.threadId) ?? false;
     try {
+      let threadInfo = knownThreads.get(ts.threadId);
+      if (!threadInfo) {
+        const ch = await discordApi<{ parent_id?: string; name?: string; type?: number }>(token, "GET", `/channels/${ts.threadId}`);
+        if (!isDiscordThreadType(ch.type)) {
+          skippedNonThreads += 1;
+          debugLog(`[Discord][REJOIN] skip non-thread session ${ts.threadId} type=${ch.type ?? "unknown"}`);
+          continue;
+        }
+        if (!ch.parent_id) {
+          skippedNonThreads += 1;
+          debugLog(`[Discord][REJOIN] skip thread session ${ts.threadId} without parent_id`);
+          continue;
+        }
+        upsertThread(ts.threadId, ch.parent_id, ch.name);
+        threadInfo = knownThreads.get(ts.threadId);
+      }
+      if (!threadInfo) continue;
+
       if (!isMember) {
         // Not in GUILD_CREATE member list — force full rejoin to reset gateway subscription
         await discordApi(token, "DELETE", `/channels/${ts.threadId}/thread-members/@me`).catch(() => {});
       }
       await discordApi(token, "PUT", `/channels/${ts.threadId}/thread-members/@me`);
+      rejoinedCount += 1;
       console.log(
         `[Discord][REJOIN] thread=${ts.threadId} GUILD_CREATE=${isMember ? "member" : "non-member"} rejoined`,
       );
-      if (!knownThreads.has(ts.threadId)) {
-        const ch = await discordApi<{ parent_id?: string }>(token, "GET", `/channels/${ts.threadId}`);
-        if (ch.parent_id) knownThreads.set(ts.threadId, { parentId: ch.parent_id });
-      }
     } catch (err) {
       console.error(`[Discord] Failed to rejoin thread ${ts.threadId}: ${err}`);
     }
   }
 
   if (infra.length > 0) {
-    console.log(`[Discord][REJOIN] done. knownThreads size=${knownThreads.size}`);
+    console.log(`[Discord][REJOIN] done. rejoined=${rejoinedCount} skippedNonThreads=${skippedNonThreads} knownThreads size=${knownThreads.size}`);
   }
 }
 
@@ -732,8 +749,8 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
     const persisted = await peekThreadSession(channelId);
     if (persisted) {
       try {
-        const ch = await discordApi<{ parent_id?: string; name?: string }>(config.token, "GET", `/channels/${channelId}`);
-        if (ch.parent_id) {
+        const ch = await discordApi<{ parent_id?: string; name?: string; type?: number }>(config.token, "GET", `/channels/${channelId}`);
+        if (isDiscordThreadType(ch.type) && ch.parent_id) {
           upsertThread(channelId, ch.parent_id, ch.name);
           debugLog(`Thread recovered from sessions.json: ${channelId} (parent: ${ch.parent_id} name: ${ch.name ?? "unknown"})`);
         }
@@ -828,6 +845,7 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
 
   // Typing indicator loop (Discord typing lasts 10s, fire every 8s)
   const typingInterval = setInterval(() => sendTyping(config.token, channelId), 8000);
+  let streamCb: DiscordStreamCallbacks | undefined;
 
   try {
     await sendTyping(config.token, channelId);
@@ -1021,23 +1039,27 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
         );
       }
     }
-    let streamCb: DiscordStreamCallbacks | undefined;
     if (config.streaming) {
       streamCb = makeDiscordStreamCallback(config.token, channelId);
     }
 
-    const result = await runUserMessage(
-      "discord",
-      prefixedPrompt,
-      sessionKey,
-      threadInfo?.agentName,
-      streamCb?.onChunk,
-      streamCb?.onToolEvent,
-    );
-
-    if (streamCb) {
-      await streamCb.finalize();
-    }
+    const result = await (async () => {
+      try {
+        return await runUserMessage(
+          "discord",
+          prefixedPrompt,
+          sessionKey,
+          threadInfo?.agentName,
+          streamCb?.onChunk,
+          streamCb?.onToolEvent,
+        );
+      } finally {
+        if (streamCb) {
+          await streamCb.finalize();
+          streamCb = undefined;
+        }
+      }
+    })();
 
     if (result.exitCode !== 0) {
       await sendMessage(config.token, channelId, `Error (exit ${result.exitCode}): ${extractErrorDetail(result) || "Unknown error"}`);
@@ -1060,6 +1082,9 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
     console.error(`[Discord] Error for ${label}: ${errMsg}`);
     await sendMessage(config.token, channelId, `Error: ${errMsg}`);
   } finally {
+    if (streamCb) {
+      await streamCb.finalize();
+    }
     clearInterval(typingInterval);
   }
 }
