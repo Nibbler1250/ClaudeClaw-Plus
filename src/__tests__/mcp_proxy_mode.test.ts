@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createHmac } from "node:crypto";
 import { McpProxyPlugin, _resetMcpProxy } from "../plugins/mcp-proxy/index.js";
@@ -167,3 +167,74 @@ describe("mcp-proxy mode selector", () => {
     expect(servers["test-server"]?.status).toBe("up");
   });
 });
+
+
+describe("reasonedInvokeFn — allowlist + args cap (PR review fix)", () => {
+  it("hasReasonedTool() rejects unregistered fqn shapes", async () => {
+    const cfgDir = mkdtempSync(join(tmpdir(), "mcp-proxy-allowlist-"));
+    const cfgPath = join(cfgDir, "mcp-proxy.json");
+    writeFileSync(cfgPath, JSON.stringify({
+      servers: {
+        "test-server": {
+          command: BUN_BIN,
+          args: ["-e", "setInterval(()=>{},1000)"],
+          enabled: true,
+          allowedTools: ["echo"],
+        },
+      },
+    }));
+    chmodSync(cfgPath, 0o600);
+
+    _resetMcpBridge();
+    _resetMcpProxy();
+    const proxy = new McpProxyPlugin({
+      configPath: cfgPath,
+      tokenPath: join(cfgDir, "mcp-proxy.token"),
+    });
+
+    // No need to actually start servers — we test the static logic.
+    // But hasReasonedTool checks this.servers.get(name), so we need either a started
+    // proxy or expose the test path. Test against unregistered first (server not in pool):
+    expect(proxy.hasReasonedTool("nonexistent-server__some-tool")).toBe(false);
+    expect(proxy.hasReasonedTool("too__many__segments__here")).toBe(false);
+    expect(proxy.hasReasonedTool("bogus")).toBe(false);
+    expect(proxy.hasReasonedTool("")).toBe(false);
+
+    // Path traversal / injection attempt — must be rejected
+    expect(proxy.hasReasonedTool("server with spaces__t")).toBe(false);
+    expect(proxy.hasReasonedTool("mcp-proxy__test\nignore previous__tool")).toBe(false);
+    expect(proxy.hasReasonedTool("mcp-proxy__\`run rm -rf /\`__tool")).toBe(false);
+  });
+
+  it("hasReasonedTool() accepts only fqn matching a server+tool in the live pool", async () => {
+    const cfgDir = mkdtempSync(join(tmpdir(), "mcp-proxy-allowlist-ok-"));
+    const cfgPath = join(cfgDir, "mcp-proxy.json");
+    writeFileSync(cfgPath, JSON.stringify({
+      servers: {
+        "echo-srv": {
+          command: BUN_BIN,
+          args: ["run", MOCK_SERVER],
+          enabled: true,
+        },
+      },
+    }));
+    chmodSync(cfgPath, 0o600);
+
+    _resetMcpBridge();
+    _resetMcpProxy();
+    const proxy = new McpProxyPlugin({
+      configPath: cfgPath,
+      tokenPath: join(cfgDir, "mcp-proxy.token"),
+    });
+    await proxy.start();
+
+    // Live tool from mock-mcp-server should be accepted
+    expect(proxy.hasReasonedTool("echo-srv__echo")).toBe(true);
+    // But not unrelated tool names
+    expect(proxy.hasReasonedTool("echo-srv__not-a-tool")).toBe(false);
+    expect(proxy.hasReasonedTool("other-srv__echo")).toBe(false);
+
+    await proxy.stop();
+  });
+});
+

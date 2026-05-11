@@ -522,7 +522,27 @@ export async function start(args: string[] = []) {
   if (existsSync(mcpProxyConfigPath) || existsSync(mcpProxyAltConfigPath)) {
     mcpProxyStarted = getMcpProxyPlugin({
       reasonedInvokeFn: async (fqn, args) => {
-        const prompt = `Use tool \`${fqn}\` with these arguments: ${JSON.stringify(args)}. Return ONLY the raw JSON result of the tool, no prose, no markdown.`;
+        // Allowlist validation: reject fqn shapes that could break out of the
+        // single backtick-delimited slot in the prompt below. Only accept
+        // identifiers from the configured mcp-proxy registry — same shape that
+        // mcp-proxy server registration produces. This prevents a misconfigured
+        // or hostile plugin from interpolating arbitrary text into a Claude
+        // session running with --dangerously-skip-permissions.
+        if (typeof fqn !== "string" || !/^[a-zA-Z0-9_-]+__[a-zA-Z0-9_-]+$/.test(fqn)) {
+          throw new Error(`reasoned mode rejected fqn shape: ${JSON.stringify(fqn).slice(0, 80)}`);
+        }
+        const proxy = getMcpProxyPlugin();
+        if (!proxy.hasReasonedTool(fqn)) {
+          throw new Error(`reasoned mode rejected: ${fqn} is not in the mcp-proxy registered-tool allowlist`);
+        }
+        // Cost-cap: every reasoned call spawns a full Claude inject (~3s + Anthropic
+        // API cost). Reject oversized arg payloads before incurring that cost, so a
+        // misbehaving plugin can't blow the budget by sending megabytes of args.
+        const argsStr = JSON.stringify(args);
+        if (argsStr.length > 8000) {
+          throw new Error(`reasoned mode rejected: args ${argsStr.length}B exceeds 8000B cap (would blow Claude prompt budget)`);
+        }
+        const prompt = `Use tool \`${fqn}\` with these arguments: ${argsStr}. Return ONLY the raw JSON result of the tool, no prose, no markdown.`;
         const result = await runUserMessage("inject", prompt);
         const text = result.stdout.trim().replace(/^```[a-z]*\n?/, "").replace(/\n?```$/, "").trim();
         try { return JSON.parse(text); } catch { return text; }

@@ -175,6 +175,24 @@ export class McpProxyPlugin {
     }
   }
 
+  /**
+   * Allowlist check for reasonedInvokeFn. Returns true iff the given fqn
+   * matches a tool currently registered by this plugin (i.e. mcp-proxy__server__tool
+   * where the server is in the live pool and the tool was advertised by it).
+   *
+   * Called from start.ts before constructing a Claude inject prompt, to prevent
+   * unregistered fqn strings from being interpolated into the prompt verbatim.
+   */
+  hasReasonedTool(fqn: string): boolean {
+    // Expected shape: <server>__<tool> (2 segments) — what registerPluginTool closure
+    const m = fqn.match(/^([a-zA-Z0-9_-]+)__([a-zA-Z0-9_-]+)$/);
+    if (!m) return false;
+    const [, server, tool] = m;
+    const proc = this.servers.get(server);
+    if (!proc) return false;
+    return proc.tools.some((t) => t.name === tool);
+  }
+
   private async _invokeReasoned(fqn: string, args: unknown): Promise<unknown> {
     if (!this.reasonedInvokeFn) {
       throw new Error(`reasoned mode not configured for ${fqn}`);
