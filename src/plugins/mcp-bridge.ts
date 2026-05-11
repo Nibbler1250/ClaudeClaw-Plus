@@ -51,7 +51,17 @@ export class PluginMcpBridge {
 
   // ── Tool registration ──────────────────────────────────────────────────
 
+  // Path-traversal guard: pluginId must be a safe identifier.
+  // Allowed: lowercase letters, digits, dashes; must start with a letter; 1-64 chars.
+  // Rejects any string containing path separators, dots, or other special chars.
+  private _validatePluginId(pluginId: string): void {
+    if (typeof pluginId !== "string" || !/^[a-z][a-z0-9-]{0,63}$/.test(pluginId)) {
+      throw new Error(`invalid pluginId: ${JSON.stringify(pluginId)} (must match /^[a-z][a-z0-9-]{0,63}$/)`);
+    }
+  }
+
   registerPluginTool(pluginId: string, tool: PluginTool): void {
+    this._validatePluginId(pluginId);
     const fqn = `${pluginId}__${tool.name}`;
 
     if (this.tools.has(fqn)) {
@@ -63,6 +73,7 @@ export class PluginMcpBridge {
   }
 
   unregisterPlugin(pluginId: string): void {
+    this._validatePluginId(pluginId);
     for (const [fqn, entry] of this.tools) {
       if (entry.plugin === pluginId) this.tools.delete(fqn);
     }
@@ -72,6 +83,7 @@ export class PluginMcpBridge {
   // ── Secret management ──────────────────────────────────────────────────
 
   loadOrCreateSecret(pluginId: string): Buffer {
+    this._validatePluginId(pluginId);
     const cached = this.secrets.get(pluginId);
     if (cached) return cached;
 

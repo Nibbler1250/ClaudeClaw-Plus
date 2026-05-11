@@ -242,3 +242,46 @@ describe("PluginMcpBridge", () => {
     });
   });
 });
+
+describe("path traversal protection (pluginId validation)", () => {
+  it("rejects pluginId with .. segments", () => {
+    const bridge = new PluginMcpBridge("/tmp/test-audit-pt.jsonl");
+    expect(() => bridge.loadOrCreateSecret("../../evil")).toThrow(/invalid pluginId/);
+    expect(() => bridge.registerPluginTool("../../evil", { name: "x", description: "", schema: {}, handler: async () => ({}) })).toThrow(/invalid pluginId/);
+    expect(() => bridge.unregisterPlugin("../../evil")).toThrow(/invalid pluginId/);
+  });
+
+  it("rejects pluginId with path separators", () => {
+    const bridge = new PluginMcpBridge("/tmp/test-audit-pt.jsonl");
+    expect(() => bridge.loadOrCreateSecret("a/b")).toThrow(/invalid pluginId/);
+    expect(() => bridge.loadOrCreateSecret("a\\b")).toThrow(/invalid pluginId/);
+  });
+
+  it("rejects pluginId with dots or special chars", () => {
+    const bridge = new PluginMcpBridge("/tmp/test-audit-pt.jsonl");
+    expect(() => bridge.loadOrCreateSecret(".hidden")).toThrow(/invalid pluginId/);
+    expect(() => bridge.loadOrCreateSecret("a.b")).toThrow(/invalid pluginId/);
+    expect(() => bridge.loadOrCreateSecret("a b")).toThrow(/invalid pluginId/);
+  });
+
+  it("accepts valid pluginId (lowercase + digits + dashes, starts with letter)", () => {
+    const bridge = new PluginMcpBridge("/tmp/test-audit-pt-valid.jsonl");
+    // Should not throw
+    bridge.loadOrCreateSecret("mcp-proxy");
+    bridge.loadOrCreateSecret("archiviste");
+    bridge.loadOrCreateSecret("plugin-a1");
+  });
+
+  it("rejects empty / too-long pluginId", () => {
+    const bridge = new PluginMcpBridge("/tmp/test-audit-pt.jsonl");
+    expect(() => bridge.loadOrCreateSecret("")).toThrow(/invalid pluginId/);
+    expect(() => bridge.loadOrCreateSecret("a".repeat(65))).toThrow(/invalid pluginId/);
+  });
+
+  it("rejects pluginId starting with digit or dash", () => {
+    const bridge = new PluginMcpBridge("/tmp/test-audit-pt.jsonl");
+    expect(() => bridge.loadOrCreateSecret("1plugin")).toThrow(/invalid pluginId/);
+    expect(() => bridge.loadOrCreateSecret("-plugin")).toThrow(/invalid pluginId/);
+  });
+});
+
