@@ -17,6 +17,7 @@
 
 import { join, isAbsolute, resolve } from "path";
 import { existsSync } from "fs";
+import { getMcpBridge, type PluginTool } from "./plugins/mcp-bridge.js";
 
 // ── Event types ──────────────────────────────────────────────────────────────
 
@@ -60,6 +61,7 @@ export interface PluginApi {
   on(event: string, handler: EventHandler): void;
   registerService(service: PluginService): void;
   registerCommand(cmd: PluginCommand): void;
+  registerTool(tool: PluginTool): void;
   runtime: {
     channel: Record<string, Record<string, (...args: unknown[]) => unknown>>;
   };
@@ -201,6 +203,9 @@ export class PluginManager {
       },
       registerCommand(cmd: PluginCommand) {
         self.commands.set(cmd.name, cmd);
+      },
+      registerTool(tool: PluginTool) {
+        getMcpBridge().registerPluginTool(pluginId, tool);
       },
       runtime: {
         channel: self.channelRuntime,

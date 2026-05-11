@@ -13,6 +13,7 @@ import { listSessions, readSessionMessages, listAgents } from "./services/sessio
 import { getSessionUsage } from "./services/usage";
 import { runUserMessage } from "../runner";
 import { readKanban, writeKanban, type KanbanBoard } from "./services/kanban";
+import { getHttpGateway } from "../plugins/http-gateway.js";
 
 // --- Security: CSRF Protection ---
 // NOTE: The Web UI has no built-in authentication. CSRF protection prevents
@@ -120,6 +121,16 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
     idleTimeout: 0,
     fetch: async (req) => {
       const url = new URL(req.url);
+
+      // Plugin HTTP gateway — handles /api/plugin/* routes
+      if (url.pathname.startsWith('/api/plugin/')) {
+        try {
+          const gatewayResp = await getHttpGateway().handleRequest(req, url);
+          if (gatewayResp !== null) return gatewayResp;
+        } catch (e) {
+          return Response.json({ error: 'gateway_error', message: String(e) }, { status: 500 });
+        }
+      }
 
       if (url.pathname === "/" || url.pathname === "/index.html") {
         return new Response(htmlPage(), {
