@@ -165,8 +165,12 @@ export class PluginHttpGateway {
 
     const ts = req.headers.get('x-plus-ts') ?? '';
     const sig = req.headers.get('x-plus-signature') ?? '';
-    // Use raw body string for HMAC — re-serialization changes byte order (breaks Python default separators)
-    const rawBody = await req.text();
+    // Use raw body bytes for HMAC — re-serialization changes byte order (breaks Python default separators)
+    const rawBuf = await req.arrayBuffer();
+    if (rawBuf.byteLength > MAX_BODY_BYTES) {
+      return json(this.errorBody('body_too_large', `Request body exceeds ${MAX_BODY_BYTES} bytes`, requestId, name), 413);
+    }
+    const rawBody = new TextDecoder().decode(rawBuf);
     const bodyStr = rawBody || '{}';
     let body: unknown;
     try { body = JSON.parse(bodyStr); } catch { body = {}; }

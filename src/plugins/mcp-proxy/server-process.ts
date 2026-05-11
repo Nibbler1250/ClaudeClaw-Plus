@@ -41,6 +41,8 @@ export class McpServerProcess {
   private restartHook?: (name: string, reason: string) => void;
   private stopping = false;
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
+  // Generation counter: stale onclose/onerror handlers from old transports are discarded
+  private generation = 0;
 
   constructor(name: string, config: McpServerConfig, opts?: {
     onCrash?: (name: string, reason: string) => void;
@@ -52,6 +54,7 @@ export class McpServerProcess {
 
   async start(): Promise<void> {
     this.status = "starting";
+    const gen = ++this.generation;
     const logDir = join(homedir(), ".cache", "claudeclaw", "mcp-proxy");
     mkdirSync(logDir, { recursive: true });
     const logPath = join(logDir, `${this.name}.log`);
@@ -75,8 +78,9 @@ export class McpServerProcess {
       { capabilities: { tools: {} } },
     );
 
-    this.transport.onclose = () => this._handleCrash("transport closed");
-    this.transport.onerror = (err) => this._handleCrash(`transport error: ${err.message}`);
+    // Capture gen in closure so stale handlers from a previous transport are silently discarded
+    this.transport.onclose = () => { if (this.generation === gen) this._handleCrash("transport closed"); };
+    this.transport.onerror = (err) => { if (this.generation === gen) this._handleCrash(`transport error: ${err.message}`); };
 
     await this.client.connect(this.transport);
 
@@ -160,9 +164,14 @@ export class McpServerProcess {
 
   private async _doRestart(): Promise<void> {
     try {
+      const oldClient = this.client;
+      const oldTransport = this.transport;
       this.client = null;
       this.transport = null;
       await this.start();
+      // Close old transport after new generation is live — stale handlers are discarded by gen guard
+      try { await oldClient?.close(); } catch {}
+      try { await oldTransport?.close(); } catch {}
     } catch (err) {
       this._handleCrash(`restart failed: ${err instanceof Error ? err.message : String(err)}`);
     }
