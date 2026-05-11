@@ -5,6 +5,7 @@ import { ProposalsStore, DEFAULT_PROPOSALS_PATH } from '../storage/proposals.js'
 import { RefusedStore, DEFAULT_REFUSED_PATH } from '../storage/refused.js';
 import { BranchManager } from '../git_ops/branches.js';
 import { SkillsSubject, type SkillOverride } from '../subjects/skills.js';
+import { WiseCronSubject } from '../subjects/wisecron.js';
 import { makeLLMClient, type LLMClient } from '../core/llm.js';
 import type { TunerConfig } from '../core/config.js';
 
@@ -55,5 +56,11 @@ function registerNativeSubjects(registry: Registry, config: TunerConfig, llm: LL
     const overrides = (skillsCfg.overrides ?? {}) as Record<string, SkillOverride>;
     const language = config.proposer?.language_preference ?? 'en';
     registry.registerSubject(new SkillsSubject({ scanDirs, overrides, language, llm }));
+  }
+
+  // WiseCron: always registered (reads crontab directly, no config deps)
+  const wisecronCfg = config.subjects['wisecron'];
+  if (wisecronCfg?.enabled !== false) {
+    registry.registerSubject(new WiseCronSubject());
   }
 }
