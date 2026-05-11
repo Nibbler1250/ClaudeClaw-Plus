@@ -6,6 +6,7 @@ import { RefusedStore, DEFAULT_REFUSED_PATH } from '../storage/refused.js';
 import { BranchManager } from '../git_ops/branches.js';
 import { SkillsSubject, type SkillOverride } from '../subjects/skills.js';
 import { WiseCronSubject } from '../subjects/wisecron.js';
+import { ConversationSubject } from '../subjects/conversation.js';
 import { makeLLMClient, type LLMClient } from '../core/llm.js';
 import type { TunerConfig } from '../core/config.js';
 
@@ -62,5 +63,11 @@ function registerNativeSubjects(registry: Registry, config: TunerConfig, llm: LL
   const wisecronCfg = config.subjects['wisecron'];
   if (wisecronCfg?.enabled !== false) {
     registry.registerSubject(new WiseCronSubject());
+  }
+
+  // Conversation: analyze discussion patterns, Simon ↔ Greg
+  const conversationCfg = config.subjects['conversation'];
+  if (conversationCfg?.enabled !== false) {
+    registry.registerSubject(new ConversationSubject());
   }
 }
