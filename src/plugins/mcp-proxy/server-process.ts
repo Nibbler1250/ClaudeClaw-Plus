@@ -79,9 +79,21 @@ export class McpServerProcess {
       { capabilities: { tools: {} } },
     );
 
-    // Capture gen in closure so stale handlers from a previous transport are silently discarded
-    this.transport.onclose = () => { if (this.generation === gen) this._handleCrash("transport closed"); };
-    this.transport.onerror = (err) => { if (this.generation === gen) this._handleCrash(`transport error: ${err.message}`); };
+    // Capture gen in closure so stale handlers from a previous transport are silently discarded.
+    // Also gate with a per-generation `crashHandled` flag: when a transport fails, both
+    // `onerror` and `onclose` fire for the same generation. Without this flag both
+    // would call _handleCrash, scheduling two restart timers and double-spawning.
+    let crashHandled = false;
+    this.transport.onclose = () => {
+      if (this.generation !== gen || crashHandled) return;
+      crashHandled = true;
+      this._handleCrash("transport closed");
+    };
+    this.transport.onerror = (err) => {
+      if (this.generation !== gen || crashHandled) return;
+      crashHandled = true;
+      this._handleCrash(`transport error: ${err.message}`);
+    };
 
     // Cleanup guarantee: if connect/listTools throws, kill the spawned subprocess
     // before propagating. Prevents zombie MCP servers across daemon restarts when
@@ -94,8 +106,8 @@ export class McpServerProcess {
       this.status = "failed";
       try { await this.client?.close(); } catch {}
       try { await this.transport?.close(); } catch {}
-      this.client = undefined;
-      this.transport = undefined;
+      this.client = null;
+      this.transport = null;
       throw err;
     }
     const allowed = this.config.allowedTools;
