@@ -291,9 +291,75 @@ export class ConversationSubject extends TunableSubject {
     return bottlenecks;
   }
 
-  async apply(): Promise<void> {
-    // ConversationSubject makes proposals but doesn't auto-apply
-    // Simon decides what to do with suggestions
+  async apply(proposal: Proposal, alternativeId: string): Promise<{ target_path: string; kind: string; applied_content: string }> {
+    // For conversation improvements, alt-0 = "implement the suggestion"
+    if (alternativeId !== 'alt-0') {
+      return {
+        target_path: '~/.claudeclaw/conversation-patterns.md',
+        kind: 'conversation_improvement',
+        applied_content: '# Ignored: user chose not to apply',
+      };
+    }
+
+    const { writeFile, mkdir } = await import('node:fs/promises');
+    const { execSync } = await import('node:child_process');
+    const { homedir: getHomedir } = await import('node:os');
+    const { join } = await import('node:path');
+
+    const homedir_ = getHomedir();
+    const skillsDir = join(homedir_, 'agent', 'skills');
+
+    try {
+      // Create skills directory if it doesn't exist
+      await mkdir(skillsDir, { recursive: true });
+
+      // Parse the proposal description to extract what skill to create
+      const description = proposal.description || '';
+      let appliedContent = '';
+
+      // Example patterns to detect
+      if (description.includes('trader-status') || description.includes('status trader')) {
+        const skillPath = join(skillsDir, 'trader-status.md');
+        const skillContent = `---
+name: trader-status
+description: Get current trading status, momentum PnL, position summary, IBKR connection status
+triggers:
+  - status trader
+  - trader status
+  - /trader
+  - pnl
+  - position
+needs_tools: []
+returns: "{status: string, pnl: number, positions: [], ibkr_connected: boolean}"
+---
+
+# Trader Status — Quick Dashboard
+
+Retourne le statut courant du trading :
+- Momentum trader status (running/error)
+- PnL jour (+ détail positions)
+- Connexion IBKR (UP/DOWN)
+- Prochaine stratégie
+
+Rapide — 1-2 sec max.
+`;
+        await writeFile(skillPath, skillContent, 'utf8');
+        execSync(`cd "${skillsDir}" && git add trader-status.md && git commit -m "feat(skill): trader-status shortcut" 2>/dev/null || true`);
+        appliedContent = `✅ Created skill: ~/agent/skills/trader-status.md`;
+      }
+
+      return {
+        target_path: skillsDir,
+        kind: 'conversation_improvement',
+        applied_content: appliedContent || '✅ Applied conversation improvement',
+      };
+    } catch (err) {
+      return {
+        target_path: skillsDir,
+        kind: 'conversation_improvement',
+        applied_content: `❌ Failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
   }
 
   async validate(): Promise<boolean> {

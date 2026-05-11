@@ -548,15 +548,84 @@ export class WiseCronSubject extends BaseSubject {
 
   async apply(proposal: Proposal, alternativeId: string): Promise<Patch> {
     const alt = proposal.alternatives.find(a => a.id === alternativeId);
-    const content = alt?.diff_or_content ?? '# no-op';
+    if (!alt) throw new Error(`Alternative ${alternativeId} not found in proposal ${proposal.id}`);
 
-    // For now, apply = generate a human-readable action report.
-    // Direct crontab modification is medium-risk, so we log + instruct.
-    return {
-      target_path: 'crontab',
-      kind: 'cron_change',
-      applied_content: content,
-    };
+    const { execSync } = await import('node:child_process');
+    const { homedir } = await import('node:os');
+
+    try {
+      // Read current crontab
+      let currentCrontab = '';
+      try {
+        currentCrontab = execSync('crontab -l 2>/dev/null || echo ""', { encoding: 'utf8' });
+      } catch {
+        currentCrontab = '';
+      }
+
+      // Apply the modification based on anomaly type
+      let modifiedCrontab = currentCrontab;
+      const sig = proposal.pattern_signature || '';
+
+      if (sig.includes('log_path_missing')) {
+        // Add log redirection to crons without one
+        const targets = sig.split(':')[2]?.split(',') || [];
+        for (const target of targets) {
+          if (!target || target.startsWith('>')) continue;
+          const scriptName = target.trim();
+          const logFile = `~/agent/logs/${scriptName.replace('.py', '').replace('.sh', '')}.log`;
+          // Find lines with this script and add log redirection if missing
+          modifiedCrontab = modifiedCrontab
+            .split('\n')
+            .map(line => {
+              if (line.includes(scriptName) && !line.includes('>>')) {
+                return `${line} >> ${logFile} 2>&1`;
+              }
+              return line;
+            })
+            .join('\n');
+        }
+      } else if (sig.includes('schedule_outside_relevance')) {
+        // Restrict cron to relevant hours (9-17 for trading, etc)
+        const target = sig.split(':')[2]?.trim() || '';
+        modifiedCrontab = modifiedCrontab
+          .split('\n')
+          .map(line => {
+            if (line.includes(target)) {
+              // Change * * * * * to 9-17 * * * 1-5 (trading hours, weekdays)
+              return line.replace(/^\*\/\d+\s+\*/, '*/15 9-17');
+            }
+            return line;
+          })
+          .join('\n');
+      } else if (sig.includes('redundant_schedule')) {
+        // Keep only the most frequent cron, remove duplicates
+        const targets = sig.split(':')[2]?.split(',') || [];
+        const linesToRemove = targets.slice(1); // Keep first, remove rest
+        modifiedCrontab = modifiedCrontab
+          .split('\n')
+          .filter(line => {
+            for (const t of linesToRemove) {
+              if (line.includes(t.trim())) return false;
+            }
+            return true;
+          })
+          .join('\n');
+      }
+
+      // Write modified crontab
+      const tmpFile = `/tmp/crontab-${Date.now()}`;
+      execSync(`cat > ${tmpFile}`, { input: modifiedCrontab });
+      execSync(`crontab ${tmpFile}`);
+      execSync(`rm ${tmpFile}`);
+
+      return {
+        target_path: 'crontab',
+        kind: 'cron_change',
+        applied_content: modifiedCrontab,
+      };
+    } catch (err) {
+      throw new Error(`Failed to apply cron change: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   async validate(patch: Patch): Promise<ValidationResult> {
