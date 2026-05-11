@@ -397,7 +397,10 @@ export async function start(args: string[] = []) {
     setPluginManager(pluginManager);
   }
 
+  let mcpProxyStarted: Promise<void> = Promise.resolve();
+
   async function shutdown() {
+    await mcpProxyStarted.catch(() => {}); // drain start() before stop() clears server map
     await getMcpProxyPlugin().stop();
     await pluginManager.stopServices();
     setPluginManager(null);
@@ -511,7 +514,7 @@ export async function start(args: string[] = []) {
   }
 
   // Start mcp-proxy plugin (warm-pooled MCP server connections)
-  getMcpProxyPlugin({
+  mcpProxyStarted = getMcpProxyPlugin({
     reasonedInvokeFn: async (fqn, args) => {
       const prompt = `Use tool \`${fqn}\` with these arguments: ${JSON.stringify(args)}. Return ONLY the raw JSON result of the tool, no prose, no markdown.`;
       const result = await runUserMessage("inject", prompt);

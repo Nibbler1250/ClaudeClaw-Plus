@@ -70,6 +70,7 @@ export class McpServerProcess {
     const stderrStream = this.transport.stderr;
     if (stderrStream) {
       const logStream = createWriteStream(logPath, { flags: "a" });
+      logStream.on("error", (err) => console.error(`[mcp-proxy] log write error for ${this.name}:`, err.message));
       stderrStream.pipe(logStream);
     }
 
