@@ -106,7 +106,7 @@ tuner skip 2
 | `revert` | `<id>` | Revert an applied proposal via `git revert` |
 | `feedback` | `<id> <yes\|yes-but\|no>` | Record preference feedback |
 | `stats` | — | Show created / applied / refused counts |
-| `setup` | — | First-run wizard: copy skill template + generate config |
+| `setup` | — | First-run wizard: init standard paths (~/.claude/skills, etc.) + copy skill + generate config |
 
 Duration format: `30s`, `10m`, `24h`, `7d`.
 
@@ -119,6 +119,33 @@ Duration format: `30s`, `10m`, `24h`, `7d`.
 | `skills` | Parses `.md` skill files, detects stale triggers, missing examples, weak descriptions |
 | `voice` | Detects repeated phrasing patterns in voice transcripts |
 | `external_process` | Spawns any Python/binary over stdio JSON-RPC — plug in Optuna, custom ML, etc. |
+
+---
+
+
+---
+
+## Where artifacts land
+
+Per-subject defaults resolve to the **standard discovery paths** read by the consuming
+runtime — no custom directories, no symlinks. Skills produced by the tuner are visible
+to Claude Code and the ClaudeClaw-Plus daemon out of the box.
+
+| Subject | Default `git_repo` | Standard |
+|---|---|---|
+| `skills` | `~/.claude/skills/` | Anthropic Skills discovery path |
+| `wisecron` | `~/.config/systemd/user/` | XDG path for systemd user units |
+| `cron` | `~/.config/cron/` | XDG-config sidecar for `crontab -l` snapshot |
+| _tuner state_ | `~/.config/tuner/` | proposals.jsonl, refused.jsonl, .secret |
+
+`tuner setup` creates each path, runs `git init`, snapshots `crontab -l` if non-empty,
+and installs the `/tuner` skill in Anthropic dir-format (`<name>/SKILL.md`).
+
+`tuner doctor` verifies the configured `git_repo` for each enabled subject matches the
+standard path, and warns if it diverges (set `git_repo:` explicitly in `config.yaml` to
+opt out of the warning if you have a deliberate non-standard target).
+
+Override any default by setting `subjects.<name>.git_repo` in `~/.config/tuner/config.yaml`.
 
 ---
 
