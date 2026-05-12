@@ -5,7 +5,7 @@ import { extractErrorDetail } from "../messaging";
 import { join } from "path";
 import { fileURLToPath } from "url";
 import { run, runUserMessage, streamUserMessage, bootstrap, ensureProjectClaudeMd, loadHeartbeatPromptTemplate, isRateLimited, getRateLimitResetAt, wasRateLimitNotified, markRateLimitNotified } from "../runner";
-import { initGatewayProcessor } from "../event-processor";
+import { initGatewayProcessor, registerGatewayDelivery, unregisterGatewayDelivery } from "../event-processor";
 import { writeState, type StateData } from "../statusline";
 import { cronMatches, nextCronMatch } from "../cron";
 import { clearJobSchedule, loadJobs, resolveJobModel, snapshotJobFrontmatter } from "../jobs";
@@ -451,11 +451,13 @@ export async function start(args: string[] = []) {
 
   async function initTelegram(token: string, receiveEnabled = true) {
     if (token && token !== telegramToken) {
-      const { startPolling, sendMessage } = await import("./telegram");
+      const { startPolling, sendMessage, deliverGatewayReply } = await import("./telegram");
       if (receiveEnabled) startPolling(debugFlag);
       telegramSend = (chatId, text) => sendMessage(token, chatId, text);
       telegramToken = token;
       telegramReceiveEnabled = receiveEnabled;
+      // Register the outbound delivery hook so gateway-routed events get a reply.
+      registerGatewayDelivery("telegram", (event, result) => deliverGatewayReply(token, event, result));
       console.log(`[${ts()}] Telegram: enabled${receiveEnabled ? "" : " (send-only)"}`);
     } else if (token && token === telegramToken && receiveEnabled !== telegramReceiveEnabled) {
       const { startPolling, stopPolling } = await import("./telegram");
@@ -470,6 +472,7 @@ export async function start(args: string[] = []) {
     } else if (!token && telegramToken) {
       telegramSend = null;
       telegramToken = "";
+      unregisterGatewayDelivery("telegram");
       console.log(`[${ts()}] Telegram: disabled`);
     }
   }
@@ -487,18 +490,21 @@ export async function start(args: string[] = []) {
 
   async function initDiscord(token: string) {
     if (token && token !== discordToken) {
-      const { startGateway, sendMessageToUser, stopGateway } = await import("./discord");
+      const { startGateway, sendMessageToUser, stopGateway, deliverGatewayReply } = await import("./discord");
       if (discordToken) stopGateway();
       startGateway(debugFlag);
       discordStopGateway = stopGateway;
       discordSendToUser = (userId, text) => sendMessageToUser(token, userId, text);
       discordToken = token;
+      // Register the outbound delivery hook so gateway-routed events get a reply.
+      registerGatewayDelivery("discord", (event, result) => deliverGatewayReply(token, event, result));
       console.log(`[${ts()}] Discord: enabled`);
     } else if (!token && discordToken) {
       if (discordStopGateway) discordStopGateway();
       discordStopGateway = null;
       discordSendToUser = null;
       discordToken = "";
+      unregisterGatewayDelivery("discord");
       console.log(`[${ts()}] Discord: disabled`);
     }
   }
