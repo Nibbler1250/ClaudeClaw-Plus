@@ -265,7 +265,7 @@ export function indexSessionsBackground(opts?: MemorySearchSettings): void {
   if (opts?.enabled === false) return;
   const check = checkMemorySearchBin(opts);
   if (!check.ok) {
-    console.log(`[memory-search] ${check.reason}`);
+    console.debug(`[memory-search] ${check.reason}`);
     return;
   }
   const proc = spawn(check.bin, ["index"], {
