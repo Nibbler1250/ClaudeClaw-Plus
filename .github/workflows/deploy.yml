@@ -41,6 +41,9 @@ jobs:
             echo "==> Updating to latest main"
             sudo git -C /opt/claudeclaw reset --hard povai/main
 
+            echo "==> Installing dependencies"
+            sudo bash -c "cd /opt/claudeclaw && /usr/local/bin/bun install --frozen-lockfile"
+
             echo "==> Restarting service"
             sudo systemctl restart claudeclaw
 
