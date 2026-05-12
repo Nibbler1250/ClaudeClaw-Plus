@@ -58,6 +58,21 @@ interface SlackFile {
   filetype?: string;
 }
 
+interface SlackAttachment {
+  text?: string;
+  fallback?: string;
+  pretext?: string;
+  title?: string;
+  fields?: Array<{ title: string; value: string }>;
+}
+
+interface SlackBlock {
+  type: string;
+  text?: { type: string; text: string };
+  fields?: Array<{ type: string; text: string }>;
+  elements?: Array<{ type: string; text?: { type: string; text: string } }>;
+}
+
 interface SlackMessage {
   type: string;
   subtype?: string;
@@ -68,6 +83,8 @@ interface SlackMessage {
   ts: string;
   thread_ts?: string;     // set on thread replies; equals ts for the first reply
   files?: SlackFile[];
+  blocks?: SlackBlock[];
+  attachments?: SlackAttachment[];
   channel_type?: string;  // "im" | "mpim" | "channel" | "group"
 }
 
@@ -802,6 +819,24 @@ function sanitizeUserInput(text: string): string {
     .replace(/\[\[slack_select:[^\]]*\]\]/gi, "[select removed]");
 }
 
+function extractBlockText(blocks: SlackBlock[]): string {
+  const parts: string[] = [];
+  for (const block of blocks) {
+    if (block.text?.text) parts.push(block.text.text);
+    if (block.fields) {
+      for (const f of block.fields) {
+        if (f.text) parts.push(f.text);
+      }
+    }
+    if (block.elements) {
+      for (const el of block.elements) {
+        if (el.text?.text) parts.push(el.text.text);
+      }
+    }
+  }
+  return parts.filter(Boolean).join("\n");
+}
+
 // --- Trigger check ---
 
 function isImageFile(f: SlackFile): boolean {
@@ -868,8 +903,21 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     return;
   }
 
-  // Strip mention from text
-  let cleanText = event.text;
+  // Strip mention from text; fall back to blocks/attachments if text is empty.
+  let cleanText = event.text
+    || (event.blocks?.length ? extractBlockText(event.blocks) : "")
+    || (event.attachments?.length
+      ? event.attachments.map((a) =>
+          [
+            a.pretext,
+            a.title,
+            a.text,
+            ...(a.fields?.map((f) => `${f.title}:\n${f.value}`) ?? []),
+          ]
+            .filter(Boolean)
+            .join("\n")
+        ).join("\n")
+      : "");
   if (botUserId) {
     cleanText = cleanText.replace(new RegExp(`<@${botUserId}>`, "g"), "").trim();
   }
