@@ -78,7 +78,7 @@ Then open a Claude Code session and run:
 /claudeclaw:start
 ```
 
-The setup wizard covers model, heartbeat, Telegram, Discord, and security. Your daemon is live in under five minutes — same as upstream.
+The setup wizard covers model, heartbeat, Telegram, Discord, Slack, and security. Your daemon is live in under five minutes — same as upstream.
 
 ---
 
