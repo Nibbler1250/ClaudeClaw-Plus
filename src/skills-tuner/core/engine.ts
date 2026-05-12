@@ -225,6 +225,23 @@ export class Engine {
       applied_target_path: patch.target_path,
     });
     auditLog('apply_success', { proposal_id: proposalId, alternative_id: alternativeId, commit_sha: commitSha, repo_path: branches.repoPath });
+
+    // Merge the proposal branch back into the base branch. Without this the
+    // commit lives only on `tune/proposal-N` and subsequent operators reading
+    // the base branch see a stale tree — they assume nothing was applied.
+    // Fast-forward-only: if the base advanced since the proposal branched
+    // off, we surface the failure rather than auto-resolving a divergent
+    // merge (the operator can resolve manually with `git merge` from the
+    // proposal branch).
+    const mergeResult = await branches.mergeProposalBranchIntoBase(proposalId);
+    if (mergeResult.merged) {
+      auditLog('apply_merged_to_base', { proposal_id: proposalId, commit_sha: commitSha });
+    } else {
+      auditLog('apply_merge_skipped', { proposal_id: proposalId, reason: mergeResult.reason });
+      console.warn(
+        `[Engine] Apply #${proposalId} committed on tune/proposal-${proposalId} but not merged to base: ${mergeResult.reason}`,
+      );
+    }
   }
 
   async refuseProposal(proposalId: number, reason = 'refuse'): Promise<void> {

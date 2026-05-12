@@ -121,20 +121,9 @@ program
   .option('--subject <name>', 'run only this subject')
   .action(async (opts) => {
     const { loadConfig } = await import('../core/config.js');
-    const { Engine } = await import('../core/engine.js');
-    const { Registry } = await import('../core/registry.js');
-    const { ProposalsStore, DEFAULT_PROPOSALS_PATH } = await import('../storage/proposals.js');
-    const { RefusedStore, DEFAULT_REFUSED_PATH } = await import('../storage/refused.js');
-    const { BranchManager } = await import('../git_ops/branches.js');
-
+    const { bootstrapEngine } = await import('./bootstrap.js');
     const config = loadConfig();
-    const registry = new Registry();
-    const proposals = new ProposalsStore(config.storage.proposals_jsonl ?? DEFAULT_PROPOSALS_PATH);
-    const refused = new RefusedStore(config.storage.refused_jsonl ?? DEFAULT_REFUSED_PATH);
-    const gitRepo = config.storage.git_repo;
-    if (!gitRepo) throw new Error('storage.git_repo must be set in config');
-    const branches = new BranchManager(gitRepo);
-    const engine = new Engine(config, registry, proposals, refused, branches);
+    const { engine, proposals } = bootstrapEngine(config);
 
     const sinceMs = parseDuration(opts.since);
     const since = new Date(Date.now() - sinceMs);
@@ -171,20 +160,9 @@ program
   .description('Apply alternative (alt = alternative ID)')
   .action(async (id: string, alt: string) => {
     const { loadConfig } = await import('../core/config.js');
-    const { Engine } = await import('../core/engine.js');
-    const { Registry } = await import('../core/registry.js');
-    const { ProposalsStore, DEFAULT_PROPOSALS_PATH } = await import('../storage/proposals.js');
-    const { RefusedStore, DEFAULT_REFUSED_PATH } = await import('../storage/refused.js');
-    const { BranchManager } = await import('../git_ops/branches.js');
-
+    const { bootstrapEngine } = await import('./bootstrap.js');
     const config = loadConfig();
-    const registry = new Registry();
-    const proposals = new ProposalsStore(config.storage.proposals_jsonl ?? DEFAULT_PROPOSALS_PATH);
-    const refused = new RefusedStore(config.storage.refused_jsonl ?? DEFAULT_REFUSED_PATH);
-    const gitRepo = config.storage.git_repo;
-    if (!gitRepo) throw new Error('storage.git_repo must be set in config');
-    const branches = new BranchManager(gitRepo);
-    const engine = new Engine(config, registry, proposals, refused, branches);
+    const { engine, proposals } = bootstrapEngine(config);
 
     const proposalId = parseInt(id, 10);
     if (isNaN(proposalId)) { console.error('id must be a number'); process.exit(1); }
@@ -198,20 +176,9 @@ program
   .description('Skip (refuse) a proposal')
   .action(async (id: string) => {
     const { loadConfig } = await import('../core/config.js');
-    const { Engine } = await import('../core/engine.js');
-    const { Registry } = await import('../core/registry.js');
-    const { ProposalsStore, DEFAULT_PROPOSALS_PATH } = await import('../storage/proposals.js');
-    const { RefusedStore, DEFAULT_REFUSED_PATH } = await import('../storage/refused.js');
-    const { BranchManager } = await import('../git_ops/branches.js');
-
+    const { bootstrapEngine } = await import('./bootstrap.js');
     const config = loadConfig();
-    const registry = new Registry();
-    const proposals = new ProposalsStore(config.storage.proposals_jsonl ?? DEFAULT_PROPOSALS_PATH);
-    const refused = new RefusedStore(config.storage.refused_jsonl ?? DEFAULT_REFUSED_PATH);
-    const gitRepo = config.storage.git_repo;
-    if (!gitRepo) throw new Error('storage.git_repo must be set in config');
-    const branches = new BranchManager(gitRepo);
-    const engine = new Engine(config, registry, proposals, refused, branches);
+    const { engine, proposals } = bootstrapEngine(config);
 
     const proposalId = parseInt(id, 10);
     if (isNaN(proposalId)) { console.error('id must be a number'); process.exit(1); }
@@ -225,20 +192,9 @@ program
   .description('Revert an applied proposal')
   .action(async (id: string) => {
     const { loadConfig } = await import('../core/config.js');
-    const { Engine } = await import('../core/engine.js');
-    const { Registry } = await import('../core/registry.js');
-    const { ProposalsStore, DEFAULT_PROPOSALS_PATH } = await import('../storage/proposals.js');
-    const { RefusedStore, DEFAULT_REFUSED_PATH } = await import('../storage/refused.js');
-    const { BranchManager } = await import('../git_ops/branches.js');
-
+    const { bootstrapEngine } = await import('./bootstrap.js');
     const config = loadConfig();
-    const registry = new Registry();
-    const proposals = new ProposalsStore(config.storage.proposals_jsonl ?? DEFAULT_PROPOSALS_PATH);
-    const refused = new RefusedStore(config.storage.refused_jsonl ?? DEFAULT_REFUSED_PATH);
-    const gitRepo = config.storage.git_repo;
-    if (!gitRepo) throw new Error('storage.git_repo must be set in config');
-    const branches = new BranchManager(gitRepo);
-    const engine = new Engine(config, registry, proposals, refused, branches);
+    const { engine, proposals } = bootstrapEngine(config);
 
     const proposalId = parseInt(id, 10);
     if (isNaN(proposalId)) { console.error('id must be a number'); process.exit(1); }
@@ -433,5 +389,62 @@ function parseDuration(s: string): number {
     default: return 24 * 60 * 60 * 1000;
   }
 }
+
+// ── compose-job ───────────────────────────────────────────────────────────────────────
+program
+  .command('compose-job')
+  .description('Create a scheduled job from a natural-language description, using the auto-detected SchedulerBackend')
+  .requiredOption('--name <name>', 'job name (lowercase, hyphens, max 63 chars)')
+  .requiredOption('--description <text>', 'schedule in natural language')
+  .requiredOption('--command <cmd>', 'shell command to run on each tick')
+  .option('--backend <name>', 'force a backend: systemd-user | crontab-posix | in-process')
+  .option('--dry', 'render without writing')
+  .action(async (opts: { name: string; description: string; command: string; backend?: string; dry?: boolean }) => {
+    const { detectBackend } = await import('../schedulers/registry.js');
+    const { loadConfig } = await import('../core/config.js');
+    const { makeLLMClient } = await import('../core/llm.js');
+
+    if (opts.backend) {
+      // detectBackend() caches its result; reset before honoring the explicit
+      // backend so a subsequent call with a different backend is not silently ignored.
+      const { resetBackendRegistry } = await import('../schedulers/registry.js');
+      resetBackendRegistry();
+      process.env['WISECRON_BACKEND'] = opts.backend;
+    }
+    const backend = await detectBackend();
+    const isSystemd = backend.name === 'systemd-user';
+
+    let llm;
+    try { llm = makeLLMClient(loadConfig()); }
+    catch (e) { console.error('LLM unavailable:', e instanceof Error ? e.message : String(e)); process.exit(1); }
+
+    const system = isSystemd
+      ? "You convert short human descriptions of a recurring schedule into a single systemd OnCalendar= clause. Output ONLY the OnCalendar value — no prefix, no quotes, no explanation. Examples:\n  'every 15 minutes' -> *:0/15\n  'every day at 7am' -> *-*-* 07:00:00\n  'every weekday at 9:30am Eastern' -> Mon..Fri *-*-* 13:30:00 UTC\nConvert timezone abbreviations to UTC and append ' UTC'."
+      : "You convert short human descriptions of a recurring schedule into a single POSIX cron expression (5 fields: min h dom mon dow). Output ONLY the 5 fields separated by single spaces — no prefix, no quotes, no explanation. Examples:\n  'every 15 minutes' -> */15 * * * *\n  'every day at 7am' -> 0 7 * * *\n  'every weekday at 9:30am Eastern' -> 30 13 * * 1-5\nConvert timezone abbreviations to UTC.";
+
+    const raw = await llm.call('intent_classifier', system, [{ role: 'user', content: opts.description }], 100);
+    const schedule = raw.trim().split('\n')[0]?.trim() ?? '';
+    if (!schedule) { console.error('LLM returned empty schedule'); process.exit(1); }
+
+    const spec = { name: opts.name, description: opts.description, schedule, command: opts.command };
+
+    if (opts.dry) {
+      const rendered = backend.render(spec);
+      console.log(`Backend: ${backend.name}`);
+      console.log(`Schedule: ${schedule}`);
+      console.log(`Summary: ${rendered.summary}`);
+      for (const [path, content] of Object.entries(rendered.files)) {
+        console.log(`\n--- ${path} ---\n${content}`);
+      }
+      return;
+    }
+
+    const result = await backend.create(spec);
+    console.log(`✅ Created job '${opts.name}' via ${backend.name}`);
+    console.log(`   schedule: ${schedule}`);
+    if (result.artifactPath) console.log(`   artifact: ${result.artifactPath}`);
+    const repo = backend.gitRepoPath();
+    if (repo) console.log(`   git_repo: ${repo} (commit it with your usual workflow)`);
+  });
 
 program.parseAsync(process.argv).catch((e: unknown) => { console.error(e instanceof Error ? e.message : String(e)); process.exit(1); });
