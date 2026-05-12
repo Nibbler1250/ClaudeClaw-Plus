@@ -3,7 +3,7 @@ import { join } from "path";
 import { homedir } from "os";
 import { getPidPath, cleanupPidFile } from "../pid";
 import { getSession } from "../sessions";
-import { getSettings, type SecurityConfig } from "../config";
+import { loadSettings, type SecurityConfig } from "../config";
 import { getMemoryPath } from "../memory";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
@@ -31,7 +31,7 @@ async function preShutdownMemorySave(): Promise<void> {
   const session = await getSession();
   if (!session) return;
 
-  const settings = getSettings();
+  const settings = await loadSettings();
   const memPath = getMemoryPath();
   console.log(`[shutdown] Saving memory to ${memPath}...`);
 

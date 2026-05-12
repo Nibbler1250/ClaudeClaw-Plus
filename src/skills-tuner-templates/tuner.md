@@ -74,11 +74,19 @@ Ask if they want to proceed (yes/no). If no, exit gracefully.
 
 ### Step 2 — Detect the git repo
 
-Scan candidate locations:
-- `~/agent/skills`
-- `~/.claude/skills`
-- `~/skills`
-- `~/.config/claude/skills`
+The **standard skills path** is `~/.claude/skills/` — the canonical Anthropic Skills
+discovery directory read by Claude Code and the ClaudeClaw-Plus daemon. If you ran
+`tuner setup` from the CLI, this directory already exists and is git-initialized.
+
+**Preferred flow** (zero config): use `~/.claude/skills/` and skip to Step 3.
+
+**Legacy installs**: scan for older custom directories and offer to migrate. Candidate
+locations to check (priority order):
+
+- `~/.claude/skills`         ← standard, default
+- `~/agent/skills`           ← legacy
+- `~/skills`                 ← legacy
+- `~/.config/claude/skills`  ← legacy
 
 For each existing path, run:
 - `test -d "$path/.git" && echo "git: yes" || echo "git: no"`
@@ -88,18 +96,21 @@ For each existing path, run:
 Show the user a table:
 
 ```
-Found candidate directories:
-  1. ~/agent/skills          12 skills, git: yes, lang: english
-  2. ~/.claude/skills          3 skills, git: no,  lang: french
-  3. ~/skills                  not found
+Found skill directories:
+  1. ~/.claude/skills    50 skills, git: yes, lang: english   ← standard
+  2. ~/agent/skills      48 skills, git: yes, lang: english   ← legacy
 
-Which one should be your tunable surface? [1/2/3/other]
+Use ~/.claude/skills as your tunable surface? [Y/n]
 ```
 
-If user picks one without git → run `git init -b main` + initial commit.
-If user picks `other` → ask path → init if needed.
+If user picks a non-standard directory → warn that it bypasses Claude Code's
+discovery path and may require manual symlinks. Offer to skip.
 
-Save the choice as `storage.git_repo` in config.
+If user picks the standard but it has no git → run `git init -b main` + initial commit.
+
+Save the choice as `storage.git_repo` in config. Per-subject `git_repo` defaults to
+the standard path automatically when omitted — see "Where artifacts land" in the
+skills-tuner README.
 
 ### Step 2.5 — Scan for legacy flat skills and offer migration
 

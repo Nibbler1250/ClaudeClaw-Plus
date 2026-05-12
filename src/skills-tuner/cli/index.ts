@@ -54,6 +54,29 @@ program
       check('storage.git_repo configured', false, 'not set in config');
     }
 
+    // 2b. Per-subject git_repo alignment with standard discovery paths (issue #52)
+    if (config) {
+      const { subjectConfig, isStandardPath, SUBJECT_STANDARD_PATHS } =
+        await import('../core/config.js');
+      for (const name of Object.keys(SUBJECT_STANDARD_PATHS)) {
+        const sub = subjectConfig(config, name);
+        if (!sub.enabled) continue;
+        const standard = SUBJECT_STANDARD_PATHS[name]?.git_repo;
+        if (sub.git_repo && standard) {
+          const aligned = isStandardPath(name, sub.git_repo);
+          if (aligned) {
+            check(`Subject ${name} git_repo on standard path`, true, sub.git_repo);
+          } else {
+            check(
+              `Subject ${name} git_repo on standard path`,
+              false,
+              `${sub.git_repo} ≠ ${standard} — run 'tuner setup' to align or override intentionally`,
+            );
+          }
+        }
+      }
+    }
+
     // 3. .secret exists + 32 bytes + 0600 perms
     const secretExists = existsSync(secretPath);
     check('Secret file exists', secretExists, secretPath);
@@ -280,17 +303,85 @@ program
 // ── setup ─────────────────────────────────────────────────────────────────────────────
 program
   .command('setup')
-  .description('First-run wizard — copies /tuner skill, generates config')
+  .description('First-run wizard — initializes standard discovery paths, copies /tuner skill, generates config')
   .action(async () => {
     const home = homedir();
-    const skillsDir = join(home, '.claude', 'skills');
-    const targetSkill = join(skillsDir, 'tuner.md');
+    const { mkdirSync, copyFileSync, writeFileSync } = await import('node:fs');
+    const { execSync } = await import('node:child_process');
+    const {
+      DEFAULT_SKILLS_DIR,
+      DEFAULT_SYSTEMD_USER_DIR,
+      DEFAULT_CRONTAB_DIR,
+    } = await import('../core/config.js');
 
+    function ensureGitRepo(dir: string, label: string, initFn?: () => void): void {
+      mkdirSync(dir, { recursive: true });
+      if (initFn) initFn();
+      if (!existsSync(join(dir, '.git'))) {
+        try {
+          execSync('git init', { cwd: dir, stdio: 'pipe' });
+          // Commit only if there is content to track (avoids empty-repo first commit).
+          const entries = readdirSync(dir).filter(f => f !== '.git');
+          if (entries.length > 0) {
+            execSync('git add -A', { cwd: dir, stdio: 'pipe' });
+            execSync(
+              `git -c user.name=tuner -c user.email=tuner@localhost commit -m "init: ${label} tracker"`,
+              { cwd: dir, stdio: 'pipe' },
+            );
+          }
+          console.log(`✅ Initialized git repo: ${dir}`);
+        } catch (e: unknown) {
+          console.warn(
+            `⚠️  Could not init git repo at ${dir}: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      } else {
+        console.log(`ℹ️  Already a git repo: ${dir}`);
+      }
+    }
+
+    // 1. Skills standard dir (~/.claude/skills/) — Anthropic Skills discovery path.
+    ensureGitRepo(DEFAULT_SKILLS_DIR, 'tuned skills');
+
+    // 2. systemd user units (~/.config/systemd/user/) — only if dir already populated,
+    //    otherwise skip silently (systems without systemd or empty installs).
+    if (existsSync(DEFAULT_SYSTEMD_USER_DIR)) {
+      const units = readdirSync(DEFAULT_SYSTEMD_USER_DIR).filter(f =>
+        f.endsWith('.service') || f.endsWith('.timer'),
+      );
+      if (units.length > 0) {
+        ensureGitRepo(DEFAULT_SYSTEMD_USER_DIR, 'systemd user units (wisecron target)');
+      } else {
+        console.log(`ℹ️  Skipping ${DEFAULT_SYSTEMD_USER_DIR} — no unit files`);
+      }
+    } else {
+      console.log(`ℹ️  Skipping ${DEFAULT_SYSTEMD_USER_DIR} — directory absent`);
+    }
+
+    // 3. POSIX crontab sidecar (~/.config/cron/) — snapshot only if user has a crontab.
+    ensureGitRepo(DEFAULT_CRONTAB_DIR, 'user crontab snapshot', () => {
+      const snapshotPath = join(DEFAULT_CRONTAB_DIR, 'crontab.snapshot');
+      if (existsSync(snapshotPath)) return;
+      try {
+        const out = execSync('crontab -l', { stdio: ['pipe', 'pipe', 'pipe'] }).toString();
+        writeFileSync(snapshotPath, out, 'utf8');
+        console.log(`✅ Snapshotted crontab → ${snapshotPath}`);
+      } catch {
+        // No crontab or crontab not installed — write empty placeholder so git repo has content.
+        writeFileSync(
+          snapshotPath,
+          '# No active crontab when this snapshot was created.\n# Re-run `tuner setup` after adding entries.\n',
+          'utf8',
+        );
+      }
+    });
+
+    // 4. Tuner skill — install as Anthropic dir-format (<name>/SKILL.md), not flat .md.
+    const skillDir = join(DEFAULT_SKILLS_DIR, 'tuner');
+    const targetSkill = join(skillDir, 'SKILL.md');
     if (!existsSync(targetSkill)) {
       const { fileURLToPath } = await import('node:url');
       const __dirname = resolve(fileURLToPath(import.meta.url), '..');
-      // Resolve template across contexts: skills-tuner-ts standalone (templates/skills/) OR
-      // Plus integration context (src/skills-tuner-templates/)
       const candidates = [
         join(__dirname, '..', '..', 'templates', 'skills', 'tuner.md'),
         join(__dirname, '..', '..', '..', 'templates', 'skills', 'tuner.md'),
@@ -299,28 +390,34 @@ program
       ];
       const templateSrc = candidates.find(p => existsSync(p)) ?? candidates[0]!;
       if (existsSync(templateSrc)) {
-        const { mkdirSync, copyFileSync } = await import('node:fs');
-        mkdirSync(skillsDir, { recursive: true });
+        mkdirSync(skillDir, { recursive: true });
         copyFileSync(templateSrc, targetSkill);
-        console.log(`✅ Copied tuner skill to ${targetSkill}`);
+        console.log(`✅ Installed tuner skill → ${targetSkill}`);
       } else {
         console.warn(`⚠️  Template not found at ${templateSrc} — skipping skill copy`);
       }
     } else {
-      console.log(`ℹ️  Skill already exists: ${targetSkill}`);
+      console.log(`ℹ️  Tuner skill already installed: ${targetSkill}`);
     }
 
+    // 5. Tuner config (~/.config/tuner/config.yaml).
     const configDir = join(home, '.config', 'tuner');
     const configPath = join(configDir, 'config.yaml');
     if (!existsSync(configPath)) {
       const { writeDefaultConfig } = await import('../core/config.js');
       writeDefaultConfig(configPath);
-      console.log(`✅ Created default config at ${configPath}`);
+      console.log(`✅ Created default config: ${configPath}`);
     } else {
       console.log(`ℹ️  Config already exists: ${configPath}`);
     }
 
-    console.log('\nRun /tuner inside Claude Code to start the wizard');
+    // 6. Final summary — show where things live.
+    console.log('\n📍 Tracked paths:');
+    console.log(`   skills    → ${DEFAULT_SKILLS_DIR}`);
+    console.log(`   wisecron  → ${DEFAULT_SYSTEMD_USER_DIR}`);
+    console.log(`   cron      → ${DEFAULT_CRONTAB_DIR}`);
+    console.log(`   config    → ${configPath}`);
+    console.log("\nRun 'tuner doctor' to verify, or invoke /tuner inside Claude Code.");
   });
 
 // ── helpers ───────────────────────────────────────────────────────────────────────────

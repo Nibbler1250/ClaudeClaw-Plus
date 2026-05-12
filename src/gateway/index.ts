@@ -542,7 +542,8 @@ export async function processEventWithFallback(
  *   const result = await submitTelegramToGateway(normalized);
  */
 export async function submitTelegramToGateway(
-  message: import("./normalizer").TelegramMessage
+  message: import("./normalizer").TelegramMessage,
+  promptOverride?: string
 ): Promise<{
   success: boolean;
   source: "gateway" | "legacy";
@@ -550,6 +551,10 @@ export async function submitTelegramToGateway(
 }> {
   const { normalizeTelegramMessage } = await import("./normalizer");
   const normalized = normalizeTelegramMessage(message);
+
+  if (promptOverride) {
+    normalized.metadata.prompt = promptOverride;
+  }
 
   const result = await processEventWithFallback(normalized, {
     legacyHandler: async () => {

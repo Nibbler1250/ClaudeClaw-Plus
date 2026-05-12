@@ -6,6 +6,33 @@ import { z } from 'zod';
 
 export const DEFAULT_CONFIG_PATH = join(homedir(), '.config', 'tuner', 'config.yaml');
 
+// ─── Standard discovery paths (per-subject defaults) ──────────────────────────────────
+// Each TunableSubject writes its artifacts to the canonical path the consuming runtime
+// already reads from. No custom directories, no symlink dance — see issue #52.
+
+/** Anthropic Skills global path. Read by Claude Code and ClaudeClaw-Plus daemon. */
+export const DEFAULT_SKILLS_DIR = join(homedir(), '.claude', 'skills');
+
+/** XDG-standard path for systemd user units. */
+export const DEFAULT_SYSTEMD_USER_DIR = join(homedir(), '.config', 'systemd', 'user');
+
+/** XDG-config sidecar for POSIX crontab snapshots (table itself is root-managed). */
+export const DEFAULT_CRONTAB_DIR = join(homedir(), '.config', 'cron');
+
+/** Subject-name → standard path mapping. Override via `subjects.<name>.git_repo` in config. */
+export const SUBJECT_STANDARD_PATHS: Record<string, { git_repo?: string; scan_dirs?: string[] }> = {
+  skills: {
+    git_repo: DEFAULT_SKILLS_DIR,
+    scan_dirs: [DEFAULT_SKILLS_DIR],
+  },
+  wisecron: {
+    git_repo: DEFAULT_SYSTEMD_USER_DIR,
+  },
+  cron: {
+    git_repo: DEFAULT_CRONTAB_DIR,
+  },
+};
+
 const ModelConfigSchema = z.object({
   intent_classifier: z.string().default('claude-haiku-4-5-20251001'),
   detector: z.string().default('claude-opus-4-7'),
@@ -67,8 +94,36 @@ const TunerConfigSchema = z.object({
 });
 export type TunerConfig = z.infer<typeof TunerConfigSchema>;
 
+/**
+ * Returns the effective config for a subject, merging user overrides with
+ * standard-path defaults. User values always win — defaults only fill gaps.
+ *
+ * - `git_repo` defaults to the canonical path read by the consuming runtime
+ *   (e.g. `~/.claude/skills/` for the `skills` subject).
+ * - `scan_dirs` defaults are appended if the user did not provide any.
+ *
+ * Override the env var `TUNER_DISABLE_STANDARD_DEFAULTS=1` to get raw user
+ * config without defaults (useful for tests / introspection).
+ */
 export function subjectConfig(config: TunerConfig, name: string): SubjectConfig {
-  return config.subjects[name] ?? SubjectConfigSchema.parse({});
+  const userCfg = config.subjects[name] ?? SubjectConfigSchema.parse({});
+  if (process.env.TUNER_DISABLE_STANDARD_DEFAULTS === '1') return userCfg;
+
+  const standard = SUBJECT_STANDARD_PATHS[name];
+  if (!standard) return userCfg;
+
+  return {
+    ...userCfg,
+    git_repo: userCfg.git_repo ?? standard.git_repo,
+    scan_dirs: userCfg.scan_dirs.length > 0 ? userCfg.scan_dirs : (standard.scan_dirs ?? []),
+  };
+}
+
+/** Returns true if the configured path matches the standard one for this subject. */
+export function isStandardPath(subjectName: string, path: string | undefined): boolean {
+  if (!path) return false;
+  const standard = SUBJECT_STANDARD_PATHS[subjectName]?.git_repo;
+  return !!standard && standard === path;
 }
 
 export function loadConfig(path = DEFAULT_CONFIG_PATH): TunerConfig {
@@ -93,6 +148,11 @@ export function loadConfig(path = DEFAULT_CONFIG_PATH): TunerConfig {
         if (typeof s['git_repo'] === 'string') {
           s['git_repo'] = (s['git_repo'] as string).replace(/^~/, homedir());
         }
+        if (Array.isArray(s['scan_dirs'])) {
+          s['scan_dirs'] = (s['scan_dirs'] as unknown[]).map(d =>
+            typeof d === 'string' ? d.replace(/^~/, homedir()) : d
+          );
+        }
       }
     }
   }
@@ -100,6 +160,15 @@ export function loadConfig(path = DEFAULT_CONFIG_PATH): TunerConfig {
 }
 
 const DEFAULT_YAML = `# Skills Tuner TS configuration
+#
+# Per-subject defaults (git_repo, scan_dirs) resolve to standard discovery paths
+# automatically — see SUBJECT_STANDARD_PATHS in core/config.ts. Override here only
+# when you need a non-standard location.
+#
+# Standard paths:
+#   skills    → ~/.claude/skills/              (Anthropic Skills, read by Claude Code)
+#   wisecron  → ~/.config/systemd/user/        (XDG systemd user units)
+#   cron      → ~/.config/cron/                (XDG sidecar for crontab snapshot)
 
 llm:
   backend: anthropic_api
@@ -126,6 +195,8 @@ subjects:
     auto_merge: [patch, frontmatter]
     proposer: claude-sonnet-4-6
     proposer_for_create: claude-opus-4-7
+    # git_repo defaults to ~/.claude/skills/
+    # scan_dirs defaults to [~/.claude/skills]
 
 ui:
   primary_adapter: cli
