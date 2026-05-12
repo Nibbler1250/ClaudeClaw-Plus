@@ -834,10 +834,15 @@ function isDM(event: SlackMessage): boolean {
 async function handleMessage(event: SlackMessage): Promise<void> {
   const config = getSettings().slack;
 
-  // Ignore bot's own messages and other bot messages
-  if (event.bot_id || !event.user) return;
-  // Skip subtype messages (edits, joins, etc.) unless they are file_share
-  if (event.subtype && event.subtype !== "file_share") return;
+  const allowBots = config.allowBots ?? [];
+  const isBotAllowed = !!event.bot_id && allowBots.includes(event.channel);
+
+  if (event.bot_id) {
+    if (event.user === botUserId) return; // never respond to our own messages
+    if (!isBotAllowed) return;
+  }
+  if (!event.bot_id && !event.user) return;
+  if (event.subtype && event.subtype !== "file_share" && !(isBotAllowed && event.subtype === "bot_message")) return;
 
   // Deduplicate: Slack sends both message + app_mention for @mentions
   if (isDuplicate(event.channel, event.ts)) {
@@ -845,7 +850,7 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     return;
   }
 
-  const userId = event.user;
+  const userId = event.user ?? event.bot_id;
   const channelId = event.channel;
   const isDirectMessage = isDM(event);
   const isListenChannel = config.listenChannels.includes(channelId);
@@ -855,13 +860,13 @@ async function handleMessage(event: SlackMessage): Promise<void> {
   const isAssistantThread = event.thread_ts
     ? assistantThreadKeys.has(assistantKey(channelId, event.thread_ts))
     : false;
-  if (!isDirectMessage && !mentioned && !isListenChannel && !isAssistantThread) {
+  if (!isDirectMessage && !mentioned && !isListenChannel && !isAssistantThread && !isBotAllowed) {
     debugLog(`Skip channel=${channelId} user=${userId} text="${event.text.slice(0, 40)}"`);
     return;
   }
 
-  // Authorization check
-  if (config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(userId)) {
+  // Authorization check — bot messages in allowBots channels bypass user-level auth
+  if (!isBotAllowed && config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(userId ?? "")) {
     if (isDirectMessage) {
       await sendMessage(config.botToken, channelId, "Unauthorized.");
     }

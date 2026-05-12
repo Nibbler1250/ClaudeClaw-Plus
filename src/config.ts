@@ -80,7 +80,7 @@ const DEFAULT_SETTINGS: Settings = {
   },
   telegram: { token: "", allowedUserIds: [], listenChats: [], receiveEnabled: true, dmIsolation: "shared" },
   discord: { token: "", allowedUserIds: [], listenChannels: [], listenGuilds: [], imageOutputRoots: [], streaming: false },
-  slack: { botToken: "", appToken: "", allowedUserIds: [], listenChannels: [] },
+  slack: { botToken: "", appToken: "", allowedUserIds: [], listenChannels: [], allowBots: [] },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   stt: { baseUrl: "", model: "" },
@@ -138,6 +138,7 @@ export interface SlackConfig {
   appToken: string;       // xapp-... Socket Mode token
   allowedUserIds: string[];
   listenChannels: string[]; // Channel IDs where bot responds without @mention
+  allowBots: string[];    // Channel IDs where bot-posted messages are passed through
 }
 
 export type SecurityLevel =
@@ -371,6 +372,7 @@ function parseSettings(
       appToken: process.env.SLACK_APP_TOKEN?.trim() || (typeof raw.slack?.appToken === "string" ? raw.slack.appToken.trim() : ""),
       allowedUserIds: Array.isArray(raw.slack?.allowedUserIds) ? raw.slack.allowedUserIds.map(String) : [],
       listenChannels: Array.isArray(raw.slack?.listenChannels) ? raw.slack.listenChannels.map(String) : [],
+      allowBots: Array.isArray(raw.slack?.allowBots) ? raw.slack.allowBots.map(String) : [],
     },
     security: {
       level,
