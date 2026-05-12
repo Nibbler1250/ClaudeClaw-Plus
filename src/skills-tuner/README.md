@@ -216,20 +216,25 @@ The script backs up the original file to `proposals.jsonl.python-backup-<timesta
 Each subject can declare its own git repository in `~/.config/tuner/config.yaml`:
 
 ```yaml
+# 'skills' subject defaults resolve to the standard Anthropic discovery path
+# (~/.claude/skills/) when omitted. Override only for non-standard layouts.
+
 storage:
-  git_repo: ~/agent/skills        # default fallback
+  # Top-level fallback for any subject without its own git_repo.
+  # Subjects with a SUBJECT_STANDARD_PATHS entry resolve to that instead.
+  git_repo: ~/.claude/skills
 
 subjects:
   skills:
     enabled: true
-    git_repo: ~/agent/skills      # explicit (matches default here)
+    # git_repo defaults to ~/.claude/skills (Anthropic Skills discovery path)
+    # scan_dirs defaults to [~/.claude/skills]
     auto_merge: [patch, frontmatter]
-    scan_dirs: [~/agent/skills]
   voice:
     enabled: true
-    git_repo: ~/agent/voice-config  # different repo for voice
+    git_repo: ~/.config/voice-config  # explicit, no standard mapping for 'voice' yet
     auto_merge: false
-    scan_dirs: [~/agent/voice-config/lexicons]
+    scan_dirs: [~/.config/voice-config/lexicons]
   trader-ml-hp:
     enabled: true
     git_repo: ~/Projects/momentum_trader_v7  # trader's own repo
