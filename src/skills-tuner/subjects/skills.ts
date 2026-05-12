@@ -3,6 +3,7 @@ import { existsSync, statSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, dirname, basename, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
+import { DEFAULT_SKILLS_DIR } from '../core/config.js';
 import { createInterface } from 'node:readline';
 import { createReadStream } from 'node:fs';
 import { BaseSubject } from './base.js';
@@ -86,7 +87,7 @@ export class SkillsSubject extends BaseSubject {
   constructor(opts: SkillsSubjectConfig = {}) {
     super();
     this.llm = opts.llm;
-    this.scanDirs = opts.scanDirs ?? [join(homedir(), 'agent', 'skills')];
+    this.scanDirs = opts.scanDirs ?? [DEFAULT_SKILLS_DIR];
     this.negRe = combineRegex(opts.negativePatterns ?? DEFAULT_NEGATIVE_PATTERNS);
     this.posRe = combineRegex(opts.positivePatterns ?? DEFAULT_POSITIVE_PATTERNS);
     this.emotRe = combineRegex(opts.emotionalPatterns ?? DEFAULT_EMOTIONAL_PATTERNS);
