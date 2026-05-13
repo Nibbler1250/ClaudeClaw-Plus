@@ -79,6 +79,8 @@ interface SlackMessage {
   text: string;
   user?: string;
   bot_id?: string;
+  username?: string;
+  bot_profile?: { name?: string };
   channel: string;
   ts: string;
   thread_ts?: string;     // set on thread replies; equals ts for the first reply
@@ -869,10 +871,18 @@ function isDM(event: SlackMessage): boolean {
 async function handleMessage(event: SlackMessage): Promise<void> {
   const config = getSettings().slack;
 
-  // Ignore bot's own messages and other bot messages
-  if (event.bot_id || !event.user) return;
-  // Skip subtype messages (edits, joins, etc.) unless they are file_share
-  if (event.subtype && event.subtype !== "file_share") return;
+  const allowBots = config.allowBots ?? [];
+  const allowBotIds = config.allowBotIds ?? [];
+  const channelAllowed = !!event.bot_id && allowBots.includes(event.channel);
+  const botIdAllowed = allowBotIds.length === 0 || (!!event.bot_id && allowBotIds.includes(event.bot_id));
+  const isBotAllowed = channelAllowed && botIdAllowed;
+
+  if (event.bot_id) {
+    if (event.user === botUserId) return; // never respond to our own messages
+    if (!isBotAllowed) return;
+  }
+  if (!event.bot_id && !event.user) return;
+  if (event.subtype && event.subtype !== "file_share" && !(isBotAllowed && event.subtype === "bot_message")) return;
 
   // Deduplicate: Slack sends both message + app_mention for @mentions
   if (isDuplicate(event.channel, event.ts)) {
@@ -880,7 +890,7 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     return;
   }
 
-  const userId = event.user;
+  const userId = event.user ?? event.bot_profile?.name ?? event.username ?? event.bot_id;
   const channelId = event.channel;
   const isDirectMessage = isDM(event);
   const isListenChannel = config.listenChannels.includes(channelId);
@@ -890,38 +900,24 @@ async function handleMessage(event: SlackMessage): Promise<void> {
   const isAssistantThread = event.thread_ts
     ? assistantThreadKeys.has(assistantKey(channelId, event.thread_ts))
     : false;
-  if (!isDirectMessage && !mentioned && !isListenChannel && !isAssistantThread) {
+  if (!isDirectMessage && !mentioned && !isListenChannel && !isAssistantThread && !isBotAllowed) {
     debugLog(`Skip channel=${channelId} user=${userId} text="${event.text.slice(0, 40)}"`);
     return;
   }
 
-  // Authorization check
-  if (config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(userId)) {
+  // Authorization check — bot messages in allowBots channels bypass user-level auth
+  if (!isBotAllowed && config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(userId ?? "")) {
     if (isDirectMessage) {
       await sendMessage(config.botToken, channelId, "Unauthorized.");
     }
     return;
   }
 
-  // Strip mention from text; fall back to blocks/attachments if text is empty.
-  let cleanText = event.text
-    || (event.blocks?.length ? extractBlockText(event.blocks) : "")
-    || (event.attachments?.length
-      ? event.attachments.map((a) =>
-          [
-            a.pretext,
-            a.title,
-            a.text,
-            ...(a.fields?.map((f) => `${f.title}:\n${f.value}`) ?? []),
-          ]
-            .filter(Boolean)
-            .join("\n")
-        ).join("\n")
-      : "");
+  let cleanText = event.text;
   if (botUserId) {
     cleanText = cleanText.replace(new RegExp(`<@${botUserId}>`, "g"), "").trim();
   }
-  cleanText = sanitizeUserInput(cleanText);
+  if (isBotAllowed) cleanText = sanitizeUserInput(cleanText);
 
   const files = event.files ?? [];
   const imageFiles = files.filter(isImageFile);
@@ -946,8 +942,14 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     // For the root message of a thread it equals event.ts.
     // We use it to key per-thread sessions; non-thread messages go to global session.
     const inThread = !!event.thread_ts;
-    const replyThreadTs = event.thread_ts ?? event.ts; // reply in same thread
-    const sessionThreadId = inThread ? slackThreadId(channelId, event.thread_ts!) : undefined;
+    const replyThreadTs = event.thread_ts ?? event.ts;
+    // Bot alerts not in a thread each get an isolated session keyed by ts,
+    // so two different bots in the same allowBots channel don't share context.
+    const sessionThreadId = inThread
+      ? slackThreadId(channelId, event.thread_ts!)
+      : isBotAllowed
+        ? slackThreadId(channelId, event.ts)
+        : undefined;
 
     // Recover lost thread from sessions.json if needed
     if (inThread && sessionThreadId) {
@@ -1099,7 +1101,7 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     }, 20_000);
 
     const agentName = sessionThreadId
-      ? (() => { try { return agentDirKey(`slack-${channelId}`, event.thread_ts!); } catch { return undefined; } })()
+      ? (() => { try { return agentDirKey(`slack-${channelId}`, replyThreadTs); } catch { return undefined; } })()
       : undefined;
 
     let result;
