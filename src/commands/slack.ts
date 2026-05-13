@@ -1066,7 +1066,7 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     }, 20_000);
 
     const agentName = sessionThreadId
-      ? (() => { try { return agentDirKey(`slack-${channelId}`, event.thread_ts!); } catch { return undefined; } })()
+      ? (() => { try { return agentDirKey(`slack-${channelId}`, replyThreadTs); } catch { return undefined; } })()
       : undefined;
 
     let result;
