@@ -921,6 +921,7 @@ async function handleMessage(event: SlackMessage): Promise<void> {
   if (botUserId) {
     cleanText = cleanText.replace(new RegExp(`<@${botUserId}>`, "g"), "").trim();
   }
+  cleanText = sanitizeUserInput(cleanText);
 
   const files = event.files ?? [];
   const imageFiles = files.filter(isImageFile);
