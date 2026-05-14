@@ -22,7 +22,11 @@
 
 <p align="center"><b>ClaudeClaw, plus the heavy stuff. Governance, orchestration, persistent memory, hardened web UI.</b></p>
 
+<<<<<<< HEAD
 ClaudeClaw+ is a sister project to [`moazbuilds/claudeclaw`](https://github.com/moazbuilds/claudeclaw) — the lightweight Claude Code daemon you already know. Plus exists to house the features that are too heavy or too opinionated for the core repo: a full governance and policy layer, durable multi-step orchestration, persistent cross-session memory, and a hardened web UI.
+=======
+ClaudeClaw turns your Claude Code into a personal assistant that never sleeps. It runs as a background daemon, executing tasks on a schedule, responding to messages on Telegram, Discord, and Slack, transcribing voice commands, and integrating with any service you need.
+>>>>>>> upstream/master
 
 Everything from upstream lives here too. ClaudeClaw+ syncs from upstream automatically every day, so you never fall behind.
 
@@ -77,6 +81,10 @@ Then open a Claude Code session and run:
 ```
 /claudeclaw:start
 ```
+<<<<<<< HEAD
+=======
+The setup wizard walks you through model, heartbeat, Telegram, Discord, Slack, and security, then your daemon is live with a web dashboard.
+>>>>>>> upstream/master
 
 The setup wizard covers model, heartbeat, Telegram, Discord, and security. Your daemon is live in under five minutes — same as upstream.
 
@@ -98,7 +106,15 @@ Every tool call (Bash, Read, Edit, etc.) is evaluated against deterministic rule
 
 ### Governance Layer — model routing, budgets, watchdog
 
+<<<<<<< HEAD
 **[PR #72 — closed upstream — lives here](https://github.com/moazbuilds/claudeclaw/pull/72)**
+=======
+### Communication
+- **Telegram:** Text, image, and voice support.
+- **Discord:** DMs, server mentions/replies, slash commands, voice messages, and image attachments.
+- **Slack:** Socket Mode bot — DMs, channel mentions, threads, voice messages, and file attachments. Configure `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` in your environment or `settings.json`.
+- **Time Awareness:** Message time prefixes help the agent understand delays and daily patterns.
+>>>>>>> upstream/master
 
 Sits between the daemon and Claude CLI. Automatically routes planning tasks to Opus and implementation tasks to Sonnet. Tracks token and cost spend per session and globally, with configurable warn/throttle/block states. Watchdog kills runaway sessions before they drain your credits.
 
@@ -200,8 +216,14 @@ Watch the [Issues](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues) tab for 
 <details open>
   <summary><strong>Is this a hard fork?</strong></summary>
   <p>
+<<<<<<< HEAD
     No. ClaudeClaw+ syncs from <a href="https://github.com/moazbuilds/claudeclaw">moazbuilds/claudeclaw</a> every day.
     Upstream fixes land here within 24 hours. It's a sister project — same foundation, wider scope.
+=======
+    If Claude Code can do it, ClaudeClaw can do it too. ClaudeClaw adds cron jobs,
+    heartbeats, and Telegram/Discord/Slack bridges on top. You can also give your ClaudeClaw new
+    skills and teach it custom workflows.
+>>>>>>> upstream/master
   </p>
 </details>
 
