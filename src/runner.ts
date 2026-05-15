@@ -35,6 +35,7 @@ import { loadAgent } from "./agents";
 import { selectModel } from "./model-router";
 import { recordResult, abortReason, clearSession, startSession } from "./watchdog";
 import { getPluginManager, type EventContext } from "./plugins";
+import { runOnPty, killAllPtys, snapshotSupervisor } from "./runner/pty-supervisor";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
 
@@ -90,6 +91,37 @@ function resolveClaudeExecutable(): string {
 }
 const CLAUDE_EXECUTABLE = resolveClaudeExecutable();
 
+/** Versions of the Claude Code CLI whose interactive TTY output the PTY parser
+ *  has been validated against (see .planning/pty-migration/SPEC.md §2 and the
+ *  golden fixture at .planning/pty-migration/fixtures/turn-boundary-sample.txt).
+ *  Other versions may still work — the parser also has a turnIdleTimeoutMs
+ *  safety net — but a mismatch here means we cannot guarantee turn-boundary
+ *  detection. Add a version after empirical validation. */
+const KNOWN_GOOD_CLAUDE_VERSIONS = ["2.1.141"];
+
+/** Probe `claude --version` at daemon startup and log the result. Warns if the
+ *  installed version isn't in the known-good list — does NOT block startup. */
+export async function probeClaudeCliVersion(): Promise<{ version: string | null; known: boolean }> {
+  try {
+    const proc = Bun.spawn([CLAUDE_EXECUTABLE, "--version"], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout] = await Promise.all([
+      new Response(proc.stdout).text(),
+      proc.exited,
+    ]);
+    // `claude --version` prints something like "2.1.141 (Claude Code)" — extract
+    // the leading semver-ish token. We don't enforce strict semver here.
+    const match = stdout.match(/(\d+\.\d+\.\d+)/);
+    const version = match ? match[1] : null;
+    const known = version !== null && KNOWN_GOOD_CLAUDE_VERSIONS.includes(version);
+    return { version, known };
+  } catch {
+    return { version: null, known: false };
+  }
+}
+
 /**
  * Compact configuration.
  * COMPACT_WARN_THRESHOLD: notify user that context is getting large.
@@ -125,7 +157,14 @@ const COMPACT_TIMEOUT_ENABLED = true;
  * object — no shell, no OS-specific calls. The `claude` CLI it spawns then
  * resolves credentials using its own per-platform code path.
  */
-function cleanSpawnEnv(): Record<string, string> {
+/**
+ * Build a sanitised env dict for any spawned `claude` (both `claude -p`
+ * subprocess and PTY supervisor). Exported as the single source of truth —
+ * the supervisor MUST import this rather than maintain a parallel strip list,
+ * or `ANTHROPIC_API_KEY` will silently leak into PTY-mode spawns and bill
+ * against raw API credits instead of the operator's subscription.
+ */
+export function cleanSpawnEnv(): Record<string, string> {
   const stripped = new Set([
     "CLAUDECODE",
     "CLAUDE_CODE_OAUTH_TOKEN",
@@ -307,14 +346,47 @@ function enqueue<T>(fn: () => Promise<T>, threadId?: string): Promise<T> {
 // outside the main queue and must not be killed by /kill.
 const mainActiveProcs = new Set<ReturnType<typeof Bun.spawn>>();
 
-/** Kill all running main-queue claude subprocesses. Returns true if anything was killed. */
+/**
+ * Kill all running main-queue claude subprocesses AND dispose every live PTY
+ * managed by the supervisor.
+ *
+ * Two cohorts:
+ *   1. Legacy `Bun.spawn` handles tracked in `mainActiveProcs` — killed
+ *      synchronously via `proc.kill()`.
+ *   2. PTY-mode processes owned by the supervisor — disposed asynchronously
+ *      via `killAllPtys()`. The supervisor's per-key serial lock turns the
+ *      in-flight `runTurn` promise into a `PtyClosedError` rejection,
+ *      mirroring the SIGTERM-style failure surface of the legacy path.
+ *
+ * The fire-and-forget pattern on the PTY disposal preserves the synchronous
+ * boolean-return contract (legacy `/kill` callsites assume immediate
+ * truthy/falsy without awaiting). PTYs detect the kill on their next event
+ * tick; the caller does not need to await disposal.
+ *
+ * Returns true iff anything was killed (legacy procs OR live PTYs).
+ *
+ * Phase D fix #4 (FA-6a): without this, `/kill` was a silent no-op against
+ * PTY-mode sessions — a runaway PTY could only be killed by manual PID
+ * intervention.
+ */
 export function killActive(): boolean {
-  if (mainActiveProcs.size === 0) return false;
-  for (const proc of mainActiveProcs) {
-    try { proc.kill(); } catch {}
+  let killed = false;
+  if (mainActiveProcs.size > 0) {
+    for (const proc of mainActiveProcs) {
+      try { proc.kill(); } catch {}
+    }
+    mainActiveProcs.clear();
+    killed = true;
   }
-  mainActiveProcs.clear();
-  return true;
+  // Best-effort async PTY disposal. We don't await because killActive is
+  // historically synchronous; PTY callers see PtyClosedError on their next
+  // tick which surfaces as a structured error via the supervisor's lock.
+  const ptyCountBefore = snapshotSupervisor().ptys.length;
+  if (ptyCountBefore > 0) {
+    void killAllPtys();
+    killed = true;
+  }
+  return killed;
 }
 
 /** True while any main-queue agent is processing a task (excludes fork). */
@@ -347,7 +419,24 @@ function isNotFoundError(error: unknown): boolean {
   return /enoent|no such file or directory/i.test(message);
 }
 
-function buildChildEnv(baseEnv: Record<string, string>, model: string, api: string): Record<string, string> {
+/**
+ * Apply provider-specific env vars on top of a sanitised base env. The same
+ * helper is used by both the legacy `claude -p` path and the PTY supervisor
+ * so model/provider selection (and GLM/Kimi base-URL shims) behave
+ * identically across the two transports.
+ *
+ * - `api` (the resolved auth token from settings/agentic routing/overrides)
+ *   becomes `ANTHROPIC_AUTH_TOKEN` so Claude Code reaches the right account.
+ * - `model === "glm"` rewrites `ANTHROPIC_BASE_URL` to z.ai's Anthropic
+ *   shim and extends the API timeout.
+ * - `model === "kimi-k2p6"` rewrites `ANTHROPIC_BASE_URL` to Kimi's coding
+ *   endpoint and prefers `KIMI_API_KEY` when set.
+ *
+ * Exported (Phase D / Codex HIGH #1) so the PTY supervisor can build child
+ * env via this single source of truth — without it, the PTY path silently
+ * dropped configured model selection and provider routing.
+ */
+export function buildChildEnv(baseEnv: Record<string, string>, model: string, api: string): Record<string, string> {
   const childEnv: Record<string, string> = { ...baseEnv };
   const normalizedModel = model.trim().toLowerCase();
 
@@ -901,7 +990,15 @@ export function setPermissionMode(mode: PermissionMode): void {
   }
 }
 
-function buildSecurityArgs(security: SecurityConfig): string[] {
+/**
+ * Build the security-related argv for a `claude` invocation (both `claude -p`
+ * and PTY-mode). Reads `getPermissionMode()` to decide between
+ * `--dangerously-skip-permissions` and `--permission-mode <mode>`, then
+ * appends tool gating per `security.level`. Exported so the PTY supervisor
+ * can pass the same argv to its spawned `claude` rather than reinventing the
+ * logic — this is the only place permission-mode policy lives.
+ */
+export function buildSecurityArgs(security: SecurityConfig): string[] {
   const permissionMode = getPermissionMode();
   const args: string[] = permissionMode === "bypassPermissions"
     ? ["--dangerously-skip-permissions"]
@@ -1348,7 +1445,57 @@ async function execClaude(
     }
   } catch {}
 
-  let exec = await runClaudeStream(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd, onChunk, onToolEvent);
+  // ──────────────────────────────────────────────────────────────────────────
+  // PTY routing decision (SPEC §5.2 + §7.1).
+  //
+  // Order of precedence:
+  //   1. `name === "bootstrap"` → ALWAYS legacy `runClaudeStream` (§7.1).
+  //      The bootstrap call seeds a fresh global session and is low-volume;
+  //      keeping it on the legacy path simplifies the supervisor.
+  //   2. `settings.pty.enabled === false` → legacy `runClaudeStream` (§5.2).
+  //   3. Otherwise → `runOnPty(sessionKey, …)` against the supervisor.
+  //
+  // Downstream logic (rate-limit fallback, corruption recovery, stale-session
+  // recovery) is unchanged — it consumes `exec` with the same shape regardless.
+  // Per §5.3 the stale-session retry path explicitly uses runClaudeStream
+  // directly, so we don't compound supervisor recovery with downstream recovery.
+  const isInfraCall = name === "bootstrap";
+  const useLegacyPath = !settings.pty.enabled || isInfraCall;
+  let exec: { rawStdout: string; stderr: string; exitCode: number; sessionId?: string };
+  if (useLegacyPath) {
+    exec = await runClaudeStream(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd, onChunk, onToolEvent);
+  } else {
+    const sessionKey = threadId
+      ? `thread:${threadId}`
+      : agentName
+        ? `agent:${agentName}`
+        : "global";
+    // Phase D fixes #2 (CRITICAL-1) and #3 (MAJOR-2/3): thread the assembled
+    // --append-system-prompt payload AND the canonical securityArgs through
+    // to the PTY path so named agents keep their identity/memory and the
+    // operator's permissionMode is honoured (instead of always
+    // --dangerously-skip-permissions).
+    //
+    // Codex Phase D #1: ALSO thread the resolved primaryConfig.model and
+    // primaryConfig.api through, so the PTY supervisor can:
+    //   - pass `--model <model>` (matching what the legacy path does), and
+    //   - build child env with `buildChildEnv(baseEnv, model, api)` —
+    //     applying ANTHROPIC_AUTH_TOKEN, the GLM/Kimi base-URL shims, etc.
+    // Without these, settings.api / agentic-router model choices / GLM /
+    // Kimi configuration silently drop on the PTY path.
+    const appendSystemPrompt = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
+    exec = await runOnPty(sessionKey, prompt, {
+      timeoutMs,
+      threadId,
+      agentName,
+      modelOverride: primaryConfig.model || (modelOverride ?? undefined),
+      api: primaryConfig.api,
+      securityArgs,
+      appendSystemPrompt,
+      onChunk,
+      onToolEvent,
+    });
+  }
   const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
   let usedFallback = false;
 

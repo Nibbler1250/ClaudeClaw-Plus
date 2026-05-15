@@ -88,6 +88,20 @@ const DEFAULT_SETTINGS: Settings = {
   stt: { baseUrl: "", model: "" },
   sessionTimeoutMs: DEFAULT_SESSION_TIMEOUT_MS,
   timeouts: { telegram: 5, discord: 5, heartbeat: 15, job: 30, default: 5 },
+  pty: {
+    // Opt-in by default. Operators flip this to true ONLY after the MCP
+    // multiplexer follow-up lands and they've validated OAuth refresh on a
+    // test deployment. See README "PTY runner mode" + PR #62 rollout notes.
+    enabled: false,
+    idleReapMinutes: 30,
+    maxRetries: 5,
+    backoffMs: [1000, 2000, 4000, 8000, 16000],
+    namedAgentsAlwaysAlive: true,
+    turnIdleTimeoutMs: 5000,
+    cols: 100,
+    rows: 30,
+    maxConcurrent: 32,
+  },
   watchdog: { maxConsecutiveTimeouts: null, maxRuntimeSeconds: null },
   session: { autoRotate: false, maxMessages: 50, maxAgeHours: 24, summaryPath: "" },
   plugins: {},
@@ -171,6 +185,45 @@ export interface TimeoutsConfig {
   default: number;
 }
 
+export interface PtyConfig {
+  /** Master switch. When false (default), runner uses today's `claude -p` path
+   *  for every callsite. Operators flip to true ONLY after the MCP multiplexer
+   *  follow-up ships and they've validated OAuth refresh on a test deployment.
+   *  See README "PTY runner mode". */
+  enabled: boolean;
+  /** Ad-hoc thread PTYs are disposed after this many minutes of inactivity.
+   *  Named agents are NEVER reaped when namedAgentsAlwaysAlive is true.
+   *  Default: 30. */
+  idleReapMinutes: number;
+  /** Maximum number of crash-respawn-replay attempts per event.
+   *  Default: 5. */
+  maxRetries: number;
+  /** Backoff between retries (ms). Cycles through this list; if maxRetries
+   *  exceeds the list length, the last value is reused.
+   *  Default: [1000, 2000, 4000, 8000, 16000]. */
+  backoffMs: number[];
+  /** When true, agents under agents/*\/ get a PTY pre-spawned at startup and
+   *  kept alive indefinitely. When false, all PTYs are lazy + idle-reaped.
+   *  Default: true. */
+  namedAgentsAlwaysAlive: boolean;
+  /** Safety net: if a turn produces no PTY bytes for this many ms AND no
+   *  OSC progress-end has been seen, the turn is considered complete.
+   *  Default: 5000. */
+  turnIdleTimeoutMs: number;
+  /** Initial PTY columns. Default: 100. */
+  cols: number;
+  /** Initial PTY rows. Default: 30. */
+  rows: number;
+  /**
+   * Hard cap on concurrent live PTYs. When the cap is hit, the supervisor
+   * evicts the LRU ad-hoc PTY (named agents are exempt — they're guarded by
+   * `namedAgentsAlwaysAlive`). Prevents a Discord/Telegram thread burst from
+   * accumulating dozens of idle `claude` processes faster than the 30-min
+   * idle-reaper can clear them. Default: 32.
+   */
+  maxConcurrent: number;
+}
+
 export interface Settings {
   model: string;
   api: string;
@@ -188,6 +241,7 @@ export interface Settings {
   apiToken?: string;
   sessionTimeoutMs: number;
   timeouts: TimeoutsConfig;
+  pty: PtyConfig;
   watchdog: WatchdogSettings;
   plugins: Record<string, PluginEntry>;
   session: SessionConfig;
@@ -414,6 +468,24 @@ function parseSettings(
       heartbeat: Number.isFinite(raw.timeouts?.heartbeat) && Number(raw.timeouts.heartbeat) > 0 ? Number(raw.timeouts.heartbeat) : 15,
       job: Number.isFinite(raw.timeouts?.job) && Number(raw.timeouts.job) > 0 ? Number(raw.timeouts.job) : 30,
       default: Number.isFinite(raw.timeouts?.default) && Number(raw.timeouts.default) > 0 ? Number(raw.timeouts.default) : 5,
+    },
+    pty: {
+      enabled: raw.pty?.enabled === true, // default false — opt-in (see DEFAULT_SETTINGS.pty)
+      idleReapMinutes: Number.isFinite(raw.pty?.idleReapMinutes) && Number(raw.pty.idleReapMinutes) > 0
+        ? Number(raw.pty.idleReapMinutes) : 30,
+      maxRetries: Number.isFinite(raw.pty?.maxRetries) && Number(raw.pty.maxRetries) >= 0
+        ? Number(raw.pty.maxRetries) : 5,
+      backoffMs: Array.isArray(raw.pty?.backoffMs) && raw.pty.backoffMs.length > 0
+        && raw.pty.backoffMs.every((n: unknown) => Number.isFinite(n) && Number(n) >= 0)
+        ? raw.pty.backoffMs.map(Number)
+        : [1000, 2000, 4000, 8000, 16000],
+      namedAgentsAlwaysAlive: raw.pty?.namedAgentsAlwaysAlive !== false, // default true
+      turnIdleTimeoutMs: Number.isFinite(raw.pty?.turnIdleTimeoutMs) && Number(raw.pty.turnIdleTimeoutMs) > 0
+        ? Number(raw.pty.turnIdleTimeoutMs) : 5000,
+      cols: Number.isFinite(raw.pty?.cols) && Number(raw.pty.cols) >= 40 ? Number(raw.pty.cols) : 100,
+      rows: Number.isFinite(raw.pty?.rows) && Number(raw.pty.rows) >= 10 ? Number(raw.pty.rows) : 30,
+      maxConcurrent: Number.isFinite(raw.pty?.maxConcurrent) && Number(raw.pty.maxConcurrent) > 0
+        ? Number(raw.pty.maxConcurrent) : 32,
     },
     watchdog: parseWatchdogConfig(raw.watchdog),
     plugins: parsePlugins(raw.plugins),
