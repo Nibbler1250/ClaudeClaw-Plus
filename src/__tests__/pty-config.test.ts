@@ -205,3 +205,105 @@ describe("parseSettings — pty interacts with existing fields", () => {
     expect(getSettings().pty).toEqual(first);
   });
 });
+
+describe("parseSettings — mcp block (MCP multiplexer, SPEC §5)", () => {
+  it("applies all defaults when mcp block is missing", async () => {
+    await writeRawSettings({});
+    await reloadSettings();
+    const { mcp } = getSettings();
+    expect(mcp.shared).toEqual([]);
+    expect(mcp.perPtyOnly).toEqual([]);
+    expect(mcp.stateless).toEqual([]);
+    expect(mcp.healthProbeIntervalMs).toBe(30000);
+  });
+
+  it("accepts a custom healthProbeIntervalMs", async () => {
+    await writeRawSettings({ mcp: { healthProbeIntervalMs: 5000 } });
+    await reloadSettings();
+    expect(getSettings().mcp.healthProbeIntervalMs).toBe(5000);
+  });
+
+  it("disables the health probe when healthProbeIntervalMs is 0", async () => {
+    await writeRawSettings({ mcp: { healthProbeIntervalMs: 0 } });
+    await reloadSettings();
+    expect(getSettings().mcp.healthProbeIntervalMs).toBe(0);
+  });
+
+  it("clamps negative healthProbeIntervalMs to the default", async () => {
+    await writeRawSettings({ mcp: { healthProbeIntervalMs: -1 } });
+    await reloadSettings();
+    expect(getSettings().mcp.healthProbeIntervalMs).toBe(30000);
+  });
+
+  it("accepts a non-empty shared list", async () => {
+    await writeRawSettings({ mcp: { shared: ["graphiti", "context7"] } });
+    await reloadSettings();
+    expect(getSettings().mcp.shared).toEqual(["graphiti", "context7"]);
+  });
+
+  it("filters non-string entries out of the shared list", async () => {
+    await writeRawSettings({ mcp: { shared: ["graphiti", 42, null, "context7", ""] } });
+    await reloadSettings();
+    expect(getSettings().mcp.shared).toEqual(["graphiti", "context7"]);
+  });
+
+  it("de-duplicates entries inside shared", async () => {
+    await writeRawSettings({ mcp: { shared: ["graphiti", "graphiti", "context7"] } });
+    await reloadSettings();
+    expect(getSettings().mcp.shared).toEqual(["graphiti", "context7"]);
+  });
+
+  it("treats a non-array shared field as empty", async () => {
+    await writeRawSettings({ mcp: { shared: "graphiti" } });
+    await reloadSettings();
+    expect(getSettings().mcp.shared).toEqual([]);
+  });
+
+  it("removes a name from shared when it's also in perPtyOnly (perPtyOnly wins)", async () => {
+    await writeRawSettings({
+      mcp: { shared: ["graphiti", "filesystem"], perPtyOnly: ["filesystem"] },
+    });
+    await reloadSettings();
+    const { mcp } = getSettings();
+    expect(mcp.shared).toEqual(["graphiti"]);
+    expect(mcp.perPtyOnly).toEqual(["filesystem"]);
+  });
+
+  it("drops a stateless entry that isn't also in shared", async () => {
+    await writeRawSettings({
+      mcp: { shared: ["graphiti"], stateless: ["context7"] },
+    });
+    await reloadSettings();
+    expect(getSettings().mcp.stateless).toEqual([]);
+  });
+
+  it("keeps stateless entries that are also in shared", async () => {
+    await writeRawSettings({
+      mcp: { shared: ["graphiti", "context7"], stateless: ["context7"] },
+    });
+    await reloadSettings();
+    expect(getSettings().mcp.stateless).toEqual(["context7"]);
+  });
+
+  it("accepts non-empty shared even when web.enabled is false (warning logged)", async () => {
+    // Warning is advisory — parseSettings does NOT remove the entries. The
+    // multiplexer plugin enforces activation at startup (SPEC §6.3).
+    await writeRawSettings({
+      web: { enabled: false },
+      mcp: { shared: ["graphiti"] },
+    });
+    await reloadSettings();
+    expect(getSettings().mcp.shared).toEqual(["graphiti"]);
+  });
+
+  it("round-trips an explicit empty mcp object", async () => {
+    await writeRawSettings({ mcp: {} });
+    await reloadSettings();
+    expect(getSettings().mcp).toEqual({
+      shared: [],
+      perPtyOnly: [],
+      stateless: [],
+      healthProbeIntervalMs: 30000,
+    });
+  });
+});

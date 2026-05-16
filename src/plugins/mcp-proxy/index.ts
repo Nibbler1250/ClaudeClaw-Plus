@@ -31,6 +31,11 @@ export interface McpProxyPluginOpts {
   tokenPath?: string;
   // For reasoned mode: inject into active Claude session
   reasonedInvokeFn?: (tool: string, args: unknown) => Promise<unknown>;
+  /** TEST SEAM: override the resolver used to discover which servers the
+   *  multiplexer is actively claiming. Production leaves this undefined →
+   *  the resolver imports `mcp-multiplexer` and asks `getMcpMultiplexerPlugin()`.
+   *  Tests can inject any set without spinning up a real multiplexer. */
+  claimedByMultiplexer?: () => Set<string>;
 }
 
 export class McpProxyPlugin {
@@ -39,11 +44,13 @@ export class McpProxyPlugin {
   private tokenPath: string;
   private reasonedInvokeFn?: (tool: string, args: unknown) => Promise<unknown>;
   private pluginToken: Buffer | null = null;
+  private claimedByMultiplexer: () => Set<string>;
 
   constructor(opts: McpProxyPluginOpts = {}) {
     this.configPath = opts.configPath ?? join(homedir(), ".config", "claudeclaw", "mcp-proxy.json");
     this.tokenPath = opts.tokenPath ?? join(homedir(), ".config", "claudeclaw", "mcp-proxy.token");
     this.reasonedInvokeFn = opts.reasonedInvokeFn;
+    this.claimedByMultiplexer = opts.claimedByMultiplexer ?? _sharedActuallyClaimedByMultiplexer;
   }
 
   async start(): Promise<void> {
@@ -65,7 +72,37 @@ export class McpProxyPlugin {
       return;
     }
 
-    const enabledServers = Object.entries(config.servers).filter(([, s]) => s.enabled);
+    // SPEC §4.1 step 4 / §6.2: when a server is actively claimed by the
+    // multiplexer (it's running AND has the server in its claimed set),
+    // mcp-proxy must NOT spawn its own copy of that upstream child —
+    // otherwise both plugins would each spawn the same MCP server
+    // (double-process, defeats the whole point). The multiplexer mirrors
+    // the FQN into the bridge so legacy `claude -p` callsites still
+    // resolve `<server>__<tool>` against the shared child.
+    //
+    // Codex PR #71 P1: skip ONLY when the multiplexer is *actually* serving
+    // the server. If the multiplexer went dormant for any reason (web
+    // disabled, non-loopback host, zero claimed servers, missing config),
+    // proxy continues to spawn the server so legacy flows keep working
+    // instead of silently losing MCP functionality.
+    const sharedClaimedByMultiplexer = this.claimedByMultiplexer();
+    const skipped: string[] = [];
+    const enabledServers = Object.entries(config.servers).filter(([name, s]) => {
+      if (!s.enabled) return false;
+      if (sharedClaimedByMultiplexer.has(name)) {
+        skipped.push(name);
+        return false;
+      }
+      return true;
+    });
+    if (skipped.length > 0) {
+      console.error(
+        `[mcp-proxy] skipping ${skipped.length} server(s) claimed by multiplexer: ${skipped.join(", ")}`,
+      );
+      try {
+        getMcpBridge().audit("mcp_proxy_skip_shared", { servers: skipped });
+      } catch {}
+    }
     const allTools: { name: string; description: string; schema: Record<string, unknown> }[] = [];
 
     await Promise.allSettled(
@@ -194,6 +231,39 @@ export class McpProxyPlugin {
       throw new Error(`reasoned mode not configured for ${fqn}`);
     }
     return this.reasonedInvokeFn(fqn, args);
+  }
+}
+
+// ── Settings helpers ──────────────────────────────────────────────────────────
+
+/** Names of servers the multiplexer is *actually* serving right now —
+ *  NOT just the names listed in `settings.mcp.shared`. The two diverge
+ *  whenever the multiplexer plugin is dormant (web disabled, non-loopback
+ *  host, zero claimed servers, missing mcp-proxy.json). When dormant, the
+ *  proxy must still spawn the servers so legacy bridge / tool-call flows
+ *  keep working — see PR #71 Codex P1 finding. */
+function _sharedActuallyClaimedByMultiplexer(): Set<string> {
+  try {
+    // Lazy require to avoid a circular import (`mcp-multiplexer` imports
+    // `mcp-bridge`, `mcp-bridge` is a peer of `mcp-proxy`). The dynamic
+    // require is fine — both modules are loaded by the time the proxy's
+    // `start()` is called from `commands/start.ts`.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const mod = require("../mcp-multiplexer/index.js") as {
+      getMcpMultiplexerPlugin?: () => {
+        isActive: () => boolean;
+        sharedServerNames: () => string[];
+      };
+    };
+    const factory = mod.getMcpMultiplexerPlugin;
+    if (typeof factory !== "function") return new Set();
+    const plugin = factory();
+    if (!plugin.isActive()) return new Set();
+    return new Set(plugin.sharedServerNames());
+  } catch {
+    // Module not present, plugin not built yet, or any other lookup error
+    // → treat as dormant, proxy spawns everything as today.
+    return new Set();
   }
 }
 

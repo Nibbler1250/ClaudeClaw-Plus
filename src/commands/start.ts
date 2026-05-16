@@ -44,6 +44,8 @@ import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wi
 import { PluginManager, setPluginManager } from "../plugins";
 import { indexSessionsBackground } from "../memory";
 import { getMcpProxyPlugin } from "../plugins/mcp-proxy/index.js";
+import { getMcpMultiplexerPlugin } from "../plugins/mcp-multiplexer/index.js";
+import { injectMcpIdentityIssuer } from "../runner/pty-supervisor";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
 const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
@@ -626,6 +628,49 @@ export async function start(args: string[] = []) {
     });
     await pluginManager.startServices();
     await pluginManager.emit("gateway_start", {}, { workspaceDir: process.cwd() });
+  }
+
+  // MCP multiplexer (SPEC §4.5, §6.3): start BEFORE mcp-proxy so the proxy
+  // can read settings.mcp.shared to skip servers the multiplexer owns. Also
+  // wires the multiplexer's issue/release functions into the PTY supervisor.
+  //
+  // Activation rule (SPEC §6.3): only attempt to start when shared is
+  // non-empty AND web.enabled is true. Otherwise the plugin would have
+  // nothing to mount routes on.
+  if (settings.mcp.shared.length > 0 && settings.web.enabled) {
+    try {
+      const plugin = getMcpMultiplexerPlugin();
+      await plugin.start();
+      // Codex PR #71 P1: plugin.start() can return successfully but leave
+      // the multiplexer dormant (missing/invalid mcp-proxy.json, zero
+      // claimed servers, etc). Only wire the supervisor seam when the
+      // plugin is *actually* serving — otherwise the supervisor would
+      // synthesize --mcp-config entries pointing at routes that were
+      // never registered. When dormant, supervisor's existing
+      // null-issuer guard skips synthesis and PTYs fall back to default
+      // MCP discovery, exactly as the surrounding comment promises.
+      if (plugin.isActive()) {
+        // bridgeBaseUrl reads from the plugin so supervisor and plugin
+        // can't drift on the URL the multiplexer actually bound to.
+        injectMcpIdentityIssuer({
+          issue: (ptyId) => plugin.issueIdentity(ptyId),
+          revoke: (ptyId) => plugin.releaseIdentity(ptyId),
+          bridgeBaseUrl: () => plugin.bridgeBaseUrl(),
+        });
+        console.log("[mcp-multiplexer] started");
+      } else {
+        console.warn(
+          "[mcp-multiplexer] start() returned dormant — supervisor wiring skipped, PTYs fall back to default MCP discovery.",
+        );
+      }
+    } catch (err) {
+      // Don't crash the daemon — log clearly and fall back to per-PTY MCP
+      // discovery (settings.mcp.shared becomes effectively dormant).
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[mcp-multiplexer] startup failed (non-fatal, falling back to per-PTY MCP discovery): ${msg}`,
+      );
+    }
   }
 
   // Start mcp-proxy plugin only when a config file is present — avoids opening

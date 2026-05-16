@@ -167,6 +167,14 @@ const DEFAULT_SETTINGS: Settings = {
     rows: 30,
     maxConcurrent: 32,
   },
+  mcp: {
+    // Default empty — the multiplexer is dormant out of the box. Operators
+    // opt in by listing server names from mcp-proxy.json here. See SPEC §6.
+    shared: [],
+    perPtyOnly: [],
+    stateless: [],
+    healthProbeIntervalMs: 30000,
+  },
   watchdog: { maxConsecutiveTimeouts: null, maxRuntimeSeconds: null },
   session: { autoRotate: false, maxMessages: 50, maxAgeHours: 24, summaryPath: "" },
   plugins: {},
@@ -246,6 +254,48 @@ export interface TimeoutsConfig {
   default: number;
 }
 
+/**
+ * MCP multiplexer settings (SPEC §5). Operators enumerate WHICH MCP servers
+ * from `mcp-proxy.json` get hosted shared by the daemon vs spawned per-PTY.
+ *
+ * Default empty `shared` list keeps the PTY path byte-identical to today —
+ * the multiplexer is dormant and Claude Code's stock per-PTY MCP discovery
+ * applies. This is the rollback path: clear `shared`, reload settings.
+ */
+export interface McpConfig {
+  /**
+   * Names of MCP servers to multiplex over the bridge. Each must also appear
+   * in `~/.config/claudeclaw/mcp-proxy.json`. Empty list (default) → multiplexer
+   * is dormant.
+   */
+  shared: string[];
+  /**
+   * Names of MCP servers that MUST spawn per-PTY locally (security-sensitive
+   * filesystem MCPs etc). Mutually exclusive with `shared`. Today a no-op
+   * surface (non-shared servers already spawn per-PTY); listed here for
+   * future extension (per-PTY env scoping, ACL hooks).
+   */
+  perPtyOnly: string[];
+  /**
+   * Subset of `shared`. Declares that the MCP server has no per-session state
+   * and can safely share one upstream MCP session across all PTYs. Default
+   * empty → assume every shared server is stateful (per-PTY session map).
+   */
+  stateless: string[];
+  /**
+   * Interval in milliseconds between health-probe samples of each shared
+   * MCP server. Set to 0 to disable. Default: 30000 (30s).
+   *
+   * The probe samples each `McpServerProcess.status` and emits a structured
+   * audit event + log line on transitions (e.g. `up` → `crashed`). Pairs
+   * with the per-server crash/failure events already emitted by the proxy
+   * substrate. Filed in response to Nibbler review on #64: the silent
+   * degradation mode (one shared MCP crashes → all PTYs lose that tool)
+   * needs an operator-visible signal before `pty.enabled: true` ships.
+   */
+  healthProbeIntervalMs: number;
+}
+
 export interface PtyConfig {
   /** Master switch. When false (default), runner uses today's `claude -p` path
    *  for every callsite. Operators flip to true ONLY after the MCP multiplexer
@@ -303,6 +353,7 @@ export interface Settings {
   sessionTimeoutMs: number;
   timeouts: TimeoutsConfig;
   pty: PtyConfig;
+  mcp: McpConfig;
   watchdog: WatchdogSettings;
   plugins: Record<string, PluginEntry>;
   session: SessionConfig;
@@ -591,6 +642,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
           ? Number(raw.pty.maxConcurrent)
           : 32,
     },
+    mcp: parseMcpConfig(raw.mcp, raw.web?.enabled),
     watchdog: parseWatchdogConfig(raw.watchdog),
     plugins: parsePlugins(raw.plugins),
     memorySearch: parseMemorySearchSettings(raw.memorySearch),
@@ -611,6 +663,81 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
 
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6];
+
+/**
+ * Parse the `mcp` block from a raw settings object (SPEC §5).
+ *
+ * Validation rules — log warnings, never throw:
+ *   1. Same name in both `shared` and `perPtyOnly` → drop from `shared`.
+ *   2. `stateless` entries must be a subset of `shared` → drop strays.
+ *   3. `settings.web.enabled === false` + non-empty `shared` → warn that the
+ *      multiplexer can't activate; callers must check this combo at startup.
+ *
+ * Note: we deliberately can't validate that names appear in `mcp-proxy.json`
+ * at parse time (that file lives on disk and is read by the multiplexer
+ * plugin, not by parseSettings). The multiplexer's own startup path warns
+ * when a shared name has no definition; see SPEC §5 rule 2.
+ */
+function parseMcpConfig(raw: any, webEnabled: unknown): McpConfig {
+  const asStringList = (v: unknown): string[] =>
+    Array.isArray(v)
+      ? v.filter((s): s is string => typeof s === "string" && s.length > 0).map(String)
+      : [];
+
+  const rawShared = asStringList(raw?.shared);
+  const rawPerPtyOnly = asStringList(raw?.perPtyOnly);
+  const rawStateless = asStringList(raw?.stateless);
+
+  // De-duplicate inside each list (silent — pure data hygiene).
+  const shared = [...new Set(rawShared)];
+  const perPtyOnly = [...new Set(rawPerPtyOnly)];
+  const stateless = [...new Set(rawStateless)];
+
+  // Rule 1: a name in both `shared` and `perPtyOnly` → `perPtyOnly` wins.
+  const sharedSet = new Set(shared);
+  for (const name of perPtyOnly) {
+    if (sharedSet.has(name)) {
+      console.warn(
+        `[mcp] server '${name}' is in both 'shared' and 'perPtyOnly'; treating as 'perPtyOnly'`,
+      );
+      sharedSet.delete(name);
+    }
+  }
+  const filteredShared = shared.filter((n) => sharedSet.has(n));
+
+  // Rule 2: `stateless` must be a subset of `shared`.
+  const filteredStateless: string[] = [];
+  for (const name of stateless) {
+    if (!sharedSet.has(name)) {
+      console.warn(
+        `[mcp] server '${name}' in settings.mcp.stateless must also be in settings.mcp.shared; ignoring 'stateless' marker`,
+      );
+      continue;
+    }
+    filteredStateless.push(name);
+  }
+
+  // Rule 3: gateway must be enabled for the multiplexer to mount HTTP routes.
+  if (filteredShared.length > 0 && webEnabled === false) {
+    console.warn(
+      "[mcp] multiplexer requires the HTTP gateway (settings.web.enabled); shared MCPs will be skipped",
+    );
+  }
+
+  // Rule 4: health-probe interval is a non-negative integer; clamp+default.
+  const rawProbeMs = raw?.healthProbeIntervalMs;
+  const healthProbeIntervalMs =
+    typeof rawProbeMs === "number" && Number.isFinite(rawProbeMs) && rawProbeMs >= 0
+      ? Math.floor(rawProbeMs)
+      : 30000;
+
+  return {
+    shared: filteredShared,
+    perPtyOnly,
+    stateless: filteredStateless,
+    healthProbeIntervalMs,
+  };
+}
 
 function parseTimezone(value: unknown): string {
   return normalizeTimezoneName(value);
