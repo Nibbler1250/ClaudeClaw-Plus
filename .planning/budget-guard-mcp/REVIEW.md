@@ -1,34 +1,35 @@
 # Plugin Review — budget-guard-mcp
 
 Plugin: budget-guard
-Reviewed at: 2026-05-16T11:00:00Z
-Branch: feat/budget-guard-mcp (e49785e)
+Reviewed at: 2026-05-16T12:15:00Z
+Branch: feat/budget-guard-mcp (c9fb6d5)
 Worktree: /home/simon/Projects/ClaudeClaw-Plus
 
 ## Phase 1 — Typecheck baseline diff
 
-- Main errors: 0
-- Plugin branch errors: 0
+- Main errors: 266
+- Plugin branch errors: 266
 - Delta: +0
 
 **Typecheck: PASS**
 
 ## Phase 2 — Test pass-rate
 
-- 31 pass / 0 fail across 2 files
-- 55 expect() calls
-- No regressions on existing suites
+- 35 pass / 0 fail across 2 files
+- 64 expect() calls
+- 4 new tests (weekly deny, monthly deny, token mode 0600, threshold sort)
+- No regressions on existing 31 tests
 
-**Tests: PASS (31/31)**
+**Tests: PASS (35/35)**
 
 ## Phase 3 — Security checklist
 
 | Item | Status |
 |---|---|
-| Token file mode 0600 | PASS — `chmodSync(this.tokenPath, 0o600)` at L283 |
-| Bearer not in audit log | PASS — no secret/bearer/token/hex in audit payloads |
+| Token file mode 0600 | PASS — `writeFileSync(..., { mode: 0o600 })` at L297 (atomic, no TOCTOU) |
+| Bearer not in audit log | PASS — test asserts no bearer/PtyIdentity in serialized payloads |
 | Audit on lifecycle (started, stopped) | PASS — `budget_guard_started`, `budget_guard_stopped` events |
-| Audit on deny/allow/threshold | PASS — `budget_guard_denied`, `budget_guard_allowed`, `budget_guard_threshold_crossed` |
+| Audit on deny/allow/threshold | PASS — `budget_guard_denied` (with `window` field), `budget_guard_allowed`, `budget_guard_threshold_crossed` |
 | Crash recovery audit | PASS — lifecycle events cover crash scenarios |
 | No SSRF / path traversal | PASS — no user-controlled URLs or paths |
 
@@ -38,12 +39,14 @@ Worktree: /home/simon/Projects/ClaudeClaw-Plus
 
 | Item | Status |
 |---|---|
-| Singleton pattern with `_reset` export | PASS — `_resetBudgetGuard()` exported at L301 |
-| ESM `.js` extensions consistent | PASS — `from "./db.js"` |
+| Singleton pattern with `_reset` export | PASS — `_resetBudgetGuard()` exported at L303 |
+| ESM `.js` extensions consistent | PASS — all relative imports use `.js` |
 | No `unknown as Y` casts in prod | PASS — none found |
-| Dead code / unused imports | PASS |
+| Dead code / unused imports | PASS — removed `chmodSync` import after TOCTOU fix |
 | Audit events fire AFTER status finalized | PASS |
-| Comments explain WHY when non-obvious | PASS |
+| Weekly/monthly cap enforcement | PASS — `_checkBudget` checks daily → weekly → monthly caps in order |
+| Denial audit includes window field | PASS — `window: "daily"|"weekly"|"monthly"` in `budget_guard_denied` payload |
+| Threshold sort defensive | PASS — `.sort((a, b) => a - b)` before iteration |
 
 **Code review: PASS**
 
@@ -73,21 +76,23 @@ Result: clean (zero hits)
 
 N/A — standalone plugin, no external API/bridge exposed.
 
-## Verdict: APPROVE-WITH-CONDITIONS
+## Conditions from prior review (d9e6f53) — resolution
 
-### Conditions (must fix before publish)
+1. **BLOCKER — Weekly/monthly cap enforcement**: FIXED in c9fb6d5. `_checkBudget` now checks `weekly_cap_usd` and `monthly_cap_usd` after daily. Denial audit includes `window` field. 2 new tests cover weekly + monthly deny scenarios.
 
-1. **Weekly/monthly cap enforcement missing (BLOCKER)** — `_checkBudget` only evaluates `daily_cap_usd`. `weekly_cap_usd` and `monthly_cap_usd` are computed but never compared against caps for deny decisions. Operators relying on weekly/monthly ceilings get zero protection. Fix: add weekly/monthly breach checks in `_checkBudget` alongside the daily check, and add tests for weekly/monthly breach scenarios.
+2. **SECURITY — Token file TOCTOU**: FIXED in c9fb6d5. `writeFileSync` now passes `{ mode: 0o600 }` directly, eliminating the race window. Unused `chmodSync` import removed. New test asserts file mode == 0o600 immediately after `start()`.
 
-2. **Token file TOCTOU on creation (SECURITY)** — `writeFileSync` creates the file with default umask (typically 0644), then `chmodSync` tightens to 0600. Bearer token is briefly world-readable. Fix: pass `{ mode: 0o600 }` to `writeFileSync` so file is created restricted; keep chmod as belt-and-suspenders.
+3. **MINOR — Threshold array sort**: FIXED in c9fb6d5. Thresholds defensively sorted with `.sort((a, b) => a - b)` before iteration. New test passes unsorted `[0.95, 0.5, 0.8]` and verifies 0.5 fires at 60% usage.
 
-3. **Threshold array sort defensiveness (minor)** — `_fireThresholdEvents` resets `fired` when `fraction < thresholds[0]`, assuming ascending sort. User-supplied unsorted thresholds cause re-firing oddities. Fix: sort defensively on input.
+## Non-blocking observations (carried forward)
 
-### Non-blocking observations
+- `record_usage` always invokes `_checkBudget`, emitting extra audit per record. Intentional design.
+- `remaining_usd` always derived from daily cap even when weekly/monthly is the binding constraint — minor misleading return value. Follow-up candidate.
+- `_fireThresholdEvents` only fires on daily ratio — weekly/monthly breaches won't trigger 50/80/95% warnings, only the terminal denial. Follow-up candidate.
+- `stop()` never invalidates the bearer token file on disk. Follow-up candidate.
 
-- `record_usage` always invokes `_checkBudget`, emitting extra `budget_guard_allowed`/`denied` audit per record. Probably intentional — flag for awareness.
-- First-start perm-check is dead code (perm check runs against pre-existing file on next `start()`). Move to after `_registerWithGateway`.
-- `stop()` never unregisters/invalidates the bearer token — token file remains on disk. Add cleanup on stop.
-- `getBudgetGuardPlugin` singleton exported but no consumer in this diff yet (config wiring reads settings but nothing constructs the plugin). Not a regression.
+## Verdict: APPROVE
 
-Ready for plugin-publish: no (fix conditions first)
+All 3 conditions from prior review addressed. No new blockers or security issues introduced.
+
+Ready for plugin-publish: yes
