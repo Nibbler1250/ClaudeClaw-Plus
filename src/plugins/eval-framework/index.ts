@@ -273,3 +273,10 @@ export class EvalFrameworkPlugin {
     return sets;
   }
 }
+
+// ── Singleton accessor (matches mcp-proxy / budget-guard pattern) ────────────
+
+export function getEvalFrameworkPlugin(opts?: EvalFrameworkPluginOpts): EvalFrameworkPlugin {
+  if (!singleton) singleton = new EvalFrameworkPlugin(opts);
+  return singleton;
+}

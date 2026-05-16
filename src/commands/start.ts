@@ -45,6 +45,8 @@ import { PluginManager, setPluginManager } from "../plugins";
 import { indexSessionsBackground } from "../memory";
 import { getMcpProxyPlugin } from "../plugins/mcp-proxy/index.js";
 import { getMcpMultiplexerPlugin } from "../plugins/mcp-multiplexer/index.js";
+import { getBudgetGuardPlugin } from "../plugins/budget-guard/index.js";
+import { getEvalFrameworkPlugin } from "../plugins/eval-framework/index.js";
 import { injectMcpIdentityIssuer } from "../runner/pty-supervisor";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
@@ -456,6 +458,10 @@ export async function start(args: string[] = []) {
   async function shutdown() {
     await mcpProxyStarted.catch(() => {}); // drain start() before stop() clears server map
     await getMcpProxyPlugin().stop();
+    await budgetGuardStarted.catch(() => {});
+    try { await getBudgetGuardPlugin().stop(); } catch {}
+    await evalFrameworkStarted.catch(() => {});
+    try { await getEvalFrameworkPlugin().stop(); } catch {}
     await pluginManager.stopServices();
     setPluginManager(null);
     if (discordStopGateway) discordStopGateway();
@@ -698,6 +704,31 @@ export async function start(args: string[] = []) {
       .catch((err) => {
         console.error(
           "[mcp-proxy] Startup error (non-fatal):",
+          err instanceof Error ? err.message : String(err),
+        );
+      });
+  }
+
+  let budgetGuardStarted: Promise<void> = Promise.resolve();
+  let evalFrameworkStarted: Promise<void> = Promise.resolve();
+
+  if (settings.budgetGuard?.enabled) {
+    budgetGuardStarted = getBudgetGuardPlugin()
+      .start()
+      .catch((err) => {
+        console.error(
+          "[budget-guard] Startup error (non-fatal):",
+          err instanceof Error ? err.message : String(err),
+        );
+      });
+  }
+
+  if (settings.evalFramework?.enabled) {
+    evalFrameworkStarted = getEvalFrameworkPlugin()
+      .start()
+      .catch((err) => {
+        console.error(
+          "[eval-framework] Startup error (non-fatal):",
           err instanceof Error ? err.message : String(err),
         );
       });
