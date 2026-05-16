@@ -32,6 +32,52 @@ const FIXTURE_MARKERS = join(FIXTURE_DIR, "sentinel-turn-sample.markers.json");
 // ─── Synthetic flow tests (single + multi turn) ──────────────────────────────
 
 describe("pty-output-parser — sentinel flow (synthetic)", () => {
+  // Issue #87 regression: pre-fix, `quiet` could fire after `startTurn` even
+  // though zero response bytes had arrived. The 500ms quiet window expired
+  // between the prompt write and claude's first ack-echo (~500–800ms on
+  // claude 2.1.89). The supervisor wrote the sentinel prematurely; claude's
+  // TUI echoed the sentinel keystrokes back fast; sentinel-found fired;
+  // runTurn returned with only the TUI splash + prompt-echo bytes as the
+  // "response" — model output never had a chance to arrive.
+  test("issue #87: quiet does NOT fire until at least one byte has arrived since startTurn", () => {
+    const parser = createParser({ quietWindowMs: 100 });
+    const uuid = "uuid-87";
+    const sentinelBytes = encodeSentinel(buildSentinel(uuid));
+
+    let now = 1000;
+    // Pre-turn data exists in the stream (e.g. TUI banner from spawn).
+    feed(parser, new TextEncoder().encode("pre-turn banner bytes"), now);
+    expect(parser.state).toBe("idle");
+
+    startTurn(parser, uuid, sentinelBytes, now);
+    expect(parser.state).toBe("accumulating");
+    expect(parser.sawByteSinceTurnStart).toBe(false);
+
+    // The quiet window elapses with ZERO bytes since startTurn (claude has
+    // received the prompt but hasn't started emitting its response yet).
+    // Pre-fix this would emit `quiet`; post-fix it must not.
+    now += 200;
+    expect(tick(parser, now)).toEqual([]);
+
+    // Even after several elapsed quiet windows, still no `quiet` — we need
+    // an actual response byte before the parser will conclude "claude is
+    // silent because it's done responding".
+    now += 5000;
+    expect(tick(parser, now)).toEqual([]);
+
+    // First response byte arrives. Now the quiet window can be counted.
+    feed(parser, new TextEncoder().encode("a"), now);
+    expect(parser.sawByteSinceTurnStart).toBe(true);
+
+    // Within the quiet window after that byte → still no quiet.
+    expect(tick(parser, now + 50)).toEqual([]);
+
+    // After the quiet window → quiet fires.
+    const qEvs = tick(parser, now + 200);
+    expect(qEvs.length).toBe(1);
+    expect(qEvs[0]!.type).toBe("quiet");
+  });
+
   test("happy path: prompt → response → quiet → sentinel echo → complete", () => {
     const enc = new TextEncoder();
     const parser = createParser({ quietWindowMs: 100 });
@@ -350,18 +396,37 @@ describe("normaliseNewlines", () => {
 });
 
 describe("extractResponseText", () => {
-  test("extracts text after ⏺ and before terminator sigil", () => {
-    const text = "garbage\n⏺hello world✻ Worked for 2s\n more";
+  test("extracts text after a line-anchored `⏺ ` and before terminator sigil", () => {
+    const text = "garbage\n⏺ hello world✻ Worked for 2s\n more";
     expect(extractResponseText(text)).toBe("hello world");
   });
 
-  test("handles ⏺ with leading space", () => {
-    const text = "garbage\n⏺ hello world✻ Worked for 2s";
-    expect(extractResponseText(text)).toBe("hello world");
+  // The marker must be at line-start and followed by a space — this is
+  // exactly how claude's TUI prints the assistant message. A bare `⏺` or
+  // `●` embedded inside a TUI element (e.g. the ClaudeClaw+ status box
+  // row `│ ● live │ 🎮 │`) MUST NOT be picked up; pre-fix that bug
+  // caused the captured "response" to be the TUI footer (everything from
+  // the status-box marker onwards) instead of the model output.
+  test("ignores `●` not at line-start (e.g. inside the ClaudeClaw+ status-box row)", () => {
+    // Realistic shape: response marker, then the `─` separator the TUI
+    // prints before re-rendering the input area, then the status box
+    // which contains another `●` we MUST NOT pick up.
+    const text = [
+      "● Pong 🏓",
+      "",
+      "─".repeat(50),
+      '❯ Try "how do I log an error?"',
+      "─".repeat(50),
+      "⏵⏵ bypass permissions on (shift+tab to cycle)",
+      "╭────── 🦞 ClaudeClaw+ 🦞 ──────╮",
+      "│ 📋 7 jobs │ ● live │ 🎮 │",
+      "╰───────────────────────────────╯",
+    ].join("\n");
+    expect(extractResponseText(text)).toBe("Pong 🏓");
   });
 
-  test("uses the LAST ⏺ (response area, not echoed prompt)", () => {
-    const text = "⏺nope ✻done\n⏺yes✻";
+  test("uses the LAST line-anchored marker (response area, not echoed prompt)", () => {
+    const text = "⏺ nope ✻done\n⏺ yes✻";
     expect(extractResponseText(text)).toBe("yes");
   });
 
@@ -385,6 +450,104 @@ describe("extractResponseText", () => {
     expect(extractResponseText(text)).toBe(
       "The prompt looked like `user@host ❯` when I tested it.",
     );
+  });
+
+  // Issue #87 follow-up: claude 2.1.89 emits `●` (U+25CF BLACK CIRCLE)
+  // rather than `⏺` (U+23FA RECORD). Pre-fix, lastIndexOf("⏺") returned
+  // -1 and we fell back to the WHOLE stripped buffer — captures leaked
+  // TUI splash, prompt-echo, and footer into the response shown to the
+  // user (Discord/Telegram).
+  test("recognises `●` (U+25CF) as the assistant marker (claude 2.1.89)", () => {
+    const text = 'garbage\n● Pong 🏓\n────────────\n❯ Try "..."';
+    expect(extractResponseText(text)).toBe("Pong 🏓");
+  });
+
+  test("real-world claude 2.1.89 turn: banner + prompt-echo + response + footer", () => {
+    // Verbatim shape captured from Hetzner (ANSI stripped). The marker
+    // before the model response is `●`, and the divider that follows is
+    // 100 horizontal-line chars before the next TUI input prompt.
+    const text = [
+      "▐▛███▜▌ Claude Code v2.1.89",
+      "▝▜█████▛▘ Sonnet 4.6 · Claude Max",
+      "▘▘ ▝▝   ~/project",
+      "",
+      "❯ [2026-05-16 18:33:59 UTC+1]",
+      "[Discord Channel: 1488536365477138602]",
+      "Message: Ping",
+      "",
+      "● Pong 🏓",
+      "",
+      "─".repeat(100),
+      '❯ Try "how do I log an error?"',
+      "─".repeat(100),
+      "⏵⏵ bypass permissions on (shift+tab to cycle)",
+    ].join("\n");
+    expect(extractResponseText(text)).toBe("Pong 🏓");
+  });
+
+  test("uses the LAST marker even when both `●` and `⏺` appear", () => {
+    // Defensive: if a future claude version mixes both, the most recent
+    // marker is the one that introduces the assistant response.
+    const text = "⏺ earlier\n● later✻";
+    expect(extractResponseText(text)).toBe("later");
+  });
+
+  test("multi-line response is preserved until divider", () => {
+    const text = `● Line one\nLine two\nLine three\n${"─".repeat(50)}\n❯ Try "next"`;
+    expect(extractResponseText(text)).toBe("Line one\nLine two\nLine three");
+  });
+
+  test("a short horizontal-line run (<4) is NOT a terminator", () => {
+    // 3 chars of ─ inside response (e.g. a markdown table) must not split.
+    const text = "● A row: ─ ─ ─ that crosses cells.";
+    expect(extractResponseText(text)).toBe("A row: ─ ─ ─ that crosses cells.");
+  });
+
+  // Hetzner-discovered shape: claude's TUI re-renders the entire screen
+  // for every turn, so a turn-2 capture contains the FULL conversation
+  // history (banner, turn-1 prompt + response, turn-2 prompt + response)
+  // followed by the input area re-render and the ClaudeClaw+ status box.
+  // The extractor must find the LATEST line-anchored marker (turn 2's
+  // response) and stop at the next divider — ignoring both turn 1's
+  // marker AND the status-box `●`.
+  //
+  // Note: claude 2.1.89 emits `●Pong` (no space) for short single-token
+  // responses after ANSI strip. The marker regex accepts an optional
+  // space after the marker glyph.
+  test("multi-turn TUI re-render: picks the LATEST `●` response, not turn-1's or the status-box `●`", () => {
+    const banner = [
+      "▐▛███▜▌ Claude Code v2.1.89",
+      "▝▜█████▛▘ Sonnet 4.6 · Claude Max",
+      "▘▘ ▝▝   ~/project",
+    ].join("\n");
+    const turn1 = [
+      "❯ [2026-05-16 18:33:59 UTC+1]",
+      "[Discord Channel: 1488536365477138602]",
+      "Message: Ping",
+      "",
+      "●Pong 🏓",
+    ].join("\n");
+    const turn2 = [
+      "❯ [2026-05-16 19:51:02 UTC+1]",
+      "[Discord Channel: 1488536365477138602]",
+      "Message: Ping",
+      "",
+      "●Pong",
+    ].join("\n");
+    const footer = [
+      "",
+      "─".repeat(100),
+      '❯ Try "write a test for reprocess-clippings.py"',
+      "─".repeat(100),
+      "⏵⏵ bypass permissions on (shift+tab to cycle) /buddy",
+      "╭────── 🦞 ClaudeClaw+ 🦞 ──────╮",
+      "│ 📋 7 jobs │ ● live │ 🎮 │",
+      "╰───────────────────────────────╯",
+      "⏵⏵ bypass permissions on (shift+tab to cycle)",
+    ].join("\n");
+    const fullScreen = [banner, "", turn1, "", turn2, footer].join("\n");
+
+    expect(extractResponseText(fullScreen)).toBe("Pong");
   });
 });
 

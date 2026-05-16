@@ -97,6 +97,14 @@ export interface Parser {
    *  every new byte so the supervisor only writes the sentinel once per
    *  quiet period. */
   quietEmitted: boolean;
+  /** Whether at least one byte has been seen SINCE the current turn started.
+   *  Issue #87: pre-fix, `quiet` could fire 500ms after `startTurn` even
+   *  though claude hadn't emitted a single byte of response yet — the
+   *  initial "silence" was just claude's latency between receiving the
+   *  prompt and starting to echo. We now only emit `quiet` once we've
+   *  observed at least one byte after turn start, so quiet truly means
+   *  "claude was responding and has stopped." */
+  sawByteSinceTurnStart: boolean;
   /** Carry-over from previous chunks needed to detect a sentinel that
    *  straddles a chunk boundary. At most `sentinelBytes.length - 1` bytes. */
   pending: Uint8Array;
@@ -116,6 +124,7 @@ export function createParser(opts?: { quietWindowMs?: number }): Parser {
     lastByteAt: 0,
     quietWindowMs: opts?.quietWindowMs ?? DEFAULT_QUIET_WINDOW_MS,
     quietEmitted: false,
+    sawByteSinceTurnStart: false,
     pending: new Uint8Array(0),
     pendingBaseOffset: 0,
   };
@@ -143,6 +152,7 @@ export function startTurn(
   parser.sentinelOffset = 0;
   parser.lastByteAt = now;
   parser.quietEmitted = false;
+  parser.sawByteSinceTurnStart = false;
   parser.pending = new Uint8Array(0);
   parser.pendingBaseOffset = parser.totalBytes;
   return { type: "turn-start", offset: parser.turnStartOffset };
@@ -164,6 +174,9 @@ export function feed(parser: Parser, chunk: Uint8Array, now: number): ParserEven
   parser.totalBytes += chunk.length;
   parser.lastByteAt = now;
   parser.quietEmitted = false; // any new byte resets the quiet emitter
+  if (parser.state === "accumulating" || parser.state === "awaiting-sentinel") {
+    parser.sawByteSinceTurnStart = true;
+  }
 
   // We only scan for the sentinel after the supervisor has actually written
   // it (state === "awaiting-sentinel"). Until then there's nothing to find,
@@ -216,6 +229,14 @@ export function feed(parser: Parser, chunk: Uint8Array, now: number): ParserEven
 export function tick(parser: Parser, now: number): ParserEvent[] {
   if (parser.state !== "accumulating") return [];
   if (parser.quietEmitted) return [];
+  // Issue #87: don't fire `quiet` until claude has emitted at least one byte
+  // of response. Otherwise the initial silence between prompt write and
+  // claude's first ack-echo (often ~500–800ms on claude 2.1.89) gets
+  // interpreted as "claude is done", the sentinel is written prematurely
+  // into claude's input buffer, claude echoes it back, the parser sees
+  // sentinel-found, and the turn returns with only the TUI splash + prompt
+  // echo as the "response" — model output never had a chance to arrive.
+  if (!parser.sawByteSinceTurnStart) return [];
   if (now - parser.lastByteAt < parser.quietWindowMs) return [];
   parser.quietEmitted = true;
   return [{ type: "quiet", offset: parser.totalBytes }];
@@ -321,18 +342,46 @@ export function normaliseNewlines(text: string): string {
  *   3. Trim whitespace; if empty, fall back to the whole stripped buffer.
  */
 export function extractResponseText(strippedNormalised: string): string {
-  const marker = "⏺";
+  // Claude 2.1.89 emits `●` (U+25CF BLACK CIRCLE) before the assistant
+  // message. Older versions used `⏺` (U+23FA RECORD button). Accept both.
+  //
+  // The marker MUST be anchored at the start of a line. claude's TUI
+  // uses `●` in plenty of other places too — the ClaudeClaw+ status box
+  // (`│ ● live │ 🎮 │`) renders the same glyph inside a box-drawn row,
+  // and the status box paints AFTER the model response in the stream. A
+  // naive `lastIndexOf("●")` would pick the box marker and return only
+  // the TUI footer as the "response". The space after the marker is
+  // optional: claude 2.1.89 ANSI-strips down to `●Pong` (no space) for
+  // short responses; longer responses (or ones with leading punctuation)
+  // come through as `● Body...`.
+  const markerRe = /(?:^|\n)([●⏺]) ?/gu;
   // Spinner glyphs and `⎿` tool-result indent are the natural terminators
-  // that follow the assistant message in the TUI. We intentionally do NOT
-  // include `❯` alone — it can legitimately appear inside response text
-  // (e.g. a shell-prompt example).
-  const terminatorRe = /[✻✶✳✢✽✺✷·◉]| {2,}⎿/u;
-  const idx = strippedNormalised.lastIndexOf(marker);
-  if (idx < 0) return strippedNormalised.trim();
+  // that follow the assistant message in the TUI. We also terminate on a
+  // line of 4+ horizontal box-drawing chars (`─` U+2500 or `━` U+2501) —
+  // claude's TUI prints that as the divider above the next input prompt
+  // after a response completes. We intentionally do NOT include `❯` alone
+  // — it can legitimately appear inside response text (e.g. a shell-prompt
+  // example).
+  const terminatorRe = /[✻✶✳✢✽✺✷·◉]| {2,}⎿|\n[─━]{4,}/u;
 
-  let after = strippedNormalised.slice(idx + marker.length);
-  if (after.startsWith(" ")) after = after.slice(1);
+  // Find the LAST line-anchored marker. Take whichever appears latest in
+  // the stream (handles streams that contain multiple turns or a turn
+  // whose response includes nested assistant markers).
+  let lastMarkerStart = -1;
+  let lastMarkerEnd = -1;
+  for (const m of strippedNormalised.matchAll(markerRe)) {
+    // m.index points at the `\n` (or position 0). The marker character
+    // itself begins at index + (newline ? 1 : 0). Easiest: m[0] is either
+    // "\n● " or "● " (at string start); the marker char is the
+    // penultimate char of the match. After-text begins right after.
+    const matchStart = m.index ?? 0;
+    const afterStart = matchStart + m[0].length;
+    lastMarkerStart = matchStart;
+    lastMarkerEnd = afterStart;
+  }
+  if (lastMarkerStart < 0) return strippedNormalised.trim();
 
+  const after = strippedNormalised.slice(lastMarkerEnd);
   const termMatch = after.match(terminatorRe);
   const body = termMatch ? after.slice(0, termMatch.index) : after;
   const trimmed = body.trim();
