@@ -713,7 +713,7 @@ export async function start(args: string[] = []) {
   let evalFrameworkStarted: Promise<void> = Promise.resolve();
 
   if (settings.budgetGuard?.enabled) {
-    budgetGuardStarted = getBudgetGuardPlugin()
+    budgetGuardStarted = getBudgetGuardPlugin({ configOverride: settings.budgetGuard })
       .start()
       .catch((err) => {
         console.error(
@@ -724,7 +724,7 @@ export async function start(args: string[] = []) {
   }
 
   if (settings.evalFramework?.enabled) {
-    evalFrameworkStarted = getEvalFrameworkPlugin()
+    evalFrameworkStarted = getEvalFrameworkPlugin({ configOverride: settings.evalFramework })
       .start()
       .catch((err) => {
         console.error(
