@@ -1,13 +1,12 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, mock } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { BudgetGuardPlugin, _resetBudgetGuard } from "../index.js";
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 
 const auditEvents: { event: string; payload: unknown }[] = [];
 const registeredTools: Map<string, unknown> = new Map();
 
-vi.mock("../../mcp-bridge.js", () => ({
+mock.module("../../mcp-bridge.js", () => ({
   getMcpBridge: () => ({
     audit: (event: string, payload: unknown) => auditEvents.push({ event, payload }),
     registerPluginTool: (_pluginId: string, tool: { name: string }) =>
@@ -15,11 +14,13 @@ vi.mock("../../mcp-bridge.js", () => ({
   }),
 }));
 
-vi.mock("../../http-gateway.js", () => ({
+mock.module("../../http-gateway.js", () => ({
   getHttpGateway: () => ({
     registerInProcess: () => Buffer.from("fake-token-32bytes-padding-here!"),
   }),
 }));
+
+import { BudgetGuardPlugin, _resetBudgetGuard } from "../index.js";
 
 function makeTmpDbPath() {
   return `/tmp/budget-guard-stress-${randomUUID()}.db`;
@@ -109,7 +110,7 @@ describe("persistence — restart-safe usage counters", () => {
       },
     });
 
-    vi.mock("../../mcp-bridge.js", () => ({
+    mock.module("../../mcp-bridge.js", () => ({
       getMcpBridge: () => ({ audit: () => {}, registerPluginTool: (_: string, t: { name: string }) => registeredTools.set(t.name, t) }),
     }));
 
