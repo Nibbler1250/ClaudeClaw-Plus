@@ -5,6 +5,7 @@ import { normalizeTimezoneName, resolveTimezoneOffsetMinutes } from "./timezone"
 import { parseWatchdogConfig, type WatchdogConfig } from "./watchdog";
 import { parsePlugins, type PluginEntry } from "./plugins";
 import { parseMemorySearchSettings, type MemorySearchSettings } from "./memory";
+import { BudgetGuardSettingsSchema, type BudgetGuardSettings } from "./plugins/budget-guard/types.js";
 
 /** Re-exported under the name used in the Settings interface. */
 export type WatchdogSettings = WatchdogConfig;
@@ -185,6 +186,7 @@ const DEFAULT_SETTINGS: Settings = {
   session: { autoRotate: false, maxMessages: 50, maxAgeHours: 24, summaryPath: "" },
   plugins: {},
   memorySearch: {},
+  budgetGuard: BudgetGuardSettingsSchema.parse({}),
 };
 
 export interface HeartbeatExcludeWindow {
@@ -395,6 +397,7 @@ export interface Settings {
   plugins: Record<string, PluginEntry>;
   session: SessionConfig;
   memorySearch: MemorySearchSettings;
+  budgetGuard: BudgetGuardSettings;
   jobsDir?: string;
 }
 
@@ -683,6 +686,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
     watchdog: parseWatchdogConfig(raw.watchdog),
     plugins: parsePlugins(raw.plugins),
     memorySearch: parseMemorySearchSettings(raw.memorySearch),
+    budgetGuard: BudgetGuardSettingsSchema.parse(raw.budgetGuard ?? {}),
     session: {
       autoRotate: raw.session?.autoRotate ?? false,
       maxMessages: Number.isFinite(raw.session?.maxMessages) ? Number(raw.session.maxMessages) : 50,
