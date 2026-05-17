@@ -825,6 +825,7 @@ async function runClaudeStream(
   cwd?: string,
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void,
+  onToolCall?: (toolName: string) => void,
 ): Promise<{ rawStdout: string; stderr: string; exitCode: number; sessionId?: string }> {
   const args = [...baseArgs];
   const normalizedModel = model.trim().toLowerCase();
@@ -873,7 +874,7 @@ async function runClaudeStream(
           }
           // Emit streaming callbacks if provided
           if (
-            (onChunk || onToolEvent) &&
+            (onChunk || onToolEvent || onToolCall) &&
             event.type === "assistant" &&
             (event.message as any)?.content
           ) {
@@ -888,9 +889,12 @@ async function runClaudeStream(
             for (const block of msg.content) {
               if (block.type === "text" && typeof block.text === "string") {
                 full += block.text;
-              } else if (block.type === "tool_use" && onToolEvent) {
-                streamPendingToolCalls.set(block.id, block.name);
-                onToolEvent(`● ${formatToolCallSummary(block.name, block.input ?? {})}`);
+              } else if (block.type === "tool_use") {
+                if (onToolEvent) {
+                  streamPendingToolCalls.set(block.id, block.name);
+                  onToolEvent(`● ${formatToolCallSummary(block.name, block.input ?? {})}`);
+                }
+                if (onToolCall && block.name) onToolCall(block.name);
               }
             }
             if (onChunk && full.length > streamDelivered.length) {
@@ -1549,6 +1553,7 @@ async function execClaude(
   timeoutCategory?: string,
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void,
+  onToolCall?: (toolName: string) => void,
 ): Promise<RunResult> {
   mainRunCount++;
   persistRunCount();
@@ -1803,6 +1808,7 @@ async function execClaude(
         spawnCwd,
         onChunk,
         onToolEvent,
+        onToolCall,
       );
     } else {
       const sessionKey = threadId
@@ -2328,6 +2334,7 @@ export async function run(
   timeoutCategory?: string,
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void,
+  onToolCall?: (toolName: string) => void,
 ): Promise<RunResult> {
   return enqueue(
     () =>
@@ -2341,6 +2348,7 @@ export async function run(
         timeoutCategory,
         onChunk,
         onToolEvent,
+        onToolCall,
       ),
     threadId,
   );
@@ -2614,6 +2622,7 @@ export async function runUserMessage(
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void,
   modelOverride?: string,
+  onToolCall?: (toolName: string) => void,
 ): Promise<RunResult> {
   return run(
     name,
@@ -2625,6 +2634,7 @@ export async function runUserMessage(
     undefined,
     onChunk,
     onToolEvent,
+    onToolCall,
   );
 }
 

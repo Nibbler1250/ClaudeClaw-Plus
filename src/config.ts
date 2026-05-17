@@ -131,6 +131,7 @@ const DEFAULT_SETTINGS: Settings = {
     listenChats: [],
     receiveEnabled: true,
     dmIsolation: "shared",
+    streamToolCalls: false,
   },
   discord: {
     token: "",
@@ -216,6 +217,8 @@ export interface TelegramConfig {
    * - "perUser": each DM user gets their own isolated session.
    */
   dmIsolation: "shared" | "perUser";
+  /** When true, stream live tool-call progress indicator to Telegram while Claude processes. Default: false */
+  streamToolCalls?: boolean;
   /** Local whisper.cpp model for voice transcription. Default: "base.en".
    *  Supported values: tiny, base, small, medium, large-v3, large-v3-turbo (with or without .en suffix).
    *  Ignored when stt.baseUrl is configured. */
@@ -588,6 +591,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
         : [],
       receiveEnabled: raw.telegram?.receiveEnabled !== false,
       dmIsolation: raw.telegram?.dmIsolation === "perUser" ? "perUser" : "shared",
+      streamToolCalls: raw.telegram?.streamToolCalls === true,
       ...(typeof raw.telegram?.whisperModel === "string" && raw.telegram.whisperModel.trim()
         ? { whisperModel: raw.telegram.whisperModel.trim() }
         : {}),

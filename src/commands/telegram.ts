@@ -475,6 +475,52 @@ async function sendTyping(token: string, chatId: number, threadId?: number): Pro
   }).catch(() => {});
 }
 
+async function sendMessageAndGetId(
+  token: string,
+  chatId: number,
+  text: string,
+  threadId?: number,
+): Promise<number | null> {
+  try {
+    const resp = await callApi<{ ok: boolean; result: { message_id: number } }>(
+      token,
+      "sendMessage",
+      {
+        chat_id: chatId,
+        text,
+        ...(threadId ? { message_thread_id: threadId } : {}),
+      },
+    );
+    return resp.result?.message_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function editProgressMessage(
+  token: string,
+  chatId: number,
+  messageId: number,
+  text: string,
+): Promise<void> {
+  await callApi(token, "editMessageText", {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+  }).catch(() => {});
+}
+
+async function deleteProgressMessage(
+  token: string,
+  chatId: number,
+  messageId: number,
+): Promise<void> {
+  await callApi(token, "deleteMessage", {
+    chat_id: chatId,
+    message_id: messageId,
+  }).catch(() => {});
+}
+
 async function sendDocumentToChat(
   token: string,
   chatId: number,
@@ -1717,16 +1763,42 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       );
       return;
     } else {
+      let progressMsgId: number | null = null;
+      let progressOp: Promise<void> = Promise.resolve();
+      const onToolCall = config.streamToolCalls
+        ? (toolName: string) => {
+            const txt = `⚙️ ${toolName}…`;
+            progressOp = progressOp
+              .then(async () => {
+                if (progressMsgId === null) {
+                  progressMsgId = await sendMessageAndGetId(config.token, chatId, txt, threadId);
+                } else {
+                  await editProgressMessage(config.token, chatId, progressMsgId, txt);
+                }
+              })
+              .catch(() => {});
+          }
+        : undefined;
+
       const stream = makeStreamCallback(config.token, chatId, threadId, { verbose });
-      result = await runUserMessage(
-        "telegram",
-        prefixedPrompt,
-        sessionKey,
-        undefined,
-        stream.onChunk,
-        stream.onToolEvent,
-        modelOverride,
-      );
+      try {
+        result = await runUserMessage(
+          "telegram",
+          prefixedPrompt,
+          sessionKey,
+          undefined,
+          stream.onChunk,
+          stream.onToolEvent,
+          modelOverride,
+          onToolCall,
+        );
+      } finally {
+        await progressOp;
+        if (progressMsgId !== null) {
+          await deleteProgressMessage(config.token, chatId, progressMsgId);
+          progressMsgId = null;
+        }
+      }
       const streamResult = await stream.waitForStreamMsg();
       streamMsgId = streamResult.msgId;
       hadToolLines = streamResult.hadToolLines;
