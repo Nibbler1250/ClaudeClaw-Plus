@@ -1357,11 +1357,14 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         : undefined;
 
       const stream = makeStreamCallback(config.token, chatId, threadId, { verbose });
-      result = await runUserMessage("telegram", prefixedPrompt, sessionKey, undefined, stream.onChunk, stream.onToolEvent, onToolCall);
-      await progressOp;
-      if (progressMsgId !== null) {
-        await deleteProgressMessage(config.token, chatId, progressMsgId);
-        progressMsgId = null;
+      try {
+        result = await runUserMessage("telegram", prefixedPrompt, sessionKey, undefined, stream.onChunk, stream.onToolEvent, onToolCall);
+      } finally {
+        await progressOp;
+        if (progressMsgId !== null) {
+          await deleteProgressMessage(config.token, chatId, progressMsgId);
+          progressMsgId = null;
+        }
       }
       const streamResult = await stream.waitForStreamMsg();
       streamMsgId = streamResult.msgId;
