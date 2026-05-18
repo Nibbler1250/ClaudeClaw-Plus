@@ -1,6 +1,6 @@
-import type { WisecronStateDB } from './state-db.js';
-import type { ScheduleState } from './types.js';
-import { INITIAL_INTERVAL_HOURS, MAX_INTERVAL_HOURS } from './types.js';
+import type { WisecronStateDB } from "./state-db.js";
+import type { ScheduleState } from "./types.js";
+import { INITIAL_INTERVAL_HOURS, MAX_INTERVAL_HOURS } from "./types.js";
 
 /**
  * AdaptiveScheduler — per-subject cadence with backoff.
@@ -34,7 +34,7 @@ export class AdaptiveScheduler {
    * subject with `due=true` if its next_run <= now.
    */
   pickNextSubject(): { subject: string; due: boolean; eta_ms: number } | null {
-    const states = this.db.listScheduleStates().filter(s => s.enabled);
+    const states = this.db.listScheduleStates().filter((s) => s.enabled);
     if (states.length === 0) return null;
     states.sort((a, b) => a.next_run.getTime() - b.next_run.getTime());
     const head = states[0]!;
@@ -144,7 +144,10 @@ export class AdaptiveScheduler {
    * Compute the next interval given current state and proposal count.
    * Pure function: no side effects, no I/O. Deterministic.
    */
-  nextIntervalHours(state: Pick<ScheduleState, 'current_interval_hours' | 'consecutive_zero_runs'>, proposalCount: number): number {
+  nextIntervalHours(
+    state: Pick<ScheduleState, "current_interval_hours" | "consecutive_zero_runs">,
+    proposalCount: number,
+  ): number {
     if (proposalCount > 0) return this.initialHours;
     const next = state.current_interval_hours + this.initialHours;
     return Math.min(next, this.maxHours);

@@ -1,11 +1,16 @@
-import { existsSync, readFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
-import { homedir } from 'node:os';
-import type { Registry } from '../../skills-tuner/core/registry.js';
-import type { Cluster, Observation, Proposal, UnsignedProposal } from '../../skills-tuner/core/types.js';
-import { computeProposalSignature, loadSecret, sanitizeObservationContent, auditLog } from '../../skills-tuner/core/security.js';
-import type { WisecronStateDB } from './state-db.js';
-import type { ProposalCycleResult, ProposalSummary } from './types.js';
+import { existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { homedir } from "node:os";
+import type { Registry } from "../../skills-tuner/core/registry.js";
+import type { Observation, Proposal, UnsignedProposal } from "../../skills-tuner/core/types.js";
+import {
+  computeProposalSignature,
+  loadSecret,
+  sanitizeObservationContent,
+  auditLog,
+} from "../../skills-tuner/core/security.js";
+import type { WisecronStateDB } from "./state-db.js";
+import type { ProposalCycleResult, ProposalSummary } from "./types.js";
 
 type AuditFn = (event: string, payload: Record<string, unknown>) => void;
 type SignFn = (proposal: UnsignedProposal) => string;
@@ -67,7 +72,7 @@ export class ProposalEngine {
     }
 
     const startedAt = this.now();
-    this.audit('wisecron_cycle_start', { subject: subjectName, since: since.toISOString() });
+    this.audit("wisecron_cycle_start", { subject: subjectName, since: since.toISOString() });
 
     const observations = await subject.collectObservations(since);
     this.cacheObservations(subjectName, observations);
@@ -79,7 +84,7 @@ export class ProposalEngine {
     }
 
     const duration_ms = this.now().getTime() - startedAt.getTime();
-    this.audit('wisecron_cycle_complete', {
+    this.audit("wisecron_cycle_complete", {
       subject: subjectName,
       observations: observations.length,
       clusters: clusters.length,
@@ -109,7 +114,7 @@ export class ProposalEngine {
     const signed: Proposal = { ...proposal, signature };
 
     // First alternative serves as the diff preview's proposed content.
-    const preview = proposal.alternatives[0]?.diff_or_content ?? '';
+    const preview = proposal.alternatives[0]?.diff_or_content ?? "";
     const diff_preview = this.computeDiff(proposal.target_path, preview);
 
     return {
@@ -124,29 +129,37 @@ export class ProposalEngine {
    * Aggregate clusters and observations across multiple subjects for the
    * `tuner wisecron status` view.
    */
-  async statusSnapshot(lookbackDays: number): Promise<Record<string, {
-    last_run: Date | null;
-    next_run: Date | null;
-    observations: number;
-    clusters: number;
-    proposals: number;
-  }>> {
+  async statusSnapshot(lookbackDays: number): Promise<
+    Record<
+      string,
+      {
+        last_run: Date | null;
+        next_run: Date | null;
+        observations: number;
+        clusters: number;
+        proposals: number;
+      }
+    >
+  > {
     const lookbackMs = lookbackDays * 86_400_000;
     const sinceIso = new Date(this.now().getTime() - lookbackMs).toISOString();
-    const result: Record<string, {
-      last_run: Date | null;
-      next_run: Date | null;
-      observations: number;
-      clusters: number;
-      proposals: number;
-    }> = {};
+    const result: Record<
+      string,
+      {
+        last_run: Date | null;
+        next_run: Date | null;
+        observations: number;
+        clusters: number;
+        proposals: number;
+      }
+    > = {};
 
     const states = this.db.listScheduleStates();
-    const stateBySubject = new Map(states.map(s => [s.subject, s]));
+    const stateBySubject = new Map(states.map((s) => [s.subject, s]));
 
     const subjects = new Set<string>([
       ...stateBySubject.keys(),
-      ...this.registry.allSubjects().map(s => s.name),
+      ...this.registry.allSubjects().map((s) => s.name),
     ]);
 
     for (const subjectName of subjects) {
@@ -177,14 +190,14 @@ export class ProposalEngine {
       return [
         `--- ${targetPath} (new file)`,
         `+++ ${targetPath}`,
-        ...proposedContent.split('\n').map(line => `+${line}`),
-      ].join('\n');
+        ...proposedContent.split("\n").map((line) => `+${line}`),
+      ].join("\n");
     }
     if (current === proposedContent) {
       return `--- ${targetPath}\n+++ ${targetPath}\n(no changes)`;
     }
-    const before = current.split('\n');
-    const after = proposedContent.split('\n');
+    const before = current.split("\n");
+    const after = proposedContent.split("\n");
     const head = [`--- ${targetPath}`, `+++ ${targetPath}`];
     const body: string[] = [];
     const maxLen = Math.max(before.length, after.length);
@@ -198,7 +211,7 @@ export class ProposalEngine {
       if (b !== undefined) body.push(`-${b}`);
       if (a !== undefined) body.push(`+${a}`);
     }
-    return [...head, ...body].join('\n');
+    return [...head, ...body].join("\n");
   }
 
   /**
@@ -215,35 +228,30 @@ export class ProposalEngine {
       this.db.cacheTelemetry(subject, obsId, sanitized);
     }
   }
-
-  /** Group clusters by subjects_touched. Currently no-op pass-through. */
-  private groupClusters(clusters: Cluster[]): Cluster[] {
-    return clusters;
-  }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 function defaultReadTarget(path: string): string | null {
-  const resolved = path.startsWith('~') ? path.replace(/^~/, homedir()) : path;
+  const resolved = path.startsWith("~") ? path.replace(/^~/, homedir()) : path;
   if (!existsSync(resolved)) return null;
   try {
-    return readFileSync(resolved, 'utf8');
+    return readFileSync(resolved, "utf8");
   } catch {
     return null;
   }
 }
 
 function stableObservationId(obs: Observation): string {
-  const h = createHash('sha256');
+  const h = createHash("sha256");
   h.update(obs.session_id);
-  h.update('|');
+  h.update("|");
   h.update(obs.observed_at.toISOString());
-  h.update('|');
+  h.update("|");
   h.update(obs.signal_type);
-  h.update('|');
+  h.update("|");
   h.update(obs.verbatim);
-  return h.digest('hex').slice(0, 32);
+  return h.digest("hex").slice(0, 32);
 }
 
 export { stableObservationId };

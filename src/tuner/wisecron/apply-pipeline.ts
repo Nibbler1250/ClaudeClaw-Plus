@@ -1,23 +1,27 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
-import { homedir } from 'node:os';
-import type { Registry } from '../../skills-tuner/core/registry.js';
-import type { Patch, Proposal } from '../../skills-tuner/core/types.js';
-import type { RiskTier } from '../../skills-tuner/core/interfaces.js';
-import {
-  auditLog,
-  loadSecret,
-  verifyProposalSignature,
-} from '../../skills-tuner/core/security.js';
-import type { WisecronStateDB } from './state-db.js';
-import type { AppliedBy, ApplyOutcome, ObservationWindowResult, RevertibleSubject } from './types.js';
-import { HIGH_RISK_OBSERVATION_WINDOW_MS } from './types.js';
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+import { homedir } from "node:os";
+import type { Registry } from "../../skills-tuner/core/registry.js";
+import type { Patch, Proposal } from "../../skills-tuner/core/types.js";
+import type { RiskTier } from "../../skills-tuner/core/interfaces.js";
+import { auditLog, loadSecret, verifyProposalSignature } from "../../skills-tuner/core/security.js";
+import type { WisecronStateDB } from "./state-db.js";
+import type {
+  AppliedBy,
+  ApplyOutcome,
+  ObservationWindowResult,
+  RevertibleSubject,
+} from "./types.js";
+import { HIGH_RISK_OBSERVATION_WINDOW_MS } from "./types.js";
 
-const HIGH_RISK_TIERS: ReadonlySet<RiskTier> = new Set(['high', 'critical']);
+const HIGH_RISK_TIERS: ReadonlySet<RiskTier> = new Set(["high", "critical"]);
 
 type AuditFn = (event: string, payload: Record<string, unknown>) => void;
 type VerifyFn = (proposal: Proposal) => boolean;
-type HealthProbeFn = (subjectName: string, target: string) => Promise<{ failed: boolean; errors: string[] }>;
+type HealthProbeFn = (
+  subjectName: string,
+  target: string,
+) => Promise<{ failed: boolean; errors: string[] }>;
 type ReadTargetFn = (path: string) => string | null;
 type WriteTargetFn = (path: string, content: string) => void;
 
@@ -94,7 +98,11 @@ export class ApplyPipeline {
    * event `wisecron_proposal_applied`. For high-risk subjects, arms an
    * observation window that may auto-revert.
    */
-  async apply(proposal: Proposal, alternativeId: string, appliedBy: AppliedBy): Promise<ApplyOutcome> {
+  async apply(
+    proposal: Proposal,
+    alternativeId: string,
+    appliedBy: AppliedBy,
+  ): Promise<ApplyOutcome> {
     const { revision_id, armed, subjectName, targetPath } = await this.withTargetLock(
       proposal.target_path,
       async () => {
@@ -104,8 +112,11 @@ export class ApplyPipeline {
         }
 
         if (!this.verify(proposal)) {
-          this.audit('wisecron_signature_mismatch', { proposal_id: proposal.id, subject: proposal.subject });
-          throw new Error('ApplyPipeline: proposal signature verification failed');
+          this.audit("wisecron_signature_mismatch", {
+            proposal_id: proposal.id,
+            subject: proposal.subject,
+          });
+          throw new Error("ApplyPipeline: proposal signature verification failed");
         }
 
         // Snapshot pre-apply state → inverse_patch BEFORE subject.apply mutates.
@@ -115,8 +126,10 @@ export class ApplyPipeline {
 
         const validation = await subject.validate(forward_patch);
         if (!validation.valid) {
-          this.audit('wisecron_validate_failed', {
-            proposal_id: proposal.id, subject: proposal.subject, reason: validation.reason,
+          this.audit("wisecron_validate_failed", {
+            proposal_id: proposal.id,
+            subject: proposal.subject,
+            reason: validation.reason,
           });
           throw new Error(`ApplyPipeline: forward_patch failed validation: ${validation.reason}`);
         }
@@ -129,7 +142,7 @@ export class ApplyPipeline {
           applied_by: appliedBy,
         });
 
-        this.audit('wisecron_proposal_applied', {
+        this.audit("wisecron_proposal_applied", {
           proposal_id: proposal.id,
           revision_id: id,
           subject: proposal.subject,
@@ -177,7 +190,9 @@ export class ApplyPipeline {
       throw new Error(`ApplyPipeline.revert: revision ${revisionId} not found`);
     }
     if (revision.rolled_back_at !== null) {
-      throw new Error(`ApplyPipeline.revert: revision ${revisionId} already rolled back at ${revision.rolled_back_at.toISOString()}`);
+      throw new Error(
+        `ApplyPipeline.revert: revision ${revisionId} already rolled back at ${revision.rolled_back_at.toISOString()}`,
+      );
     }
 
     await this.withTargetLock(revision.inverse_patch.target_path, async () => {
@@ -190,7 +205,7 @@ export class ApplyPipeline {
       };
 
       const subjectWithRevert = subject as unknown as Partial<RevertibleSubject> | undefined;
-      if (subjectWithRevert && typeof subjectWithRevert.revert === 'function') {
+      if (subjectWithRevert && typeof subjectWithRevert.revert === "function") {
         await subjectWithRevert.revert(inverse);
       } else {
         // Generic fallback: overwrite target_path with inverse content.
@@ -198,7 +213,7 @@ export class ApplyPipeline {
       }
 
       this.db.markRolledBack(revisionId);
-      this.audit('wisecron_rollback', {
+      this.audit("wisecron_rollback", {
         revision_id: revisionId,
         proposal_id: revision.proposal_id,
         subject: revision.subject,
@@ -214,8 +229,12 @@ export class ApplyPipeline {
    *
    * Public for direct test access; in production runs called by apply().
    */
-  async armObservationWindow(revisionId: number, subjectName: string, targetPath: string): Promise<ObservationWindowResult> {
-    await new Promise<void>(resolve => setTimeout(resolve, this.observationWindowMs));
+  async armObservationWindow(
+    revisionId: number,
+    subjectName: string,
+    targetPath: string,
+  ): Promise<ObservationWindowResult> {
+    await new Promise<void>((resolve) => setTimeout(resolve, this.observationWindowMs));
 
     let probe: { failed: boolean; errors: string[] };
     try {
@@ -226,21 +245,21 @@ export class ApplyPipeline {
 
     if (probe.failed) {
       try {
-        await this.revert(revisionId, 'auto-revert');
+        await this.revert(revisionId, "auto-revert");
       } catch (err) {
-        this.audit('wisecron_auto_revert_failed', {
+        this.audit("wisecron_auto_revert_failed", {
           revision_id: revisionId,
           subject: subjectName,
           error: (err as Error).message,
         });
-        return { reverted: false, reason: 'revert-error', errors_detected: probe.errors };
+        return { reverted: false, reason: "revert-error", errors_detected: probe.errors };
       }
-      this.audit('wisecron_auto_revert', {
+      this.audit("wisecron_auto_revert", {
         revision_id: revisionId,
         subject: subjectName,
         errors: probe.errors,
       });
-      return { reverted: true, reason: 'health-probe-failed', errors_detected: probe.errors };
+      return { reverted: true, reason: "health-probe-failed", errors_detected: probe.errors };
     }
     return { reverted: false, reason: null, errors_detected: [] };
   }
@@ -273,7 +292,7 @@ export class ApplyPipeline {
     if (subject?.snapshotInverse) {
       applied_content = await subject.snapshotInverse(proposal.target_path);
     } else {
-      applied_content = this.readTarget(proposal.target_path) ?? '';
+      applied_content = this.readTarget(proposal.target_path) ?? "";
     }
     return {
       target_path: proposal.target_path,
@@ -298,7 +317,9 @@ export class ApplyPipeline {
     const existing = this.locks.get(targetPath);
     const prev = existing?.tail ?? Promise.resolve();
     let release: () => void;
-    const gate = new Promise<void>(resolve => { release = resolve; });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
     const newTail = prev.then(() => gate);
     if (existing) {
       existing.tail = newTail;
@@ -310,7 +331,7 @@ export class ApplyPipeline {
     try {
       return await fn();
     } finally {
-      release!();
+      release?.();
       const entry = this.locks.get(targetPath);
       if (entry) {
         entry.waiters -= 1;
@@ -322,24 +343,27 @@ export class ApplyPipeline {
 
 // ── Default impls (production) ─────────────────────────────────────────────
 
-async function defaultHealthProbe(_subject: string, _target: string): Promise<{ failed: boolean; errors: string[] }> {
+async function defaultHealthProbe(
+  _subject: string,
+  _target: string,
+): Promise<{ failed: boolean; errors: string[] }> {
   // Production: shell out per-subject (systemctl is-failed, hook log scan, ...).
   // Default returns OK — concrete probes are wired by subject implementations.
   return { failed: false, errors: [] };
 }
 
 function defaultReadTarget(path: string): string | null {
-  const resolved = path.startsWith('~') ? path.replace(/^~/, homedir()) : path;
+  const resolved = path.startsWith("~") ? path.replace(/^~/, homedir()) : path;
   if (!existsSync(resolved)) return null;
   try {
-    return readFileSync(resolved, 'utf8');
+    return readFileSync(resolved, "utf8");
   } catch {
     return null;
   }
 }
 
 function defaultWriteTarget(path: string, content: string): void {
-  const resolved = path.startsWith('~') ? path.replace(/^~/, homedir()) : path;
+  const resolved = path.startsWith("~") ? path.replace(/^~/, homedir()) : path;
   mkdirSync(dirname(resolved), { recursive: true });
   writeFileSync(resolved, content);
 }

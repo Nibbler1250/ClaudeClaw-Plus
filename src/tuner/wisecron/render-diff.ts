@@ -29,23 +29,23 @@ export function renderDiff(
   opts: RenderDiffOptions = {},
 ): string {
   const max = opts.maxBytes ?? 2048;
-  const from = opts.fromLabel ?? 'a';
-  const to = opts.toLabel ?? 'b';
+  const from = opts.fromLabel ?? "a";
+  const to = opts.toLabel ?? "b";
 
-  const a = original.split('\n');
-  const b = modified.split('\n');
+  const a = original.split("\n");
+  const b = modified.split("\n");
 
   // Linewise membership: presence in the other side. Multiset-correct for
   // duplicate lines via index tracking.
   const aIndex = new Map<string, number[]>();
   a.forEach((line, i) => {
     if (!aIndex.has(line)) aIndex.set(line, []);
-    aIndex.get(line)!.push(i);
+    aIndex.get(line)?.push(i);
   });
   const bIndex = new Map<string, number[]>();
   b.forEach((line, i) => {
     if (!bIndex.has(line)) bIndex.set(line, []);
-    bIndex.get(line)!.push(i);
+    bIndex.get(line)?.push(i);
   });
 
   const removed: string[] = [];
@@ -54,7 +54,7 @@ export function renderDiff(
 
   const aSeen = new Map<string, number>();
   for (const line of a) {
-    const seen = (aSeen.get(line) ?? 0);
+    const seen = aSeen.get(line) ?? 0;
     const bOccurrences = bIndex.get(line) ?? [];
     if (seen >= bOccurrences.length) {
       removed.push(line);
@@ -69,7 +69,7 @@ export function renderDiff(
 
   const bSeen = new Map<string, number>();
   for (const line of b) {
-    const seen = (bSeen.get(line) ?? 0);
+    const seen = bSeen.get(line) ?? 0;
     const aOccurrences = aIndex.get(line) ?? [];
     if (seen >= aOccurrences.length) added.push(line);
     bSeen.set(line, seen + 1);
@@ -85,10 +85,10 @@ export function renderDiff(
   const bodyLines: string[] = [];
   for (const l of removed) bodyLines.push(`-${l}`);
   for (const l of added) bodyLines.push(`+${l}`);
-  let body = bodyLines.join('\n');
+  let body = bodyLines.join("\n");
 
   if (header.length + body.length > max) {
-    const trailer = '\n... [diff truncated]';
+    const trailer = "\n... [diff truncated]";
     const room = Math.max(0, max - header.length - trailer.length);
     body = body.slice(0, room) + trailer;
   }

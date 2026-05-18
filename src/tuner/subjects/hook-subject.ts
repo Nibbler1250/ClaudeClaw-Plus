@@ -6,15 +6,22 @@ import {
   readdirSync,
   statSync,
   chmodSync,
-} from 'node:fs';
-import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { spawnSync } from 'node:child_process';
-import { BaseSubject } from '../../skills-tuner/subjects/base.js';
-import { sanitizeObservationContent } from '../../skills-tuner/core/security.js';
-import type { LLMClient } from '../../skills-tuner/core/llm.js';
-import type { Cluster, Observation, Patch, Proposal, UnsignedProposal, ValidationResult } from '../../skills-tuner/core/types.js';
-import type { RevertibleSubject } from '../wisecron/types.js';
+} from "node:fs";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { BaseSubject } from "../../skills-tuner/subjects/base.js";
+import { sanitizeObservationContent } from "../../skills-tuner/core/security.js";
+import type { LLMClient } from "../../skills-tuner/core/llm.js";
+import type {
+  Cluster,
+  Observation,
+  Patch,
+  Proposal,
+  UnsignedProposal,
+  ValidationResult,
+} from "../../skills-tuner/core/types.js";
+import type { RevertibleSubject } from "../wisecron/types.js";
 
 const DEFAULT_CRASH_RATE_THRESHOLD = 0.2;
 const DEFAULT_P95_DURATION_THRESHOLD_MS = 5_000;
@@ -72,8 +79,8 @@ export interface HookSubjectConfig {
 }
 
 export class HookSubject extends BaseSubject implements RevertibleSubject {
-  readonly name = 'hook';
-  readonly risk_tier = 'high' as const;
+  readonly name = "hook";
+  readonly risk_tier = "high" as const;
   readonly auto_merge_default = false;
   readonly supports_creation = false;
   readonly orphan_min_observations = 3;
@@ -88,7 +95,7 @@ export class HookSubject extends BaseSubject implements RevertibleSubject {
   constructor(opts: HookSubjectConfig = {}) {
     super();
     this.llm = opts.llm;
-    this.hooksDir = expandHome(opts.hooksDir ?? join(homedir(), '.claude', 'hooks'));
+    this.hooksDir = expandHome(opts.hooksDir ?? join(homedir(), ".claude", "hooks"));
     this.crashRateThreshold = opts.crashRateThreshold ?? DEFAULT_CRASH_RATE_THRESHOLD;
     this.p95DurationThresholdMs = opts.p95DurationThresholdMs ?? DEFAULT_P95_DURATION_THRESHOLD_MS;
     this.logReader = opts.logReader ?? defaultLogReader;
@@ -109,22 +116,24 @@ export class HookSubject extends BaseSubject implements RevertibleSubject {
       if (!crashedOnce && !slow) continue;
 
       const signal_type =
-        h.crashRate > this.crashRateThreshold ? 'correction' :
-        slow ? 'repeated_trigger' : 'orphan';
+        h.crashRate > this.crashRateThreshold ? "correction" : slow ? "repeated_trigger" : "orphan";
 
       observations.push({
         session_id: `hook-${hook}-${now.getTime()}`,
         observed_at: now,
         signal_type,
-        verbatim: sanitizeObservationContent(JSON.stringify({
-          hook,
-          runs: h.runs,
-          crashes: h.crashes,
-          crash_rate: Math.round(h.crashRate * 100) / 100,
-          p95_duration_ms: h.p95DurationMs,
-        }), 500),
+        verbatim: sanitizeObservationContent(
+          JSON.stringify({
+            hook,
+            runs: h.runs,
+            crashes: h.crashes,
+            crash_rate: Math.round(h.crashRate * 100) / 100,
+            p95_duration_ms: h.p95DurationMs,
+          }),
+          500,
+        ),
         metadata: {
-          subject: 'hook',
+          subject: "hook",
           hook,
           crash_rate: h.crashRate,
           p95_duration_ms: h.p95DurationMs,
@@ -142,8 +151,8 @@ export class HookSubject extends BaseSubject implements RevertibleSubject {
 
     for (const obs of observations) {
       const meta = obs.metadata as Record<string, unknown>;
-      const crashRate = (meta['crash_rate'] as number | undefined) ?? 0;
-      const p95 = (meta['p95_duration_ms'] as number | undefined) ?? 0;
+      const crashRate = (meta.crash_rate as number | undefined) ?? 0;
+      const p95 = (meta.p95_duration_ms as number | undefined) ?? 0;
       if (crashRate > this.crashRateThreshold) crashes.push(obs);
       if (p95 > this.p95DurationThresholdMs) slow.push(obs);
     }
@@ -151,24 +160,28 @@ export class HookSubject extends BaseSubject implements RevertibleSubject {
     const clusters: Cluster[] = [];
     if (crashes.length > 0) {
       clusters.push({
-        id: 'hook-crashing',
-        subject: 'hook',
+        id: "hook-crashing",
+        subject: "hook",
         observations: crashes,
         frequency: crashes.length,
         success_rate: 0.1,
-        sentiment: 'negative',
-        subjects_touched: Array.from(new Set(crashes.map(o => (o.metadata as Record<string, unknown>)['hook'] as string))),
+        sentiment: "negative",
+        subjects_touched: Array.from(
+          new Set(crashes.map((o) => (o.metadata as Record<string, unknown>).hook as string)),
+        ),
       });
     }
     if (slow.length > 0) {
       clusters.push({
-        id: 'hook-slow',
-        subject: 'hook',
+        id: "hook-slow",
+        subject: "hook",
         observations: slow,
         frequency: slow.length,
         success_rate: 0.5,
-        sentiment: 'neutral',
-        subjects_touched: Array.from(new Set(slow.map(o => (o.metadata as Record<string, unknown>)['hook'] as string))),
+        sentiment: "neutral",
+        subjects_touched: Array.from(
+          new Set(slow.map((o) => (o.metadata as Record<string, unknown>).hook as string)),
+        ),
       });
     }
     return clusters;
@@ -176,29 +189,48 @@ export class HookSubject extends BaseSubject implements RevertibleSubject {
 
   async proposeChange(cluster: Cluster): Promise<UnsignedProposal> {
     const firstObs = cluster.observations[0];
-    if (!firstObs) throw new Error('hook-subject.proposeChange: cluster empty');
-    const hook = (firstObs.metadata as Record<string, unknown>)['hook'] as string;
+    if (!firstObs) throw new Error("hook-subject.proposeChange: cluster empty");
+    const hook = (firstObs.metadata as Record<string, unknown>).hook as string;
     const hookPath = join(this.hooksDir, hook);
 
-    let currentContent = '';
+    let currentContent = "";
     if (existsSync(hookPath)) {
-      try { currentContent = readFileSync(hookPath, 'utf8'); } catch { currentContent = ''; }
+      try {
+        currentContent = readFileSync(hookPath, "utf8");
+      } catch {
+        currentContent = "";
+      }
     }
 
-    const hardened = ensureStrictMode(currentContent || '#!/bin/sh\n');
-    const debounced = withDebounceWrapper(currentContent || '#!/bin/sh\n');
-    const disabled = '#!/bin/sh\n# Disabled by wisecron — original moved to disabled/\nexit 0\n';
+    const hardened = ensureStrictMode(currentContent || "#!/bin/sh\n");
+    const debounced = withDebounceWrapper(currentContent || "#!/bin/sh\n");
+    const disabled = "#!/bin/sh\n# Disabled by wisecron — original moved to disabled/\nexit 0\n";
 
     return {
       id: Date.now(),
       cluster_id: cluster.id,
-      subject: 'hook',
-      kind: 'patch',
+      subject: "hook",
+      kind: "patch",
       target_path: hookPath,
       alternatives: [
-        { id: 'harden', label: 'Add set -euo pipefail + error trap', diff_or_content: hardened, tradeoff: 'Surfaces silent failures.' },
-        { id: 'debounce', label: 'Add caching/debounce wrapper', diff_or_content: debounced, tradeoff: 'Reduces p95 at cost of staleness.' },
-        { id: 'disable', label: 'Disable hook (stub returning 0)', diff_or_content: disabled, tradeoff: 'Stops failures; removes functionality.' },
+        {
+          id: "harden",
+          label: "Add set -euo pipefail + error trap",
+          diff_or_content: hardened,
+          tradeoff: "Surfaces silent failures.",
+        },
+        {
+          id: "debounce",
+          label: "Add caching/debounce wrapper",
+          diff_or_content: debounced,
+          tradeoff: "Reduces p95 at cost of staleness.",
+        },
+        {
+          id: "disable",
+          label: "Disable hook (stub returning 0)",
+          diff_or_content: disabled,
+          tradeoff: "Stops failures; removes functionality.",
+        },
       ],
       pattern_signature: `hook:${cluster.id}:${hook}`,
       created_at: new Date(),
@@ -206,27 +238,27 @@ export class HookSubject extends BaseSubject implements RevertibleSubject {
   }
 
   async apply(proposal: Proposal, alternativeId: string): Promise<Patch> {
-    const alt = proposal.alternatives.find(a => a.id === alternativeId);
+    const alt = proposal.alternatives.find((a) => a.id === alternativeId);
     if (!alt) throw new Error(`hook-subject.apply: alternative ${alternativeId} not found`);
 
     this.assertInsideHooksDir(proposal.target_path);
 
     if (existsSync(proposal.target_path)) {
-      copyFileSync(proposal.target_path, proposal.target_path + '.bak');
+      copyFileSync(proposal.target_path, `${proposal.target_path}.bak`);
     }
-    writeFileSync(proposal.target_path, alt.diff_or_content, 'utf8');
+    writeFileSync(proposal.target_path, alt.diff_or_content, "utf8");
     chmodSync(proposal.target_path, HOOK_EXEC_MODE);
 
     return {
       target_path: proposal.target_path,
-      kind: 'patch',
+      kind: "patch",
       applied_content: alt.diff_or_content,
     };
   }
 
   async validate(patch: Patch): Promise<ValidationResult> {
-    if (typeof patch.applied_content !== 'string' || patch.applied_content.trim().length === 0) {
-      return { valid: false, reason: 'applied_content is empty' };
+    if (typeof patch.applied_content !== "string" || patch.applied_content.trim().length === 0) {
+      return { valid: false, reason: "applied_content is empty" };
     }
     try {
       this.assertInsideHooksDir(patch.target_path);
@@ -248,32 +280,75 @@ export class HookSubject extends BaseSubject implements RevertibleSubject {
    */
   async snapshotInverse(target: string): Promise<string> {
     this.assertInsideHooksDir(target);
-    if (!existsSync(target)) return '';
+    if (!existsSync(target)) return "";
     try {
-      return readFileSync(target, 'utf8');
+      return readFileSync(target, "utf8");
     } catch {
-      return '';
+      return "";
     }
   }
 
   async revert(inversePatch: Patch): Promise<void> {
     this.assertInsideHooksDir(inversePatch.target_path);
 
-    const bakPath = inversePatch.target_path + '.bak';
+    const bakPath = `${inversePatch.target_path}.bak`;
     if (existsSync(bakPath)) {
       // Prefer .bak restoration when present — it captured the exact pre-apply
       // bytes (including any trailing/leading whitespace the patch may have lost).
       copyFileSync(bakPath, inversePatch.target_path);
     } else {
-      writeFileSync(inversePatch.target_path, inversePatch.applied_content, 'utf8');
+      writeFileSync(inversePatch.target_path, inversePatch.applied_content, "utf8");
     }
     chmodSync(inversePatch.target_path, HOOK_EXEC_MODE);
+  }
+
+  async healthCheck(): Promise<{
+    producer_found: boolean;
+    sample_event_match_rate: number;
+    reason?: string;
+  }> {
+    if (!existsSync(this.hooksDir)) {
+      return {
+        producer_found: false,
+        sample_event_match_rate: 0,
+        reason: `hooksDir does not exist: ${this.hooksDir}`,
+      };
+    }
+    let allFiles: string[];
+    try {
+      allFiles = readdirSync(this.hooksDir);
+    } catch (e) {
+      return {
+        producer_found: false,
+        sample_event_match_rate: 0,
+        reason: `readdir failed: ${(e as Error).message.slice(0, 120)}`,
+      };
+    }
+    const executables = allFiles.filter(f => f.endsWith(".sh") || f.endsWith(".js") || f.endsWith(".py"));
+    if (executables.length === 0) {
+      return {
+        producer_found: false,
+        sample_event_match_rate: 0,
+        reason: `no hook scripts (*.sh/*.js/*.py) in ${this.hooksDir}`,
+      };
+    }
+    const logFiles = allFiles.filter(f => f.endsWith(".log"));
+    return {
+      producer_found: true,
+      // Match rate = fraction of hook scripts that have a corresponding .log
+      // (no log = subject can't observe that hook). 0 means scripts exist
+      // but the wrapper that emits .log entries isn't wired.
+      sample_event_match_rate: executables.length === 0 ? 0 : logFiles.length / executables.length,
+      reason: logFiles.length === 0
+        ? `${executables.length} hook scripts but 0 *.log files — exec wrapper not wired?`
+        : undefined,
+    };
   }
 
   private assertInsideHooksDir(target: string): void {
     const resolved = resolve(target);
     const root = resolve(this.hooksDir);
-    if (resolved !== root && !resolved.startsWith(root + '/')) {
+    if (resolved !== root && !resolved.startsWith(`${root}/`)) {
       throw new Error(`target_path outside hooksDir: ${target}`);
     }
   }
@@ -282,7 +357,7 @@ export class HookSubject extends BaseSubject implements RevertibleSubject {
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 function expandHome(p: string): string {
-  if (p.startsWith('~/')) return join(homedir(), p.slice(2));
+  if (p.startsWith("~/")) return join(homedir(), p.slice(2));
   return p;
 }
 
@@ -314,22 +389,23 @@ function computeP95(samples: number[]): number {
 
 function ensureStrictMode(content: string): string {
   if (/set\s+-euo?\s+pipefail/.test(content)) return content;
-  const lines = content.split('\n');
+  const lines = content.split("\n");
   let insertAt = 0;
-  if (lines[0]?.startsWith('#!')) insertAt = 1;
-  lines.splice(insertAt, 0, 'set -euo pipefail');
-  return lines.join('\n');
+  if (lines[0]?.startsWith("#!")) insertAt = 1;
+  lines.splice(insertAt, 0, "set -euo pipefail");
+  return lines.join("\n");
 }
 
 function withDebounceWrapper(content: string): string {
-  const header = '#!/bin/sh\n# wisecron debounce wrapper — 30s cache\n_DEBOUNCE_FILE=/tmp/$(basename "$0").lastrun\nif [ -f "$_DEBOUNCE_FILE" ] && [ "$(find "$_DEBOUNCE_FILE" -mmin -0.5 2>/dev/null)" ]; then exit 0; fi\ntouch "$_DEBOUNCE_FILE"\n';
-  const body = content.startsWith('#!') ? content.split('\n').slice(1).join('\n') : content;
+  const header =
+    '#!/bin/sh\n# wisecron debounce wrapper — 30s cache\n_DEBOUNCE_FILE=/tmp/$(basename "$0").lastrun\nif [ -f "$_DEBOUNCE_FILE" ] && [ "$(find "$_DEBOUNCE_FILE" -mmin -0.5 2>/dev/null)" ]; then exit 0; fi\ntouch "$_DEBOUNCE_FILE"\n';
+  const body = content.startsWith("#!") ? content.split("\n").slice(1).join("\n") : content;
   return header + body;
 }
 
 function defaultLogReader(dir: string, since: Date): HookLogEntry[] {
   if (!existsSync(dir)) return [];
-  const files = readdirSync(dir).filter(f => f.endsWith('.log'));
+  const files = readdirSync(dir).filter((f) => f.endsWith(".log"));
   const entries: HookLogEntry[] = [];
   for (const f of files) {
     const path = join(dir, f);
@@ -337,11 +413,11 @@ function defaultLogReader(dir: string, since: Date): HookLogEntry[] {
     try {
       const stats = statSync(path);
       if (stats.mtime < since) continue;
-      content = readFileSync(path, 'utf8');
+      content = readFileSync(path, "utf8");
     } catch {
       continue;
     }
-    for (const line of content.split('\n')) {
+    for (const line of content.split("\n")) {
       const parsed = parseHookLogLine(line, f);
       if (parsed) entries.push(parsed);
     }
@@ -354,12 +430,13 @@ function parseHookLogLine(line: string, file: string): HookLogEntry | null {
   if (!trimmed) return null;
   try {
     const obj = JSON.parse(trimmed);
-    if (typeof obj !== 'object' || obj === null) return null;
-    const hookName = (obj as Record<string, unknown>)['hook'] as string ?? file.replace(/\.log$/, '');
-    const exit = Number((obj as Record<string, unknown>)['exit_code'] ?? 0);
-    const dur = Number((obj as Record<string, unknown>)['duration_ms'] ?? 0);
-    const event = (obj as Record<string, unknown>)['event'] as string ?? 'unknown';
-    const tsRaw = (obj as Record<string, unknown>)['ts'] as string | number | undefined;
+    if (typeof obj !== "object" || obj === null) return null;
+    const hookName =
+      ((obj as Record<string, unknown>).hook as string) ?? file.replace(/\.log$/, "");
+    const exit = Number((obj as Record<string, unknown>).exit_code ?? 0);
+    const dur = Number((obj as Record<string, unknown>).duration_ms ?? 0);
+    const event = ((obj as Record<string, unknown>).event as string) ?? "unknown";
+    const tsRaw = (obj as Record<string, unknown>).ts as string | number | undefined;
     const ts = tsRaw ? new Date(tsRaw) : new Date();
     return { hook: hookName, exitCode: exit, durationMs: dur, eventType: event, timestamp: ts };
   } catch {
@@ -368,8 +445,12 @@ function parseHookLogLine(line: string, file: string): HookLogEntry | null {
 }
 
 function defaultShellcheckRunner(content: string): { ok: boolean; message: string } | null {
-  const result = spawnSync('shellcheck', ['-n', '-'], { input: content, encoding: 'utf8', timeout: 5000 });
+  const result = spawnSync("shellcheck", ["-n", "-"], {
+    input: content,
+    encoding: "utf8",
+    timeout: 5000,
+  });
   if (result.error || result.status === null) return null; // not installed
-  if (result.status === 0) return { ok: true, message: '' };
-  return { ok: false, message: (result.stdout || result.stderr || '').slice(0, 500) };
+  if (result.status === 0) return { ok: true, message: "" };
+  return { ok: false, message: (result.stdout || result.stderr || "").slice(0, 500) };
 }

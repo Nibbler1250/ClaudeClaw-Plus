@@ -64,6 +64,29 @@ export abstract class TunableSubject {
    * disabled (the default pipeline probe is fail-open).
    */
   healthProbe?(target: string): Promise<{ failed: boolean; errors: string[] }>;
+
+  /**
+   * Optional: report whether the subject's expected telemetry producer is
+   * present and emitting data. Five wisecron subjects (cron, hook,
+   * mcp-plugin, model-routing, prompt-template) silently return 0
+   * observations when their log/journal source is missing — operators have
+   * no signal that the subject is misconfigured vs. genuinely quiet.
+   *
+   * `producer_found`: whether the upstream source exists at all (e.g.
+   * journal contains wisecron-* units, hooks dir has *.sh files,
+   * operations.jsonl exists).
+   * `sample_event_match_rate`: of recent events from the source, fraction
+   * that the subject's filter would actually pick up. 0..1.
+   * `reason`: human-readable diagnostic when producer_found is false.
+   *
+   * Called once at boot (registerWisecronSubjects) and logged. Optional —
+   * subjects that scan static files (memory, agent, claude-md) can skip.
+   */
+  healthCheck?(): Promise<{
+    producer_found: boolean;
+    sample_event_match_rate: number;
+    reason?: string;
+  }>;
 }
 
 export abstract class Adapter {
