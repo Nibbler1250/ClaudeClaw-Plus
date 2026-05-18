@@ -95,6 +95,53 @@ disabled for that subject until a probe is supplied. Apply with explicit
 
 See `WisecronSettingsSchema` in `types.ts`. Opt-in: `wisecron.enabled: true` required.
 
+### Per-subject config
+
+Each entry under `wisecron.subjects.<name>` accepts an optional `config` map
+forwarded to the subject's constructor. Defaults shown below are the values used
+when `config` is absent — they match `~/.claude/*` on a default install. On
+machines that follow the `~/agent/*` layout (e.g. ProDesk), override the
+relevant keys.
+
+| Subject | Key | Default | Override example |
+|---|---|---|---|
+| `agent` | `agentsDir` | `~/.claude/agents` | `~/agent/agents` |
+| `claude_md` | `projectRoots` (string[]) | `['~/agent', '~/Projects']` | `['~/work']` |
+| `cron` | `journalUnitGlob` | `wisecron-*.service` | `myprefix-*.service` |
+| `cron` | `unitPrefix` | `wisecron-` | `myprefix-` |
+| `cron` | `allowedCommandRoots` (string[]) | `[~/.config, ~/agent, ~/Projects, /usr/bin, /bin]` | `[/opt/scripts]` |
+| `cron` | `staleThresholdHours` | `168` | `72` |
+| `hook` | `hooksDir` | `~/.claude/hooks` | `~/agent/hooks` |
+| `hook` | `crashRateThreshold` | `0.2` | `0.1` |
+| `hook` | `p95DurationThresholdMs` | `5000` | `2000` |
+| `mcp_plugin` | `auditLog` | `~/.claudeclaw/journal/operations.jsonl` | `~/agent/.claudeclaw/journal/operations.jsonl` |
+| `mcp_plugin` | `settingsPath` | `~/.claude/settings.json` | `~/agent/settings.json` |
+| `memory` | `memoryIndex` | `~/.claude/projects/-home-<user>/memory/MEMORY.md` | `~/agent/memory/MEMORY.md` |
+| `memory` | `hookLog` | _(none)_ | `~/agent/hooks/userPromptSubmit.log` |
+| `model_routing` | `modesConfigPath` | `~/.claude/agentic.yaml` | `~/agent/agentic.yaml` |
+| `prompt_template` | `feedbackLog` | `~/.config/tuner/template_feedback.jsonl` | _(custom)_ |
+| `prompt_template` | `templatesDir` | `~/.config/tuner/templates` | _(custom)_ |
+
+Example `config.yaml` snippet for the ProDesk `~/agent/*` layout:
+
+```yaml
+wisecron:
+  enabled: true
+  subjects:
+    agent:
+      enabled: true
+      config: { agentsDir: "~/agent/agents" }
+    hook:
+      enabled: true
+      config: { hooksDir: "~/agent/hooks" }
+    claude_md:
+      enabled: true
+      config: { projectRoots: ["~/agent", "~/Projects"] }
+```
+
+When `config` is absent the subject uses its built-in defaults — existing
+operator configs without the `config` key keep working unchanged.
+
 ## What is NOT here (yet)
 
 - CLI commands (`tuner wisecron list-subjects`, `run`, `next`, `status`, `rollback`, `pause`, `resume`) — wired in `src/skills-tuner/cli/index.ts` post-rename.

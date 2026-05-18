@@ -9,23 +9,23 @@
  * Phase 1 — fork Nibbler1250, opt-in via wisecron.enabled in config.yaml.
  */
 
-import type { Registry } from '../../skills-tuner/core/registry.js';
-import type { LLMClient } from '../../skills-tuner/core/llm.js';
-import type { TunableSubject } from '../../skills-tuner/core/interfaces.js';
-import { WisecronStateDB } from './state-db.js';
-import { AdaptiveScheduler } from './adaptive-scheduler.js';
-import { ProposalEngine } from './proposal-engine.js';
-import { ApplyPipeline } from './apply-pipeline.js';
-import type { WisecronSettings } from './types.js';
+import type { Registry } from "../../skills-tuner/core/registry.js";
+import type { LLMClient } from "../../skills-tuner/core/llm.js";
+import type { TunableSubject } from "../../skills-tuner/core/interfaces.js";
+import { WisecronStateDB } from "./state-db.js";
+import { AdaptiveScheduler } from "./adaptive-scheduler.js";
+import { ProposalEngine } from "./proposal-engine.js";
+import { ApplyPipeline } from "./apply-pipeline.js";
+import type { WisecronSettings } from "./types.js";
 
-import { CronSubject } from '../subjects/cron-subject.js';
-import { ClaudeMdSubject } from '../subjects/claude-md-subject.js';
-import { HookSubject } from '../subjects/hook-subject.js';
-import { McpPluginSubject } from '../subjects/mcp-plugin-subject.js';
-import { ModelRoutingSubject } from '../subjects/model-routing-subject.js';
-import { PromptTemplateSubject } from '../subjects/prompt-template-subject.js';
-import { MemorySubject } from '../subjects/memory-subject.js';
-import { AgentSubject } from '../subjects/agent-subject.js';
+import { CronSubject } from "../subjects/cron-subject.js";
+import { ClaudeMdSubject } from "../subjects/claude-md-subject.js";
+import { HookSubject } from "../subjects/hook-subject.js";
+import { McpPluginSubject } from "../subjects/mcp-plugin-subject.js";
+import { ModelRoutingSubject } from "../subjects/model-routing-subject.js";
+import { PromptTemplateSubject } from "../subjects/prompt-template-subject.js";
+import { MemorySubject } from "../subjects/memory-subject.js";
+import { AgentSubject } from "../subjects/agent-subject.js";
 
 export interface WisecronContext {
   db: WisecronStateDB;
@@ -54,6 +54,7 @@ export function registerWisecronSubjects(
   const pipeline = new ApplyPipeline(registry, db);
 
   const enabled = (name: string) => settings.subjects?.[name]?.enabled !== false;
+  const cfg = (name: string): Record<string, unknown> => settings.subjects?.[name]?.config ?? {};
 
   const registerWithProbeCheck = (subject: TunableSubject): void => {
     registry.registerSubject(subject);
@@ -61,14 +62,20 @@ export function registerWisecronSubjects(
     warnIfMissingHealthProbe(subject);
   };
 
-  if (enabled('cron')) registerWithProbeCheck(new CronSubject({ llm: opts.llm }));
-  if (enabled('claude_md')) registerWithProbeCheck(new ClaudeMdSubject({ llm: opts.llm }));
-  if (enabled('hook')) registerWithProbeCheck(new HookSubject({ llm: opts.llm }));
-  if (enabled('mcp_plugin')) registerWithProbeCheck(new McpPluginSubject({ llm: opts.llm }));
-  if (enabled('model_routing')) registerWithProbeCheck(new ModelRoutingSubject({ llm: opts.llm }));
-  if (enabled('prompt_template')) registerWithProbeCheck(new PromptTemplateSubject({ llm: opts.llm }));
-  if (enabled('memory')) registerWithProbeCheck(new MemorySubject({ llm: opts.llm }));
-  if (enabled('agent')) registerWithProbeCheck(new AgentSubject({ llm: opts.llm }));
+  if (enabled("cron")) registerWithProbeCheck(new CronSubject({ llm: opts.llm, ...cfg("cron") }));
+  if (enabled("claude_md"))
+    registerWithProbeCheck(new ClaudeMdSubject({ llm: opts.llm, ...cfg("claude_md") }));
+  if (enabled("hook")) registerWithProbeCheck(new HookSubject({ llm: opts.llm, ...cfg("hook") }));
+  if (enabled("mcp_plugin"))
+    registerWithProbeCheck(new McpPluginSubject({ llm: opts.llm, ...cfg("mcp_plugin") }));
+  if (enabled("model_routing"))
+    registerWithProbeCheck(new ModelRoutingSubject({ llm: opts.llm, ...cfg("model_routing") }));
+  if (enabled("prompt_template"))
+    registerWithProbeCheck(new PromptTemplateSubject({ llm: opts.llm, ...cfg("prompt_template") }));
+  if (enabled("memory"))
+    registerWithProbeCheck(new MemorySubject({ llm: opts.llm, ...cfg("memory") }));
+  if (enabled("agent"))
+    registerWithProbeCheck(new AgentSubject({ llm: opts.llm, ...cfg("agent") }));
 
   return { db, scheduler, engine, pipeline };
 }
@@ -85,18 +92,19 @@ export function registerWisecronSubjects(
  * is informational only.
  */
 function warnIfMissingHealthProbe(subject: TunableSubject): void {
-  if (subject.risk_tier !== 'high' && subject.risk_tier !== 'medium') return;
-  if (typeof (subject as TunableSubject & { healthProbe?: unknown }).healthProbe === 'function') return;
+  if (subject.risk_tier !== "high" && subject.risk_tier !== "medium") return;
+  if (typeof (subject as TunableSubject & { healthProbe?: unknown }).healthProbe === "function")
+    return;
   console.warn(
     `[tuner] subject '${subject.name}' (risk=${subject.risk_tier}) has no healthProbe — ` +
-    `auto-revert disabled. Wire a probe via ApplyPipeline opts or apply only with explicit observe=false.`,
+      `auto-revert disabled. Wire a probe via ApplyPipeline opts or apply only with explicit observe=false.`,
   );
 }
 
-export { WisecronStateDB } from './state-db.js';
-export { AdaptiveScheduler } from './adaptive-scheduler.js';
-export { ProposalEngine } from './proposal-engine.js';
-export { ApplyPipeline } from './apply-pipeline.js';
+export { WisecronStateDB } from "./state-db.js";
+export { AdaptiveScheduler } from "./adaptive-scheduler.js";
+export { ProposalEngine } from "./proposal-engine.js";
+export { ApplyPipeline } from "./apply-pipeline.js";
 export type {
   ScheduleState,
   RevisionRecord,
@@ -107,4 +115,4 @@ export type {
   ObservationWindowResult,
   WisecronSettings,
   RevertibleSubject,
-} from './types.js';
+} from "./types.js";

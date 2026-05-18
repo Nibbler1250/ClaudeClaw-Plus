@@ -1,6 +1,6 @@
-import { z } from 'zod';
-import type { Patch, Proposal, UnsignedProposal } from '../../skills-tuner/core/types.js';
-import type { RiskTier } from '../../skills-tuner/core/interfaces.js';
+import { z } from "zod";
+import type { Patch, Proposal, UnsignedProposal } from "../../skills-tuner/core/types.js";
+import type { RiskTier } from "../../skills-tuner/core/interfaces.js";
 
 // ── Adaptive scheduling ─────────────────────────────────────────────────────
 
@@ -21,7 +21,7 @@ export const HIGH_RISK_OBSERVATION_WINDOW_MS = 5 * 60 * 1000;
 
 // ── Rollback history ────────────────────────────────────────────────────────
 
-export const AppliedBy = z.enum(['cli', 'telegram', 'auto-revert']);
+export const AppliedBy = z.enum(["cli", "telegram", "auto-revert"]);
 export type AppliedBy = z.infer<typeof AppliedBy>;
 
 export const RevisionRecordSchema = z.object({
@@ -93,16 +93,32 @@ export interface ObservationWindowResult {
 
 export const WisecronSettingsSchema = z.object({
   enabled: z.boolean().default(false),
-  db_path: z.string().default('~/.config/tuner/wisecron.db'),
-  systemd_unit_prefix: z.string().default('wisecron-'),
+  db_path: z.string().default("~/.config/tuner/wisecron.db"),
+  systemd_unit_prefix: z.string().default("wisecron-"),
   initial_interval_hours: z.number().int().min(1).default(INITIAL_INTERVAL_HOURS),
   max_interval_hours: z.number().int().min(1).default(MAX_INTERVAL_HOURS),
-  llm_model_for_propose: z.string().default('claude-sonnet-4-6'),
-  llm_call_path: z.enum(['direct-sdk', 'llm-router']).default('direct-sdk'),
-  subjects: z.record(z.string(), z.object({ enabled: z.boolean() })).default({}),
-  rollback: z.object({
-    retention_days: z.number().int().min(1).default(90),
-    require_confirm_on_rollback: z.boolean().default(true),
-  }).default({}),
+  llm_model_for_propose: z.string().default("claude-sonnet-4-6"),
+  llm_call_path: z.enum(["direct-sdk", "llm-router"]).default("direct-sdk"),
+  subjects: z
+    .record(
+      z.string(),
+      z.object({
+        enabled: z.boolean(),
+        /**
+         * Per-subject ctor overrides. Forwarded verbatim to the subject's
+         * constructor opts (e.g. `{ hooksDir: '~/agent/hooks' }`). Keys recognised
+         * are subject-specific — see each subject's `*SubjectConfig` interface and
+         * the wisecron README "Per-subject config" table.
+         */
+        config: z.record(z.string(), z.unknown()).optional(),
+      }),
+    )
+    .default({}),
+  rollback: z
+    .object({
+      retention_days: z.number().int().min(1).default(90),
+      require_confirm_on_rollback: z.boolean().default(true),
+    })
+    .default({}),
 });
 export type WisecronSettings = z.infer<typeof WisecronSettingsSchema>;
