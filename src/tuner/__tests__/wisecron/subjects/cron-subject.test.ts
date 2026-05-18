@@ -483,6 +483,40 @@ describe('CronSubject — Pass B: risk_tier guardrails', () => {
   });
 });
 
+describe('CronSubject — Pass B: journalctl field name', () => {
+  it('parses _SYSTEMD_USER_UNIT (journalctl --user user-scope services)', async () => {
+    // Replicates a real journalctl --user JSON line for a wisecron-* unit.
+    // Pre-fix this was silently dropped because parser only checked
+    // _SYSTEMD_UNIT (which is set only for system-scope units).
+    const now = new Date();
+    const entry = JSON.stringify({
+      _SYSTEMD_USER_UNIT: 'wisecron-user.service',
+      __REALTIME_TIMESTAMP: microsUsec(now),
+      MESSAGE: 'started',
+      EXIT_STATUS: '1',
+    });
+    const subject = new CronSubject({ journalRunner: async () => entry });
+    const obs = await subject.collectObservations(new Date(0));
+    expect(obs.length).toBe(1);
+    expect(obs[0]!.metadata['unit']).toBe('wisecron-user.service');
+  });
+
+  it('_SYSTEMD_USER_UNIT takes precedence over _SYSTEMD_UNIT when both present', async () => {
+    const now = new Date();
+    const entry = JSON.stringify({
+      _SYSTEMD_USER_UNIT: 'wisecron-user-scope.service',
+      _SYSTEMD_UNIT: 'user@1000.service',  // systemd often sets this to the user manager
+      __REALTIME_TIMESTAMP: microsUsec(now),
+      MESSAGE: 'started',
+      EXIT_STATUS: '1',
+    });
+    const subject = new CronSubject({ journalRunner: async () => entry });
+    const obs = await subject.collectObservations(new Date(0));
+    expect(obs.length).toBe(1);
+    expect(obs[0]!.metadata['unit']).toBe('wisecron-user-scope.service');
+  });
+});
+
 describe('CronSubject — snapshotInverse', () => {
   it('serializes the existing JobSpec from scheduler.list()', async () => {
     class ListingBackend extends MockSchedulerBackend {

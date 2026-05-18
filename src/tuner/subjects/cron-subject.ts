@@ -435,7 +435,14 @@ function parseJournalJsonLines(raw: string): JournalEntry[] {
     } catch {
       continue;
     }
-    const unit = (parsed['_SYSTEMD_UNIT'] as string) ?? (parsed['UNIT'] as string) ?? '';
+    // journalctl --user emits `_SYSTEMD_USER_UNIT` for user-scope services
+    // and `_SYSTEMD_UNIT` only for system-scope. Wisecron timers run under
+    // --user, so omitting the user variant silently dropped every entry.
+    const unit =
+      (parsed['_SYSTEMD_USER_UNIT'] as string) ??
+      (parsed['_SYSTEMD_UNIT'] as string) ??
+      (parsed['UNIT'] as string) ??
+      '';
     if (!unit) continue;
 
     // journalctl reports timestamps in microseconds-since-epoch as a string.
