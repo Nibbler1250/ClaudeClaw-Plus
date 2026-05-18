@@ -23,7 +23,7 @@ import { McpPluginSubject } from '../src/tuner/subjects/mcp-plugin-subject.js';
 import { ModelRoutingSubject } from '../src/tuner/subjects/model-routing-subject.js';
 import { PromptTemplateSubject } from '../src/tuner/subjects/prompt-template-subject.js';
 
-const OUT = '/tmp/wisecron-phase4';
+const OUT = process.env['WISECRON_PHASE_OUTPUT'] ?? '/tmp/wisecron-phase4';
 mkdirSync(OUT, { recursive: true });
 
 const SEVEN_DAYS_AGO = new Date(Date.now() - 7 * 24 * 3600 * 1000);
