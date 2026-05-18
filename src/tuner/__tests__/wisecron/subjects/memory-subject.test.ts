@@ -112,22 +112,28 @@ describe('MemorySubject — detectProblems', () => {
 
 describe('MemorySubject — apply / validate', () => {
   it('apply writes .bak before replacement', async () => {
-    seed('# Memory Index\n\n- [A](a.md) — old\n');
+    // dedup-dead strategy removes entries whose .md file does not exist on
+    // disk. Seed an index with two entries; only `a.md` exists.
+    seed('# Memory Index\n\n- [A](a.md) — alpha\n- [Ghost](ghost.md) — gone\n');
     touch('a.md');
     const s = new MemorySubject({ memoryIndex: indexPath });
     const proposal: Proposal = {
       id: 1, cluster_id: 'memory-index-cleanup', subject: 'memory', kind: 'patch',
       target_path: indexPath, pattern_signature: 'sig', created_at: new Date(),
       signature: 'sig',
+      // diff_or_content is now informational (unified diff text) — apply
+      // re-runs the strategy on disk state rather than writing this verbatim.
       alternatives: [{
         id: 'dedup-dead', label: 'lbl', tradeoff: '',
-        diff_or_content: '# Memory Index\n\n- [A](a.md) — new\n',
+        diff_or_content: '--- MEMORY.md\n+++ MEMORY.md (dedup-dead)\n@@ 1 removed @@\n-- [Ghost](ghost.md) — gone',
       }],
     };
     await s.apply(proposal, 'dedup-dead');
     expect(existsSync(indexPath + '.bak')).toBe(true);
-    expect(readFileSync(indexPath + '.bak', 'utf8')).toContain('old');
-    expect(readFileSync(indexPath, 'utf8')).toContain('new');
+    expect(readFileSync(indexPath + '.bak', 'utf8')).toContain('Ghost');
+    const written = readFileSync(indexPath, 'utf8');
+    expect(written).toContain('[A](a.md)');
+    expect(written).not.toContain('Ghost');
   });
 
   it('apply rejects mismatching target_path', async () => {
@@ -246,18 +252,20 @@ describe('MemorySubject — Pass B: edges', () => {
 
 describe('MemorySubject — Pass B: idempotency', () => {
   it('apply same content twice → identical file state', async () => {
-    seed('# Memory Index\n- [Old](old.md)\n');
+    // dedup-dead strategy is deterministic given the same disk state, so
+    // applying twice in a row yields the same content (no further dead
+    // entries to remove on the second pass).
+    seed('# Memory Index\n- [Old](old.md) — old\n');
     const s = new MemorySubject({ memoryIndex: indexPath });
-    const newContent = '# Memory Index\n- [New](new.md) — new\n';
     const proposal: Proposal = {
       id: 1, cluster_id: 'c', subject: 'memory', kind: 'patch',
       target_path: indexPath, pattern_signature: 'sig', created_at: new Date(),
       signature: 's',
-      alternatives: [{ id: 'a', label: '', tradeoff: '', diff_or_content: newContent }],
+      alternatives: [{ id: 'dedup-dead', label: '', tradeoff: '', diff_or_content: '' }],
     };
-    await s.apply(proposal, 'a');
+    await s.apply(proposal, 'dedup-dead');
     const after1 = readFileSync(indexPath, 'utf8');
-    await s.apply(proposal, 'a');
+    await s.apply(proposal, 'dedup-dead');
     expect(readFileSync(indexPath, 'utf8')).toBe(after1);
   });
 
@@ -308,17 +316,17 @@ describe('MemorySubject — Pass B: perf', () => {
 
 describe('MemorySubject — Pass B: validate/apply symmetry', () => {
   it('apply roundtrip: produced Patch validates clean', async () => {
-    seed('# Memory Index\n- [A](a.md)\n');
+    seed('# Memory Index\n\n- [A](a.md) — alpha\n- [B](b.md) — beta\n');
     touch('a.md');
+    touch('b.md');
     const s = new MemorySubject({ memoryIndex: indexPath });
-    const newContent = '# Memory Index\n\n- [A](a.md) — alpha\n- [B](b.md) — beta\n';
     const proposal: Proposal = {
       id: 1, cluster_id: 'c', subject: 'memory', kind: 'patch',
       target_path: indexPath, pattern_signature: 'sig', created_at: new Date(),
       signature: 's',
-      alternatives: [{ id: 'a', label: '', tradeoff: '', diff_or_content: newContent }],
+      alternatives: [{ id: 'dedup-dead', label: '', tradeoff: '', diff_or_content: '' }],
     };
-    const patch = await s.apply(proposal, 'a');
+    const patch = await s.apply(proposal, 'dedup-dead');
     const v = await s.validate(patch);
     expect(v.valid).toBe(true);
   });
@@ -341,5 +349,141 @@ describe('MemorySubject — Pass B: risk_tier guardrails', () => {
     const s = new MemorySubject({ memoryIndex: indexPath });
     expect(s.risk_tier).toBe('low');
     expect(s.auto_merge_default).toBe(true);
+  });
+});
+
+describe('MemorySubject — Pass B: proposeChange emits unified diff', () => {
+  function seedRealistic(): void {
+    // Mirror the ~50KB MEMORY.md shape that triggered Phase 4's wall-of-text
+    // problem. 50 entries with 4 of them pointing at non-existent files.
+    const lines = ['# Memory Index', ''];
+    for (let i = 0; i < 50; i++) {
+      lines.push(`- [Entry ${i}](file_${String(i).padStart(2, '0')}.md) — hook ${i}`);
+    }
+    seed(lines.join('\n') + '\n');
+    // Only 46 of the 50 reference files exist on disk → 4 dead refs.
+    for (let i = 0; i < 50; i++) {
+      if (i === 7 || i === 19 || i === 33 || i === 41) continue;
+      touch(`file_${String(i).padStart(2, '0')}.md`);
+    }
+  }
+
+  it('each alternative diff_or_content is ≤ 2KB', async () => {
+    seedRealistic();
+    const s = new MemorySubject({ memoryIndex: indexPath });
+    const cluster: Cluster = {
+      id: 'memory-index-cleanup', subject: 'memory',
+      observations: [{
+        session_id: 't', observed_at: new Date(), signal_type: 'orphan', verbatim: '{}',
+        metadata: { subject: 'memory' },
+      }],
+      frequency: 4, success_rate: 0.5, sentiment: 'neutral', subjects_touched: ['memory'],
+    };
+    const proposal = await s.proposeChange(cluster);
+    expect(proposal.alternatives).toHaveLength(3);
+    for (const alt of proposal.alternatives) {
+      expect(alt.diff_or_content.length).toBeLessThanOrEqual(2048);
+    }
+  });
+
+  it('all three alternatives produce visibly distinct diff text', async () => {
+    seedRealistic();
+    const s = new MemorySubject({ memoryIndex: indexPath });
+    const cluster: Cluster = {
+      id: 'memory-index-cleanup', subject: 'memory',
+      observations: [{
+        session_id: 't', observed_at: new Date(), signal_type: 'orphan', verbatim: '{}',
+        metadata: { subject: 'memory' },
+      }],
+      frequency: 4, success_rate: 0.5, sentiment: 'neutral', subjects_touched: ['memory'],
+    };
+    const proposal = await s.proposeChange(cluster);
+    const [a, b, c] = proposal.alternatives.map(alt => alt.diff_or_content);
+    expect(a).not.toBe(b);
+    expect(b).not.toBe(c);
+    expect(a).not.toBe(c);
+  });
+
+  it('each alternative diff includes a summary header line', async () => {
+    seedRealistic();
+    const s = new MemorySubject({ memoryIndex: indexPath });
+    const cluster: Cluster = {
+      id: 'memory-index-cleanup', subject: 'memory',
+      observations: [{
+        session_id: 't', observed_at: new Date(), signal_type: 'orphan', verbatim: '{}',
+        metadata: { subject: 'memory' },
+      }],
+      frequency: 4, success_rate: 0.5, sentiment: 'neutral', subjects_touched: ['memory'],
+    };
+    const proposal = await s.proposeChange(cluster);
+    for (const alt of proposal.alternatives) {
+      expect(alt.diff_or_content).toMatch(/@@ \d+ removed, \d+ added, \d+ reordered @@/);
+    }
+  });
+});
+
+describe('MemorySubject — Pass B: apply re-computes strategy on current state', () => {
+  it('apply rejects unknown strategy id', async () => {
+    seed('# Memory Index\n- [A](a.md)\n');
+    const s = new MemorySubject({ memoryIndex: indexPath });
+    const proposal: Proposal = {
+      id: 1, cluster_id: 'c', subject: 'memory', kind: 'patch',
+      target_path: indexPath, pattern_signature: 'sig', created_at: new Date(),
+      signature: 's',
+      alternatives: [{ id: 'free-form', label: '', tradeoff: '', diff_or_content: '' }],
+    };
+    await expect(s.apply(proposal, 'free-form')).rejects.toThrow(/unknown strategy/);
+  });
+
+  it('apply dedup-reorder sorts entries alphabetically', async () => {
+    seed('# Memory Index\n\n- [Zeta](z.md) — z\n- [Alpha](a.md) — a\n- [Mu](m.md) — m\n');
+    touch('a.md'); touch('m.md'); touch('z.md');
+    const s = new MemorySubject({ memoryIndex: indexPath });
+    const proposal: Proposal = {
+      id: 1, cluster_id: 'c', subject: 'memory', kind: 'patch',
+      target_path: indexPath, pattern_signature: 'sig', created_at: new Date(),
+      signature: 's',
+      alternatives: [{ id: 'dedup-reorder', label: '', tradeoff: '', diff_or_content: '' }],
+    };
+    await s.apply(proposal, 'dedup-reorder');
+    const written = readFileSync(indexPath, 'utf8');
+    const aIdx = written.indexOf('Alpha');
+    const mIdx = written.indexOf('Mu');
+    const zIdx = written.indexOf('Zeta');
+    expect(aIdx).toBeGreaterThan(0);
+    expect(aIdx).toBeLessThan(mIdx);
+    expect(mIdx).toBeLessThan(zIdx);
+  });
+
+  it('apply dedup-group buckets entries by name prefix', async () => {
+    seed([
+      '# Memory Index', '',
+      '- [Project A](project_alpha.md)',
+      '- [Feedback B](feedback_beta.md)',
+      '- [Project C](project_charlie.md)',
+      '- [Feedback D](feedback_delta.md)',
+    ].join('\n') + '\n');
+    touch('project_alpha.md');
+    touch('feedback_beta.md');
+    touch('project_charlie.md');
+    touch('feedback_delta.md');
+    const s = new MemorySubject({ memoryIndex: indexPath });
+    const proposal: Proposal = {
+      id: 1, cluster_id: 'c', subject: 'memory', kind: 'patch',
+      target_path: indexPath, pattern_signature: 'sig', created_at: new Date(),
+      signature: 's',
+      alternatives: [{ id: 'dedup-group', label: '', tradeoff: '', diff_or_content: '' }],
+    };
+    await s.apply(proposal, 'dedup-group');
+    const written = readFileSync(indexPath, 'utf8');
+    // feedback_* bucket precedes project_* (alphabetical group key order),
+    // and entries within each bucket are contiguous.
+    const fbBeta = written.indexOf('feedback_beta');
+    const fbDelta = written.indexOf('feedback_delta');
+    const projAlpha = written.indexOf('project_alpha');
+    const projCharlie = written.indexOf('project_charlie');
+    expect(fbBeta).toBeLessThan(projAlpha);
+    expect(fbDelta).toBeLessThan(projAlpha);
+    expect(projAlpha).toBeLessThan(projCharlie === -1 ? Infinity : projCharlie);
   });
 });

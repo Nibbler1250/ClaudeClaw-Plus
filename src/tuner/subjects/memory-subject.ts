@@ -6,6 +6,7 @@ import { sanitizeObservationContent } from '../../skills-tuner/core/security.js'
 import type { LLMClient } from '../../skills-tuner/core/llm.js';
 import type { Cluster, Observation, Patch, Proposal, UnsignedProposal, ValidationResult } from '../../skills-tuner/core/types.js';
 import type { RevertibleSubject } from '../wisecron/types.js';
+import { renderDiff } from '../wisecron/render-diff.js';
 
 /** Derive Claude Code's per-user memory index location.
  * Mirrors Claude Code's pattern: `~/.claude/projects/-home-<basename>/memory/MEMORY.md`.
@@ -132,17 +133,13 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject {
       throw new Error('memory-subject.proposeChange: index missing');
     }
     const current = readFileSync(this.memoryIndex, 'utf8');
-    const entries = parseEntries(current);
-    const deadFiles = new Set<string>();
-    const memoryDir = dirname(this.memoryIndex);
-    for (const e of entries) {
-      if (!existsSync(resolve(memoryDir, e.file))) deadFiles.add(e.file);
-    }
+    const dedupDead = applyStrategy(current, this.memoryIndex, 'dedup-dead');
+    const dedupReorder = applyStrategy(current, this.memoryIndex, 'dedup-reorder');
+    const dedupGroup = applyStrategy(current, this.memoryIndex, 'dedup-group');
 
-    const dedupedNoDead = renderIndex(dedupe(entries.filter(e => !deadFiles.has(e.file))));
-    const dedupedReordered = renderIndex(dedupe(entries.filter(e => !deadFiles.has(e.file)))); // ordering is op-dependent; safe placeholder
-    const dedupedGrouped = renderIndex(dedupe(entries.filter(e => !deadFiles.has(e.file))));
-
+    // Emit unified diffs (≤2KB each) so the three alternatives stay visually
+    // distinct in adapter surfaces. apply() re-runs the strategy against the
+    // live file rather than blindly writing what's in diff_or_content.
     return {
       id: Date.now(),
       cluster_id: cluster.id,
@@ -153,23 +150,23 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject {
         {
           id: 'dedup-dead',
           label: 'Dedup + remove dead refs',
-          diff_or_content: dedupedNoDead,
+          diff_or_content: renderDiff(current, dedupDead, { fromLabel: 'MEMORY.md', toLabel: 'MEMORY.md (dedup-dead)' }),
           tradeoff: 'Smallest diff, removes only confirmed-dead pointers.',
         },
         {
           id: 'dedup-reorder',
-          label: 'Dedup + reorder by read-frequency',
-          diff_or_content: dedupedReordered,
-          tradeoff: 'Most useful order, but reorder churn in git blame.',
+          label: 'Dedup + reorder alphabetically',
+          diff_or_content: renderDiff(current, dedupReorder, { fromLabel: 'MEMORY.md', toLabel: 'MEMORY.md (dedup-reorder)' }),
+          tradeoff: 'Easier visual scan; reorder churn in git blame.',
         },
         {
           id: 'dedup-group',
-          label: 'Dedup + group by category',
-          diff_or_content: dedupedGrouped,
-          tradeoff: 'Easier scan by type; loses chronological order.',
+          label: 'Dedup + group by name prefix',
+          diff_or_content: renderDiff(current, dedupGroup, { fromLabel: 'MEMORY.md', toLabel: 'MEMORY.md (dedup-group)' }),
+          tradeoff: 'Groups feedback_/project_/user_ entries together; loses chronological order.',
         },
       ],
-      pattern_signature: `memory:dedup:${entries.length}`,
+      pattern_signature: `memory:dedup:${parseEntries(current).length}`,
       created_at: new Date(),
     };
   }
@@ -180,16 +177,22 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject {
     }
     const alt = proposal.alternatives.find(a => a.id === alternativeId);
     if (!alt) throw new Error(`memory-subject.apply: alternative ${alternativeId} not found`);
+    if (!isKnownStrategy(alternativeId)) {
+      throw new Error(`memory-subject.apply: unknown strategy '${alternativeId}'`);
+    }
+
+    const current = existsSync(this.memoryIndex) ? readFileSync(this.memoryIndex, 'utf8') : '';
+    const newContent = applyStrategy(current, this.memoryIndex, alternativeId);
 
     if (existsSync(this.memoryIndex)) {
       copyFileSync(this.memoryIndex, this.memoryIndex + '.bak');
     }
-    writeFileSync(this.memoryIndex, alt.diff_or_content, 'utf8');
+    writeFileSync(this.memoryIndex, newContent, 'utf8');
 
     return {
       target_path: this.memoryIndex,
       kind: 'patch',
-      applied_content: alt.diff_or_content,
+      applied_content: newContent,
     };
   }
 
@@ -262,4 +265,43 @@ function renderIndex(entries: MemoryEntry[]): string {
     else lines.push(`- [${e.title}](${e.file})`);
   }
   return lines.join('\n') + '\n';
+}
+
+type Strategy = 'dedup-dead' | 'dedup-reorder' | 'dedup-group';
+
+function isKnownStrategy(s: string): s is Strategy {
+  return s === 'dedup-dead' || s === 'dedup-reorder' || s === 'dedup-group';
+}
+
+function applyStrategy(current: string, indexPath: string, strategy: Strategy): string {
+  const entries = parseEntries(current);
+  const memoryDir = dirname(indexPath);
+  const live = entries.filter(e => existsSync(resolve(memoryDir, e.file)));
+  const deduped = dedupe(live);
+
+  switch (strategy) {
+    case 'dedup-dead':
+      return renderIndex(deduped);
+    case 'dedup-reorder':
+      return renderIndex([...deduped].sort((a, b) => a.title.localeCompare(b.title)));
+    case 'dedup-group': {
+      // Group by leading slug-prefix (e.g. `feedback_`, `project_`, `user_`);
+      // entries without an underscore prefix go to a final 'misc' bucket.
+      const groups = new Map<string, MemoryEntry[]>();
+      for (const e of deduped) {
+        const m = e.file.match(/^([a-zA-Z][a-zA-Z0-9]*)_/);
+        const key = m ? m[1]! : 'misc';
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key)!.push(e);
+      }
+      const orderedKeys = [...groups.keys()].sort();
+      const out: MemoryEntry[] = [];
+      for (const k of orderedKeys) {
+        const bucket = groups.get(k)!;
+        bucket.sort((a, b) => a.title.localeCompare(b.title));
+        out.push(...bucket);
+      }
+      return renderIndex(out);
+    }
+  }
 }
