@@ -662,3 +662,36 @@ describe("CronSubject — snapshotInverse", () => {
     expect(parsed.schedule).toBe("never");
   });
 });
+
+describe("CronSubject — healthCheck", () => {
+  it("returns producer_found=false when journalctl runner throws", async () => {
+    const subject = new CronSubject({
+      journalRunner: async () => {
+        throw new Error("not installed");
+      },
+    });
+    const h = await subject.healthCheck!();
+    expect(h.producer_found).toBe(false);
+    expect(h.reason).toMatch(/journalctl runner failed/);
+  });
+
+  it("returns producer_found=false when no wisecron-* entries in 7d window", async () => {
+    const subject = new CronSubject({ journalRunner: async () => "" });
+    const h = await subject.healthCheck!();
+    expect(h.producer_found).toBe(false);
+    expect(h.sample_event_match_rate).toBe(0);
+    expect(h.reason).toMatch(/no 'wisecron-/);
+  });
+
+  it("returns producer_found=true with match_rate=1 when all entries match prefix", async () => {
+    const now = new Date();
+    const fixture = [
+      journalLine({ unit: "wisecron-a.service", ts: now, exit: 0 }),
+      journalLine({ unit: "wisecron-b.service", ts: now, exit: 0 }),
+    ].join("\n");
+    const subject = new CronSubject({ journalRunner: async () => fixture });
+    const h = await subject.healthCheck!();
+    expect(h.producer_found).toBe(true);
+    expect(h.sample_event_match_rate).toBe(1);
+  });
+});

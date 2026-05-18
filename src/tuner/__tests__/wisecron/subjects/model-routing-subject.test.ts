@@ -393,3 +393,34 @@ describe("ModelRoutingSubject — Pass B: risk_tier guardrails", () => {
     expect(s.risk_tier).toBe("medium");
   });
 });
+
+describe("ModelRoutingSubject — healthCheck", () => {
+  it("returns producer_found=false when dispatchReader is not injected", async () => {
+    // Default ctor: dispatchReader=() => [], i.e. not configured.
+    const s = new ModelRoutingSubject({ modesConfigPath: configPath });
+    const h = await s.healthCheck!();
+    expect(h.producer_found).toBe(false);
+    expect(h.reason).toMatch(/dispatchReader not configured/);
+  });
+
+  it("returns producer_found=true match_rate=0 when reader returns no events", async () => {
+    const s = new ModelRoutingSubject({
+      modesConfigPath: configPath,
+      dispatchReader: () => [],
+    });
+    const h = await s.healthCheck!();
+    expect(h.producer_found).toBe(true);
+    expect(h.sample_event_match_rate).toBe(0);
+    expect(h.reason).toMatch(/0 events/);
+  });
+
+  it("returns match_rate>0 when reader emits dispatch events", async () => {
+    const s = new ModelRoutingSubject({
+      modesConfigPath: configPath,
+      dispatchReader: () => [{ type: "dispatch", mode: "code-fix" }, { type: "other" }],
+    });
+    const h = await s.healthCheck!();
+    expect(h.producer_found).toBe(true);
+    expect(h.sample_event_match_rate).toBeGreaterThan(0);
+  });
+});

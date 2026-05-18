@@ -151,6 +151,52 @@ describe("registerWisecronSubjects — healthProbe boot warning", () => {
     expect(subjects.some((s) => s.name === "memory")).toBe(true);
   });
 
+  it("runHealthChecks logs producer_found per subject at boot", async () => {
+    const registry = new Registry();
+    const logCalls: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: unknown[]) => {
+      logCalls.push(args.map((a) => String(a)).join(" "));
+    };
+    try {
+      // runHealthChecks defaults to true; fire and await the next microtask
+      // round so the async health calls settle.
+      registerWisecronSubjects(registry, makeSettings());
+      await new Promise((r) => setTimeout(r, 100));
+    } finally {
+      console.log = origLog;
+    }
+    const healthLines = [...logCalls, ...warnSpy.calls].filter((c) =>
+      /\[tuner\] subject '\w+' health:/.test(c),
+    );
+    // At least the 5 producer-dependent subjects must log a line.
+    const subjectNames = new Set(healthLines.map((c) => c.match(/'(\w+)'/)?.[1]));
+    expect(subjectNames.has("cron")).toBe(true);
+    expect(subjectNames.has("hook")).toBe(true);
+    expect(subjectNames.has("mcp_plugin")).toBe(true);
+    expect(subjectNames.has("model_routing")).toBe(true);
+    expect(subjectNames.has("prompt_template")).toBe(true);
+  });
+
+  it("runHealthChecks can be disabled via opts.runHealthChecks=false", async () => {
+    const registry = new Registry();
+    const logCalls: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: unknown[]) => {
+      logCalls.push(args.map((a) => String(a)).join(" "));
+    };
+    try {
+      registerWisecronSubjects(registry, makeSettings(), { runHealthChecks: false });
+      await new Promise((r) => setTimeout(r, 100));
+    } finally {
+      console.log = origLog;
+    }
+    const healthLines = [...logCalls, ...warnSpy.calls].filter((c) =>
+      /\[tuner\] subject '\w+' health:/.test(c),
+    );
+    expect(healthLines.length).toBe(0);
+  });
+
   it("suppresses the warning when subject defines its own healthProbe", () => {
     const registry = new Registry();
     // Spy a subject in flight: monkey-patch CronSubject prototype to add a

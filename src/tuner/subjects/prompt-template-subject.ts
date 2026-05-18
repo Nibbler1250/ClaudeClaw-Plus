@@ -215,6 +215,43 @@ export class PromptTemplateSubject extends BaseSubject implements RevertibleSubj
     writeFileSync(inversePatch.target_path, inversePatch.applied_content, "utf8");
   }
 
+  async healthCheck(): Promise<{
+    producer_found: boolean;
+    sample_event_match_rate: number;
+    reason?: string;
+  }> {
+    if (!existsSync(this.feedbackLog)) {
+      return {
+        producer_found: false,
+        sample_event_match_rate: 0,
+        reason: `feedbackLog does not exist: ${this.feedbackLog}`,
+      };
+    }
+    const since = new Date(Date.now() - 7 * 86_400_000);
+    let entries: Array<Record<string, unknown>>;
+    try {
+      entries = this.feedbackReader(this.feedbackLog, since);
+    } catch (e) {
+      return {
+        producer_found: false,
+        sample_event_match_rate: 0,
+        reason: `feedbackReader failed: ${(e as Error).message.slice(0, 120)}`,
+      };
+    }
+    if (entries.length === 0) {
+      return {
+        producer_found: false,
+        sample_event_match_rate: 0,
+        reason: `no feedback entries in last 7d at ${this.feedbackLog}`,
+      };
+    }
+    const usable = entries.filter((e) => typeof e.template === "string").length;
+    return {
+      producer_found: true,
+      sample_event_match_rate: usable / entries.length,
+    };
+  }
+
   private assertInsideTemplatesDir(target: string): void {
     const resolved = resolve(target);
     const root = resolve(this.templatesDir);

@@ -361,3 +361,46 @@ describe("McpPluginSubject — Pass B: risk_tier guardrails", () => {
     expect(s.auto_merge_default).toBe(false);
   });
 });
+
+describe("McpPluginSubject — healthCheck", () => {
+  it("returns producer_found=false when auditLog does not exist", async () => {
+    const s = new McpPluginSubject({ auditLog: join(tmpRoot, "missing.jsonl") });
+    const h = await s.healthCheck!();
+    expect(h.producer_found).toBe(false);
+    expect(h.reason).toMatch(/auditLog does not exist/);
+  });
+
+  it("returns producer_found=false when no events in 7d window", async () => {
+    writeFileSync(auditPath, "", "utf8");
+    const s = new McpPluginSubject({
+      auditLog: auditPath,
+      auditReader: () => [],
+    });
+    const h = await s.healthCheck!();
+    expect(h.producer_found).toBe(false);
+    expect(h.reason).toMatch(/no audit events/);
+  });
+
+  it("returns match_rate=0 with reason when audit log has events but none are mcp_tool_call", async () => {
+    writeFileSync(auditPath, "{}\n", "utf8");
+    const s = new McpPluginSubject({
+      auditLog: auditPath,
+      auditReader: () => [{ type: "skill_run" }, { type: "session_start" }],
+    });
+    const h = await s.healthCheck!();
+    expect(h.producer_found).toBe(true);
+    expect(h.sample_event_match_rate).toBe(0);
+    expect(h.reason).toMatch(/instrumentation missing/);
+  });
+
+  it("returns match_rate>0 when mcp_tool_call entries are present", async () => {
+    writeFileSync(auditPath, "{}\n", "utf8");
+    const s = new McpPluginSubject({
+      auditLog: auditPath,
+      auditReader: () => [{ type: "mcp_tool_call", server: "s", tool: "t" }, { type: "skill_run" }],
+    });
+    const h = await s.healthCheck!();
+    expect(h.producer_found).toBe(true);
+    expect(h.sample_event_match_rate).toBe(0.5);
+  });
+});

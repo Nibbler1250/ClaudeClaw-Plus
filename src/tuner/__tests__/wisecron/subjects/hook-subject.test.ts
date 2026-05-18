@@ -459,3 +459,39 @@ describe("HookSubject — snapshotInverse", () => {
     await expect(s.snapshotInverse("/etc/passwd")).rejects.toThrow(/outside hooksDir/);
   });
 });
+
+describe("HookSubject — healthCheck", () => {
+  it("returns producer_found=false when hooksDir does not exist", async () => {
+    const s = new HookSubject({ hooksDir: join(tmpRoot, "missing") });
+    const h = await s.healthCheck!();
+    expect(h.producer_found).toBe(false);
+    expect(h.reason).toMatch(/does not exist/);
+  });
+
+  it("returns producer_found=false when hooksDir has zero scripts", async () => {
+    // hooksDir exists but empty
+    const s = new HookSubject({ hooksDir });
+    const h = await s.healthCheck!();
+    expect(h.producer_found).toBe(false);
+    expect(h.reason).toMatch(/no hook scripts/);
+  });
+
+  it("returns producer_found=true with match_rate=0 when scripts present but no .log files", async () => {
+    writeFileSync(join(hooksDir, "pre_commit.sh"), "#!/bin/sh\n");
+    writeFileSync(join(hooksDir, "post_run.js"), "// noop\n");
+    const s = new HookSubject({ hooksDir });
+    const h = await s.healthCheck!();
+    expect(h.producer_found).toBe(true);
+    expect(h.sample_event_match_rate).toBe(0);
+    expect(h.reason).toMatch(/exec wrapper not wired/);
+  });
+
+  it("returns producer_found=true with match_rate=1 when every script has a log", async () => {
+    writeFileSync(join(hooksDir, "a.sh"), "#!/bin/sh\n");
+    writeFileSync(join(hooksDir, "a.log"), "{}\n");
+    const s = new HookSubject({ hooksDir });
+    const h = await s.healthCheck!();
+    expect(h.producer_found).toBe(true);
+    expect(h.sample_event_match_rate).toBe(1);
+  });
+});

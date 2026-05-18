@@ -48,6 +48,7 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
   private readonly llm?: LLMClient;
   private readonly modesConfigPath: string;
   private readonly dispatchReader: (since: Date) => Array<Record<string, unknown>>;
+  private readonly dispatchReaderInjected: boolean;
 
   constructor(opts: ModelRoutingSubjectConfig = {}) {
     super();
@@ -55,6 +56,7 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
     this.modesConfigPath = expandHome(
       opts.modesConfigPath ?? join(homedir(), ".claude", "agentic.yaml"),
     );
+    this.dispatchReaderInjected = opts.dispatchReader !== undefined;
     this.dispatchReader = opts.dispatchReader ?? (() => []);
   }
 
@@ -280,6 +282,44 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
 
   async revert(inversePatch: Patch): Promise<void> {
     writeFileSync(inversePatch.target_path, inversePatch.applied_content, "utf8");
+  }
+
+  async healthCheck(): Promise<{
+    producer_found: boolean;
+    sample_event_match_rate: number;
+    reason?: string;
+  }> {
+    if (!this.dispatchReaderInjected) {
+      return {
+        producer_found: false,
+        sample_event_match_rate: 0,
+        reason:
+          "dispatchReader not configured — default returns []; no dispatch telemetry available",
+      };
+    }
+    const since = new Date(Date.now() - 7 * 86_400_000);
+    let events: Array<Record<string, unknown>>;
+    try {
+      events = this.dispatchReader(since);
+    } catch (e) {
+      return {
+        producer_found: false,
+        sample_event_match_rate: 0,
+        reason: `dispatchReader failed: ${(e as Error).message.slice(0, 120)}`,
+      };
+    }
+    if (events.length === 0) {
+      return {
+        producer_found: true,
+        sample_event_match_rate: 0,
+        reason: "dispatchReader returned 0 events in last 7d",
+      };
+    }
+    const dispatched = events.filter((e) => e.type === "dispatch" || e.mode !== undefined).length;
+    return {
+      producer_found: true,
+      sample_event_match_rate: dispatched / events.length,
+    };
   }
 }
 

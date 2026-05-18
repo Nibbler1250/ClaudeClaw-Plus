@@ -311,3 +311,39 @@ describe("PromptTemplateSubject — Pass B: risk_tier guardrails", () => {
     expect(s.risk_tier).toBe("low");
   });
 });
+
+describe("PromptTemplateSubject — healthCheck", () => {
+  it("returns producer_found=false when feedbackLog does not exist", async () => {
+    const s = new PromptTemplateSubject({
+      templatesDir,
+      feedbackLog: join(tmpRoot, "missing.jsonl"),
+    });
+    const h = await s.healthCheck!();
+    expect(h.producer_found).toBe(false);
+    expect(h.reason).toMatch(/feedbackLog does not exist/);
+  });
+
+  it("returns producer_found=false when feedback log has no entries", async () => {
+    writeFileSync(feedbackPath, "", "utf8");
+    const s = new PromptTemplateSubject({
+      templatesDir,
+      feedbackLog: feedbackPath,
+      feedbackReader: () => [],
+    });
+    const h = await s.healthCheck!();
+    expect(h.producer_found).toBe(false);
+    expect(h.reason).toMatch(/no feedback entries/);
+  });
+
+  it("returns match_rate>0 when entries include template field", async () => {
+    writeFileSync(feedbackPath, "{}\n", "utf8");
+    const s = new PromptTemplateSubject({
+      templatesDir,
+      feedbackLog: feedbackPath,
+      feedbackReader: () => [{ template: "foo", rating: 5 }, { rating: 3 }],
+    });
+    const h = await s.healthCheck!();
+    expect(h.producer_found).toBe(true);
+    expect(h.sample_event_match_rate).toBe(0.5);
+  });
+});

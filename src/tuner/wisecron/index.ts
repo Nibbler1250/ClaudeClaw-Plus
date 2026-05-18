@@ -43,7 +43,7 @@ export interface WisecronContext {
 export function registerWisecronSubjects(
   registry: Registry,
   settings: WisecronSettings,
-  opts: { llm?: LLMClient } = {},
+  opts: { llm?: LLMClient; runHealthChecks?: boolean } = {},
 ): WisecronContext {
   const db = new WisecronStateDB(settings.db_path);
   const scheduler = new AdaptiveScheduler(db, {
@@ -77,7 +77,56 @@ export function registerWisecronSubjects(
   if (enabled("agent"))
     registerWithProbeCheck(new AgentSubject({ llm: opts.llm, ...cfg("agent") }));
 
+  // Producer-presence reporting. Default ON; tests can opt-out to keep their
+  // console.warn assertions tight. Fire-and-forget — never blocks register.
+  if (opts.runHealthChecks !== false) {
+    void runHealthChecks(registry);
+  }
+
   return { db, scheduler, engine, pipeline };
+}
+
+/**
+ * Boot-time log of each subject's producer presence. Five subjects (cron,
+ * hook, mcp_plugin, model_routing, prompt_template) silently emit zero
+ * observations when their telemetry source is absent; this surfaces the
+ * gap so operators can spot a misconfigured ProDesk-style deployment
+ * (~/.claude/* vs ~/agent/*).
+ *
+ * High/medium-risk subjects with `producer_found=false` escalate to
+ * console.warn. Low-risk subjects are info-level only.
+ */
+async function runHealthChecks(registry: Registry): Promise<void> {
+  for (const subject of registry.allSubjects()) {
+    const fn = (
+      subject as TunableSubject & {
+        healthCheck?: () => Promise<{
+          producer_found: boolean;
+          sample_event_match_rate: number;
+          reason?: string;
+        }>;
+      }
+    ).healthCheck;
+    if (typeof fn !== "function") continue;
+    let result: { producer_found: boolean; sample_event_match_rate: number; reason?: string };
+    try {
+      result = await fn.call(subject);
+    } catch (e) {
+      console.warn(
+        `[tuner] subject '${subject.name}' healthCheck threw: ${(e as Error).message.slice(0, 120)}`,
+      );
+      continue;
+    }
+    const tail = result.reason ? `, reason="${result.reason}"` : "";
+    const line =
+      `[tuner] subject '${subject.name}' health: ` +
+      `producer_found=${result.producer_found}, ` +
+      `match_rate=${result.sample_event_match_rate.toFixed(2)}${tail}`;
+    const escalate =
+      !result.producer_found && (subject.risk_tier === "high" || subject.risk_tier === "medium");
+    if (escalate) console.warn(line);
+    else console.log(line);
+  }
 }
 
 /**
