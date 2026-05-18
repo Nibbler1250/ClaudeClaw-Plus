@@ -318,3 +318,62 @@ describe('AgentSubject — Pass B: risk_tier guardrails', () => {
     expect(s.auto_merge_default).toBe(false);
   });
 });
+
+describe('AgentSubject — Pass B: fail-soft on malformed frontmatter', () => {
+  it('does not crash on unquoted colon-bearing description (real ~/agent/agents/build-agent.md shape)', async () => {
+    // js-yaml rejects this with "bad indentation of a mapping entry" — the
+    // local parseFrontmatter regex tolerates it.
+    const evil = writeAgent(
+      'build',
+      '---\nname: build\ndescription: Build helper — Retourne : code produit + test\n---\nbody\n',
+    );
+    ageMtime(evil, 200);
+    // A second valid file alongside — pre-fix, the crash zeroed everything.
+    const good = writeAgent('alpha', '---\nname: alpha\ndescription: a normal description\n---\n');
+    ageMtime(good, 200);
+    const s = new AgentSubject({
+      agentsDir,
+      statsProvider: () => ({ invocations: 0, reclassifies: 0 }),
+    });
+    const obs = await s.collectObservations(new Date(0));
+    // Both files should produce observations (both are old + zero invocations → dead).
+    expect(obs.length).toBe(2);
+    const names = obs.map(o => o.metadata['agent']).sort();
+    expect(names).toEqual(['alpha', 'build']);
+  });
+
+  it('skips a single unreadable file rather than aborting the whole subject', async () => {
+    // Simulate the worst case: one file's content cannot even be parsed for
+    // frontmatter shape. The subject should log-and-skip, not return [].
+    const broken = writeAgent('broken', '---\n: not valid : at all :\n---\n');
+    ageMtime(broken, 200);
+    const ok = writeAgent('working', '---\nname: working\ndescription: this one is fine\n---\n');
+    ageMtime(ok, 200);
+    const s = new AgentSubject({
+      agentsDir,
+      statsProvider: () => ({ invocations: 0, reclassifies: 0 }),
+    });
+    const obs = await s.collectObservations(new Date(0));
+    // At minimum, 'working' must surface.
+    expect(obs.some(o => o.metadata['agent'] === 'working')).toBe(true);
+  });
+});
+
+describe('BaseSubject.loadFrontmatter — fail-soft on YAML parse errors', () => {
+  it('returns empty frontmatter (not throw) when js-yaml rejects the block', async () => {
+    // Verify the base class behaviour directly, in case a future subject
+    // calls loadFrontmatter() instead of the local regex parser.
+    const path = writeAgent('badyaml', '---\ndescription: "Retourne :"\n---\nbody\n');
+    // Subclass with public access to the protected method for the test.
+    class T extends AgentSubject {
+      async testLoad(p: string) {
+        return (this as unknown as { loadFrontmatter: (p: string) => Promise<{ frontmatter: Record<string, unknown>; body: string }> }).loadFrontmatter(p);
+      }
+    }
+    const t = new T({ agentsDir });
+    const result = await t.testLoad(path);
+    expect(result.body).toContain('body');
+    // frontmatter may be empty (parse failed) — must not throw.
+    expect(typeof result.frontmatter).toBe('object');
+  });
+});

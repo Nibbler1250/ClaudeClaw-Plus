@@ -59,7 +59,16 @@ export class AgentSubject extends BaseSubject implements RevertibleSubject {
     const observations: Observation[] = [];
 
     for (const file of files) {
-      const { frontmatter } = await this.loadFrontmatter(file);
+      let frontmatter: Record<string, unknown> = {};
+      try {
+        // Use the local regex parser (line 257) — it tolerates unquoted
+        // colon-bearing values that crash js-yaml in BaseSubject.loadFrontmatter.
+        const content = readFileSync(file, 'utf8');
+        frontmatter = parseFrontmatter(content) ?? {};
+      } catch {
+        // One unreadable file does not zero the whole subject.
+        continue;
+      }
       const name = (frontmatter['name'] as string) ?? basename(file, '.md');
       const description = (frontmatter['description'] as string) ?? '';
       const stats = this.statsProvider(name, since);
