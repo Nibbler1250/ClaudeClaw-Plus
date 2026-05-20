@@ -177,6 +177,10 @@ async function fetchDiscordWithSizeLimit(url: string): Promise<Uint8Array> {
 // Track known thread channel IDs and their parent channel IDs for multi-session support
 const knownThreads = new Map<string, { parentId: string; agentName?: string }>();
 
+function isDiscordThreadType(type: number | undefined): boolean {
+  return type === 10 || type === 11 || type === 12;
+}
+
 // Upsert knownThreads, preserving any existing agentName when a new one is not supplied.
 // The agentName key is "<slug>-<threadId>" to guarantee uniqueness across threads whose
 // display names would otherwise map to the same slug.
@@ -420,31 +424,69 @@ async function uploadImageMessage(
 }
 
 // --- Thread rejoin helper ---
-async function rejoinThreads(token: string): Promise<void> {
+// trigger='RESUMED': skip all REST calls — session is intact, delivery should be live.
+// trigger='GUILD_CREATE': PUT-only for threads listed as member=yes; DELETE+PUT for others.
+async function rejoinThreads(
+  token: string,
+  trigger: "GUILD_CREATE" | "RESUMED",
+  memberThreadIds?: Set<string>,
+): Promise<void> {
   const threadSessions = await listThreadSessions();
+  const sessionShort = gatewaySessionId?.slice(0, 8) ?? "?";
+  const infra = threadSessions.filter((ts) => /^\d{17,19}$/.test(ts.threadId));
+
+  if (trigger === "RESUMED") {
+    console.log(`[Discord][REJOIN] trigger=RESUMED threads=${infra.length} session=${sessionShort}`);
+    for (const ts of infra) {
+      console.log(`[Discord][REJOIN] thread=${ts.threadId} RESUMED=skip (session intact)`);
+    }
+    return;
+  }
+
+  // GUILD_CREATE path
+  console.log(
+    `[Discord][REJOIN] trigger=GUILD_CREATE sessions=${infra.length} session=${sessionShort}`,
+  );
   let rejoinedCount = 0;
-  for (const ts of threadSessions) {
-    // Skip non-snowflake keys (e.g. job names); they are not Discord channel IDs.
-    if (!/^\d{17,19}$/.test(ts.threadId)) continue;
+  let skippedNonThreads = 0;
+
+  for (const ts of infra) {
+    const isMember = memberThreadIds?.has(ts.threadId) ?? false;
     try {
-      const ch = await discordApi<{ parent_id?: string; name?: string; type?: number }>(token, "GET", `/channels/${ts.threadId}`);
-      const isThread = ch.type === 10 || ch.type === 11 || ch.type === 12;
-      if (!isThread) continue;
-
-      if (ch.parent_id && !knownThreads.has(ts.threadId)) {
+      let threadInfo = knownThreads.get(ts.threadId);
+      if (!threadInfo) {
+        const ch = await discordApi<{ parent_id?: string; name?: string; type?: number }>(token, "GET", `/channels/${ts.threadId}`);
+        if (!isDiscordThreadType(ch.type)) {
+          skippedNonThreads += 1;
+          debugLog(`[Discord][REJOIN] skip non-thread session ${ts.threadId} type=${ch.type ?? "unknown"}`);
+          continue;
+        }
+        if (!ch.parent_id) {
+          skippedNonThreads += 1;
+          debugLog(`[Discord][REJOIN] skip thread session ${ts.threadId} without parent_id`);
+          continue;
+        }
         upsertThread(ts.threadId, ch.parent_id, ch.name);
+        threadInfo = knownThreads.get(ts.threadId);
       }
+      if (!threadInfo) continue;
 
-      await discordApi(token, "DELETE", `/channels/${ts.threadId}/thread-members/@me`).catch(() => {});
+      if (!isMember) {
+        // Not in GUILD_CREATE member list — force full rejoin to reset gateway subscription
+        await discordApi(token, "DELETE", `/channels/${ts.threadId}/thread-members/@me`).catch(() => {});
+      }
       await discordApi(token, "PUT", `/channels/${ts.threadId}/thread-members/@me`);
       rejoinedCount += 1;
-      console.log(`[Discord] Rejoined thread: ${ts.threadId}`);
+      console.log(
+        `[Discord][REJOIN] thread=${ts.threadId} GUILD_CREATE=${isMember ? "member" : "non-member"} rejoined`,
+      );
     } catch (err) {
       console.error(`[Discord] Failed to rejoin thread ${ts.threadId}: ${err}`);
     }
   }
-  if (rejoinedCount > 0) {
-    console.log(`[Discord] Rejoined ${rejoinedCount} thread(s) from sessions.json`);
+
+  if (infra.length > 0) {
+    console.log(`[Discord][REJOIN] done. rejoined=${rejoinedCount} skippedNonThreads=${skippedNonThreads} knownThreads size=${knownThreads.size}`);
   }
 }
 
@@ -618,6 +660,124 @@ async function respondToInteraction(
   );
 }
 
+// --- Discord streaming callback ---
+
+const STREAM_EDIT_INTERVAL_MS = 1500;
+const STREAM_CONTENT_MAX = DISCORD_MAX_MESSAGE_LEN - 10; // room for italic markers
+
+function escapeItalic(text: string): string {
+  return text.replace(/_/g, "\\_");
+}
+
+interface DiscordStreamCallbacks {
+  onChunk: (text: string) => void;
+  onToolEvent: (line: string) => void;
+  finalize: () => Promise<void>;
+  waitForStreamMsg: () => Promise<{ msgId: string } | null>;
+}
+
+function makeDiscordStreamCallback(token: string, channelId: string): DiscordStreamCallbacks {
+  let accumulated = "";
+  let streamMsgId: string | null = null;
+  let editTimer: ReturnType<typeof setTimeout> | null = null;
+  let placeholderPosted = false;
+
+  // Resolvers for waitForStreamMsg
+  let streamMsgResolvers: Array<(v: { msgId: string } | null) => void> = [];
+  let streamMsgSettled = false;
+  let streamMsgResult: { msgId: string } | null = null;
+
+  function notifyStreamMsgWaiters(result: { msgId: string } | null): void {
+    streamMsgSettled = true;
+    streamMsgResult = result;
+    for (const resolve of streamMsgResolvers) resolve(result);
+    streamMsgResolvers = [];
+  }
+
+  async function postPlaceholder(): Promise<void> {
+    if (placeholderPosted) return;
+    placeholderPosted = true;
+    try {
+      const msg = await discordApi<{ id: string }>(
+        token,
+        "POST",
+        `/channels/${channelId}/messages`,
+        { content: "⏳" },
+      );
+      streamMsgId = msg.id;
+      notifyStreamMsgWaiters({ msgId: msg.id });
+    } catch (err) {
+      console.error(`[Discord][stream] Failed to post placeholder: ${err instanceof Error ? err.message : err}`);
+      notifyStreamMsgWaiters(null);
+    }
+  }
+
+  function scheduleEdit(): void {
+    if (editTimer) return;
+    editTimer = setTimeout(async () => {
+      editTimer = null;
+      if (!streamMsgId) return;
+      const snippet = accumulated.slice(-STREAM_CONTENT_MAX);
+      const escaped = escapeItalic(snippet);
+      const content = `_${escaped}_`;
+      try {
+        await discordApi(
+          token,
+          "PATCH",
+          `/channels/${channelId}/messages/${streamMsgId}`,
+          { content },
+        );
+      } catch (err) {
+        debugLog(`Stream edit failed: ${err instanceof Error ? err.message : err}`);
+      }
+    }, STREAM_EDIT_INTERVAL_MS);
+  }
+
+  const onChunk = (text: string): void => {
+    accumulated += text;
+    if (!placeholderPosted) {
+      postPlaceholder().catch((err) =>
+        console.error(`[Discord][stream] postPlaceholder error: ${err instanceof Error ? err.message : err}`),
+      );
+    }
+    if (streamMsgId) scheduleEdit();
+  };
+
+  const onToolEvent = (line: string): void => {
+    // Post the placeholder on the first tool event
+    if (!placeholderPosted) {
+      postPlaceholder().catch((err) =>
+        console.error(`[Discord][stream] postPlaceholder error: ${err instanceof Error ? err.message : err}`),
+      );
+    }
+    accumulated += (accumulated ? "\n" : "") + line;
+    if (streamMsgId) scheduleEdit();
+  };
+
+  const waitForStreamMsg = (): Promise<{ msgId: string } | null> => {
+    if (streamMsgSettled) return Promise.resolve(streamMsgResult);
+    return new Promise<{ msgId: string } | null>((resolve) => {
+      streamMsgResolvers.push(resolve);
+    });
+  };
+
+  const finalize = async (): Promise<void> => {
+    if (editTimer) { clearTimeout(editTimer); editTimer = null; }
+    // If no placeholder was ever triggered, nothing to clean up
+    if (!placeholderPosted) return;
+    // Wait for the in-flight POST to resolve (already done if streamMsgId is set)
+    const result = await waitForStreamMsg();
+    if (!result?.msgId) return;
+    try {
+      await discordApi(token, "DELETE", `/channels/${channelId}/messages/${result.msgId}`);
+    } catch (err) {
+      debugLog(`Stream finalize delete failed: ${err instanceof Error ? err.message : err}`);
+    }
+  };
+
+  return { onChunk, onToolEvent, finalize, waitForStreamMsg };
+}
+
 // --- Message handler ---
 
 // Pending forwards: when Discord delivers a forward with empty content, hold it briefly
@@ -641,8 +801,8 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
     const persisted = await peekThreadSession(channelId);
     if (persisted) {
       try {
-        const ch = await discordApi<{ parent_id?: string; name?: string }>(config.token, "GET", `/channels/${channelId}`);
-        if (ch.parent_id) {
+        const ch = await discordApi<{ parent_id?: string; name?: string; type?: number }>(config.token, "GET", `/channels/${channelId}`);
+        if (isDiscordThreadType(ch.type) && ch.parent_id) {
           upsertThread(channelId, ch.parent_id, ch.name);
           debugLog(`Thread recovered from sessions.json: ${channelId} (parent: ${ch.parent_id} name: ${ch.name ?? "unknown"})`);
         }
@@ -743,6 +903,7 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
 
   // Typing indicator loop (Discord typing lasts 10s, fire every 8s)
   const typingInterval = setInterval(() => sendTyping(config.token, channelId), 8000);
+  let streamCb: DiscordStreamCallbacks | undefined;
 
   try {
     await sendTyping(config.token, channelId);
@@ -1009,7 +1170,27 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
         );
       }
     }
-    const result = await runUserMessage("discord", prefixedPrompt, sessionKey, threadInfo?.agentName);
+    if (config.streaming) {
+      streamCb = makeDiscordStreamCallback(config.token, channelId);
+    }
+
+    const result = await (async () => {
+      try {
+        return await runUserMessage(
+          "discord",
+          prefixedPrompt,
+          sessionKey,
+          threadInfo?.agentName,
+          streamCb?.onChunk,
+          streamCb?.onToolEvent,
+        );
+      } finally {
+        if (streamCb) {
+          await streamCb.finalize();
+          streamCb = undefined;
+        }
+      }
+    })();
 
     if (result.exitCode !== 0) {
       await sendMessage(config.token, channelId, `Error (exit ${result.exitCode}): ${extractErrorDetail(result) || "Unknown error"}`);
@@ -1032,6 +1213,9 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
     console.error(`[Discord] Error for ${label}: ${errMsg}`);
     await sendMessage(config.token, channelId, `Error: ${errMsg}`);
   } finally {
+    if (streamCb) {
+      await streamCb.finalize();
+    }
     clearInterval(typingInterval);
   }
 }
@@ -1379,8 +1563,8 @@ function handleDispatch(token: string, eventName: string, data: any): void {
       break;
 
     case "RESUMED":
-      console.log("[Discord] Session resumed — rejoining threads");
-      rejoinThreads(token).catch((err) =>
+      console.log("[Discord] Session resumed — skipping REST rejoin (session intact)");
+      rejoinThreads(token, "RESUMED").catch((err) =>
         console.error(`[Discord] Failed to rejoin threads on RESUMED: ${err}`),
       );
       break;
@@ -1398,25 +1582,31 @@ function handleDispatch(token: string, eventName: string, data: any): void {
       );
       break;
 
-    case "GUILD_CREATE":
-      // Cache active threads for multi-session support
+    case "GUILD_CREATE": {
+      // Cache active threads and collect member status for targeted rejoin
+      const memberThreadIds = new Set<string>();
       if (data.threads) {
         console.log(`[Discord] GUILD_CREATE: ${data.threads.length} active threads in guild ${data.id}`);
         for (const thread of data.threads) {
           upsertThread(thread.id, thread.parent_id, thread.name);
-          console.log(`[Discord]   thread: ${thread.id} name="${thread.name}" parent=${thread.parent_id}`);
+          const memberStatus = thread.member ? "yes" : "no";
+          console.log(
+            `[Discord]   thread: ${thread.id} name="${thread.name}" parent=${thread.parent_id} member=${memberStatus}`,
+          );
+          if (thread.member) memberThreadIds.add(thread.id);
         }
       } else {
         console.log(`[Discord] GUILD_CREATE: no active threads in guild ${data.id}`);
       }
-      // Rejoin all known threads from sessions.json so gateway sends MESSAGE_CREATE
-      rejoinThreads(token).catch((err) =>
+      // Rejoin threads: PUT-only for member=yes, DELETE+PUT for others
+      rejoinThreads(token, "GUILD_CREATE", memberThreadIds).catch((err) =>
         console.error(`[Discord] Failed to rejoin threads: ${err}`),
       );
       handleGuildCreate(token, data).catch((err) =>
         console.error(`[Discord] GUILD_CREATE unhandled: ${err}`),
       );
       break;
+    }
 
     case "THREAD_CREATE":
       if (data.id && data.parent_id) {
@@ -1488,24 +1678,23 @@ function handleGatewayPayload(token: string, payload: GatewayPayload): void {
       break;
 
     case GatewayOp.RECONNECT:
-      debugLog("Gateway requested reconnect");
+      console.log("[Discord][GW] op=RECONNECT — gateway requested reconnect");
       ws?.close(4000, "Reconnect requested");
       break;
 
     case GatewayOp.INVALID_SESSION: {
       const resumable = payload.d;
-      debugLog(`Invalid session, resumable=${resumable}`);
-      if (!resumable) {
+      console.log(`[Discord][GW] op=INVALID_SESSION resumable=${resumable}`);
+      if (resumable && gatewaySessionId) {
+        setTimeout(() => sendResume(token), 1000 + Math.random() * 4000);
+      } else {
+        // Close the ws so onclose opens a fresh connection and sends IDENTIFY from scratch.
+        // Sending IDENTIFY on the same ws that just failed RESUME causes Discord to not
+        // restore thread message delivery for the new session.
         gatewaySessionId = null;
         lastSequence = null;
+        ws?.close(4000, "Non-resumable INVALID_SESSION — reconnecting fresh");
       }
-      setTimeout(() => {
-        if (resumable && gatewaySessionId) {
-          sendResume(token);
-        } else {
-          sendIdentify(token);
-        }
-      }, 1000 + Math.random() * 4000);
       break;
     }
 
