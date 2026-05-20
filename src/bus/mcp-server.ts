@@ -550,7 +550,7 @@ export function buildMcpServer(): Server {
       },
       instructions:
         "ClaudeClaw+ Bus channel. Messages from a surface (Telegram/Discord/Slack/Web) " +
-        "arrive as <channel source=\"...\" chat_id=\"...\" user_id=\"...\" ts=\"...\">text</channel> " +
+        'arrive as <channel source="..." chat_id="..." user_id="..." ts="...">text</channel> ' +
         "blocks typed into your REPL. Your transcript output is NOT visible to the user — " +
         "only the `reply` and `edit_message` tools reach them. You MUST answer with `reply`.\n\n" +
         "Pick ONE pattern per turn:\n" +

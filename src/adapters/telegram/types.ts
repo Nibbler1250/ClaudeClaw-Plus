@@ -139,10 +139,7 @@ export interface TelegramApi {
     text: string;
   }): Promise<{ ok: boolean; result?: { message_id: number } | true }>;
   /** Show a chat action (e.g. typing) — expires after ~5s. */
-  sendChatAction(params: {
-    chat_id: number;
-    action: "typing";
-  }): Promise<{ ok: boolean }>;
+  sendChatAction(params: { chat_id: number; action: "typing" }): Promise<{ ok: boolean }>;
   /** Sets a single emoji reaction on a message (mirrors §5.5.2 reaction model). */
   setMessageReaction(params: {
     chat_id: number;

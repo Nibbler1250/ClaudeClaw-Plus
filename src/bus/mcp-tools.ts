@@ -34,7 +34,7 @@ export const BUS_MCP_TOOLS = [
     name: "edit_message",
     description:
       "Edit the bot's most recent outbound message on this surface — for interim " +
-      "progress updates (\"reading files...\", \"found 3 results...\"). Edits do NOT " +
+      'progress updates ("reading files...", "found 3 results..."). Edits do NOT ' +
       "push-notify the user, so finish a long task with `reply` intent:'final' to " +
       "ping their device. Falls back to a new message if nothing was sent yet.",
     inputSchema: {
