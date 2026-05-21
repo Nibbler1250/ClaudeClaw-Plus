@@ -17,6 +17,11 @@
  */
 
 import type { ChildProcess } from "node:child_process";
+// Import from the standalone sanitiser module to avoid pulling bun-pty into
+// `session-agent-process` at startup. Non-PTY supervision modes (process,
+// process-stream-json, tmux) must not require the native PTY dep just to
+// construct an AgentProcess (Codex P1 on PR #149).
+import { sanitizePtyPromptText } from "../runner/pty-prompt-sanitizer";
 import type { SupervisionMode } from "./types";
 
 export type ExitHandler = (code: number) => void;
@@ -134,12 +139,16 @@ export class PtyAgentProcess implements AgentProcess {
     // text lands in the input box but is not submitted. So we write the text,
     // let the paste settle, then send the CR as a separate keystroke.
     //
+    // Sanitize CR/LF in the prompt: an embedded `\r` would submit the prompt
+    // mid-line and corrupt the turn (Codex review P2 on PR #140).
+    //
     // The write/settle/CR sequence is chained per process so two prompts
     // dispatched within the 200ms settle window serialise instead of
-    // interleaving their bytes in the PTY input buffer.
+    // interleaving their bytes in the PTY input buffer (#141 review P1).
+    const text = sanitizePtyPromptText(line);
     const run = this.writeChain.then(async () => {
       if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
-      this.pty.write(line);
+      this.pty.write(text);
       await new Promise((r) => setTimeout(r, 200));
       this.pty.write("\r");
     });
