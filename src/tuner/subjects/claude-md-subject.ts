@@ -19,6 +19,8 @@ import type {
   UnsignedProposal,
   ValidationResult,
 } from "../../skills-tuner/core/types.js";
+import type { DateRange, Metric, TelemetryProvider } from "../../skills-tuner/core/telemetry.js";
+import { ARTIFACT_SOURCE } from "../../skills-tuner/core/telemetry.js";
 import type { RevertibleSubject } from "../wisecron/types.js";
 
 const STALE_DAYS = 180;
@@ -215,6 +217,41 @@ export class ClaudeMdSubject extends BaseSubject implements RevertibleSubject {
       return { valid: false, reason: `unresolvable @-imports: ${unresolved.join(", ")}` };
     }
     return { valid: true };
+  }
+
+  /**
+   * OutcomeLoop Tier 1b (artifact): count of unresolvable @-imports across all
+   * managed CLAUDE.md files. Always activatable — scans current file state, no
+   * telemetry stream. A fix proposal that lowers this measurably improved.
+   */
+  fitnessSignals(): Metric[] {
+    return [
+      {
+        name: "broken_import_count",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "lower_is_better",
+        windowDays: 1,
+      },
+    ];
+  }
+
+  async measureFitness(
+    _range: DateRange,
+    _provider: TelemetryProvider,
+  ): Promise<Record<string, number>> {
+    let total = 0;
+    for (const root of this.projectRoots) {
+      if (!existsSync(root)) continue;
+      for (const file of findClaudeMdFiles(root)) {
+        try {
+          total += brokenImports(readFileSync(file, "utf8"), dirname(file)).length;
+        } catch {
+          /* unreadable file contributes nothing */
+        }
+      }
+    }
+    return { broken_import_count: total };
   }
 
   async revert(inversePatch: Patch): Promise<void> {

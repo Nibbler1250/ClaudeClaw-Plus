@@ -24,6 +24,14 @@ type HealthProbeFn = (
 ) => Promise<{ failed: boolean; errors: string[] }>;
 type ReadTargetFn = (path: string) => string | null;
 type WriteTargetFn = (path: string, content: string) => void;
+/**
+ * OutcomeLoop hook (structural, to avoid coupling). When injected, the
+ * baseline fitness snapshot is taken right after a successful apply. Optional
+ * and default-off — absent it, the pipeline behaves exactly as before.
+ */
+type OutcomeRecorderHook = {
+  snapshotBaseline(proposal: Proposal, commitSha?: string): Promise<void>;
+};
 
 /**
  * ApplyPipeline — single-action approval → apply with rollback history.
@@ -50,6 +58,7 @@ export class ApplyPipeline {
   private readonly readTarget: ReadTargetFn;
   private readonly writeTarget: WriteTargetFn;
   private readonly waitForWindow: boolean;
+  private readonly outcomeRecorder?: OutcomeRecorderHook;
   // Per-target serialization queue. Each entry holds the current tail of
   // the lock chain plus the count of in-flight + queued waiters; the entry
   // is removed once the last waiter drains so the map cannot grow unbounded
@@ -71,6 +80,8 @@ export class ApplyPipeline {
        *  via setTimeout and returns immediately. When true, await the
        *  observation-window result before returning ApplyOutcome. */
       waitForObservationWindow?: boolean;
+      /** OutcomeLoop: when supplied, snapshot baseline fitness after apply. */
+      outcomeRecorder?: OutcomeRecorderHook;
     } = {},
   ) {
     this.registry = registry;
@@ -91,6 +102,7 @@ export class ApplyPipeline {
     this.readTarget = opts.readTarget ?? defaultReadTarget;
     this.writeTarget = opts.writeTarget ?? defaultWriteTarget;
     this.waitForWindow = opts.waitForObservationWindow ?? false;
+    this.outcomeRecorder = opts.outcomeRecorder;
   }
 
   /**
@@ -170,6 +182,18 @@ export class ApplyPipeline {
       } else {
         void this.armObservationWindow(revision_id, subjectName, targetPath);
       }
+    }
+
+    // OutcomeLoop step 5: snapshot baseline fitness. Fire-and-forget — never
+    // blocks or fails the apply (observation-only). No-op when unconfigured.
+    if (this.outcomeRecorder) {
+      void this.outcomeRecorder.snapshotBaseline(proposal).catch((e) => {
+        this.audit("wisecron_outcome_snapshot_failed", {
+          proposal_id: proposal.id,
+          subject: proposal.subject,
+          error: (e as Error).message.slice(0, 160),
+        });
+      });
     }
 
     return {

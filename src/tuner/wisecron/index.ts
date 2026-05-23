@@ -12,6 +12,9 @@
 import type { Registry } from "../../skills-tuner/core/registry.js";
 import type { LLMClient } from "../../skills-tuner/core/llm.js";
 import type { TunableSubject } from "../../skills-tuner/core/interfaces.js";
+import type { TelemetryProvider, TelemetryStream } from "../../skills-tuner/core/telemetry.js";
+import { AuditLog } from "../../skills-tuner/core/audit-log.js";
+import { activateFitness } from "../../skills-tuner/core/fitness.js";
 import { WisecronStateDB } from "./state-db.js";
 import { AdaptiveScheduler } from "./adaptive-scheduler.js";
 import { ProposalEngine } from "./proposal-engine.js";
@@ -40,10 +43,29 @@ export interface WisecronContext {
  *
  * Honours per-subject `enabled` flags in settings.subjects.
  */
+/** Maps each producer-dependent subject to the telemetry stream it consumes. */
+const SUBJECT_STREAM: Partial<Record<string, TelemetryStream>> = {
+  cron: "cron_run",
+  hook: "hook_exec",
+  mcp_plugin: "tool_call",
+  model_routing: "mode_dispatch",
+  prompt_template: "template_feedback",
+  memory: "memory_access",
+  skills: "skill_access",
+  agent: "agent_dispatch",
+};
+
 export function registerWisecronSubjects(
   registry: Registry,
   settings: WisecronSettings,
-  opts: { llm?: LLMClient; runHealthChecks?: boolean } = {},
+  opts: {
+    llm?: LLMClient;
+    runHealthChecks?: boolean;
+    /** Host telemetry surface. When supplied, the fitness activation gate runs. */
+    telemetry?: TelemetryProvider;
+    /** Audit sink for the gate's fitness_active/inactive records. */
+    audit?: AuditLog;
+  } = {},
 ): WisecronContext {
   const db = new WisecronStateDB(settings.db_path);
   const scheduler = new AdaptiveScheduler(db, {
@@ -81,6 +103,25 @@ export function registerWisecronSubjects(
   // console.warn assertions tight. Fire-and-forget — never blocks register.
   if (opts.runHealthChecks !== false) {
     void runHealthChecks(registry);
+  }
+
+  // OutcomeLoop fitness activation gate. Runs ONLY when the host wires a
+  // TelemetryProvider — absent one, every subject runs proposal-only exactly
+  // as before (degrade-gracefully). Emits a distinct `fitness:` boot line so
+  // it never collides with the `health:` producer log above.
+  if (opts.telemetry) {
+    const audit = opts.audit ?? new AuditLog();
+    const activation = activateFitness(registry.allSubjects(), opts.telemetry, audit);
+    for (const a of activation.active) {
+      console.log(
+        `[tuner] subject '${a.subject}' fitness: active metric='${a.metric.name}' source=${a.metric.source}`,
+      );
+    }
+    for (const i of activation.inactive) {
+      console.log(
+        `[tuner] subject '${i.subject}' fitness: inactive metric='${i.metric.name}' reason="${i.reason}"`,
+      );
+    }
   }
 
   return { db, scheduler, engine, pipeline };
@@ -150,6 +191,7 @@ function warnIfMissingHealthProbe(subject: TunableSubject): void {
   );
 }
 
+export { SUBJECT_STREAM };
 export { WisecronStateDB } from "./state-db.js";
 export { AdaptiveScheduler } from "./adaptive-scheduler.js";
 export { ProposalEngine } from "./proposal-engine.js";

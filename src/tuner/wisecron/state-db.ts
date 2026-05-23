@@ -26,6 +26,19 @@ interface RollbackRow {
   rolled_back_at: string | null;
 }
 
+export interface OutcomeRow {
+  proposal_id: string;
+  metric: string;
+  commit_sha: string | null;
+  subject: string;
+  baseline: number | null;
+  post: number | null;
+  delta: number | null;
+  window_start: string;
+  window_end: string;
+  verdict: string | null;
+}
+
 function rowToScheduleState(row: SubjectStateRow): ScheduleState {
   return {
     subject: row.subject,
@@ -81,8 +94,38 @@ CREATE TABLE IF NOT EXISTS telemetry_cache (
   PRIMARY KEY (subject, observation_id)
 );
 
+-- OutcomeLoop ledger. One row per (proposal, metric): baseline snapshotted at
+-- apply, post/delta/verdict filled by the maturation pass once windowDays
+-- elapse. Reality correction vs spec: PK is (proposal_id, metric) — a single
+-- proposal scores several metrics — keyed on the EXISTING proposal id + its
+-- commit_sha (no separate revision_id). proposal_id is TEXT to match
+-- rollback_history. post/delta/verdict are NULL until maturation.
+CREATE TABLE IF NOT EXISTS outcomes (
+  proposal_id  TEXT NOT NULL,
+  metric       TEXT NOT NULL,
+  commit_sha   TEXT,
+  subject      TEXT NOT NULL,
+  baseline     REAL,
+  post         REAL,
+  delta        REAL,
+  window_start TEXT NOT NULL,
+  window_end   TEXT NOT NULL,
+  verdict      TEXT,
+  PRIMARY KEY (proposal_id, metric)
+);
+
+-- Phase 2 substrate (generative ranking). Empty + unused in Phase 1.
+CREATE TABLE IF NOT EXISTS priors (
+  subject    TEXT NOT NULL,
+  kind       TEXT NOT NULL,
+  ewma_delta REAL NOT NULL DEFAULT 0,
+  n          INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (subject, kind)
+);
+
 CREATE INDEX IF NOT EXISTS idx_rollback_subject ON rollback_history(subject, applied_at DESC);
 CREATE INDEX IF NOT EXISTS idx_telemetry_collected ON telemetry_cache(subject, collected_at DESC);
+CREATE INDEX IF NOT EXISTS idx_outcomes_pending ON outcomes(verdict, window_end);
 `;
 
 export class WisecronStateDB {
@@ -228,6 +271,103 @@ export class WisecronStateDB {
     `)
       .all(subject, sinceIso) as Array<{ observation_id: string; data_json: string }>;
     return rows.map((r) => ({ observation_id: r.observation_id, data: JSON.parse(r.data_json) }));
+  }
+
+  // ── outcomes ledger (OutcomeLoop) ─────────────────────────────────────────
+
+  /**
+   * Snapshot the baseline fitness for one (proposal, metric) at apply time.
+   * Idempotent: re-snapshotting the same key refreshes baseline + window,
+   * leaving post/delta/verdict untouched.
+   */
+  snapshotBaseline(row: {
+    proposal_id: string;
+    metric: string;
+    commit_sha?: string;
+    subject: string;
+    baseline: number;
+    window_start: Date;
+    window_end: Date;
+  }): void {
+    this.db
+      .prepare(`
+      INSERT INTO outcomes(
+        proposal_id, metric, commit_sha, subject, baseline, window_start, window_end
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(proposal_id, metric) DO UPDATE SET
+        commit_sha = excluded.commit_sha,
+        subject = excluded.subject,
+        baseline = excluded.baseline,
+        window_start = excluded.window_start,
+        window_end = excluded.window_end
+    `)
+      .run(
+        row.proposal_id,
+        row.metric,
+        row.commit_sha ?? null,
+        row.subject,
+        row.baseline,
+        row.window_start.toISOString(),
+        row.window_end.toISOString(),
+      );
+  }
+
+  /** Fill post / delta / verdict once a window matures. */
+  finalizeOutcome(row: {
+    proposal_id: string;
+    metric: string;
+    post: number;
+    delta: number;
+    verdict: string;
+  }): void {
+    this.db
+      .prepare(`
+      UPDATE outcomes SET post = ?, delta = ?, verdict = ?
+      WHERE proposal_id = ? AND metric = ?
+    `)
+      .run(row.post, row.delta, row.verdict, row.proposal_id, row.metric);
+  }
+
+  getOutcomes(proposalId: string): OutcomeRow[] {
+    return this.db
+      .prepare("SELECT * FROM outcomes WHERE proposal_id = ? ORDER BY metric ASC")
+      .all(proposalId) as OutcomeRow[];
+  }
+
+  /**
+   * Outcomes whose verdict is still NULL and whose window_end is at or before
+   * `asOf` — i.e. ready for the maturation pass to compute post/delta/verdict.
+   */
+  listMaturableOutcomes(asOf: Date): OutcomeRow[] {
+    return this.db
+      .prepare(
+        "SELECT * FROM outcomes WHERE verdict IS NULL AND window_end <= ? ORDER BY window_end ASC",
+      )
+      .all(asOf.toISOString()) as OutcomeRow[];
+  }
+
+  // ── priors (Phase 2 substrate; unused in Phase 1) ─────────────────────────
+
+  /** EWMA-update the prior for (subject, kind) with a new observed delta. */
+  upsertPrior(subject: string, kind: string, delta: number, alpha = 0.3): void {
+    const existing = this.db
+      .prepare("SELECT ewma_delta, n FROM priors WHERE subject = ? AND kind = ?")
+      .get(subject, kind) as { ewma_delta: number; n: number } | undefined;
+    const ewma = existing ? alpha * delta + (1 - alpha) * existing.ewma_delta : delta;
+    const n = (existing?.n ?? 0) + 1;
+    this.db
+      .prepare(`
+      INSERT INTO priors(subject, kind, ewma_delta, n) VALUES (?, ?, ?, ?)
+      ON CONFLICT(subject, kind) DO UPDATE SET ewma_delta = excluded.ewma_delta, n = excluded.n
+    `)
+      .run(subject, kind, ewma, n);
+  }
+
+  getPrior(subject: string, kind: string): { ewma_delta: number; n: number } | null {
+    const row = this.db
+      .prepare("SELECT ewma_delta, n FROM priors WHERE subject = ? AND kind = ?")
+      .get(subject, kind) as { ewma_delta: number; n: number } | undefined;
+    return row ?? null;
   }
 
   // ── lifecycle / migration ────────────────────────────────────────────────
