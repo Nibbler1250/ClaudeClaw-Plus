@@ -10,6 +10,8 @@
  *
  * Phase 1 emits: fitness_active / fitness_inactive (activation gate),
  * baseline_snapshot (at apply), verdict (maturation), revert (defensive close).
+ * telemetry_query records each fitness measurement served over the MCP bridge,
+ * so the provenance of every number that fed a verdict is itself in the chain.
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -23,7 +25,8 @@ export type AuditEvent =
   | "baseline_snapshot"
   | "verdict"
   | "revert"
-  | "proposal";
+  | "proposal"
+  | "telemetry_query";
 
 /** The author-supplied content of an audit record (everything but the chain fields). */
 export interface AuditEntry {
