@@ -14,6 +14,9 @@ import type {
 } from "../../skills-tuner/core/types.js";
 import type { JobSpec, SchedulerBackend } from "../../skills-tuner/schedulers/base.js";
 import type { RevertibleSubject } from "../wisecron/types.js";
+import type { DateRange, Metric, TelemetryProvider } from "../../skills-tuner/core/telemetry.js";
+import { ARTIFACT_SOURCE } from "../../skills-tuner/core/telemetry.js";
+import { median, nonzeroRate } from "../../skills-tuner/core/aggregate.js";
 
 /**
  * CronSubject — wisecron-managed `cron` subject (HIGH RISK).
@@ -50,6 +53,14 @@ export interface CronSubjectConfig {
    * as stale. Default 168h (7d) per SPEC.
    */
   staleThresholdHours?: number;
+  /**
+   * Cost attribution (OutcomeLoop `cron_cost`): substrings that, when present
+   * in a `session_cost` sample's `job` label, mark that session as
+   * cron-originated. The cost store's `job` is free-text (often a raw prompt
+   * prefix), so attribution is substring-based, not exact. Default matches
+   * scheduler-dispatched sessions (`source="cron"`) and wisecron unit names.
+   */
+  costJobMatch?: string[];
 }
 
 /** One parsed journalctl entry (JSON line). */
@@ -87,6 +98,7 @@ export class CronSubject extends BaseSubject implements RevertibleSubject {
   private readonly allowedCommandRoots: string[];
   private readonly journalRunner: (args: string[]) => Promise<string>;
   private readonly staleThresholdHours: number;
+  private readonly costJobMatch: string[];
 
   constructor(opts: CronSubjectConfig = {}) {
     super();
@@ -105,6 +117,7 @@ export class CronSubject extends BaseSubject implements RevertibleSubject {
     ).map((p) => resolve(p));
     this.journalRunner = opts.journalRunner ?? defaultJournalRunner;
     this.staleThresholdHours = opts.staleThresholdHours ?? DEFAULT_STALE_HOURS;
+    this.costJobMatch = opts.costJobMatch ?? ['source="cron"', this.unitPrefix];
   }
 
   async collectObservations(since: Date): Promise<Observation[]> {
@@ -443,6 +456,115 @@ export class CronSubject extends BaseSubject implements RevertibleSubject {
       producer_found: true,
       sample_event_match_rate: matching / entries.length,
     };
+  }
+
+  /**
+   * OutcomeLoop fitness metrics for the cron subject.
+   *
+   * Target — `cron_cost` (Tier 1, `session_cost`): median USD of cron-originated
+   * Claude sessions over the window. Lower is better. Guarded against Goodhart
+   * by TWO companions, because the cheapest way to "reduce cron cost" is to
+   * neuter or delete crons:
+   *  - `active_cron_count` (Tier 1b, artifact): count of still-active managed
+   *    units. Always activatable (scans scheduler state, no host stream), so the
+   *    no-regression rule has teeth even where no runtime stream exists. A cost
+   *    drop that comes from killing units shows up here as a regression.
+   *  - `critical_fire_success` (Tier 1, `cron_run`): success rate of critical
+   *    fires. The catalogue's intended guardrail, but `cron_run` has no producer
+   *    in the reference host, so it degrades to inactive (logged) — kept so it
+   *    activates automatically the day a host emits the stream.
+   *
+   * NO single-number maximisation: `cron_cost` is never scored alone.
+   */
+  fitnessSignals(): Metric[] {
+    return [
+      {
+        name: "cron_cost",
+        source: "session_cost",
+        kind: "verifiable",
+        direction: "lower_is_better",
+        windowDays: 7,
+        guardrails: ["active_cron_count", "critical_fire_success"],
+      },
+      {
+        name: "active_cron_count",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "higher_is_better",
+        windowDays: 7,
+      },
+      {
+        name: "critical_fire_success",
+        source: "cron_run",
+        kind: "verifiable",
+        direction: "higher_is_better",
+        windowDays: 7,
+      },
+    ];
+  }
+
+  /**
+   * Measure the declared fitness metrics over `range`. Telemetry is read ONLY
+   * through `provider.query(...)` — never the cost store directly. Aggregation
+   * is outlier-robust (median), never a raw sum: cost is spiky (one debug
+   * session dwarfs a week of crons).
+   *
+   * A metric is OMITTED from the result when it has no data (no cron-attributed
+   * sessions, no scheduler, no `cron_run` producer) rather than reported as 0 —
+   * the loop then simply doesn't snapshot/score it, which is the correct
+   * degrade-gracefully behaviour.
+   */
+  async measureFitness(
+    range: DateRange,
+    provider: TelemetryProvider,
+  ): Promise<Record<string, number>> {
+    const out: Record<string, number> = {};
+
+    // ── Tier 1: cron_cost (session_cost) ────────────────────────────────────
+    // Query broadly (job is free-text → exact label filter is brittle) then
+    // post-filter to cron-originated sessions on the job label.
+    const costSamples = await provider.query("session_cost", range);
+    const cronCosts = costSamples
+      .filter((s) => this.isCronAttributed(s.labels))
+      .map((s) => s.value);
+    if (cronCosts.length > 0) out.cron_cost = median(cronCosts);
+
+    // ── Tier 1b: active_cron_count (artifact — scheduler state) ─────────────
+    const activeCount = await this.countActiveUnits();
+    if (activeCount !== null) out.active_cron_count = activeCount;
+
+    // ── Tier 1: critical_fire_success (cron_run) ────────────────────────────
+    // No producer in the reference host → query returns []; metric omitted.
+    // Host contract for cron_run: value 0 = clean exit, nonzero = failure.
+    const fireSamples = await provider.query("cron_run", range);
+    if (fireSamples.length > 0) {
+      out.critical_fire_success = 1 - nonzeroRate(fireSamples.map((s) => s.value));
+    }
+
+    return out;
+  }
+
+  /** True if a cost sample's `job` label marks it cron-originated. */
+  private isCronAttributed(labels?: Record<string, string>): boolean {
+    const job = labels?.job;
+    if (!job) return false;
+    return this.costJobMatch.some((needle) => job.includes(needle));
+  }
+
+  /**
+   * Count managed units the scheduler reports as active. Returns null when no
+   * scheduler is wired (metric simply doesn't activate). Artifact-tier: reads
+   * managed state, no telemetry stream.
+   */
+  private async countActiveUnits(): Promise<number | null> {
+    if (!this.scheduler) return null;
+    let jobs: Awaited<ReturnType<NonNullable<typeof this.scheduler>["list"]>>;
+    try {
+      jobs = await this.scheduler.list();
+    } catch {
+      return null;
+    }
+    return jobs.filter((j) => j.status === "active").length;
   }
 
   private assertUnitNameAllowed(name: string): void {
