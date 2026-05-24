@@ -3,7 +3,7 @@ import { dirname } from "node:path";
 import { homedir } from "node:os";
 import type { Registry } from "../../skills-tuner/core/registry.js";
 import type { Patch, Proposal } from "../../skills-tuner/core/types.js";
-import type { RiskTier } from "../../skills-tuner/core/interfaces.js";
+import type { RiskTier, TunableSubject } from "../../skills-tuner/core/interfaces.js";
 import { auditLog, loadSecret, verifyProposalSignature } from "../../skills-tuner/core/security.js";
 import type { WisecronStateDB } from "./state-db.js";
 import type {
@@ -98,7 +98,11 @@ export class ApplyPipeline {
         return verifyProposalSignature(proposal, cachedSecret);
       };
     }
-    this.healthProbe = opts.healthProbe ?? defaultHealthProbe;
+    // An injected probe (operator override) wins. Absent one, dispatch to the
+    // subject's own `healthProbe(target)` so the observation-window auto-revert
+    // is actually ACTIVE for any subject that implements it — falling back to
+    // the fail-open default only for subjects with no probe.
+    this.healthProbe = opts.healthProbe ?? this.subjectHealthProbe.bind(this);
     this.readTarget = opts.readTarget ?? defaultReadTarget;
     this.writeTarget = opts.writeTarget ?? defaultWriteTarget;
     this.waitForWindow = opts.waitForObservationWindow ?? false;
@@ -295,6 +299,30 @@ export class ApplyPipeline {
     return this.db.purgeExpiredRevisions(retentionDays);
   }
 
+  /**
+   * Default health probe: route to the registered subject's own
+   * `healthProbe(target)`. This is what makes the observation-window
+   * auto-revert real — the subject knows how to tell if its just-applied
+   * artifact is broken (a JobSpec that no longer parses, a hook that lost its
+   * shebang, a CLAUDE.md with fresh broken imports). Subjects without a probe
+   * fall back to the fail-open default so the pipeline behaves exactly as
+   * before for them.
+   */
+  private async subjectHealthProbe(
+    subjectName: string,
+    target: string,
+  ): Promise<{ failed: boolean; errors: string[] }> {
+    const subject = this.registry.getSubject(subjectName) as
+      | (TunableSubject & {
+          healthProbe?: (t: string) => Promise<{ failed: boolean; errors: string[] }>;
+        })
+      | undefined;
+    if (subject && typeof subject.healthProbe === "function") {
+      return subject.healthProbe(target);
+    }
+    return defaultHealthProbe(subjectName, target);
+  }
+
   // ── Pure helpers (testable) ───────────────────────────────────────────────
 
   isHighRisk(riskTier: RiskTier): boolean {
@@ -371,8 +399,8 @@ async function defaultHealthProbe(
   _subject: string,
   _target: string,
 ): Promise<{ failed: boolean; errors: string[] }> {
-  // Production: shell out per-subject (systemctl is-failed, hook log scan, ...).
-  // Default returns OK — concrete probes are wired by subject implementations.
+  // Fail-open fallback used only when the subject implements no healthProbe.
+  // Concrete probes live on the subjects and are reached via subjectHealthProbe.
   return { failed: false, errors: [] };
 }
 

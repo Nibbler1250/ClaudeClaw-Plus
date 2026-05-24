@@ -702,3 +702,65 @@ describe("ApplyPipeline — snapshotInverse routing", () => {
     expect(outcome.revision.inverse_patch.applied_content).toBe("disk-content");
   });
 });
+
+// ── auto-revert via subject.healthProbe (default dispatch, no injected probe) ─
+
+class ProbeSubject extends FakeSubject {
+  probeResult: { failed: boolean; errors: string[] } = { failed: false, errors: [] };
+  async healthProbe(_target: string): Promise<{ failed: boolean; errors: string[] }> {
+    return this.probeResult;
+  }
+}
+
+describe("ApplyPipeline — auto-revert via subject healthProbe (default dispatch)", () => {
+  it("high-risk broken apply auto-reverts using the subject's OWN healthProbe (no injected probe)", async () => {
+    writeFileSync(join(tmpDir, "target.txt"), "before");
+    const sub = new ProbeSubject("cron", "high");
+    sub.probeResult = { failed: true, errors: ["registered JobSpec failed validation"] };
+    registry.registerSubject(sub);
+    // NOTE: no `healthProbe` option — this exercises the registry-dispatch
+    // default that makes the observation-window auto-revert actually ACTIVE.
+    const pipeline = new ApplyPipeline(registry, db, {
+      audit: captureAudit(auditEvents),
+      verify: () => true,
+      observationWindowMs: 10,
+      waitForObservationWindow: true,
+    });
+    const r = await pipeline.apply(makeProposal({ subject: "cron" }), "a1", "cli");
+    expect(r.auto_reverted).toBe(true);
+    const ev = auditEvents.find((e) => e.event === "wisecron_auto_revert");
+    expect(ev).toBeDefined();
+    expect(ev?.payload.errors).toContain("registered JobSpec failed validation");
+    expect(sub.revertCalls).toHaveLength(1);
+  });
+
+  it("high-risk healthy apply does NOT revert (subject healthProbe reports OK)", async () => {
+    writeFileSync(join(tmpDir, "target.txt"), "before");
+    const sub = new ProbeSubject("cron", "high");
+    sub.probeResult = { failed: false, errors: [] };
+    registry.registerSubject(sub);
+    const pipeline = new ApplyPipeline(registry, db, {
+      audit: captureAudit(auditEvents),
+      verify: () => true,
+      observationWindowMs: 10,
+      waitForObservationWindow: true,
+    });
+    const r = await pipeline.apply(makeProposal({ subject: "cron" }), "a1", "cli");
+    expect(r.auto_reverted).toBe(false);
+    expect(auditEvents.find((e) => e.event === "wisecron_auto_revert")).toBeUndefined();
+  });
+
+  it("high-risk subject WITHOUT a healthProbe falls back to fail-open (no revert)", async () => {
+    writeFileSync(join(tmpDir, "target.txt"), "before");
+    const sub = new FakeSubject("cron", "high"); // no healthProbe on prototype
+    registry.registerSubject(sub);
+    const pipeline = new ApplyPipeline(registry, db, {
+      audit: captureAudit(auditEvents),
+      verify: () => true,
+      observationWindowMs: 10,
+      waitForObservationWindow: true,
+    });
+    const r = await pipeline.apply(makeProposal({ subject: "cron" }), "a1", "cli");
+    expect(r.auto_reverted).toBe(false);
+  });
+});
