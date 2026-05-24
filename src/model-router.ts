@@ -97,7 +97,13 @@ export function classifyTask(
   // Fallback to default mode
   const fallback = modes.find((m) => m.name === defaultMode) ?? modes[0];
   if (!fallback) {
-    return { mode: "unknown", model: "", confidence: 0, reasoning: "No modes configured", matchedKeyword: "" };
+    return {
+      mode: "unknown",
+      model: "",
+      confidence: 0,
+      reasoning: "No modes configured",
+      matchedKeyword: "",
+    };
   }
 
   return {

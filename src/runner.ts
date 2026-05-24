@@ -36,10 +36,7 @@ import {
   selectModel as governanceSelectModel,
   configureRouter as configureGovernanceRouter,
 } from "./governance/model-router";
-import {
-  setModeDispatchSink,
-  fileModeDispatchSink,
-} from "./governance/mode-dispatch-journal";
+import { setModeDispatchSink, fileModeDispatchSink } from "./governance/mode-dispatch-journal";
 import {
   recordInvocationStart,
   recordInvocationCompletion,

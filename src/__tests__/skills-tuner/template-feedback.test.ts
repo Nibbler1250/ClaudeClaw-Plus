@@ -33,7 +33,12 @@ describe("template-feedback", () => {
 
   it("appends a well-formed line (creating the parent dir) matching the subject reader shape", () => {
     const entry = appendTemplateFeedback(
-      { templateId: "daily-brief", verdict: "yes", comment: "nailed it", ts: "2026-05-20T00:00:00.000Z" },
+      {
+        templateId: "daily-brief",
+        verdict: "yes",
+        comment: "nailed it",
+        ts: "2026-05-20T00:00:00.000Z",
+      },
       path,
     );
     expect(existsSync(path)).toBe(true);
@@ -51,7 +56,10 @@ describe("template-feedback", () => {
   });
 
   it("omits comment when not provided", () => {
-    appendTemplateFeedback({ templateId: "t1", verdict: "no", ts: "2026-05-20T00:00:00.000Z" }, path);
+    appendTemplateFeedback(
+      { templateId: "t1", verdict: "no", ts: "2026-05-20T00:00:00.000Z" },
+      path,
+    );
     const parsed = JSON.parse(readFileSync(path, "utf8").trim());
     expect(parsed.comment).toBeUndefined();
     expect(parsed.rating).toBe(1);

@@ -72,7 +72,11 @@ describe("mode-dispatch-journal", () => {
 
     it("appends one JSON line per event, creating the parent dir", () => {
       setModeDispatchSink(fileModeDispatchSink(path));
-      recordModeDispatch({ mode: "coding", matched_keyword: "bug", ts: "2026-05-20T01:00:00.000Z" });
+      recordModeDispatch({
+        mode: "coding",
+        matched_keyword: "bug",
+        ts: "2026-05-20T01:00:00.000Z",
+      });
       recordModeDispatch({
         mode: "planning",
         matched_keyword: "design",
