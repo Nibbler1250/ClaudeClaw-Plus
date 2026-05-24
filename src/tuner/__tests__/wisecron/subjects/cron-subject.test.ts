@@ -695,3 +695,71 @@ describe("CronSubject — healthCheck", () => {
     expect(h.sample_event_match_rate).toBe(1);
   });
 });
+
+describe("CronSubject — healthProbe (observation window auto-revert)", () => {
+  class ListScheduler extends MockSchedulerBackend {
+    jobs: ScheduledJob[] = [];
+    async list(): Promise<ScheduledJob[]> {
+      return this.jobs;
+    }
+  }
+
+  function job(overrides: Partial<ScheduledJob> = {}): ScheduledJob {
+    return {
+      name: "wisecron-foo",
+      schedule: "*-*-* *:00:00",
+      command: "/usr/bin/foo.sh",
+      status: "active",
+      artifactPath: null,
+      ...overrides,
+    };
+  }
+
+  it("healthy registered JobSpec → failed:false", async () => {
+    const sched = new ListScheduler();
+    sched.jobs = [job()];
+    const s = new CronSubject({ scheduler: sched });
+    const probe = await s.healthProbe!("wisecron-foo.service");
+    expect(probe.failed).toBe(false);
+    expect(probe.errors).toEqual([]);
+  });
+
+  it("malformed schedule (invalid OnCalendar) → failed:true + errors", async () => {
+    const sched = new ListScheduler();
+    sched.jobs = [job({ schedule: "!!not-a-calendar!!" })];
+    const s = new CronSubject({ scheduler: sched });
+    const probe = await s.healthProbe!("wisecron-foo.service");
+    expect(probe.failed).toBe(true);
+    expect(probe.errors.length).toBeGreaterThan(0);
+  });
+
+  it("command escaping allowed roots → failed:true", async () => {
+    const sched = new ListScheduler();
+    sched.jobs = [job({ command: "/etc/evil.sh" })];
+    const s = new CronSubject({ scheduler: sched, allowedCommandRoots: ["/usr/bin"] });
+    const probe = await s.healthProbe!("wisecron-foo.service");
+    expect(probe.failed).toBe(true);
+  });
+
+  it("unit reported failed by the backend → failed:true", async () => {
+    const sched = new ListScheduler();
+    sched.jobs = [job({ status: "failed" })];
+    const s = new CronSubject({ scheduler: sched });
+    const probe = await s.healthProbe!("wisecron-foo.service");
+    expect(probe.failed).toBe(true);
+    expect(probe.errors.join(" ")).toMatch(/status=failed/);
+  });
+
+  it("unit absent after apply (e.g. disable-unit removed it) → not a break", async () => {
+    const sched = new ListScheduler();
+    const s = new CronSubject({ scheduler: sched });
+    const probe = await s.healthProbe!("wisecron-gone.service");
+    expect(probe.failed).toBe(false);
+  });
+
+  it("no scheduler wired → fail-open (failed:false)", async () => {
+    const s = new CronSubject();
+    const probe = await s.healthProbe!("wisecron-foo.service");
+    expect(probe.failed).toBe(false);
+  });
+});

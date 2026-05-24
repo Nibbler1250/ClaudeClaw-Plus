@@ -459,6 +459,61 @@ export class CronSubject extends BaseSubject implements RevertibleSubject {
   }
 
   /**
+   * Observation-window health probe (HIGH risk). Runs AFTER apply, inside the
+   * ApplyPipeline's observe window, to decide whether the just-applied change
+   * left the managed unit BROKEN — in which case the pipeline auto-reverts.
+   *
+   * Artifact-based + deterministic: re-reads the registered JobSpec from the
+   * scheduler (the unit name is the target) and re-runs validate() on it —
+   * the schedule must still parse as a valid OnCalendar/cron expression and the
+   * command/name must still be inside the allowed roots. A unit the backend
+   * reports as `failed` (didn't load) is also broken. No journal/stream
+   * dependency, so the probe is always available.
+   *
+   * Not-broken (failed:false) cases: no scheduler wired (can't introspect →
+   * fail-open), or the unit is legitimately absent (e.g. the `disable-unit`
+   * alternative removed it).
+   */
+  async healthProbe(target: string): Promise<{ failed: boolean; errors: string[] }> {
+    if (!this.scheduler) {
+      return { failed: false, errors: ["no scheduler configured — probe skipped (fail-open)"] };
+    }
+    const name = target.replace(/\.service$/, "");
+    let jobs: Awaited<ReturnType<NonNullable<typeof this.scheduler>["list"]>>;
+    try {
+      jobs = await this.scheduler.list();
+    } catch (e) {
+      return {
+        failed: false,
+        errors: [`scheduler list failed: ${(e as Error).message.slice(0, 120)}`],
+      };
+    }
+    const found = jobs.find((j) => j.name === name);
+    if (!found) {
+      // Unit gone after apply is an expected outcome (disable/remove), not a break.
+      return { failed: false, errors: [] };
+    }
+    const errors: string[] = [];
+    if (found.status === "failed") {
+      errors.push(`unit '${found.name}' reports status=failed`);
+    }
+    const validation = await this.validate({
+      target_path: target,
+      kind: "cron_change",
+      applied_content: JSON.stringify({
+        name: found.name,
+        description: "",
+        schedule: found.schedule,
+        command: found.command,
+      }),
+    });
+    if (!validation.valid) {
+      errors.push(validation.reason ?? "registered JobSpec failed validation");
+    }
+    return { failed: errors.length > 0, errors };
+  }
+
+  /**
    * OutcomeLoop fitness metrics for the cron subject.
    *
    * Target — `cron_cost` (Tier 1, `session_cost`): median USD of cron-originated

@@ -354,6 +354,50 @@ export class HookSubject extends BaseSubject implements RevertibleSubject {
   }
 
   /**
+   * Observation-window health probe (HIGH risk). Runs AFTER apply, inside the
+   * ApplyPipeline's observe window — a broken hook can block every Claude Code
+   * interaction, so on failure the pipeline auto-reverts.
+   *
+   * Artifact-based + deterministic: re-reads the just-applied hook from disk and
+   * checks it is still a runnable script — non-empty + valid shellcheck (via
+   * validate(), which skips cleanly when shellcheck isn't installed), present
+   * `#!` shebang, and the executable bit set. The shebang + mode checks are
+   * deterministic regardless of whether shellcheck is available, so the probe
+   * never silently degrades to fail-open. A hook gone from disk is treated as a
+   * non-break (a disable/remove outcome).
+   */
+  async healthProbe(target: string): Promise<{ failed: boolean; errors: string[] }> {
+    try {
+      this.assertInsideHooksDir(target);
+    } catch (e) {
+      return { failed: true, errors: [(e as Error).message] };
+    }
+    if (!existsSync(target)) {
+      return { failed: false, errors: [] };
+    }
+    let content: string;
+    try {
+      content = readFileSync(target, "utf8");
+    } catch (e) {
+      return { failed: true, errors: [`unreadable hook: ${(e as Error).message.slice(0, 120)}`] };
+    }
+    const errors: string[] = [];
+    const validation = await this.validate({
+      target_path: target,
+      kind: "patch",
+      applied_content: content,
+    });
+    if (!validation.valid) errors.push(validation.reason ?? "hook failed validation");
+    if (!content.startsWith("#!")) errors.push("hook missing '#!' shebang");
+    try {
+      if ((statSync(target).mode & 0o111) === 0) errors.push("hook is not executable");
+    } catch {
+      /* readability already covered above; ignore stat failure here */
+    }
+    return { failed: errors.length > 0, errors };
+  }
+
+  /**
    * OutcomeLoop fitness for the hook subject (HIGH risk).
    *
    * Target — `hook_crash_rate` (Tier 1, `hook_exec`): fraction of hook fires

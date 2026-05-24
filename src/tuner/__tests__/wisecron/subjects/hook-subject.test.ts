@@ -495,3 +495,67 @@ describe("HookSubject — healthCheck", () => {
     expect(h.sample_event_match_rate).toBe(1);
   });
 });
+
+describe("HookSubject — healthProbe (observation window auto-revert)", () => {
+  function writeHook(name: string, content: string, mode = 0o755): string {
+    const p = join(hooksDir, name);
+    writeFileSync(p, content, "utf8");
+    chmodSync(p, mode);
+    return p;
+  }
+
+  it("healthy applied hook (shebang + executable + clean shellcheck) → failed:false", async () => {
+    const s = new HookSubject({ hooksDir, shellcheckRunner: () => ({ ok: true, message: "" }) });
+    const p = writeHook("good.sh", "#!/bin/sh\necho ok\n");
+    const probe = await s.healthProbe!(p);
+    expect(probe.failed).toBe(false);
+    expect(probe.errors).toEqual([]);
+  });
+
+  it("empty applied hook → failed:true (validation)", async () => {
+    const s = new HookSubject({ hooksDir });
+    const p = writeHook("empty.sh", "");
+    const probe = await s.healthProbe!(p);
+    expect(probe.failed).toBe(true);
+    expect(probe.errors.length).toBeGreaterThan(0);
+  });
+
+  it("hook missing shebang → failed:true", async () => {
+    const s = new HookSubject({ hooksDir, shellcheckRunner: () => ({ ok: true, message: "" }) });
+    const p = writeHook("noshebang.sh", "echo hello\n");
+    const probe = await s.healthProbe!(p);
+    expect(probe.failed).toBe(true);
+    expect(probe.errors.join(" ")).toMatch(/shebang/);
+  });
+
+  it("non-executable hook → failed:true", async () => {
+    const s = new HookSubject({ hooksDir, shellcheckRunner: () => ({ ok: true, message: "" }) });
+    const p = writeHook("noexec.sh", "#!/bin/sh\necho hi\n", 0o644);
+    const probe = await s.healthProbe!(p);
+    expect(probe.failed).toBe(true);
+    expect(probe.errors.join(" ")).toMatch(/not executable/);
+  });
+
+  it("shellcheck failure on applied hook → failed:true", async () => {
+    const s = new HookSubject({
+      hooksDir,
+      shellcheckRunner: () => ({ ok: false, message: "SC1009 syntax error" }),
+    });
+    const p = writeHook("bad.sh", "#!/bin/sh\nif then fi\n");
+    const probe = await s.healthProbe!(p);
+    expect(probe.failed).toBe(true);
+    expect(probe.errors.join(" ")).toMatch(/shellcheck/);
+  });
+
+  it("target outside hooksDir → failed:true", async () => {
+    const s = new HookSubject({ hooksDir });
+    const probe = await s.healthProbe!(join(tmpRoot, "outside.sh"));
+    expect(probe.failed).toBe(true);
+  });
+
+  it("hook gone from disk after apply → not a break", async () => {
+    const s = new HookSubject({ hooksDir });
+    const probe = await s.healthProbe!(join(hooksDir, "ghost.sh"));
+    expect(probe.failed).toBe(false);
+  });
+});
