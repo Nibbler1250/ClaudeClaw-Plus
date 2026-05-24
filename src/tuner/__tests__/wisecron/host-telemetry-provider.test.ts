@@ -8,6 +8,7 @@ import {
   HookExecTelemetryProducer,
   SkillAccessTelemetryProducer,
   JournalTelemetryProducer,
+  ModeDispatchTelemetryProducer,
   CompositeTelemetryProvider,
   buildHostTelemetryProvider,
 } from "../../wisecron/host-telemetry-provider.js";
@@ -317,6 +318,74 @@ describe("JournalTelemetryProducer", () => {
   it("reports journal-not-found reason when the file is absent", () => {
     const p = new JournalTelemetryProducer({ journalPath: join(dir, "nope.jsonl") });
     expect(p.capabilities().every((c) => /journal not found/.test(c.reason ?? ""))).toBe(true);
+  });
+});
+
+describe("ModeDispatchTelemetryProducer", () => {
+  let dir: string;
+  let journal: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "mode-dispatch-"));
+    journal = join(dir, "mode_dispatch.jsonl");
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("emits mode_dispatch with value=reclassified and mode/matched_keyword labels", async () => {
+    writeFileSync(
+      journal,
+      [
+        JSON.stringify({
+          ts: IN.toISOString(),
+          mode: "coding",
+          matched_keyword: "fix",
+          reclassified: false,
+        }),
+        JSON.stringify({
+          ts: IN.toISOString(),
+          mode: "planning",
+          matched_keyword: "design",
+          reclassified: true,
+        }),
+        JSON.stringify({
+          ts: OUT.toISOString(),
+          mode: "coding",
+          matched_keyword: "x",
+          reclassified: false,
+        }), // out of window
+        "not json",
+      ].join("\n"),
+    );
+    const p = new ModeDispatchTelemetryProducer({ journalPath: journal });
+    const samples = await p.query("mode_dispatch", RANGE);
+    expect(samples).toHaveLength(2);
+    const reclassified = samples.find((s) => s.value === 1)!;
+    expect(reclassified.labels).toEqual({ mode: "planning", matched_keyword: "design" });
+    expect(samples.find((s) => s.value === 0)!.labels!.mode).toBe("coding");
+    expect(p.capabilities()[0]!.available).toBe(true);
+  });
+
+  it("advertises unavailable+reason when the dispatch journal is absent", () => {
+    const p = new ModeDispatchTelemetryProducer({ journalPath: journal });
+    const cap = p.capabilities()[0]!;
+    expect(cap.available).toBe(false);
+    expect(cap.reason).toMatch(/dispatch journal not found/);
+    expect(cap.reason).toMatch(/no agentic-mode route emitted yet/);
+  });
+
+  it("advertises unavailable+reason when the journal exists but is empty", () => {
+    writeFileSync(journal, "");
+    const p = new ModeDispatchTelemetryProducer({ journalPath: journal });
+    expect(p.capabilities()[0]!.available).toBe(false);
+    expect(p.capabilities()[0]!.reason).toMatch(/no dispatch records/);
+  });
+
+  it("returns [] for streams it does not own", async () => {
+    writeFileSync(
+      journal,
+      `${JSON.stringify({ ts: IN.toISOString(), mode: "coding", matched_keyword: "fix", reclassified: false })}\n`,
+    );
+    const p = new ModeDispatchTelemetryProducer({ journalPath: journal });
+    expect(await p.query("hook_exec", RANGE)).toEqual([]);
   });
 });
 

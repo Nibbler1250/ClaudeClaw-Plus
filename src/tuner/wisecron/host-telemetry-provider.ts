@@ -43,6 +43,7 @@ import {
   TELEMETRY_CONTRACT_VERSION,
   TELEMETRY_STREAMS,
 } from "../../skills-tuner/core/telemetry.js";
+import { DEFAULT_MODE_DISPATCH_LOG } from "../../governance/mode-dispatch-journal.js";
 import { SessionCostTelemetryProvider } from "./session-cost-provider.js";
 import { SessionJsonlTelemetryProducer } from "./session-jsonl-provider.js";
 
@@ -694,6 +695,105 @@ export class JournalTelemetryProducer implements TelemetryProvider {
   }
 }
 
+// ── mode_dispatch ────────────────────────────────────────────────────────────
+
+export interface ModeDispatchProducerConfig {
+  /** Dispatch journal. Default ~/.claudeclaw/journal/mode_dispatch.jsonl. */
+  journalPath?: string;
+  schemaVersion?: string;
+}
+
+interface ModeDispatchEntry {
+  ts: Date;
+  mode: string;
+  matchedKeyword: string;
+  reclassified: boolean;
+}
+
+/**
+ * Emits `mode_dispatch` from the dedicated dispatch journal written by the
+ * daemon's `recordModeDispatch` (`src/governance/mode-dispatch-journal.ts`) —
+ * one `{ ts, mode, matched_keyword, reclassified }` line per agentic-mode route.
+ * value = `reclassified ? 1 : 0`, matching ModelRoutingSubject's
+ * `routing_reclassify_rate = nonzeroRate`; mode + matched_keyword ride in labels.
+ *
+ * Inactive-with-reason until the daemon writes its first dispatch (no faked
+ * data). `JournalTelemetryProducer` still advertises mode_dispatch off the
+ * coarse operations journal as a forward-compat fallback, but the live source is
+ * disjoint (this dedicated file), so the composite never double-counts.
+ */
+export class ModeDispatchTelemetryProducer implements TelemetryProvider {
+  private readonly journalPath: string;
+  private readonly schemaVersion: string;
+
+  constructor(cfg: ModeDispatchProducerConfig = {}) {
+    this.journalPath = expandHome(cfg.journalPath ?? DEFAULT_MODE_DISPATCH_LOG);
+    this.schemaVersion = cfg.schemaVersion ?? TELEMETRY_CONTRACT_VERSION;
+  }
+
+  contractVersion(): string {
+    return TELEMETRY_CONTRACT_VERSION;
+  }
+
+  private read(): ModeDispatchEntry[] {
+    if (!existsSync(this.journalPath)) return [];
+    let content: string;
+    try {
+      content = readFileSync(this.journalPath, "utf8");
+    } catch {
+      return [];
+    }
+    const out: ModeDispatchEntry[] = [];
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const obj = JSON.parse(trimmed) as Record<string, unknown>;
+        if (typeof obj !== "object" || obj === null) continue;
+        const tsRaw = obj.ts as string | number | undefined;
+        const ts = tsRaw ? new Date(tsRaw) : new Date();
+        if (Number.isNaN(ts.getTime())) continue;
+        out.push({
+          ts,
+          mode: String(obj.mode ?? ""),
+          matchedKeyword: String(obj.matched_keyword ?? ""),
+          reclassified: obj.reclassified === true,
+        });
+      } catch {
+        /* skip malformed line */
+      }
+    }
+    return out;
+  }
+
+  capabilities(): TelemetryCapability[] {
+    if (this.read().length === 0) {
+      return [
+        {
+          stream: "mode_dispatch",
+          schemaVersion: this.schemaVersion,
+          available: false,
+          reason: existsSync(this.journalPath)
+            ? `no dispatch records in ${this.journalPath}`
+            : `dispatch journal not found at ${this.journalPath} (no agentic-mode route emitted yet)`,
+        },
+      ];
+    }
+    return [{ stream: "mode_dispatch", schemaVersion: this.schemaVersion, available: true }];
+  }
+
+  async query(stream: TelemetryStream, range: DateRange): Promise<MetricSample[]> {
+    if (stream !== "mode_dispatch") return [];
+    return this.read()
+      .filter((e) => inRange(e.ts, range))
+      .map((e) => ({
+        ts: e.ts,
+        value: e.reclassified ? 1 : 0,
+        labels: { mode: e.mode, matched_keyword: e.matchedKeyword },
+      }));
+  }
+}
+
 // ── composite ────────────────────────────────────────────────────────────────
 
 /**
@@ -754,6 +854,8 @@ export interface HostTelemetryConfig {
   hooksDir?: string;
   skillAccessLog?: string;
   journalPath?: string;
+  /** Dedicated mode_dispatch journal. Default ~/.claudeclaw/journal/mode_dispatch.jsonl. */
+  modeDispatchLog?: string;
   cronJournalRunner?: (args: string[]) => string;
   /** Session-transcript root for the universal producer. Default `~/.claude/projects`. */
   sessionProjectsDir?: string;
@@ -774,6 +876,12 @@ export interface HostTelemetryConfig {
  * `[]` for these streams on the reference host, so no double-counting).
  * `CronRunTelemetryProducer` auto-detects its source (systemd → bus-scheduler →
  * none) from `costDbPath`, so a host with no wisecron units still lights up.
+ *
+ * `ModeDispatchTelemetryProducer` owns `mode_dispatch` off the dedicated dispatch
+ * journal the daemon writes (`recordModeDispatch`); it is listed before the
+ * journal producer so its capability wins the merge. The two sources are
+ * disjoint (dedicated file vs operations-journal event type), so the composite
+ * never double-counts that stream either.
  */
 export function buildHostTelemetryProvider(
   cfg: HostTelemetryConfig = {},
@@ -786,6 +894,7 @@ export function buildHostTelemetryProvider(
     }),
     new HookExecTelemetryProducer({ hooksDir: cfg.hooksDir }),
     new SkillAccessTelemetryProducer({ accessLog: cfg.skillAccessLog }),
+    new ModeDispatchTelemetryProducer({ journalPath: cfg.modeDispatchLog }),
     new SessionJsonlTelemetryProducer({ projectsDir: cfg.sessionProjectsDir }),
     new JournalTelemetryProducer({ journalPath: cfg.journalPath }),
     new SessionCostTelemetryProvider({ dbPath: cfg.costDbPath }),
