@@ -29,6 +29,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  __captureClaudeVersionForTests,
   encodeCwd,
   predictJsonlPath,
   type ProbeRunner,
@@ -37,6 +38,8 @@ import {
   SchemaProbeFailure,
   SCHEMA_VERSION,
 } from "../schema-probe";
+import type { ChildProcess, SpawnOptions } from "node:child_process";
+import { EventEmitter } from "node:events";
 
 const IS_UNIX = process.platform !== "win32";
 
@@ -676,6 +679,54 @@ describe("SchemaProbe — homeOverride threads to default cache file", () => {
     } finally {
       h.cleanup();
     }
+  });
+});
+
+/* ───────────────────────────────────────────────────────────────────── */
+/* captureClaudeVersion — injectable platform + spawn (#157 follow-up)   */
+/* ───────────────────────────────────────────────────────────────────── */
+
+describe("captureClaudeVersion — win32 shell-true branch is platform-injectable", () => {
+  function makeFakeSpawn(): {
+    spawn: (cmd: string, args: ReadonlyArray<string>, opts: SpawnOptions) => ChildProcess;
+    calls: Array<{ cmd: string; args: ReadonlyArray<string>; opts: SpawnOptions }>;
+  } {
+    const calls: Array<{ cmd: string; args: ReadonlyArray<string>; opts: SpawnOptions }> = [];
+    const spawn = (cmd: string, args: ReadonlyArray<string>, opts: SpawnOptions): ChildProcess => {
+      calls.push({ cmd, args, opts });
+      const ee = new EventEmitter() as ChildProcess;
+      // Minimal ChildProcess shape: emit exit code 0 on next tick so the
+      // promise resolves cleanly. stdout/stderr left undefined — the
+      // capture path tolerates missing streams.
+      ee.kill = (() => true) as ChildProcess["kill"];
+      queueMicrotask(() => ee.emit("exit", 0, null));
+      return ee;
+    };
+    return { spawn, calls };
+  }
+
+  it("passes shell: true when platform === 'win32'", async () => {
+    const { spawn, calls } = makeFakeSpawn();
+    await __captureClaudeVersionForTests("/fake/claude.cmd", 1000, "win32", spawn);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.cmd).toBe("/fake/claude.cmd");
+    expect(calls[0]?.args).toEqual(["--version"]);
+    expect(calls[0]?.opts.shell).toBe(true);
+  });
+
+  it("passes shell: false on POSIX platforms (no shell injection surface)", async () => {
+    const { spawn, calls } = makeFakeSpawn();
+    await __captureClaudeVersionForTests("/usr/local/bin/claude", 1000, "linux", spawn);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.opts.shell).toBe(false);
+  });
+
+  it("defaults to process.platform when platform omitted (shell matches host)", async () => {
+    const { spawn, calls } = makeFakeSpawn();
+    // Omit platform; pass injected spawn so we can read what was sent.
+    await __captureClaudeVersionForTests("/fake/claude", 1000, undefined, spawn);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.opts.shell).toBe(process.platform === "win32");
   });
 });
 
