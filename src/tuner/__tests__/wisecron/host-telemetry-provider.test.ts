@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +11,7 @@ import {
   CompositeTelemetryProvider,
   buildHostTelemetryProvider,
 } from "../../wisecron/host-telemetry-provider.js";
+import { SessionJsonlTelemetryProducer } from "../../wisecron/session-jsonl-provider.js";
 import type {
   DateRange,
   MetricSample,
@@ -52,20 +54,30 @@ describe("CronRunTelemetryProducer", () => {
       unit: "wisecron-a.service",
       exit_code: "0",
       status: "success",
+      source: "systemd",
     });
     expect(samples[1]!.labels!.status).toBe("failure");
   });
 
-  it("advertises available when run completions exist, unavailable+reason otherwise", () => {
+  it("advertises systemd source when wisecron completions exist", () => {
     const ok = new CronRunTelemetryProducer({
       journalRunner: () => journalLine({ unit: "wisecron-a.service", ts: IN, exit: 0 }),
     });
-    expect(ok.capabilities()[0]!.available).toBe(true);
+    const cap = ok.capabilities()[0]!;
+    expect(cap.available).toBe(true);
+    expect(cap.reason).toMatch(/source=systemd/);
+  });
 
-    const empty = new CronRunTelemetryProducer({ journalRunner: () => "" });
+  it("advertises unavailable+reason naming configured cron when no completion source", () => {
+    const empty = new CronRunTelemetryProducer({
+      journalRunner: () => "",
+      costDbPath: "/nonexistent/costs.db",
+      cronConfigProbe: () => ({ crontab: true, configSnapshot: true }),
+    });
     const cap = empty.capabilities()[0]!;
     expect(cap.available).toBe(false);
-    expect(cap.reason).toMatch(/no .* run completions/);
+    expect(cap.reason).toMatch(/no cron run-completion source/);
+    expect(cap.reason).toMatch(/crontab/);
   });
 
   it("returns [] (does not throw) when the journal runner fails", async () => {
@@ -73,14 +85,55 @@ describe("CronRunTelemetryProducer", () => {
       journalRunner: () => {
         throw new Error("journalctl missing");
       },
+      costDbPath: "/nonexistent/costs.db",
+      cronConfigProbe: () => ({ crontab: false, configSnapshot: false }),
     });
     expect(await p.query("cron_run", RANGE)).toEqual([]);
     expect(p.capabilities()[0]!.available).toBe(false);
   });
 
   it("returns [] for any non-cron_run stream", async () => {
-    const p = new CronRunTelemetryProducer({ journalRunner: () => "" });
+    const p = new CronRunTelemetryProducer({
+      journalRunner: () => "",
+      costDbPath: "/nonexistent/costs.db",
+    });
     expect(await p.query("hook_exec", RANGE)).toEqual([]);
+  });
+
+  it("auto-detects the bus_scheduler source from costs.db when no systemd units", async () => {
+    const dbDir = mkdtempSync(join(tmpdir(), "cron-costs-"));
+    const dbPath = join(dbDir, "costs.db");
+    const db = new Database(dbPath);
+    db.run(
+      "CREATE TABLE session_costs (session_id TEXT, date TEXT, job TEXT, model TEXT, cost_usd REAL)",
+    );
+    db.run(
+      `INSERT INTO session_costs VALUES
+        ('s1', '2026-05-20', '<channel source="cron" chat_id="bus-scheduler:abc">', 'opus', 0.1),
+        ('s2', '2026-05-20', 'gmail', 'opus', 0.2),
+        ('s3', '2026-06-09', '<channel source="cron" chat_id="bus-scheduler:abc">', 'opus', 0.1)`,
+    );
+    db.close();
+
+    const p = new CronRunTelemetryProducer({
+      journalRunner: () => "", // no systemd units
+      costDbPath: dbPath,
+    });
+    const cap = p.capabilities()[0]!;
+    expect(cap.available).toBe(true);
+    expect(cap.reason).toMatch(/source=bus_scheduler/);
+
+    const samples = await p.query("cron_run", RANGE);
+    // s1 in-window (cron), s2 not cron, s3 out-of-window.
+    expect(samples).toHaveLength(1);
+    expect(samples[0]!.value).toBe(0); // completed fire
+    expect(samples[0]!.labels).toEqual({
+      unit: "bus-scheduler:abc",
+      exit_code: "0",
+      status: "success",
+      source: "bus_scheduler",
+    });
+    rmSync(dbDir, { recursive: true, force: true });
   });
 });
 
@@ -187,7 +240,7 @@ describe("JournalTelemetryProducer", () => {
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
   it("advertises the 4 derived streams unavailable+reason when no matching events", () => {
-    writeFileSync(journal, JSON.stringify({ type: "deploy", ts: IN.toISOString() }) + "\n");
+    writeFileSync(journal, `${JSON.stringify({ type: "deploy", ts: IN.toISOString() })}\n`);
     const p = new JournalTelemetryProducer({ journalPath: journal });
     const caps = p.capabilities();
     expect(caps.map((c) => c.stream).sort()).toEqual([
@@ -297,17 +350,150 @@ describe("buildHostTelemetryProvider (real host wiring)", () => {
   it("returns a provider advertising one capability per declared stream", () => {
     const dir = mkdtempSync(join(tmpdir(), "host-"));
     mkdirSync(join(dir, "hooks"), { recursive: true });
+    mkdirSync(join(dir, "projects"), { recursive: true });
     const p = buildHostTelemetryProvider({
       costDbPath: join(dir, "costs.db"),
       hooksDir: join(dir, "hooks"),
       skillAccessLog: join(dir, "skills.jsonl"),
       journalPath: join(dir, "ops.jsonl"),
+      sessionProjectsDir: join(dir, "projects"),
       cronJournalRunner: () => "",
+      cronConfigProbe: () => ({ crontab: false, configSnapshot: false }),
     });
     const caps = p.capabilities();
     expect(caps).toHaveLength(TELEMETRY_STREAMS.length);
     // Nothing seeded → every stream degrades to unavailable, each with a reason.
     expect(caps.every((c) => c.available === false && !!c.reason)).toBe(true);
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("SessionJsonlTelemetryProducer", () => {
+  let root: string;
+  let sessionDir: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "sessions-"));
+    sessionDir = join(root, "-home-x-proj");
+    mkdirSync(sessionDir, { recursive: true });
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  /** Build a session JSONL fixture: assistant tool_use lines + user tool_result lines. */
+  function writeSession(name: string, lines: object[]): void {
+    writeFileSync(join(sessionDir, name), `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`);
+  }
+
+  function assistantToolUse(ts: Date, blocks: object[]): object {
+    return {
+      type: "assistant",
+      timestamp: ts.toISOString(),
+      message: { role: "assistant", content: blocks },
+    };
+  }
+  function userToolResult(ts: Date, toolUseId: string, isError: boolean): object {
+    return {
+      type: "user",
+      timestamp: ts.toISOString(),
+      message: {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: toolUseId, content: "ok", is_error: isError },
+        ],
+      },
+    };
+  }
+
+  it("derives tool_call with failure joined from the matching tool_result is_error", async () => {
+    writeSession("s.jsonl", [
+      assistantToolUse(IN, [
+        { type: "tool_use", id: "t1", name: "Bash", input: {} },
+        { type: "tool_use", id: "t2", name: "mcp__busplug__reply", input: {} },
+      ]),
+      userToolResult(IN, "t1", false),
+      userToolResult(IN, "t2", true), // failed MCP call
+      // out-of-window line ignored
+      assistantToolUse(OUT, [
+        { type: "tool_use", id: "t3", name: "Read", input: { file_path: "/x" } },
+      ]),
+    ]);
+    const p = new SessionJsonlTelemetryProducer({ projectsDir: root });
+    const samples = await p.query("tool_call", RANGE);
+    expect(samples).toHaveLength(2);
+    const bash = samples.find((s) => s.labels!.tool === "Bash")!;
+    expect(bash.value).toBe(0);
+    expect(bash.labels!.server).toBe("");
+    const mcp = samples.find((s) => s.labels!.tool === "mcp__busplug__reply")!;
+    expect(mcp.value).toBe(1); // is_error → failure
+    expect(mcp.labels!.server).toBe("busplug");
+    expect(p.capabilities().find((c) => c.stream === "tool_call")!.available).toBe(true);
+  });
+
+  it("derives agent_dispatch from Agent/Task tool_use, labelled by subagent (value 0)", async () => {
+    writeSession("s.jsonl", [
+      assistantToolUse(IN, [
+        { type: "tool_use", id: "a1", name: "Agent", input: { subagent_type: "Explore" } },
+        { type: "tool_use", id: "a2", name: "Agent", input: {} }, // no subagent_type → default
+        { type: "tool_use", id: "t1", name: "Bash", input: {} }, // not a dispatch
+      ]),
+    ]);
+    const p = new SessionJsonlTelemetryProducer({ projectsDir: root });
+    const samples = await p.query("agent_dispatch", RANGE);
+    expect(samples).toHaveLength(2);
+    expect(samples.every((s) => s.value === 0)).toBe(true);
+    expect(samples.map((s) => s.labels!.agent).sort()).toEqual(["Explore", "default"]);
+    expect(p.capabilities().find((c) => c.stream === "agent_dispatch")!.available).toBe(true);
+  });
+
+  it("derives memory_access only for Reads of memory/CLAUDE.md paths", async () => {
+    writeSession("s.jsonl", [
+      assistantToolUse(IN, [
+        { type: "tool_use", id: "r1", name: "Read", input: { file_path: "/home/x/CLAUDE.md" } },
+        {
+          type: "tool_use",
+          id: "r2",
+          name: "Read",
+          input: { file_path: "/home/x/simon-memory/a.md" },
+        },
+        { type: "tool_use", id: "r3", name: "Read", input: { file_path: "/home/x/src/index.ts" } }, // not memory
+      ]),
+    ]);
+    const p = new SessionJsonlTelemetryProducer({ projectsDir: root });
+    const samples = await p.query("memory_access", RANGE);
+    expect(samples).toHaveLength(2);
+    expect(samples.every((s) => s.value === 1)).toBe(true);
+    expect(samples.map((s) => s.labels!.file).sort()).toEqual([
+      "/home/x/CLAUDE.md",
+      "/home/x/simon-memory/a.md",
+    ]);
+  });
+
+  it("advertises mode_dispatch inactive-with-reason (not in the transcript)", () => {
+    const p = new SessionJsonlTelemetryProducer({ projectsDir: root });
+    const cap = p.capabilities().find((c) => c.stream === "mode_dispatch")!;
+    expect(cap.available).toBe(false);
+    expect(cap.reason).toMatch(/orchestration event/);
+  });
+
+  it("degrades gracefully (all active streams unavailable+reason) on an empty/absent dir", async () => {
+    const empty = new SessionJsonlTelemetryProducer({ projectsDir: root }); // dir exists, no sessions
+    const caps = empty.capabilities();
+    for (const s of ["tool_call", "agent_dispatch", "memory_access"] as const) {
+      const c = caps.find((x) => x.stream === s)!;
+      expect(c.available).toBe(false);
+      expect(c.reason).toBeTruthy();
+    }
+    expect(await empty.query("tool_call", RANGE)).toEqual([]);
+
+    const absent = new SessionJsonlTelemetryProducer({ projectsDir: join(root, "nope") });
+    expect(await absent.query("tool_call", RANGE)).toEqual([]);
+    expect(absent.capabilities().find((c) => c.stream === "tool_call")!.reason).toMatch(
+      /projects dir not found/,
+    );
+  });
+
+  it("returns [] for streams it does not own", async () => {
+    const p = new SessionJsonlTelemetryProducer({ projectsDir: root });
+    expect(await p.query("cron_run", RANGE)).toEqual([]);
+    expect(await p.query("session_cost", RANGE)).toEqual([]);
   });
 });
