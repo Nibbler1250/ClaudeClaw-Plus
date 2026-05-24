@@ -283,6 +283,32 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
     return { valid: true };
   }
 
+  /**
+   * Observation-window health probe (MEDIUM risk). Runs AFTER apply: re-reads
+   * the just-applied modes config and re-runs validate() — the config must
+   * still parse as YAML and carry no duplicate keyword across modes (the exact
+   * collision that causes mis-routing). Failed on a parse error or a
+   * duplicate-keyword regression. Artifact-based + deterministic. A file gone
+   * from disk is not a break.
+   */
+  async healthProbe(target: string): Promise<{ failed: boolean; errors: string[] }> {
+    if (!existsSync(target)) return { failed: false, errors: [] };
+    let content: string;
+    try {
+      content = readFileSync(target, "utf8");
+    } catch (e) {
+      return { failed: true, errors: [`unreadable config: ${(e as Error).message.slice(0, 120)}`] };
+    }
+    const validation = await this.validate({
+      target_path: target,
+      kind: "patch",
+      applied_content: content,
+    });
+    return validation.valid
+      ? { failed: false, errors: [] }
+      : { failed: true, errors: [validation.reason ?? "validation failed"] };
+  }
+
   async revert(inversePatch: Patch): Promise<void> {
     writeFileSync(inversePatch.target_path, inversePatch.applied_content, "utf8");
   }

@@ -254,6 +254,32 @@ export class ClaudeMdSubject extends BaseSubject implements RevertibleSubject {
     return { broken_import_count: total };
   }
 
+  /**
+   * Observation-window health probe (MEDIUM risk). Runs AFTER apply: re-reads
+   * the just-applied CLAUDE.md and re-runs validate() on it — i.e. the
+   * broken-`@import` and `@import`-escape checks. Failed when the applied file
+   * introduced (or left) any unresolvable or projectRoots-escaping import.
+   * Artifact-based + deterministic, no telemetry. A file gone from disk is not
+   * a break (nothing to validate).
+   */
+  async healthProbe(target: string): Promise<{ failed: boolean; errors: string[] }> {
+    if (!existsSync(target)) return { failed: false, errors: [] };
+    let content: string;
+    try {
+      content = readFileSync(target, "utf8");
+    } catch (e) {
+      return { failed: true, errors: [`unreadable file: ${(e as Error).message.slice(0, 120)}`] };
+    }
+    const validation = await this.validate({
+      target_path: target,
+      kind: "patch",
+      applied_content: content,
+    });
+    return validation.valid
+      ? { failed: false, errors: [] }
+      : { failed: true, errors: [validation.reason ?? "validation failed"] };
+  }
+
   async revert(inversePatch: Patch): Promise<void> {
     this.assertInsideProjectRoots(inversePatch.target_path);
     const bak = `${inversePatch.target_path}.bak`;

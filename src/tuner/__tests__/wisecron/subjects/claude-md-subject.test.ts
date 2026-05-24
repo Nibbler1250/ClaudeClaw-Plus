@@ -322,3 +322,35 @@ describe("ClaudeMdSubject — Pass B: risk_tier guardrails", () => {
     expect(s.auto_merge_default).toBe(false);
   });
 });
+
+describe("ClaudeMdSubject — healthProbe (post-apply artifact check)", () => {
+  it("applied file with resolvable @-imports → failed:false", async () => {
+    const s = new ClaudeMdSubject({ projectRoots: [projectA] });
+    writeFileSync(join(projectA, "ref.md"), "x", "utf8");
+    const p = writeClaudeMd(projectA, "# Title\n@./ref.md\n");
+    const probe = await s.healthProbe!(p);
+    expect(probe.failed).toBe(false);
+    expect(probe.errors).toEqual([]);
+  });
+
+  it("applied file with a broken @-import → failed:true + errors", async () => {
+    const s = new ClaudeMdSubject({ projectRoots: [projectA] });
+    const p = writeClaudeMd(projectA, "# Title\n@./does-not-exist.md\n");
+    const probe = await s.healthProbe!(p);
+    expect(probe.failed).toBe(true);
+    expect(probe.errors.length).toBeGreaterThan(0);
+  });
+
+  it("applied file with a projectRoots-escaping @-import → failed:true", async () => {
+    const s = new ClaudeMdSubject({ projectRoots: [projectA] });
+    const p = writeClaudeMd(projectA, "@../../../../etc/passwd\nbody\n");
+    const probe = await s.healthProbe!(p);
+    expect(probe.failed).toBe(true);
+  });
+
+  it("file absent after apply → not a break", async () => {
+    const s = new ClaudeMdSubject({ projectRoots: [projectA] });
+    const probe = await s.healthProbe!(join(projectA, "CLAUDE.md"));
+    expect(probe.failed).toBe(false);
+  });
+});

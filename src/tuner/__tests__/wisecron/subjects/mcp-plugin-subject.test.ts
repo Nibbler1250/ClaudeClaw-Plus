@@ -404,3 +404,34 @@ describe("McpPluginSubject — healthCheck", () => {
     expect(h.sample_event_match_rate).toBe(0.5);
   });
 });
+
+describe("McpPluginSubject — healthProbe (post-apply artifact check)", () => {
+  it("valid JSON settings with allowedTools[] → failed:false", async () => {
+    const s = new McpPluginSubject({ auditLog: auditPath, settingsPath });
+    writeFileSync(settingsPath, JSON.stringify({ allowedTools: ["mcp__a__b"] }), "utf8");
+    const probe = await s.healthProbe!(settingsPath);
+    expect(probe.failed).toBe(false);
+    expect(probe.errors).toEqual([]);
+  });
+
+  it("malformed JSON → failed:true + errors", async () => {
+    const s = new McpPluginSubject({ auditLog: auditPath, settingsPath });
+    writeFileSync(settingsPath, "{ not json", "utf8");
+    const probe = await s.healthProbe!(settingsPath);
+    expect(probe.failed).toBe(true);
+    expect(probe.errors.length).toBeGreaterThan(0);
+  });
+
+  it("schema regression (allowedTools not an array) → failed:true", async () => {
+    const s = new McpPluginSubject({ auditLog: auditPath, settingsPath });
+    writeFileSync(settingsPath, JSON.stringify({ allowedTools: "nope" }), "utf8");
+    const probe = await s.healthProbe!(settingsPath);
+    expect(probe.failed).toBe(true);
+  });
+
+  it("settings file absent after apply → not a break", async () => {
+    const s = new McpPluginSubject({ auditLog: auditPath, settingsPath });
+    const probe = await s.healthProbe!(settingsPath);
+    expect(probe.failed).toBe(false);
+  });
+});

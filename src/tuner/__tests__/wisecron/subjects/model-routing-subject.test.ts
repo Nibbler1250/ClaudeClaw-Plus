@@ -424,3 +424,42 @@ describe("ModelRoutingSubject — healthCheck", () => {
     expect(h.sample_event_match_rate).toBeGreaterThan(0);
   });
 });
+
+describe("ModelRoutingSubject — healthProbe (post-apply artifact check)", () => {
+  it("valid modes YAML with unique keywords → failed:false", async () => {
+    const s = new ModelRoutingSubject({ modesConfigPath: configPath });
+    writeFileSync(
+      configPath,
+      "modes:\n  fast:\n    keywords: [quick, q]\n  deep:\n    keywords: [research]\n",
+      "utf8",
+    );
+    const probe = await s.healthProbe!(configPath);
+    expect(probe.failed).toBe(false);
+    expect(probe.errors).toEqual([]);
+  });
+
+  it("duplicate keyword across modes → failed:true + errors", async () => {
+    const s = new ModelRoutingSubject({ modesConfigPath: configPath });
+    writeFileSync(
+      configPath,
+      "modes:\n  fast:\n    keywords: [quick]\n  deep:\n    keywords: [quick]\n",
+      "utf8",
+    );
+    const probe = await s.healthProbe!(configPath);
+    expect(probe.failed).toBe(true);
+    expect(probe.errors.join(" ")).toMatch(/duplicate keyword/);
+  });
+
+  it("invalid YAML → failed:true", async () => {
+    const s = new ModelRoutingSubject({ modesConfigPath: configPath });
+    writeFileSync(configPath, "modes:\n  fast: [unclosed\n", "utf8");
+    const probe = await s.healthProbe!(configPath);
+    expect(probe.failed).toBe(true);
+  });
+
+  it("config absent after apply → not a break", async () => {
+    const s = new ModelRoutingSubject({ modesConfigPath: configPath });
+    const probe = await s.healthProbe!(configPath);
+    expect(probe.failed).toBe(false);
+  });
+});
