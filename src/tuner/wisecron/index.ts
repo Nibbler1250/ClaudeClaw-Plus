@@ -192,6 +192,17 @@ function warnIfMissingHealthProbe(subject: TunableSubject): void {
 }
 
 export { SUBJECT_STREAM };
+// The reference-host telemetry surface. Pass into
+// `registerWisecronSubjects(registry, settings, { telemetry: buildHostTelemetryProvider() })`
+// to run the fitness activation gate and let subjects measure real outcomes.
+export {
+  buildHostTelemetryProvider,
+  CompositeTelemetryProvider,
+  CronRunTelemetryProducer,
+  HookExecTelemetryProducer,
+  SkillAccessTelemetryProducer,
+  JournalTelemetryProducer,
+} from "./host-telemetry-provider.js";
 export { WisecronStateDB } from "./state-db.js";
 export { AdaptiveScheduler } from "./adaptive-scheduler.js";
 export { ProposalEngine } from "./proposal-engine.js";

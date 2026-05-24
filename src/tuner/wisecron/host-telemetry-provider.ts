@@ -1,0 +1,606 @@
+/**
+ * Host telemetry producers + composite (OutcomeLoop Phase B).
+ *
+ * The tuner CONSUMES telemetry through `provider.query(...)`; the HOST PRODUCES
+ * it. `session-cost-provider.ts` covers the `session_cost` stream. This file
+ * adds the remaining feasible reference-host producers, each owning ONE stream,
+ * each reading a single real source with graceful degradation, and composes
+ * them (+ the cost provider) into one `TelemetryProvider` the subjects see.
+ *
+ * Provenance, per stream:
+ *  - `cron_run`     ← `journalctl --user -u 'wisecron-*'` (unit run completions).
+ *                     value = exit_code (0 = clean, nonzero = failure — matches
+ *                     CronSubject.critical_fire_success); labels = unit, status,
+ *                     exit_code.
+ *  - `hook_exec`    ← `~/.claude/hooks/*.log` (one JSON line per hook fire).
+ *                     value = duration_ms; labels = hook, exit_code, event.
+ *  - `skill_access` ← `~/.config/tuner/skill_accesses.jsonl` (log-skill-access.py
+ *                     PostToolUse hook). value = 1 per access; labels = skill.
+ *  - `tool_call`, `mode_dispatch`, `agent_dispatch`, `memory_access`
+ *                   ← `~/.claudeclaw/journal/operations.jsonl`, IF the journal
+ *                     carries matching event types. The reference journal records
+ *                     coarse operation entries only, so these advertise
+ *                     `available:false` with a reason today — declared + inactive
+ *                     by design (no faked data), active the day those events land.
+ *
+ * Every producer returns `[]` (never throws) for a stream it does not own and
+ * for its own stream when the source is absent. The composite therefore just
+ * concatenates query results, and merges capabilities one-per-stream preferring
+ * an available producer.
+ */
+
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, join } from "node:path";
+import {
+  type DateRange,
+  type MetricSample,
+  type TelemetryCapability,
+  type TelemetryProvider,
+  type TelemetryStream,
+  TELEMETRY_CONTRACT_VERSION,
+  TELEMETRY_STREAMS,
+} from "../../skills-tuner/core/telemetry.js";
+import { SessionCostTelemetryProvider } from "./session-cost-provider.js";
+
+function expandHome(p: string): string {
+  if (p.startsWith("~/")) return join(homedir(), p.slice(2));
+  return p;
+}
+
+function inRange(ts: Date, range: DateRange): boolean {
+  const t = ts.getTime();
+  return t >= range.start.getTime() && t < range.end.getTime();
+}
+
+// ── cron_run ─────────────────────────────────────────────────────────────────
+
+export interface CronRunProducerConfig {
+  /** journalctl unit glob. Default 'wisecron-*.service'. */
+  journalUnitGlob?: string;
+  /** Required unit prefix used for the capability match rate. Default 'wisecron-'. */
+  unitPrefix?: string;
+  schemaVersion?: string;
+  /** Injected journalctl runner (args → raw stdout). Synchronous so capability
+   *  detection stays sync per the TelemetryProvider contract. Tests pass a fixture. */
+  journalRunner?: (args: string[]) => string;
+}
+
+interface CronRunEntry {
+  unit: string;
+  ts: Date;
+  exitCode: number;
+}
+
+/**
+ * Emits `cron_run` from systemd-user journal entries that carry an
+ * `EXIT_STATUS` (i.e. a service run completed). Other journal lines are
+ * ignored. value = exit_code so a consumer can compute success rate via
+ * `1 - nonzeroRate`.
+ */
+export class CronRunTelemetryProducer implements TelemetryProvider {
+  private readonly journalUnitGlob: string;
+  private readonly unitPrefix: string;
+  private readonly schemaVersion: string;
+  private readonly journalRunner: (args: string[]) => string;
+
+  constructor(cfg: CronRunProducerConfig = {}) {
+    this.journalUnitGlob = cfg.journalUnitGlob ?? "wisecron-*.service";
+    this.unitPrefix = cfg.unitPrefix ?? "wisecron-";
+    this.schemaVersion = cfg.schemaVersion ?? TELEMETRY_CONTRACT_VERSION;
+    this.journalRunner = cfg.journalRunner ?? defaultJournalRunner;
+  }
+
+  contractVersion(): string {
+    return TELEMETRY_CONTRACT_VERSION;
+  }
+
+  private readEntries(since: Date): CronRunEntry[] {
+    const args = [
+      "--user",
+      "-u",
+      this.journalUnitGlob,
+      "--since",
+      since.toISOString(),
+      "--output",
+      "json",
+    ];
+    let raw: string;
+    try {
+      raw = this.journalRunner(args);
+    } catch {
+      return [];
+    }
+    return parseCronRunJournal(raw);
+  }
+
+  capabilities(): TelemetryCapability[] {
+    const since = new Date(Date.now() - 7 * 86_400_000);
+    const entries = this.readEntries(since);
+    if (entries.length === 0) {
+      return [
+        {
+          stream: "cron_run",
+          schemaVersion: this.schemaVersion,
+          available: false,
+          reason: `no '${this.journalUnitGlob}' run completions in last 7d (no wisecron units installed?)`,
+        },
+      ];
+    }
+    return [{ stream: "cron_run", schemaVersion: this.schemaVersion, available: true }];
+  }
+
+  async query(stream: TelemetryStream, range: DateRange): Promise<MetricSample[]> {
+    if (stream !== "cron_run") return [];
+    const entries = this.readEntries(range.start);
+    return entries
+      .filter((e) => inRange(e.ts, range))
+      .map((e) => ({
+        ts: e.ts,
+        value: e.exitCode,
+        labels: {
+          unit: e.unit,
+          exit_code: String(e.exitCode),
+          status: e.exitCode === 0 ? "success" : "failure",
+        },
+      }));
+  }
+}
+
+function parseCronRunJournal(raw: string): CronRunEntry[] {
+  const out: CronRunEntry[] = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    // Only run-completion entries carry EXIT_STATUS.
+    const exitStatus = parsed.EXIT_STATUS;
+    let exitCode: number | null = null;
+    if (typeof exitStatus === "string") {
+      const n = parseInt(exitStatus, 10);
+      if (!Number.isNaN(n)) exitCode = n;
+    } else if (typeof exitStatus === "number") {
+      exitCode = exitStatus;
+    }
+    if (exitCode === null) continue;
+
+    const unit =
+      (parsed._SYSTEMD_USER_UNIT as string) ??
+      (parsed._SYSTEMD_UNIT as string) ??
+      (parsed.UNIT as string) ??
+      "";
+    if (!unit) continue;
+
+    const tsRaw = parsed.__REALTIME_TIMESTAMP as string | undefined;
+    let ts = new Date();
+    if (tsRaw) {
+      const usec = Number(tsRaw);
+      if (!Number.isNaN(usec)) ts = new Date(Math.floor(usec / 1000));
+    }
+    out.push({ unit, ts, exitCode });
+  }
+  return out;
+}
+
+function defaultJournalRunner(args: string[]): string {
+  const res = spawnSync("journalctl", args, { encoding: "utf8", timeout: 10_000 });
+  // journalctl exits 0 with "No data available" on stderr when the unit glob
+  // matches nothing; treat any no-output case as empty rather than throwing.
+  if (res.error) return "";
+  return res.stdout ?? "";
+}
+
+// ── hook_exec ────────────────────────────────────────────────────────────────
+
+export interface HookExecProducerConfig {
+  /** Hooks dir. Default ~/.claude/hooks. */
+  hooksDir?: string;
+  schemaVersion?: string;
+  /** Injected reader (dir → parsed entries). Tests pass a fixture. */
+  logReader?: (dir: string) => HookExecEntry[];
+}
+
+export interface HookExecEntry {
+  hook: string;
+  exitCode: number;
+  durationMs: number;
+  event: string;
+  ts: Date;
+}
+
+/**
+ * Emits `hook_exec` from `~/.claude/hooks/*.log` (one JSON object per line:
+ * `{ hook?, exit_code, duration_ms, event?, ts }`). value = duration_ms;
+ * exit_code + event ride in labels so a consumer can derive crash-rate and p95.
+ */
+export class HookExecTelemetryProducer implements TelemetryProvider {
+  private readonly hooksDir: string;
+  private readonly schemaVersion: string;
+  private readonly logReader: (dir: string) => HookExecEntry[];
+
+  constructor(cfg: HookExecProducerConfig = {}) {
+    this.hooksDir = expandHome(cfg.hooksDir ?? join(homedir(), ".claude", "hooks"));
+    this.schemaVersion = cfg.schemaVersion ?? TELEMETRY_CONTRACT_VERSION;
+    this.logReader = cfg.logReader ?? defaultHookLogReader;
+  }
+
+  contractVersion(): string {
+    return TELEMETRY_CONTRACT_VERSION;
+  }
+
+  capabilities(): TelemetryCapability[] {
+    let entries: HookExecEntry[];
+    try {
+      entries = this.logReader(this.hooksDir);
+    } catch {
+      entries = [];
+    }
+    if (entries.length === 0) {
+      return [
+        {
+          stream: "hook_exec",
+          schemaVersion: this.schemaVersion,
+          available: false,
+          reason: `no parseable *.log entries in ${this.hooksDir} (hook exec-wrapper not wired?)`,
+        },
+      ];
+    }
+    return [{ stream: "hook_exec", schemaVersion: this.schemaVersion, available: true }];
+  }
+
+  async query(stream: TelemetryStream, range: DateRange): Promise<MetricSample[]> {
+    if (stream !== "hook_exec") return [];
+    let entries: HookExecEntry[];
+    try {
+      entries = this.logReader(this.hooksDir);
+    } catch {
+      return [];
+    }
+    return entries
+      .filter((e) => inRange(e.ts, range))
+      .map((e) => ({
+        ts: e.ts,
+        value: e.durationMs,
+        labels: { hook: e.hook, exit_code: String(e.exitCode), event: e.event },
+      }));
+  }
+}
+
+function defaultHookLogReader(dir: string): HookExecEntry[] {
+  if (!existsSync(dir)) return [];
+  let files: string[];
+  try {
+    files = readdirSync(dir).filter((f) => f.endsWith(".log"));
+  } catch {
+    return [];
+  }
+  const out: HookExecEntry[] = [];
+  for (const f of files) {
+    let content: string;
+    try {
+      content = readFileSync(join(dir, f), "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const obj = JSON.parse(trimmed) as Record<string, unknown>;
+        if (typeof obj !== "object" || obj === null) continue;
+        const hook = (obj.hook as string) ?? f.replace(/\.log$/, "");
+        const exitCode = Number(obj.exit_code ?? 0);
+        const durationMs = Number(obj.duration_ms ?? 0);
+        const event = (obj.event as string) ?? "unknown";
+        const tsRaw = obj.ts as string | number | undefined;
+        const ts = tsRaw ? new Date(tsRaw) : new Date();
+        if (Number.isNaN(ts.getTime())) continue;
+        out.push({ hook, exitCode, durationMs, event, ts });
+      } catch {
+        /* skip malformed line */
+      }
+    }
+  }
+  return out;
+}
+
+// ── skill_access ───────────────────────────────────────────────────────────--
+
+export interface SkillAccessProducerConfig {
+  /** JSONL log. Default ~/.config/tuner/skill_accesses.jsonl. */
+  accessLog?: string;
+  schemaVersion?: string;
+}
+
+/**
+ * Emits `skill_access` from `~/.config/tuner/skill_accesses.jsonl`
+ * (`{ skill_path, accessed_at }` per line). value = 1 per access; the skill
+ * name (file basename, minus `.md`) rides in labels for per-skill grouping.
+ */
+export class SkillAccessTelemetryProducer implements TelemetryProvider {
+  private readonly accessLog: string;
+  private readonly schemaVersion: string;
+
+  constructor(cfg: SkillAccessProducerConfig = {}) {
+    this.accessLog = expandHome(
+      cfg.accessLog ?? join(homedir(), ".config", "tuner", "skill_accesses.jsonl"),
+    );
+    this.schemaVersion = cfg.schemaVersion ?? TELEMETRY_CONTRACT_VERSION;
+  }
+
+  contractVersion(): string {
+    return TELEMETRY_CONTRACT_VERSION;
+  }
+
+  private read(): Array<{ ts: Date; skill: string }> {
+    if (!existsSync(this.accessLog)) return [];
+    let content: string;
+    try {
+      content = readFileSync(this.accessLog, "utf8");
+    } catch {
+      return [];
+    }
+    const out: Array<{ ts: Date; skill: string }> = [];
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const obj = JSON.parse(trimmed) as Record<string, unknown>;
+        const path = obj.skill_path as string | undefined;
+        const at = obj.accessed_at as string | undefined;
+        if (!path || !at) continue;
+        const ts = new Date(at);
+        if (Number.isNaN(ts.getTime())) continue;
+        out.push({ ts, skill: basename(path, ".md") });
+      } catch {
+        /* skip */
+      }
+    }
+    return out;
+  }
+
+  capabilities(): TelemetryCapability[] {
+    if (this.read().length === 0) {
+      return [
+        {
+          stream: "skill_access",
+          schemaVersion: this.schemaVersion,
+          available: false,
+          reason: `no skill-access entries at ${this.accessLog}`,
+        },
+      ];
+    }
+    return [{ stream: "skill_access", schemaVersion: this.schemaVersion, available: true }];
+  }
+
+  async query(stream: TelemetryStream, range: DateRange): Promise<MetricSample[]> {
+    if (stream !== "skill_access") return [];
+    return this.read()
+      .filter((e) => inRange(e.ts, range))
+      .map((e) => ({ ts: e.ts, value: 1, labels: { skill: e.skill } }));
+  }
+}
+
+// ── operations.jsonl-derived streams ─────────────────────────────────────────
+
+export interface JournalProducerConfig {
+  /** Operations journal. Default ~/.claudeclaw/journal/operations.jsonl. */
+  journalPath?: string;
+  schemaVersion?: string;
+}
+
+/** Streams this producer can derive from the operations journal, by type match. */
+const JOURNAL_STREAMS: TelemetryStream[] = [
+  "tool_call",
+  "mode_dispatch",
+  "agent_dispatch",
+  "memory_access",
+];
+
+/**
+ * Derives the dispatch/tool/memory streams from `operations.jsonl` IF the
+ * journal carries matching event types. The reference journal records coarse
+ * operation entries (deploy, infra_fix, …) and emits none of these today, so
+ * each advertises `available:false` with a reason — declared + inactive by
+ * design. Activates automatically the day the host journals matching events.
+ */
+export class JournalTelemetryProducer implements TelemetryProvider {
+  private readonly journalPath: string;
+  private readonly schemaVersion: string;
+
+  constructor(cfg: JournalProducerConfig = {}) {
+    this.journalPath = expandHome(
+      cfg.journalPath ?? join(homedir(), ".claudeclaw", "journal", "operations.jsonl"),
+    );
+    this.schemaVersion = cfg.schemaVersion ?? TELEMETRY_CONTRACT_VERSION;
+  }
+
+  contractVersion(): string {
+    return TELEMETRY_CONTRACT_VERSION;
+  }
+
+  private readAll(): Array<Record<string, unknown>> {
+    if (!existsSync(this.journalPath)) return [];
+    let content: string;
+    try {
+      content = readFileSync(this.journalPath, "utf8");
+    } catch {
+      return [];
+    }
+    const out: Array<Record<string, unknown>> = [];
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const obj = JSON.parse(trimmed);
+        if (typeof obj === "object" && obj !== null) out.push(obj as Record<string, unknown>);
+      } catch {
+        /* skip */
+      }
+    }
+    return out;
+  }
+
+  /** Map one journal entry to a sample for `stream`, or null if it doesn't match. */
+  private toSample(stream: TelemetryStream, e: Record<string, unknown>): MetricSample | null {
+    const type = String(e.type ?? "");
+    const tsRaw = e.ts as string | number | undefined;
+    const ts = tsRaw ? new Date(tsRaw) : new Date();
+    if (Number.isNaN(ts.getTime())) return null;
+    const truthy = (v: unknown) => v === true;
+
+    switch (stream) {
+      case "tool_call": {
+        if (type !== "tool_call" && type !== "mcp_tool_call" && e.tool === undefined) return null;
+        const failed = e.success === false || e.ok === false || truthy(e.blocked);
+        return {
+          ts,
+          value: failed ? 1 : 0,
+          labels: {
+            server: String(e.server ?? ""),
+            tool: String(e.tool ?? ""),
+            blocked: String(truthy(e.blocked)),
+          },
+        };
+      }
+      case "mode_dispatch": {
+        if (type !== "mode_dispatch" && type !== "mode_dispatched") return null;
+        return {
+          ts,
+          value: truthy(e.reclassified) ? 1 : 0,
+          labels: {
+            mode: String(e.mode ?? ""),
+            keyword: String(e.keyword ?? ""),
+            task_class: String(e.task_class ?? ""),
+          },
+        };
+      }
+      case "agent_dispatch": {
+        if (type !== "agent_dispatch" && type !== "agent_dispatched") return null;
+        return {
+          ts,
+          value: truthy(e.reclassified) ? 1 : 0,
+          labels: { agent: String(e.agent ?? e.agent_name ?? "") },
+        };
+      }
+      case "memory_access": {
+        if (type !== "memory_access" && type !== "memory_read") return null;
+        return { ts, value: 1, labels: { file: String(e.file ?? e.path ?? "") } };
+      }
+      default:
+        return null;
+    }
+  }
+
+  capabilities(): TelemetryCapability[] {
+    const all = this.readAll();
+    return JOURNAL_STREAMS.map((stream) => {
+      const has = all.some((e) => this.toSample(stream, e) !== null);
+      if (has) return { stream, schemaVersion: this.schemaVersion, available: true };
+      return {
+        stream,
+        schemaVersion: this.schemaVersion,
+        available: false,
+        reason: existsSync(this.journalPath)
+          ? `no '${stream}' events in ${this.journalPath}`
+          : `operations journal not found at ${this.journalPath}`,
+      };
+    });
+  }
+
+  async query(stream: TelemetryStream, range: DateRange): Promise<MetricSample[]> {
+    if (!JOURNAL_STREAMS.includes(stream)) return [];
+    const out: MetricSample[] = [];
+    for (const e of this.readAll()) {
+      const s = this.toSample(stream, e);
+      if (s && inRange(s.ts, range)) out.push(s);
+    }
+    return out;
+  }
+}
+
+// ── composite ────────────────────────────────────────────────────────────────
+
+/**
+ * Composes per-stream producers into one `TelemetryProvider`. `query` simply
+ * concatenates (each producer returns `[]` for streams it doesn't own).
+ * `capabilities` resolves to one entry per contract stream, preferring an
+ * available producer; streams no producer claims are reported unavailable.
+ *
+ * Provider order matters for the unavailable-reason chosen: list the specific
+ * producers BEFORE the cost provider (which reports every non-cost stream with
+ * a generic placeholder reason) so the specific reason wins.
+ */
+export class CompositeTelemetryProvider implements TelemetryProvider {
+  constructor(private readonly providers: TelemetryProvider[]) {}
+
+  contractVersion(): string {
+    return TELEMETRY_CONTRACT_VERSION;
+  }
+
+  capabilities(): TelemetryCapability[] {
+    const caps: TelemetryCapability[] = [];
+    for (const p of this.providers) caps.push(...p.capabilities());
+    const best = new Map<TelemetryStream, TelemetryCapability>();
+    for (const c of caps) {
+      const cur = best.get(c.stream);
+      // First writer wins; an available producer upgrades a prior unavailable.
+      if (!cur) best.set(c.stream, c);
+      else if (!cur.available && c.available) best.set(c.stream, c);
+    }
+    for (const s of TELEMETRY_STREAMS) {
+      if (!best.has(s)) {
+        best.set(s, {
+          stream: s,
+          schemaVersion: TELEMETRY_CONTRACT_VERSION,
+          available: false,
+          reason: "no producer wired for this stream",
+        });
+      }
+    }
+    return [...best.values()];
+  }
+
+  async query(
+    stream: TelemetryStream,
+    range: DateRange,
+    filters?: Record<string, string>,
+  ): Promise<MetricSample[]> {
+    const out: MetricSample[] = [];
+    for (const p of this.providers) {
+      out.push(...(await p.query(stream, range, filters)));
+    }
+    return out;
+  }
+}
+
+export interface HostTelemetryConfig {
+  costDbPath?: string;
+  hooksDir?: string;
+  skillAccessLog?: string;
+  journalPath?: string;
+  cronJournalRunner?: (args: string[]) => string;
+}
+
+/**
+ * The reference-host telemetry surface: every feasible producer composed into
+ * one provider. Pass into `registerWisecronSubjects(registry, settings,
+ * { telemetry })` so the activation gate runs and subjects measure fitness.
+ */
+export function buildHostTelemetryProvider(
+  cfg: HostTelemetryConfig = {},
+): CompositeTelemetryProvider {
+  return new CompositeTelemetryProvider([
+    new CronRunTelemetryProducer({ journalRunner: cfg.cronJournalRunner }),
+    new HookExecTelemetryProducer({ hooksDir: cfg.hooksDir }),
+    new SkillAccessTelemetryProducer({ accessLog: cfg.skillAccessLog }),
+    new JournalTelemetryProducer({ journalPath: cfg.journalPath }),
+    new SessionCostTelemetryProvider({ dbPath: cfg.costDbPath }),
+  ]);
+}
