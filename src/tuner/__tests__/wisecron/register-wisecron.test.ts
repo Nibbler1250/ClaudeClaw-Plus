@@ -37,20 +37,22 @@ function makeSettings() {
 }
 
 describe("registerWisecronSubjects — healthProbe boot warning", () => {
-  it("emits a warning for each high/medium-risk subject without healthProbe", () => {
+  it("emits NO healthProbe boot warning now that every medium/high-risk subject implements one", () => {
     const registry = new Registry();
     registerWisecronSubjects(registry, makeSettings());
 
     // cron (high), hook (high), claude_md (medium), mcp_plugin (medium),
-    // model_routing (medium) all currently ship without healthProbe.
+    // model_routing (medium) now all ship a healthProbe — the fail-open
+    // "auto-revert disabled" warning must be gone for every one of them.
     const matchingWarnings = warnSpy.calls.filter((c) =>
       /\[tuner\] subject '\w+' \(risk=(high|medium)\) has no healthProbe/.test(c),
     );
-    expect(matchingWarnings.length).toBeGreaterThanOrEqual(5);
-    expect(
-      matchingWarnings.some((c) => /risk=high.*'cron'/.test(c) || /'cron'.*risk=high/.test(c)),
-    ).toBe(true);
-    expect(matchingWarnings.some((c) => /'hook'/.test(c))).toBe(true);
+    expect(matchingWarnings).toHaveLength(0);
+    for (const name of ["cron", "hook", "claude_md", "mcp_plugin", "model_routing"]) {
+      expect(
+        warnSpy.calls.some((c) => c.includes(`'${name}'`) && c.includes("has no healthProbe")),
+      ).toBe(false);
+    }
   });
 
   it("does not warn for low-risk subjects", () => {
