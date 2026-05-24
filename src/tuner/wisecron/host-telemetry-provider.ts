@@ -29,8 +29,9 @@
  * an available producer.
  */
 
+import { Database } from "bun:sqlite";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import {
@@ -43,6 +44,7 @@ import {
   TELEMETRY_STREAMS,
 } from "../../skills-tuner/core/telemetry.js";
 import { SessionCostTelemetryProvider } from "./session-cost-provider.js";
+import { SessionJsonlTelemetryProducer } from "./session-jsonl-provider.js";
 
 function expandHome(p: string): string {
   if (p.startsWith("~/")) return join(homedir(), p.slice(2));
@@ -65,6 +67,12 @@ export interface CronRunProducerConfig {
   /** Injected journalctl runner (args → raw stdout). Synchronous so capability
    *  detection stays sync per the TelemetryProvider contract. Tests pass a fixture. */
   journalRunner?: (args: string[]) => string;
+  /** costs.db for ClaudeClaw bus-scheduler cron-session detection (fallback
+   *  source). Default `~/agent/data/costs.db`. */
+  costDbPath?: string;
+  /** Injected cron-config presence probe (feeds the unavailable reason). Default
+   *  inspects `crontab -l` + `~/.config/cron`. Tests override for hermeticity. */
+  cronConfigProbe?: () => CronConfigPresence;
 }
 
 interface CronRunEntry {
@@ -73,23 +81,53 @@ interface CronRunEntry {
   exitCode: number;
 }
 
+/** Which classic cron systems are configured (for diagnostics only). */
+interface CronConfigPresence {
+  /** `crontab -l` returned at least one schedule line. */
+  crontab: boolean;
+  /** `~/.config/cron` (XDG crontab snapshot sidecar) is present. */
+  configSnapshot: boolean;
+}
+
+/** The cron source auto-detection resolved to. */
+type CronSourceKind = "systemd" | "bus_scheduler" | "none";
+
 /**
- * Emits `cron_run` from systemd-user journal entries that carry an
- * `EXIT_STATUS` (i.e. a service run completed). Other journal lines are
- * ignored. value = exit_code so a consumer can compute success rate via
- * `1 - nonzeroRate`.
+ * Emits `cron_run` from whichever real cron source THIS host actually has,
+ * detected at registration instead of assuming `wisecron-*`. Priority:
+ *
+ *   1. **systemd**       — `journalctl --user -u 'wisecron-*'` entries that
+ *                          carry `EXIT_STATUS` (a service run completed).
+ *                          value = exit_code (0 clean, nonzero failure) — the
+ *                          richest source, true crash detection.
+ *   2. **bus_scheduler** — ClaudeClaw bus-scheduler cron sessions in costs.db
+ *                          (`job LIKE '%source="cron"%'` …). A recorded session
+ *                          IS a completed fire, so value = 0 (success); costs.db
+ *                          carries no exit code, so this source cannot surface
+ *                          crash-failures — flagged in the capability reason.
+ *   3. **none**          — neither present. Advertised unavailable, the reason
+ *                          naming any classic cron config found (crontab /
+ *                          `~/.config/cron`) which defines schedules but logs no
+ *                          machine-readable run completions.
+ *
+ * Either way the consumer (`CronSubject.critical_fire_success = 1 - nonzeroRate`)
+ * reads the same value contract: 0 = clean, nonzero = failure.
  */
 export class CronRunTelemetryProducer implements TelemetryProvider {
   private readonly journalUnitGlob: string;
   private readonly unitPrefix: string;
   private readonly schemaVersion: string;
   private readonly journalRunner: (args: string[]) => string;
+  private readonly costDbPath: string;
+  private readonly cronConfigProbe: () => CronConfigPresence;
 
   constructor(cfg: CronRunProducerConfig = {}) {
     this.journalUnitGlob = cfg.journalUnitGlob ?? "wisecron-*.service";
     this.unitPrefix = cfg.unitPrefix ?? "wisecron-";
     this.schemaVersion = cfg.schemaVersion ?? TELEMETRY_CONTRACT_VERSION;
     this.journalRunner = cfg.journalRunner ?? defaultJournalRunner;
+    this.costDbPath = expandHome(cfg.costDbPath ?? join(homedir(), "agent", "data", "costs.db"));
+    this.cronConfigProbe = cfg.cronConfigProbe ?? defaultCronConfigProbe;
   }
 
   contractVersion(): string {
@@ -115,37 +153,158 @@ export class CronRunTelemetryProducer implements TelemetryProvider {
     return parseCronRunJournal(raw);
   }
 
+  /** Resolve the active source by probing each candidate in priority order. */
+  private detectKind(): CronSourceKind {
+    if (this.readEntries(new Date(Date.now() - 7 * 86_400_000)).length > 0) return "systemd";
+    if (busSchedulerRowCount(this.costDbPath) > 0) return "bus_scheduler";
+    return "none";
+  }
+
   capabilities(): TelemetryCapability[] {
-    const since = new Date(Date.now() - 7 * 86_400_000);
-    const entries = this.readEntries(since);
-    if (entries.length === 0) {
+    const kind = this.detectKind();
+    if (kind === "systemd") {
       return [
         {
           stream: "cron_run",
           schemaVersion: this.schemaVersion,
-          available: false,
-          reason: `no '${this.journalUnitGlob}' run completions in last 7d (no wisecron units installed?)`,
+          available: true,
+          reason: `source=systemd ('${this.journalUnitGlob}' journal, exit codes)`,
         },
       ];
     }
-    return [{ stream: "cron_run", schemaVersion: this.schemaVersion, available: true }];
+    if (kind === "bus_scheduler") {
+      return [
+        {
+          stream: "cron_run",
+          schemaVersion: this.schemaVersion,
+          available: true,
+          reason: `source=bus_scheduler (ClaudeClaw cron sessions in ${this.costDbPath}; completions only, no crash-failure signal)`,
+        },
+      ];
+    }
+    const cfg = this.cronConfigProbe();
+    const configured: string[] = [];
+    if (cfg.crontab) configured.push("crontab");
+    if (cfg.configSnapshot) configured.push("~/.config/cron");
+    const tail =
+      configured.length > 0
+        ? `${configured.join(" + ")} present but log no machine-readable run completions`
+        : `no '${this.journalUnitGlob}' units, no bus-scheduler sessions, no crontab`;
+    return [
+      {
+        stream: "cron_run",
+        schemaVersion: this.schemaVersion,
+        available: false,
+        reason: `no cron run-completion source — ${tail}`,
+      },
+    ];
   }
 
   async query(stream: TelemetryStream, range: DateRange): Promise<MetricSample[]> {
     if (stream !== "cron_run") return [];
-    const entries = this.readEntries(range.start);
-    return entries
-      .filter((e) => inRange(e.ts, range))
-      .map((e) => ({
-        ts: e.ts,
-        value: e.exitCode,
-        labels: {
-          unit: e.unit,
-          exit_code: String(e.exitCode),
-          status: e.exitCode === 0 ? "success" : "failure",
-        },
-      }));
+    const kind = this.detectKind();
+    if (kind === "systemd") {
+      return this.readEntries(range.start)
+        .filter((e) => inRange(e.ts, range))
+        .map((e) => ({
+          ts: e.ts,
+          value: e.exitCode,
+          labels: {
+            unit: e.unit,
+            exit_code: String(e.exitCode),
+            status: e.exitCode === 0 ? "success" : "failure",
+            source: "systemd",
+          },
+        }));
+    }
+    if (kind === "bus_scheduler") {
+      return readBusSchedulerRuns(this.costDbPath, range);
+    }
+    return [];
   }
+}
+
+/** Count cron-attributed sessions in costs.db (any date). 0 when absent/unreadable. */
+function busSchedulerRowCount(dbPath: string): number {
+  if (!existsSync(dbPath)) return 0;
+  let db: Database | null = null;
+  try {
+    db = new Database(dbPath, { readonly: true });
+    const r = db
+      .query(
+        `SELECT COUNT(*) AS n FROM session_costs
+         WHERE job LIKE '%source="cron"%' OR job LIKE '%bus-scheduler%' OR job LIKE 'cron%'`,
+      )
+      .get() as { n: number } | null;
+    return r ? r.n : 0;
+  } catch {
+    return 0;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/** Each cron-attributed session = one completed fire (value 0). day-granular ts. */
+function readBusSchedulerRuns(dbPath: string, range: DateRange): MetricSample[] {
+  if (!existsSync(dbPath)) return [];
+  let db: Database | null = null;
+  try {
+    db = new Database(dbPath, { readonly: true });
+    const rows = db
+      .query(
+        `SELECT date, job FROM session_costs
+         WHERE (job LIKE '%source="cron"%' OR job LIKE '%bus-scheduler%' OR job LIKE 'cron%')
+           AND date >= ? AND date < ?
+         ORDER BY date ASC`,
+      )
+      .all(range.start.toISOString().slice(0, 10), range.end.toISOString().slice(0, 10)) as Array<{
+      date: string;
+      job: string;
+    }>;
+    return rows.map((r) => ({
+      ts: new Date(`${r.date}T00:00:00.000Z`),
+      value: 0, // a recorded session is a completed fire; no exit code in costs.db
+      labels: {
+        unit: busSchedulerUnit(r.job),
+        exit_code: "0",
+        status: "success",
+        source: "bus_scheduler",
+      },
+    }));
+  } catch {
+    return [];
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/** Pull the `chat_id="bus-scheduler:<id>"` out of a job string, else "bus-scheduler". */
+function busSchedulerUnit(job: string): string {
+  const m = job.match(/chat_id="(bus-scheduler:[^"]+)"/);
+  return m ? m[1]! : "bus-scheduler";
+}
+
+/** Default cron-config presence probe: `crontab -l` + `~/.config/cron`. */
+function defaultCronConfigProbe(): CronConfigPresence {
+  let crontab = false;
+  try {
+    const res = spawnSync("crontab", ["-l"], { encoding: "utf8", timeout: 5_000 });
+    crontab =
+      res.status === 0 &&
+      (res.stdout ?? "").split("\n").some((l) => l.trim() && !l.trim().startsWith("#"));
+  } catch {
+    crontab = false;
+  }
+  const configSnapshot = existsSync(join(homedir(), ".config", "cron"));
+  return { crontab, configSnapshot };
 }
 
 function parseCronRunJournal(raw: string): CronRunEntry[] {
@@ -586,20 +745,38 @@ export interface HostTelemetryConfig {
   skillAccessLog?: string;
   journalPath?: string;
   cronJournalRunner?: (args: string[]) => string;
+  /** Session-transcript root for the universal producer. Default `~/.claude/projects`. */
+  sessionProjectsDir?: string;
+  /** Hermeticity escape hatch (tests): override the cron-config presence probe. */
+  cronConfigProbe?: () => CronConfigPresence;
 }
 
 /**
  * The reference-host telemetry surface: every feasible producer composed into
  * one provider. Pass into `registerWisecronSubjects(registry, settings,
  * { telemetry })` so the activation gate runs and subjects measure fitness.
+ *
+ * `SessionJsonlTelemetryProducer` is the UNIVERSAL source for the dispatch/tool/
+ * memory streams (real, abundant data on any Claude Code host). It is listed
+ * before `JournalTelemetryProducer` so its available capabilities win the
+ * per-stream merge; the journal producer stays wired only as a forward-compat
+ * fallback for the day `operations.jsonl` carries matching events (it returns
+ * `[]` for these streams on the reference host, so no double-counting).
+ * `CronRunTelemetryProducer` auto-detects its source (systemd → bus-scheduler →
+ * none) from `costDbPath`, so a host with no wisecron units still lights up.
  */
 export function buildHostTelemetryProvider(
   cfg: HostTelemetryConfig = {},
 ): CompositeTelemetryProvider {
   return new CompositeTelemetryProvider([
-    new CronRunTelemetryProducer({ journalRunner: cfg.cronJournalRunner }),
+    new CronRunTelemetryProducer({
+      journalRunner: cfg.cronJournalRunner,
+      costDbPath: cfg.costDbPath,
+      cronConfigProbe: cfg.cronConfigProbe,
+    }),
     new HookExecTelemetryProducer({ hooksDir: cfg.hooksDir }),
     new SkillAccessTelemetryProducer({ accessLog: cfg.skillAccessLog }),
+    new SessionJsonlTelemetryProducer({ projectsDir: cfg.sessionProjectsDir }),
     new JournalTelemetryProducer({ journalPath: cfg.journalPath }),
     new SessionCostTelemetryProvider({ dbPath: cfg.costDbPath }),
   ]);
