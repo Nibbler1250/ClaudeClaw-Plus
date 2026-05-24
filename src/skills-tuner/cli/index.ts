@@ -232,6 +232,26 @@ program
     console.log(`📝 Feedback recorded: proposal ${id} → ${preferred}`);
   });
 
+// ── rate-template ─────────────────────────────────────────────────────────────────────
+program
+  .command('rate-template <id> <verdict>')
+  .description('Rate a prompt template (verdict = yes|yes-but|no) — feeds the template_feedback telemetry stream')
+  .option('--comment <text>', 'optional free-text note')
+  .action(async (id: string, verdict: string, opts: { comment?: string }) => {
+    const { isTemplateVerdict, appendTemplateFeedback, DEFAULT_TEMPLATE_FEEDBACK_LOG } =
+      await import('../core/template-feedback.js');
+    if (!isTemplateVerdict(verdict)) {
+      console.error('verdict must be one of: yes, yes-but, no');
+      process.exit(1);
+    }
+    const entry = appendTemplateFeedback({ templateId: id, verdict, comment: opts.comment });
+    const { auditLog } = await import('../core/security.js');
+    auditLog('template_rated', { template_id: id, verdict, rating: entry.rating });
+    console.log(
+      `📝 Rated template '${id}': ${verdict} (rating ${entry.rating}) → ${DEFAULT_TEMPLATE_FEEDBACK_LOG}`,
+    );
+  });
+
 // ── stats ─────────────────────────────────────────────────────────────────────────────
 program
   .command('stats')

@@ -44,6 +44,7 @@ import {
   TELEMETRY_STREAMS,
 } from "../../skills-tuner/core/telemetry.js";
 import { DEFAULT_MODE_DISPATCH_LOG } from "../../governance/mode-dispatch-journal.js";
+import { DEFAULT_TEMPLATE_FEEDBACK_LOG } from "../../skills-tuner/core/template-feedback.js";
 import { SessionCostTelemetryProvider } from "./session-cost-provider.js";
 import { SessionJsonlTelemetryProducer } from "./session-jsonl-provider.js";
 
@@ -794,6 +795,101 @@ export class ModeDispatchTelemetryProducer implements TelemetryProvider {
   }
 }
 
+// ── template_feedback ────────────────────────────────────────────────────────
+
+export interface TemplateFeedbackProducerConfig {
+  /** Feedback log. Default ~/.config/tuner/template_feedback.jsonl. */
+  feedbackLog?: string;
+  schemaVersion?: string;
+}
+
+interface TemplateFeedbackEntry {
+  ts: Date;
+  templateId: string;
+  rating: number;
+  verdict: string;
+}
+
+/**
+ * Emits `template_feedback` from `~/.config/tuner/template_feedback.jsonl`
+ * (written by `tuner rate-template`). value = rating (1..5); template_id +
+ * verdict ride in labels. Matches PromptTemplateSubject's
+ * `template_avg_rating = median(values)` (higher_is_better).
+ *
+ * Starts inactive-with-reason (the log doesn't exist until the first rating) and
+ * activates on first `rate-template` — empty is correct, not faked.
+ */
+export class TemplateFeedbackTelemetryProducer implements TelemetryProvider {
+  private readonly feedbackLog: string;
+  private readonly schemaVersion: string;
+
+  constructor(cfg: TemplateFeedbackProducerConfig = {}) {
+    this.feedbackLog = expandHome(cfg.feedbackLog ?? DEFAULT_TEMPLATE_FEEDBACK_LOG);
+    this.schemaVersion = cfg.schemaVersion ?? TELEMETRY_CONTRACT_VERSION;
+  }
+
+  contractVersion(): string {
+    return TELEMETRY_CONTRACT_VERSION;
+  }
+
+  private read(): TemplateFeedbackEntry[] {
+    if (!existsSync(this.feedbackLog)) return [];
+    let content: string;
+    try {
+      content = readFileSync(this.feedbackLog, "utf8");
+    } catch {
+      return [];
+    }
+    const out: TemplateFeedbackEntry[] = [];
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const obj = JSON.parse(trimmed) as Record<string, unknown>;
+        if (typeof obj !== "object" || obj === null) continue;
+        const templateId = String(obj.template_id ?? "");
+        if (!templateId) continue;
+        const rating = Number(obj.rating);
+        if (Number.isNaN(rating)) continue;
+        const tsRaw = obj.ts as string | number | undefined;
+        const ts = tsRaw ? new Date(tsRaw) : new Date();
+        if (Number.isNaN(ts.getTime())) continue;
+        out.push({ ts, templateId, rating, verdict: String(obj.verdict ?? "") });
+      } catch {
+        /* skip malformed line */
+      }
+    }
+    return out;
+  }
+
+  capabilities(): TelemetryCapability[] {
+    if (this.read().length === 0) {
+      return [
+        {
+          stream: "template_feedback",
+          schemaVersion: this.schemaVersion,
+          available: false,
+          reason: existsSync(this.feedbackLog)
+            ? `no ratings in ${this.feedbackLog}`
+            : `no ratings yet at ${this.feedbackLog} (run 'tuner rate-template <id> <yes|yes-but|no>')`,
+        },
+      ];
+    }
+    return [{ stream: "template_feedback", schemaVersion: this.schemaVersion, available: true }];
+  }
+
+  async query(stream: TelemetryStream, range: DateRange): Promise<MetricSample[]> {
+    if (stream !== "template_feedback") return [];
+    return this.read()
+      .filter((e) => inRange(e.ts, range))
+      .map((e) => ({
+        ts: e.ts,
+        value: e.rating,
+        labels: { template_id: e.templateId, verdict: e.verdict },
+      }));
+  }
+}
+
 // ── composite ────────────────────────────────────────────────────────────────
 
 /**
@@ -856,6 +952,8 @@ export interface HostTelemetryConfig {
   journalPath?: string;
   /** Dedicated mode_dispatch journal. Default ~/.claudeclaw/journal/mode_dispatch.jsonl. */
   modeDispatchLog?: string;
+  /** Template-rating log. Default ~/.config/tuner/template_feedback.jsonl. */
+  templateFeedbackLog?: string;
   cronJournalRunner?: (args: string[]) => string;
   /** Session-transcript root for the universal producer. Default `~/.claude/projects`. */
   sessionProjectsDir?: string;
@@ -895,6 +993,7 @@ export function buildHostTelemetryProvider(
     new HookExecTelemetryProducer({ hooksDir: cfg.hooksDir }),
     new SkillAccessTelemetryProducer({ accessLog: cfg.skillAccessLog }),
     new ModeDispatchTelemetryProducer({ journalPath: cfg.modeDispatchLog }),
+    new TemplateFeedbackTelemetryProducer({ feedbackLog: cfg.templateFeedbackLog }),
     new SessionJsonlTelemetryProducer({ projectsDir: cfg.sessionProjectsDir }),
     new JournalTelemetryProducer({ journalPath: cfg.journalPath }),
     new SessionCostTelemetryProvider({ dbPath: cfg.costDbPath }),

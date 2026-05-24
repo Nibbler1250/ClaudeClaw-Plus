@@ -9,6 +9,7 @@ import {
   SkillAccessTelemetryProducer,
   JournalTelemetryProducer,
   ModeDispatchTelemetryProducer,
+  TemplateFeedbackTelemetryProducer,
   CompositeTelemetryProvider,
   buildHostTelemetryProvider,
 } from "../../wisecron/host-telemetry-provider.js";
@@ -389,6 +390,59 @@ describe("ModeDispatchTelemetryProducer", () => {
   });
 });
 
+describe("TemplateFeedbackTelemetryProducer", () => {
+  let dir: string;
+  let log: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "tmpl-fb-"));
+    log = join(dir, "template_feedback.jsonl");
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("emits template_feedback with value=rating and template_id/verdict labels", async () => {
+    writeFileSync(
+      log,
+      [
+        JSON.stringify({
+          ts: IN.toISOString(),
+          template_id: "daily-brief",
+          rating: 5,
+          verdict: "yes",
+        }),
+        JSON.stringify({ ts: IN.toISOString(), template_id: "pitch", rating: 1, verdict: "no" }),
+        JSON.stringify({ ts: OUT.toISOString(), template_id: "x", rating: 3, verdict: "yes-but" }), // out
+        "not json",
+      ].join("\n"),
+    );
+    const p = new TemplateFeedbackTelemetryProducer({ feedbackLog: log });
+    const samples = await p.query("template_feedback", RANGE);
+    expect(samples).toHaveLength(2);
+    expect(samples.map((s) => s.value).sort((a, b) => a - b)).toEqual([1, 5]);
+    expect(samples.find((s) => s.value === 5)!.labels).toEqual({
+      template_id: "daily-brief",
+      verdict: "yes",
+    });
+    expect(p.capabilities()[0]!.available).toBe(true);
+  });
+
+  it("advertises unavailable+reason (with the rate-template hint) when no log exists", () => {
+    const p = new TemplateFeedbackTelemetryProducer({ feedbackLog: log });
+    const cap = p.capabilities()[0]!;
+    expect(cap.available).toBe(false);
+    expect(cap.reason).toMatch(/no ratings yet/);
+    expect(cap.reason).toMatch(/rate-template/);
+  });
+
+  it("returns [] for streams it does not own", async () => {
+    writeFileSync(
+      log,
+      `${JSON.stringify({ ts: IN.toISOString(), template_id: "t", rating: 5, verdict: "yes" })}\n`,
+    );
+    const p = new TemplateFeedbackTelemetryProducer({ feedbackLog: log });
+    expect(await p.query("mode_dispatch", RANGE)).toEqual([]);
+  });
+});
+
 describe("CompositeTelemetryProvider", () => {
   /** A trivial provider owning exactly one stream. */
   function one(
@@ -455,6 +509,8 @@ describe("buildHostTelemetryProvider (real host wiring)", () => {
       hooksDir: join(dir, "hooks"),
       skillAccessLog: join(dir, "skills.jsonl"),
       journalPath: join(dir, "ops.jsonl"),
+      modeDispatchLog: join(dir, "mode_dispatch.jsonl"),
+      templateFeedbackLog: join(dir, "template_feedback.jsonl"),
       sessionProjectsDir: join(dir, "projects"),
       cronJournalRunner: () => "",
       cronConfigProbe: () => ({ crontab: false, configSnapshot: false }),
