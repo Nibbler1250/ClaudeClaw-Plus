@@ -220,16 +220,24 @@ export type JsonlLine =
 
 /**
  * Encode an absolute realpath'd cwd into the directory name Claude Code
- * uses under `~/.claude/projects/`. Empirically:
- *   `/Users/foo/bar` → `-Users-foo-bar`
- * i.e. `/` → `-`. No other transformation — case is preserved.
+ * uses under `~/.claude/projects/`. Claude replaces the platform's path
+ * separators with `-`; case is preserved. Empirically:
+ *   POSIX:   `/Users/foo/bar`        → `-Users-foo-bar`   (`/` only)
+ *   Windows: `C:\Users\foo\bar`      → `C--Users-foo-bar` (`\`, `/` and the
+ *            drive `:`) — verified against claude.exe on a Win11 host.
+ * `:` must NOT be replaced on POSIX, where it is a legal path character.
+ *
+ * `platform` is injectable so both branches are testable off-Windows.
  *
  * Session Manager already calls `fs.realpathSync(cwd)` before passing
  * cwd to the Tailer (resolves macOS `/tmp` → `/private/tmp` symlink per
  * Spike 0.5). Tailer trusts that contract.
  */
-export function encodeCwdForProjectsDir(cwd: string): string {
-  return cwd.replace(/\//g, "-");
+export function encodeCwdForProjectsDir(
+  cwd: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return platform === "win32" ? cwd.replace(/[/\\:]/g, "-") : cwd.replace(/\//g, "-");
 }
 
 /* ───────────────────────────────────────────────────────────────────── */
