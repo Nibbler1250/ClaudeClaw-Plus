@@ -13,6 +13,11 @@ triggers:
   - /tuner audit
   - /tuner optimize
   - /tuner report
+  - /tuner wire-subject
+  - wire a tunable subject
+  - add a tunable subject
+  - câble un subject
+  - measure a subject
   - tune this skill
   - tune the skill
   - improve the tuner
@@ -40,7 +45,7 @@ triggers:
 
 # Tuner — companion skill
 
-You are the companion skill for the **skills-tuner** platform. The user invokes you to manage their skills-tuner installation across six modes. Read the user message carefully to detect the intended mode. If unclear, ask.
+You are the companion skill for the **skills-tuner** platform. The user invokes you to manage their skills-tuner installation across seven modes. Read the user message carefully to detect the intended mode. If unclear, ask.
 
 ## Mode dispatch
 
@@ -52,6 +57,7 @@ Detect mode from the trigger:
 - `/tuner audit` or "audit le tuner" or "review tuner state" → **audit**
 - `/tuner optimize` or "reduce tuner cost" → **optimize**
 - `/tuner report` or "this looks like a tuner bug" or "ouvre une issue" → **report**
+- `/tuner wire-subject` or "add/wire a tunable subject" or "câble un subject" → **wire-subject** (DEVELOPER mode — authoring a new TunableSubject *class* in code + its OutcomeLoop fitness; distinct from `create`, which only registers an existing skill file)
 
 If `~/.config/tuner/config.yaml` does not exist and mode is unclear, default to **setup**. If the verbatim is genuinely ambiguous (e.g. just "tune-moi"), ask the user which mode applies before doing anything.
 
@@ -327,6 +333,44 @@ If the skill is in a specialized domain, suggest adding domain words to `_EMOTIO
 User confirms before adding.
 
 End create.
+---
+
+## Mode: wire-subject
+
+**DEVELOPER mode** — authoring a NEW `TunableSubject` *class* in the tuner codebase and wiring
+its OutcomeLoop fitness end to end (detection → proposal → apply → **measured** baseline/delta/
+verdict). Distinct from `create` (which only registers an existing skill file in config).
+
+**Full playbook (authoritative, do-not-forget checklist + copy-paste skeleton + host
+stream-producer PR template):** `docs/add-tunable-subject-SKILL.md`. Read it before coding —
+this mode is the index; that doc is the procedure.
+
+Condensed flow (see the doc for each step):
+1. **Decide shape** — what it tunes, `risk_tier`, and the fitness tier: Tier 1b *artifact*
+   (always available — every subject ships at least one) vs Tier 1 *stream* (host-emitted).
+2. **Subject class** (`src/tuner/subjects/<name>-subject.ts`, extends `BaseSubject`): the 5
+   abstract methods (`collectObservations/detectProblems/proposeChange/apply/validate`) PLUS the
+   often-forgotten pieces — `snapshotInverse`, `healthProbe` (required for medium/high risk or
+   auto-revert is fail-open), `currentStateHash`, and the OutcomeLoop `fitnessSignals()` +
+   `measureFitness()` (aggregate outlier-robust: median/trimmed-mean, never a raw sum). Skeleton
+   in Appendix A.
+3. **Telemetry source** — artifact: scan the file. Stream not yet emitted: it's a HOST job →
+   open a producer PR to ClaudeClaw-Plus (add to `TELEMETRY_STREAMS`, bump
+   `TELEMETRY_CONTRACT_VERSION`, implement `query`+`capabilities`). Template in Appendix B. Until
+   it lands the metric is `fitness_inactive` and the subject runs proposal-only (by design).
+4. **Register** — `registerWithProbeCheck(new XSubject(...))` in `src/tuner/wisecron/index.ts`
+   + `subjects.x` block in `config.yaml` + `tuner doctor` green.
+5. **Tests** — the full checklist in the doc (pipeline + fitness gate + baseline→maturation→
+   verdict + guardrail-override + tier-routed revert + audit chain). `bun test` + `bun run lint`.
+6. **Live verify** — `tuner doctor`, `tuner cron-run --dry`, a real `measureFitness` run, then
+   apply one through the loop and confirm `outcomes.jsonl` gets a baseline/post/delta/verdict row.
+
+**Definition of done:** pipeline + ≥1 Tier 1b fitness metric implemented; (if Tier 1) host
+stream exists or producer PR open; registered + config + doctor green; all tests + lint pass; a
+**real** `measureFitness` returns a number. Detection alone is NOT done — the measured outcome is
+the point. Ship via SDC (version bumps + tests-passing + security/code review), no `Co-Authored-By`.
+
+End wire-subject.
 ---
 
 ## Mode: adjust
