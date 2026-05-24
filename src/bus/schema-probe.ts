@@ -15,7 +15,13 @@
  * `jsonl-tailer.ts`); a parser bump auto-invalidates the cache and re-probes.
  */
 
-import { spawn as nodeSpawn } from "node:child_process";
+import { spawn as nodeSpawn, type SpawnOptions } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+
+// Injectable for tests so the win32 `shell: true` branch in
+// `captureClaudeVersion` is verifiable off-Windows. Defaults to the real
+// `node:child_process` `spawn`.
+type SpawnFn = (cmd: string, args: ReadonlyArray<string>, opts: SpawnOptions) => ChildProcess;
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -137,10 +143,30 @@ function writeCache(path: string, entry: CacheEntry): void {
  * Run `<claudeBin> --version` and return the trimmed first line. Returns
  * `null` on any failure (binary missing, non-zero exit) so callers can
  * decide whether that warrants a warn or a throw.
+ *
+ * `platform` is injectable so the win32 `shell: true` branch is testable
+ * off-Windows, mirroring the pattern used by `encodeCwdForProjectsDir`
+ * in `jsonl-line-types.ts`. Production callers omit it and pick up
+ * `process.platform` by default.
  */
-async function captureClaudeVersion(claudeBin: string, timeoutMs = 5000): Promise<string | null> {
+async function captureClaudeVersion(
+  claudeBin: string,
+  timeoutMs = 5000,
+  platform: NodeJS.Platform = process.platform,
+  spawn: SpawnFn = nodeSpawn,
+): Promise<string | null> {
   return new Promise((resolve) => {
-    const child = nodeSpawn(claudeBin, ["--version"], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(claudeBin, ["--version"], {
+      stdio: ["ignore", "pipe", "pipe"],
+      // On Windows `claude` resolves to `claude.cmd`; since the CVE-2024-27980
+      // fix Node refuses to spawn a .cmd/.bat without a shell (EINVAL/EFTYPE),
+      // so route through the shell there. Args are static and `claudeBin` is
+      // operator config (never request-derived) — no injection surface; keep
+      // it that way so this win32 shell path never becomes a sink.
+      // (runner.ts resolves the underlying claude.exe instead — that's for
+      // Bun.spawn + long argvs; here we're on node:child_process with `--version`.)
+      shell: platform === "win32",
+    });
     let out = "";
     let settled = false;
     const settle = (v: string | null): void => {
@@ -493,3 +519,6 @@ export { ASSERTION_DEFS, runAssertions };
 export type { AssertionResult, CollectedJsonl };
 export { defaultPtyRunnerFactory };
 export type { ProbeRunner, ProbeRunnerFactory, ProbeRunnerSpawnArgs };
+
+/** For tests only — verifies the win32 `shell: true` branch off-Windows. */
+export { captureClaudeVersion as __captureClaudeVersionForTests };
