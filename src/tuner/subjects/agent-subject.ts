@@ -13,6 +13,9 @@ import type {
   ValidationResult,
 } from "../../skills-tuner/core/types.js";
 import type { RevertibleSubject } from "../wisecron/types.js";
+import type { DateRange, Metric, TelemetryProvider } from "../../skills-tuner/core/telemetry.js";
+import { ARTIFACT_SOURCE } from "../../skills-tuner/core/telemetry.js";
+import { nonzeroRate } from "../../skills-tuner/core/aggregate.js";
 
 const DEAD_AGENT_AGE_DAYS = 180;
 const RECLASSIFY_RATE_THRESHOLD = 0.4;
@@ -254,6 +257,104 @@ export class AgentSubject extends BaseSubject implements RevertibleSubject {
   async revert(inversePatch: Patch): Promise<void> {
     this.assertInsideAgentsDir(inversePatch.target_path);
     writeFileSync(inversePatch.target_path, inversePatch.applied_content, "utf8");
+  }
+
+  /**
+   * OutcomeLoop fitness for the agent subject (LOW risk).
+   *
+   * Target — `agent_reclassify_rate` (Tier 1, `agent_dispatch`): fraction of
+   * sub-agent dispatches the orchestrator reclassified (picked the wrong agent).
+   * Lower is better. The gameable shortcut is to disable agents so none get
+   * picked, so it is guarded by `active_agent_count` (Tier 1b artifact,
+   * higher_is_better). `agent_desc_defect_count` (Tier 1b artifact): always-on
+   * scan for agents whose frontmatter is missing name/description or whose
+   * description length is out of the `[MIN,MAX]` band `validate()` enforces.
+   */
+  fitnessSignals(): Metric[] {
+    return [
+      {
+        name: "agent_reclassify_rate",
+        source: "agent_dispatch",
+        kind: "verifiable",
+        direction: "lower_is_better",
+        windowDays: 7,
+        guardrails: ["active_agent_count"],
+      },
+      {
+        name: "agent_desc_defect_count",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "lower_is_better",
+        windowDays: 1,
+      },
+      {
+        name: "active_agent_count",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "higher_is_better",
+        windowDays: 7,
+      },
+    ];
+  }
+
+  /**
+   * Telemetry read ONLY via `provider.query("agent_dispatch", …)`; reclassify
+   * rate is a rate, not a sum. Artifact metrics scan the managed agents dir and
+   * are omitted when it is absent (degrade gracefully).
+   */
+  async measureFitness(
+    range: DateRange,
+    provider: TelemetryProvider,
+  ): Promise<Record<string, number>> {
+    const out: Record<string, number> = {};
+
+    // ── Tier 1: agent_dispatch stream (value 1 = reclassified) ──────────────
+    const samples = await provider.query("agent_dispatch", range);
+    if (samples.length > 0) {
+      out.agent_reclassify_rate = nonzeroRate(samples.map((s) => s.value));
+    }
+
+    // ── Tier 1b: artifact scan of the agents dir ────────────────────────────
+    const scan = await this.scanAgents();
+    if (scan !== null) {
+      out.active_agent_count = scan.agents;
+      out.agent_desc_defect_count = scan.defects;
+    }
+
+    return out;
+  }
+
+  /**
+   * Scan the managed agents dir; defects = files with missing name/description
+   * or a description length outside `[MIN_DESC_LEN, MAX_DESC_LEN]`. Returns null
+   * when the dir is absent (metric doesn't measure).
+   */
+  private async scanAgents(): Promise<{ agents: number; defects: number } | null> {
+    if (!existsSync(this.agentsDir)) return null;
+    let files: string[];
+    try {
+      files = await this.scanMdFiles(this.agentsDir);
+    } catch {
+      return null;
+    }
+    let defects = 0;
+    for (const file of files) {
+      let fm: Record<string, unknown> | null;
+      try {
+        fm = parseFrontmatter(readFileSync(file, "utf8"));
+      } catch {
+        defects += 1;
+        continue;
+      }
+      const name = fm?.name;
+      const description = fm?.description;
+      if (typeof name !== "string" || typeof description !== "string") {
+        defects += 1;
+        continue;
+      }
+      if (description.length < MIN_DESC_LEN || description.length > MAX_DESC_LEN) defects += 1;
+    }
+    return { agents: files.length, defects };
   }
 
   private assertInsideAgentsDir(target: string): void {

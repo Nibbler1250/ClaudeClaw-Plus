@@ -13,6 +13,9 @@ import type {
   ValidationResult,
 } from "../../skills-tuner/core/types.js";
 import type { RevertibleSubject } from "../wisecron/types.js";
+import type { DateRange, Metric, TelemetryProvider } from "../../skills-tuner/core/telemetry.js";
+import { ARTIFACT_SOURCE } from "../../skills-tuner/core/telemetry.js";
+import { nonzeroRate } from "../../skills-tuner/core/aggregate.js";
 
 const BROKEN_MIN_CALLS = 100;
 const BROKEN_SUCCESS_RATE = 0.5;
@@ -305,14 +308,108 @@ export class McpPluginSubject extends BaseSubject implements RevertibleSubject {
         reason: `no audit events in last 7d at ${this.auditLog}`,
       };
     }
-    const mcpCalls = events.filter(e => e.type === "mcp_tool_call").length;
+    const mcpCalls = events.filter((e) => e.type === "mcp_tool_call").length;
     return {
       producer_found: true,
       sample_event_match_rate: mcpCalls / events.length,
-      reason: mcpCalls === 0
-        ? `${events.length} audit events but 0 mcp_tool_call entries — instrumentation missing?`
-        : undefined,
+      reason:
+        mcpCalls === 0
+          ? `${events.length} audit events but 0 mcp_tool_call entries — instrumentation missing?`
+          : undefined,
     };
+  }
+
+  /**
+   * OutcomeLoop fitness for the mcp_plugin subject (MEDIUM risk).
+   *
+   * Target — `mcp_tool_failure_rate` (Tier 1, `tool_call`): fraction of MCP tool
+   * calls that failed or were blocked over the window. Lower is better. The
+   * gameable shortcut is to empty `allowedTools` (no calls → no failures), so it
+   * is guarded by `mcp_allowed_tool_count` (Tier 1b artifact, higher_is_better) —
+   * a failure-rate drop achieved by removing tools regresses the guardrail.
+   * `mcp_allowed_tool_defect_count` (Tier 1b artifact): always-on scan of the
+   * managed settings for duplicate / empty allowlist entries.
+   */
+  fitnessSignals(): Metric[] {
+    return [
+      {
+        name: "mcp_tool_failure_rate",
+        source: "tool_call",
+        kind: "verifiable",
+        direction: "lower_is_better",
+        windowDays: 7,
+        guardrails: ["mcp_allowed_tool_count"],
+      },
+      {
+        name: "mcp_allowed_tool_defect_count",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "lower_is_better",
+        windowDays: 1,
+      },
+      {
+        name: "mcp_allowed_tool_count",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "higher_is_better",
+        windowDays: 7,
+      },
+    ];
+  }
+
+  /**
+   * Telemetry read ONLY via `provider.query("tool_call", …)`; failure rate is a
+   * rate (outlier-robust by construction), not a sum. The artifact metrics scan
+   * the managed settings file directly and are omitted only when that file is
+   * absent (an empty/absent `allowedTools` legitimately measures as 0).
+   */
+  async measureFitness(
+    range: DateRange,
+    provider: TelemetryProvider,
+  ): Promise<Record<string, number>> {
+    const out: Record<string, number> = {};
+
+    // ── Tier 1: tool_call stream (value 1 = failed/blocked, 0 = ok) ─────────
+    const samples = await provider.query("tool_call", range);
+    if (samples.length > 0) {
+      out.mcp_tool_failure_rate = nonzeroRate(samples.map((s) => s.value));
+    }
+
+    // ── Tier 1b: artifact scan of allowedTools ──────────────────────────────
+    const scan = this.scanAllowedTools();
+    if (scan !== null) {
+      out.mcp_allowed_tool_count = scan.count;
+      out.mcp_allowed_tool_defect_count = scan.defects;
+    }
+
+    return out;
+  }
+
+  /**
+   * Scan the managed settings `allowedTools`. defects = duplicate + empty
+   * entries. Returns null when the settings file is absent (metric doesn't
+   * measure); an existing file with no `allowedTools` measures as `{0,0}`.
+   */
+  private scanAllowedTools(): { count: number; defects: number } | null {
+    if (!existsSync(this.settingsPath)) return null;
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(readFileSync(this.settingsPath, "utf8"));
+    } catch {
+      return null;
+    }
+    const allowed = Array.isArray(parsed.allowedTools) ? (parsed.allowedTools as unknown[]) : [];
+    const seen = new Set<string>();
+    let defects = 0;
+    for (const t of allowed) {
+      if (typeof t !== "string" || t.trim().length === 0) {
+        defects += 1;
+        continue;
+      }
+      if (seen.has(t)) defects += 1;
+      else seen.add(t);
+    }
+    return { count: allowed.length, defects };
   }
 }
 

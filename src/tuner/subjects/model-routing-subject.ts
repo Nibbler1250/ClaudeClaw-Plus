@@ -13,6 +13,9 @@ import type {
   ValidationResult,
 } from "../../skills-tuner/core/types.js";
 import type { RevertibleSubject } from "../wisecron/types.js";
+import type { DateRange, Metric, TelemetryProvider } from "../../skills-tuner/core/telemetry.js";
+import { ARTIFACT_SOURCE } from "../../skills-tuner/core/telemetry.js";
+import { nonzeroRate } from "../../skills-tuner/core/aggregate.js";
 
 const DEAD_DAYS = 90;
 const MISTRIGGER_RATE = 0.3;
@@ -320,6 +323,107 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
       producer_found: true,
       sample_event_match_rate: dispatched / events.length,
     };
+  }
+
+  /**
+   * OutcomeLoop fitness for the model_routing subject (MEDIUM risk).
+   *
+   * Target — `routing_reclassify_rate` (Tier 1, `mode_dispatch`): fraction of
+   * mode dispatches the orchestrator later reclassified (a mis-route). Lower is
+   * better. The gameable shortcut is to delete modes so nothing dispatches, so
+   * it is guarded by `routing_active_mode_count` (Tier 1b artifact,
+   * higher_is_better). `routing_duplicate_keyword_count` (Tier 1b artifact):
+   * always-on scan for keywords claimed by more than one mode — the exact
+   * collision `validate()` rejects, and a direct cause of mis-routing.
+   */
+  fitnessSignals(): Metric[] {
+    return [
+      {
+        name: "routing_reclassify_rate",
+        source: "mode_dispatch",
+        kind: "verifiable",
+        direction: "lower_is_better",
+        windowDays: 7,
+        guardrails: ["routing_active_mode_count"],
+      },
+      {
+        name: "routing_duplicate_keyword_count",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "lower_is_better",
+        windowDays: 1,
+      },
+      {
+        name: "routing_active_mode_count",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "higher_is_better",
+        windowDays: 7,
+      },
+    ];
+  }
+
+  /**
+   * Telemetry read ONLY via `provider.query("mode_dispatch", …)`; reclassify
+   * rate is a rate, not a sum. The artifact metrics parse the managed modes
+   * config and are omitted when that file is absent (degrade gracefully).
+   */
+  async measureFitness(
+    range: DateRange,
+    provider: TelemetryProvider,
+  ): Promise<Record<string, number>> {
+    const out: Record<string, number> = {};
+
+    // ── Tier 1: mode_dispatch stream (value 1 = reclassified) ───────────────
+    const samples = await provider.query("mode_dispatch", range);
+    if (samples.length > 0) {
+      out.routing_reclassify_rate = nonzeroRate(samples.map((s) => s.value));
+    }
+
+    // ── Tier 1b: artifact scan of the modes config ──────────────────────────
+    const scan = await this.scanModes();
+    if (scan !== null) {
+      out.routing_active_mode_count = scan.modes;
+      out.routing_duplicate_keyword_count = scan.duplicateKeywords;
+    }
+
+    return out;
+  }
+
+  /**
+   * Parse the managed modes YAML; count modes + keywords claimed by >1 mode.
+   * Returns null when the config is absent or unparseable (metric doesn't
+   * measure rather than reporting a misleading 0).
+   */
+  private async scanModes(): Promise<{ modes: number; duplicateKeywords: number } | null> {
+    if (!existsSync(this.modesConfigPath)) return null;
+    let parsed: unknown;
+    try {
+      const yaml = await import("js-yaml");
+      parsed = yaml.load(readFileSync(this.modesConfigPath, "utf8"));
+    } catch {
+      return null;
+    }
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const root = parsed as Record<string, unknown>;
+    const modes = (root.modes ?? root) as Record<string, unknown>;
+    if (typeof modes !== "object" || modes === null) return null;
+
+    const keywordCounts = new Map<string, number>();
+    let modeCount = 0;
+    for (const def of Object.values(modes)) {
+      if (typeof def !== "object" || def === null) continue;
+      modeCount += 1;
+      const kws = (def as Record<string, unknown>).keywords;
+      if (!Array.isArray(kws)) continue;
+      for (const kw of kws) {
+        if (typeof kw !== "string") continue;
+        keywordCounts.set(kw, (keywordCounts.get(kw) ?? 0) + 1);
+      }
+    }
+    let duplicateKeywords = 0;
+    for (const n of keywordCounts.values()) if (n > 1) duplicateKeywords += 1;
+    return { modes: modeCount, duplicateKeywords };
   }
 }
 

@@ -14,6 +14,9 @@ import type {
 } from "../../skills-tuner/core/types.js";
 import type { RevertibleSubject } from "../wisecron/types.js";
 import { renderDiff } from "../wisecron/render-diff.js";
+import type { DateRange, Metric, TelemetryProvider } from "../../skills-tuner/core/telemetry.js";
+import { ARTIFACT_SOURCE } from "../../skills-tuner/core/telemetry.js";
+import { median } from "../../skills-tuner/core/aggregate.js";
 
 /** Derive Claude Code's per-user memory index location.
  * Mirrors Claude Code's pattern: `~/.claude/projects/-home-<basename>/memory/MEMORY.md`.
@@ -253,6 +256,104 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject {
       throw new Error(`memory-subject.revert: target_path mismatch`);
     }
     writeFileSync(this.memoryIndex, inversePatch.applied_content, "utf8");
+  }
+
+  /**
+   * OutcomeLoop fitness for the memory subject (LOW risk).
+   *
+   * Target — `memory_median_reads_per_entry` (Tier 1, `memory_access`): the
+   * typical index entry's read frequency (median per-entry access count over the
+   * window). Higher is better — a well-curated index gets used. Median, so one
+   * hot entry can't dominate. The gameable shortcut is to delete entries to lift
+   * the per-entry median, so it is guarded by `memory_index_entry_count`
+   * (Tier 1b artifact, higher_is_better). `memory_index_defect_count`
+   * (Tier 1b artifact): always-on scan for dead-ref + duplicate-slug entries.
+   */
+  fitnessSignals(): Metric[] {
+    return [
+      {
+        name: "memory_median_reads_per_entry",
+        source: "memory_access",
+        kind: "verifiable",
+        direction: "higher_is_better",
+        windowDays: 7,
+        guardrails: ["memory_index_entry_count"],
+      },
+      {
+        name: "memory_index_defect_count",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "lower_is_better",
+        windowDays: 1,
+      },
+      {
+        name: "memory_index_entry_count",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "higher_is_better",
+        windowDays: 7,
+      },
+    ];
+  }
+
+  /**
+   * Telemetry read ONLY via `provider.query("memory_access", …)`; aggregated as
+   * a median of per-entry read counts (outlier-robust). Artifact metrics parse
+   * the managed index and are omitted only when the index file is absent.
+   */
+  async measureFitness(
+    range: DateRange,
+    provider: TelemetryProvider,
+  ): Promise<Record<string, number>> {
+    const out: Record<string, number> = {};
+
+    // ── Tier 1: memory_access stream (one sample per read, labels.file) ─────
+    const samples = await provider.query("memory_access", range);
+    if (samples.length > 0) {
+      const perFile = new Map<string, number>();
+      for (const s of samples) {
+        const file = s.labels?.file ?? "unknown";
+        perFile.set(file, (perFile.get(file) ?? 0) + 1);
+      }
+      out.memory_median_reads_per_entry = median([...perFile.values()]);
+    }
+
+    // ── Tier 1b: artifact scan of the index ─────────────────────────────────
+    const scan = this.scanIndex();
+    if (scan !== null) {
+      out.memory_index_entry_count = scan.entries;
+      out.memory_index_defect_count = scan.defects;
+    }
+
+    return out;
+  }
+
+  /**
+   * Scan MEMORY.md: defects = entries whose referenced file is missing (dead) +
+   * duplicate-slug entries. Returns null when the index file is absent.
+   */
+  private scanIndex(): { entries: number; defects: number } | null {
+    if (!existsSync(this.memoryIndex)) return null;
+    let content: string;
+    try {
+      content = readFileSync(this.memoryIndex, "utf8");
+    } catch {
+      return null;
+    }
+    const entries = parseEntries(content);
+    const memoryDir = dirname(this.memoryIndex);
+    const slugCounts = new Map<string, number>();
+    for (const e of entries) {
+      const slug = e.file.replace(/\.md$/, "");
+      slugCounts.set(slug, (slugCounts.get(slug) ?? 0) + 1);
+    }
+    let defects = 0;
+    for (const e of entries) {
+      const slug = e.file.replace(/\.md$/, "");
+      if (!existsSync(resolve(memoryDir, e.file))) defects += 1;
+      else if ((slugCounts.get(slug) ?? 0) > 1) defects += 1;
+    }
+    return { entries: entries.length, defects };
   }
 }
 

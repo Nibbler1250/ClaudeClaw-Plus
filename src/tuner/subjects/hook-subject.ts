@@ -22,8 +22,13 @@ import type {
   ValidationResult,
 } from "../../skills-tuner/core/types.js";
 import type { RevertibleSubject } from "../wisecron/types.js";
+import type { DateRange, Metric, TelemetryProvider } from "../../skills-tuner/core/telemetry.js";
+import { ARTIFACT_SOURCE } from "../../skills-tuner/core/telemetry.js";
+import { nonzeroRate } from "../../skills-tuner/core/aggregate.js";
 
 const DEFAULT_CRASH_RATE_THRESHOLD = 0.2;
+/** Hook scripts the subject manages — extensions that count as executable hooks. */
+const HOOK_SCRIPT_EXTS = [".sh", ".js", ".py"];
 const DEFAULT_P95_DURATION_THRESHOLD_MS = 5_000;
 const HOOK_EXEC_MODE = 0o755;
 
@@ -324,7 +329,9 @@ export class HookSubject extends BaseSubject implements RevertibleSubject {
         reason: `readdir failed: ${(e as Error).message.slice(0, 120)}`,
       };
     }
-    const executables = allFiles.filter(f => f.endsWith(".sh") || f.endsWith(".js") || f.endsWith(".py"));
+    const executables = allFiles.filter(
+      (f) => f.endsWith(".sh") || f.endsWith(".js") || f.endsWith(".py"),
+    );
     if (executables.length === 0) {
       return {
         producer_found: false,
@@ -332,17 +339,126 @@ export class HookSubject extends BaseSubject implements RevertibleSubject {
         reason: `no hook scripts (*.sh/*.js/*.py) in ${this.hooksDir}`,
       };
     }
-    const logFiles = allFiles.filter(f => f.endsWith(".log"));
+    const logFiles = allFiles.filter((f) => f.endsWith(".log"));
     return {
       producer_found: true,
       // Match rate = fraction of hook scripts that have a corresponding .log
       // (no log = subject can't observe that hook). 0 means scripts exist
       // but the wrapper that emits .log entries isn't wired.
       sample_event_match_rate: executables.length === 0 ? 0 : logFiles.length / executables.length,
-      reason: logFiles.length === 0
-        ? `${executables.length} hook scripts but 0 *.log files — exec wrapper not wired?`
-        : undefined,
+      reason:
+        logFiles.length === 0
+          ? `${executables.length} hook scripts but 0 *.log files — exec wrapper not wired?`
+          : undefined,
     };
+  }
+
+  /**
+   * OutcomeLoop fitness for the hook subject (HIGH risk).
+   *
+   * Target — `hook_crash_rate` (Tier 1, `hook_exec`): fraction of hook fires
+   * with a nonzero exit code over the window. Lower is better. The cheapest way
+   * to drive crashes to zero is to disable every hook, so it is guarded by
+   * `hook_active_count` (Tier 1b artifact) — a crash-rate drop that comes from
+   * stubbing hooks shows up there as a regression.
+   * `hook_p95_duration_ms` (Tier 1, `hook_exec`): tail latency, also guarded by
+   * the active count. `hook_defect_count` (Tier 1b artifact): always-on static
+   * scan of broken hook scripts (empty / missing shebang), so the subject is
+   * never dead even with no `hook_exec` producer.
+   */
+  fitnessSignals(): Metric[] {
+    return [
+      {
+        name: "hook_crash_rate",
+        source: "hook_exec",
+        kind: "verifiable",
+        direction: "lower_is_better",
+        windowDays: 7,
+        guardrails: ["hook_active_count"],
+      },
+      {
+        name: "hook_p95_duration_ms",
+        source: "hook_exec",
+        kind: "verifiable",
+        direction: "lower_is_better",
+        windowDays: 7,
+        guardrails: ["hook_active_count"],
+      },
+      {
+        name: "hook_defect_count",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "lower_is_better",
+        windowDays: 1,
+      },
+      {
+        name: "hook_active_count",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "higher_is_better",
+        windowDays: 7,
+      },
+    ];
+  }
+
+  /**
+   * Telemetry is read ONLY through `provider.query("hook_exec", …)`. Stream
+   * metrics are OMITTED (not zeroed) when no producer/data exists so the loop
+   * degrades gracefully. Artifact metrics are omitted only when the hooks dir
+   * itself is absent. Aggregation is outlier-robust (rate / p95-percentile,
+   * never a raw sum).
+   */
+  async measureFitness(
+    range: DateRange,
+    provider: TelemetryProvider,
+  ): Promise<Record<string, number>> {
+    const out: Record<string, number> = {};
+
+    // ── Tier 1: hook_exec stream ────────────────────────────────────────────
+    const samples = await provider.query("hook_exec", range);
+    if (samples.length > 0) {
+      const crashFlags = samples.map((s) => ((s.labels?.exit_code ?? "0") === "0" ? 0 : 1));
+      out.hook_crash_rate = nonzeroRate(crashFlags);
+      out.hook_p95_duration_ms = computeP95(samples.map((s) => s.value));
+    }
+
+    // ── Tier 1b: artifact scan of the hooks dir ─────────────────────────────
+    const scan = this.scanHookScripts();
+    if (scan !== null) {
+      out.hook_defect_count = scan.defects;
+      out.hook_active_count = scan.scripts;
+    }
+
+    return out;
+  }
+
+  /**
+   * Static scan of the managed hooks dir. Returns `{ scripts, defects }` where
+   * a defect is a hook script that is empty or lacks a `#!` shebang on line 1.
+   * Returns null when the dir is absent (metric simply doesn't measure).
+   */
+  private scanHookScripts(): { scripts: number; defects: number } | null {
+    if (!existsSync(this.hooksDir)) return null;
+    let files: string[];
+    try {
+      files = readdirSync(this.hooksDir).filter((f) =>
+        HOOK_SCRIPT_EXTS.some((ext) => f.endsWith(ext)),
+      );
+    } catch {
+      return null;
+    }
+    let defects = 0;
+    for (const f of files) {
+      let content: string;
+      try {
+        content = readFileSync(join(this.hooksDir, f), "utf8");
+      } catch {
+        defects += 1; // unreadable hook script is a defect
+        continue;
+      }
+      if (content.trim().length === 0 || !content.startsWith("#!")) defects += 1;
+    }
+    return { scripts: files.length, defects };
   }
 
   private assertInsideHooksDir(target: string): void {

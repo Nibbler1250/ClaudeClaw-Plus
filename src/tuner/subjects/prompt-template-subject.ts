@@ -1,4 +1,4 @@
-import { existsSync, copyFileSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, copyFileSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { BaseSubject } from "../../skills-tuner/subjects/base.js";
@@ -13,6 +13,9 @@ import type {
   ValidationResult,
 } from "../../skills-tuner/core/types.js";
 import type { RevertibleSubject } from "../wisecron/types.js";
+import type { DateRange, Metric, TelemetryProvider } from "../../skills-tuner/core/telemetry.js";
+import { ARTIFACT_SOURCE } from "../../skills-tuner/core/telemetry.js";
+import { median } from "../../skills-tuner/core/aggregate.js";
 
 const MIN_FEEDBACK_COUNT = 3;
 const MAX_AVG_RATING_FOR_FLAG = 3;
@@ -250,6 +253,92 @@ export class PromptTemplateSubject extends BaseSubject implements RevertibleSubj
       producer_found: true,
       sample_event_match_rate: usable / entries.length,
     };
+  }
+
+  /**
+   * OutcomeLoop fitness for the prompt_template subject (LOW risk).
+   *
+   * Target — `template_avg_rating` (Tier 1, `template_feedback`): median user
+   * rating across template uses. Higher is better. The gameable shortcut is to
+   * delete poorly-rated templates to lift the average, so it is guarded by
+   * `template_count` (Tier 1b artifact, higher_is_better). `template_defect_count`
+   * (Tier 1b artifact): always-on scan for empty templates.
+   */
+  fitnessSignals(): Metric[] {
+    return [
+      {
+        name: "template_avg_rating",
+        source: "template_feedback",
+        kind: "verifiable",
+        direction: "higher_is_better",
+        windowDays: 7,
+        guardrails: ["template_count"],
+      },
+      {
+        name: "template_defect_count",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "lower_is_better",
+        windowDays: 1,
+      },
+      {
+        name: "template_count",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "higher_is_better",
+        windowDays: 7,
+      },
+    ];
+  }
+
+  /**
+   * Telemetry read ONLY via `provider.query("template_feedback", …)`; the rating
+   * is aggregated with a median (outlier-robust, never a sum). Artifact metrics
+   * scan the managed templates dir and are omitted when it is absent.
+   */
+  async measureFitness(
+    range: DateRange,
+    provider: TelemetryProvider,
+  ): Promise<Record<string, number>> {
+    const out: Record<string, number> = {};
+
+    // ── Tier 1: template_feedback stream (value = rating) ───────────────────
+    const samples = await provider.query("template_feedback", range);
+    if (samples.length > 0) {
+      out.template_avg_rating = median(samples.map((s) => s.value));
+    }
+
+    // ── Tier 1b: artifact scan of the templates dir ─────────────────────────
+    const scan = this.scanTemplates();
+    if (scan !== null) {
+      out.template_count = scan.count;
+      out.template_defect_count = scan.defects;
+    }
+
+    return out;
+  }
+
+  /**
+   * Scan the managed templates dir for `*.md` files; defects = empty templates.
+   * Returns null when the dir is absent (metric doesn't measure).
+   */
+  private scanTemplates(): { count: number; defects: number } | null {
+    if (!existsSync(this.templatesDir)) return null;
+    let files: string[];
+    try {
+      files = readdirSync(this.templatesDir).filter((f) => f.endsWith(".md"));
+    } catch {
+      return null;
+    }
+    let defects = 0;
+    for (const f of files) {
+      try {
+        if (readFileSync(join(this.templatesDir, f), "utf8").trim().length === 0) defects += 1;
+      } catch {
+        defects += 1;
+      }
+    }
+    return { count: files.length, defects };
   }
 
   private assertInsideTemplatesDir(target: string): void {
