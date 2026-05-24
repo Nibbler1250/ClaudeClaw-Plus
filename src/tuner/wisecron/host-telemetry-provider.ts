@@ -373,10 +373,19 @@ export interface HookExecEntry {
   ts: Date;
 }
 
+/** Canonical exec-logger sink written by `~/.claude/hooks/exec-log.sh`. */
+const HOOK_EXEC_LOG_FILE = "exec-log.jsonl";
+
 /**
- * Emits `hook_exec` from `~/.claude/hooks/*.log` (one JSON object per line:
+ * Emits `hook_exec` from the hooks dir (one JSON object per line:
  * `{ hook?, exit_code, duration_ms, event?, ts }`). value = duration_ms;
  * exit_code + event ride in labels so a consumer can derive crash-rate and p95.
+ *
+ * Source files, in order: the canonical `exec-log.jsonl` written by the
+ * `exec-log.sh` wrapper (the instrumentation this stream ships with), plus any
+ * legacy per-hook `*.log` files using the same line shape. The wrapper is the
+ * producer of record; `*.log` support is kept for hosts with an older logging
+ * convention.
  */
 export class HookExecTelemetryProducer implements TelemetryProvider {
   private readonly hooksDir: string;
@@ -406,7 +415,7 @@ export class HookExecTelemetryProducer implements TelemetryProvider {
           stream: "hook_exec",
           schemaVersion: this.schemaVersion,
           available: false,
-          reason: `no parseable *.log entries in ${this.hooksDir} (hook exec-wrapper not wired?)`,
+          reason: `no parseable ${HOOK_EXEC_LOG_FILE}/*.log entries in ${this.hooksDir} (exec-log.sh wrapper not wired into any hook yet)`,
         },
       ];
     }
@@ -435,7 +444,8 @@ function defaultHookLogReader(dir: string): HookExecEntry[] {
   if (!existsSync(dir)) return [];
   let files: string[];
   try {
-    files = readdirSync(dir).filter((f) => f.endsWith(".log"));
+    // Canonical exec-logger sink (.jsonl) + legacy per-hook *.log files.
+    files = readdirSync(dir).filter((f) => f === HOOK_EXEC_LOG_FILE || f.endsWith(".log"));
   } catch {
     return [];
   }

@@ -180,11 +180,41 @@ describe("HookExecTelemetryProducer", () => {
     expect(p.capabilities()[0]!.available).toBe(true);
   });
 
-  it("advertises unavailable+reason when no *.log present", () => {
+  it("reads the canonical exec-log.jsonl sink written by exec-log.sh", async () => {
+    writeFileSync(
+      join(dir, "exec-log.jsonl"),
+      [
+        JSON.stringify({
+          ts: IN.toISOString(),
+          hook: "log-skill-access",
+          exit_code: 0,
+          duration_ms: 42,
+          event: "PostToolUse",
+        }),
+        JSON.stringify({
+          ts: IN.toISOString(),
+          hook: "context-injector",
+          exit_code: 1,
+          duration_ms: 1500,
+          event: "UserPromptSubmit",
+        }),
+      ].join("\n"),
+    );
+    const p = new HookExecTelemetryProducer({ hooksDir: dir });
+    const samples = await p.query("hook_exec", RANGE);
+    expect(samples).toHaveLength(2);
+    expect(samples.map((s) => s.value).sort((a, b) => a - b)).toEqual([42, 1500]);
+    expect(samples.find((s) => s.value === 1500)!.labels!.exit_code).toBe("1");
+    expect(samples.find((s) => s.value === 42)!.labels!.hook).toBe("log-skill-access");
+    expect(p.capabilities()[0]!.available).toBe(true);
+  });
+
+  it("advertises unavailable+reason when no exec-log/*.log present", () => {
     const p = new HookExecTelemetryProducer({ hooksDir: dir });
     const cap = p.capabilities()[0]!;
     expect(cap.available).toBe(false);
     expect(cap.reason).toMatch(/no parseable .* entries/);
+    expect(cap.reason).toMatch(/exec-log\.sh wrapper not wired/);
   });
 });
 
