@@ -203,6 +203,18 @@ export {
   SkillAccessTelemetryProducer,
   JournalTelemetryProducer,
 } from "./host-telemetry-provider.js";
+// Telemetry over the MCP bridge: host-side tools + the tuner-side consumer.
+export {
+  McpTelemetryProvider,
+  registerHostTelemetryTools,
+  bridgeToolCaller,
+  mcpClientToolCaller,
+  TELEMETRY_PLUGIN_ID,
+  TELEMETRY_CAPABILITIES_TOOL,
+  TELEMETRY_QUERY_TOOL,
+  type TelemetryMcpClient,
+} from "./telemetry-mcp.js";
+export { serveTunerOverMcp, type ServedTuner, type ServeTunerOverMcpOpts } from "./serve.js";
 export { WisecronStateDB } from "./state-db.js";
 export { AdaptiveScheduler } from "./adaptive-scheduler.js";
 export { ProposalEngine } from "./proposal-engine.js";
