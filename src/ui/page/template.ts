@@ -117,6 +117,7 @@ ${pageStyles}
       <button class="tab-btn" id="tab-chat" type="button" role="tab" aria-selected="false" aria-controls="chat-panel">Chat</button>
       <button class="tab-btn" id="tab-kanban" type="button" role="tab" aria-selected="false" aria-controls="kanban-panel">Kanban</button>
       <button class="tab-btn" id="tab-usage" type="button" role="tab" aria-selected="false" aria-controls="usage-panel">Usage</button>
+      <button class="tab-btn" id="tab-observability" type="button" role="tab" aria-selected="false" aria-controls="observability-panel">Observability</button>
     </nav>
     <div id="dashboard-panel">
     <section class="hero">
@@ -194,6 +195,35 @@ ${pageStyles}
         </div>
         <div class="usage-table-wrap" id="usage-table-wrap">
           <div class="usage-loading">Loading usage data...</div>
+        </div>
+      </section>
+    </div>
+    <div id="observability-panel" hidden>
+      <section class="obs-section">
+        <div class="obs-head">
+          <div>
+            <div class="obs-title">Observability Hub</div>
+            <div class="obs-sub">Auto-discovered MCP plugins · universal boundary metrics · refreshes every 30s</div>
+          </div>
+          <div class="obs-controls">
+            <label class="obs-range-label" for="obs-range">Window</label>
+            <select class="obs-range" id="obs-range">
+              <option value="24">24h</option>
+              <option value="72">3d</option>
+              <option value="168" selected>7d</option>
+              <option value="720">30d</option>
+            </select>
+          </div>
+        </div>
+        <div class="obs-body" id="obs-body">
+          <div class="obs-list-pane">
+            <div class="obs-list" id="obs-plugin-list">
+              <div class="obs-loading">Loading plugins…</div>
+            </div>
+          </div>
+          <div class="obs-detail-pane" id="obs-detail">
+            <div class="obs-empty">Select a plugin to view its page.</div>
+          </div>
         </div>
       </section>
     </div>
