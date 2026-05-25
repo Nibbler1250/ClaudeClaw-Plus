@@ -29,7 +29,12 @@ export type AuditEvent =
   | "telemetry_query"
   // Provenance: the active global + per-subject tuning scope at boot/registration.
   // An auditor reads "the tuner operated at scope=X" from one immutable record.
-  | "scope_registration";
+  | "scope_registration"
+  // Phase A observability hub: one tamper-evident record per MCP tool call,
+  // emitted by the gateway (mcp-multiplexer) onto a DEDICATED tool-call chain
+  // (never the tuner's outcome chain). subject=plugin; detail carries tool,
+  // status, duration_ms, agent_id, args_hash (no raw args).
+  | "mcp.tool_call";
 
 /** The author-supplied content of an audit record (everything but the chain fields). */
 export interface AuditEntry {
