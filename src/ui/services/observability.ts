@@ -97,9 +97,29 @@ function getReader(): { reader: ObservabilityReader; provider: CompositeTelemetr
   return readerSingleton;
 }
 
-/** Test seam: drop the memoized reader so a test can re-resolve sources. */
+/** Test seam: drop the memoized reader so a test can re-resolve sources. Also
+ *  clears the overview cache, since cached pages are derived from the reader. */
 export function resetObservabilityReader(): void {
   readerSingleton = null;
+  overviewCache.clear();
+}
+
+/**
+ * Test seam: inject a pre-built reader (with fake telemetry) so the service's
+ * range conversion + caching + page shape can be exercised without touching the
+ * host filesystem. The `provider` half is unused by the read paths below, so a
+ * minimal stub is accepted. Clears the overview cache so the injected reader
+ * isn't shadowed by stale entries.
+ */
+export function __setObservabilityReaderForTest(
+  reader: ObservabilityReader,
+  provider?: CompositeTelemetryProvider,
+): void {
+  readerSingleton = {
+    reader,
+    provider: provider ?? (undefined as unknown as CompositeTelemetryProvider),
+  };
+  overviewCache.clear();
 }
 
 function rangeFromHours(hours: number): { start: Date; end: Date } {
