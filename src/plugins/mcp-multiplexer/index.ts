@@ -34,6 +34,7 @@ import { getMcpBridge } from "../mcp-bridge.js";
 import { McpServerProcess, type McpServerConfig } from "../mcp-proxy/server-process.js";
 import { getSettings } from "../../config.js";
 import { McpHttpHandler } from "./http-handler.js";
+import { getToolCallSink } from "../../observability/tool-call-sink.js";
 import { getMetricsRegistry } from "./metrics.js";
 import { getResponseCache } from "./cache.js";
 import {
@@ -106,6 +107,11 @@ export interface MuxSettingsView {
    *  + latency samples and the `/api/multiplexer/metrics` endpoint
    *  returns aggregated data. */
   metricsEnabled: boolean;
+  /** Phase A observability hub: emit a uniform `mcp.tool_call` event per call
+   *  to the audited tool-call chain. Fire-and-forget; never blocks dispatch.
+   *  Default true (zero-config universal capture); opt-out for hosts that don't
+   *  want the boundary log. */
+  observabilityEnabled: boolean;
   /** Issue #69: response cache for idempotent tools. */
   cache: {
     enabled: boolean;
@@ -146,6 +152,8 @@ function _readSettings(): MuxSettingsView {
   const sessionPersistencePath =
     typeof rawPath === "string" && rawPath.length > 0 && rawPath.startsWith("/") ? rawPath : "";
   const metricsEnabled = mcpObj.metricsEnabled === true;
+  // Default-on: only an explicit `false` disables the boundary capture.
+  const observabilityEnabled = mcpObj.observabilityEnabled !== false;
   // Issue #69 cache config from settings.mcp.cache; falls back to a
   // safe disabled default when absent so existing test fixtures keep
   // working.
@@ -182,6 +190,7 @@ function _readSettings(): MuxSettingsView {
     sessionMaxAgeSeconds,
     sessionPersistencePath,
     metricsEnabled,
+    observabilityEnabled,
     cache: {
       enabled: cacheEnabled,
       ttlMs: cacheTtlMs,
@@ -288,6 +297,10 @@ export class McpMultiplexerPlugin {
     // process exits. Use the injected settingsView so tests can drive
     // the flag without standing up real settings.
     getMetricsRegistry().setEnabled(settings.metricsEnabled);
+
+    // Phase A observability: reflect the boundary-capture flag onto the
+    // fire-and-forget tool-call sink, same start()-time pattern as metrics.
+    getToolCallSink().setEnabled(settings.observabilityEnabled);
 
     // Issue #69: response cache. Same reflection pattern — translate
     // the `cacheable: Record<string, string[]>` from settings into the
