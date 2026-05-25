@@ -11,6 +11,7 @@ import { fireJob } from "../commands/fire";
 import { readLogs } from "./services/logs";
 import { listSessions, readSessionMessages, listAgents } from "./services/sessions";
 import { getSessionUsage } from "./services/usage";
+import { getObservabilityOverview, getObservabilityPluginPage } from "./services/observability";
 import { runUserMessage } from "../runner";
 import { readKanban, writeKanban, type KanbanBoard } from "./services/kanban";
 import { getHttpGateway } from "../plugins/http-gateway.js";
@@ -365,6 +366,31 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
           return json(await getSessionUsage(channelNames));
         } catch (err) {
           return json({ ok: false, error: String(err) });
+        }
+      }
+
+      // Observability hub — read-only. The plugin name in the path segment is
+      // matched against auto-discovered `plugin` labels; checked BEFORE the
+      // bare overview route so `/api/observability/plugin/<name>` wins.
+      if (url.pathname.startsWith("/api/observability/plugin/") && req.method === "GET") {
+        try {
+          const plugin = decodeURIComponent(
+            url.pathname.slice("/api/observability/plugin/".length),
+          );
+          if (!plugin) return json({ ok: false, error: "plugin name required" }, 400);
+          const hours = clampInt(url.searchParams.get("hours"), 168, 1, 720);
+          return json(await getObservabilityPluginPage(plugin, hours));
+        } catch (err) {
+          return json({ ok: false, error: String(err) }, 500);
+        }
+      }
+
+      if (url.pathname === "/api/observability" && req.method === "GET") {
+        try {
+          const hours = clampInt(url.searchParams.get("hours"), 168, 1, 720);
+          return json(await getObservabilityOverview(hours));
+        } catch (err) {
+          return json({ ok: false, error: String(err) }, 500);
         }
       }
 
