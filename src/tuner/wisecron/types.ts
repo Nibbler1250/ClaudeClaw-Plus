@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { Patch, Proposal, UnsignedProposal } from "../../skills-tuner/core/types.js";
 import type { RiskTier } from "../../skills-tuner/core/interfaces.js";
+import { SCOPES } from "../../skills-tuner/core/scope.js";
 
 // ── Adaptive scheduling ─────────────────────────────────────────────────────
 
@@ -93,6 +94,13 @@ export interface ObservationWindowResult {
 
 export const WisecronSettingsSchema = z.object({
   enabled: z.boolean().default(false),
+  /**
+   * Global tuning scope for the wisecron-managed subjects (mirrors
+   * TunerConfig.scope for this subject set). `all` reads every stream unfiltered;
+   * `agent` restricts each subject to agent-originated telemetry. Override per
+   * subject via `subjects.<name>.scope`. See ../../skills-tuner/core/scope.ts.
+   */
+  scope: z.enum(SCOPES).default("all"),
   db_path: z.string().default("~/.config/tuner/wisecron.db"),
   systemd_unit_prefix: z.string().default("wisecron-"),
   initial_interval_hours: z.number().int().min(1).default(INITIAL_INTERVAL_HOURS),
@@ -104,6 +112,8 @@ export const WisecronSettingsSchema = z.object({
       z.string(),
       z.object({
         enabled: z.boolean(),
+        /** Per-subject scope override. Falls back to the global `scope` when omitted. */
+        scope: z.enum(SCOPES).optional(),
         /**
          * Per-subject ctor overrides. Forwarded verbatim to the subject's
          * constructor opts (e.g. `{ hooksDir: '~/agent/hooks' }`). Keys recognised

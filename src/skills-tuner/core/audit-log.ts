@@ -26,7 +26,10 @@ export type AuditEvent =
   | "verdict"
   | "revert"
   | "proposal"
-  | "telemetry_query";
+  | "telemetry_query"
+  // Provenance: the active global + per-subject tuning scope at boot/registration.
+  // An auditor reads "the tuner operated at scope=X" from one immutable record.
+  | "scope_registration";
 
 /** The author-supplied content of an audit record (everything but the chain fields). */
 export interface AuditEntry {
