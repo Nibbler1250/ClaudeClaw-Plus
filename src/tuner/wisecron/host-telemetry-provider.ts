@@ -37,12 +37,17 @@ import { basename, join } from "node:path";
 import {
   type DateRange,
   type MetricSample,
+  type PanelData,
   type TelemetryCapability,
   type TelemetryProvider,
   type TelemetryStream,
   TELEMETRY_CONTRACT_VERSION,
   TELEMETRY_STREAMS,
+  type ViewManifest,
+  type ViewManifestSource,
 } from "../../skills-tuner/core/telemetry.js";
+import { McpToolCallTelemetryProducer } from "../../observability/mcp-tool-call-producer.js";
+import { type TunerViewSources, TunerViewProvider } from "./tuner-view-provider.js";
 import { DEFAULT_MODE_DISPATCH_LOG } from "../../governance/mode-dispatch-journal.js";
 import { DEFAULT_TEMPLATE_FEEDBACK_LOG } from "../../skills-tuner/core/template-feedback.js";
 import { SessionCostTelemetryProvider } from "./session-cost-provider.js";
@@ -902,7 +907,7 @@ export class TemplateFeedbackTelemetryProducer implements TelemetryProvider {
  * producers BEFORE the cost provider (which reports every non-cost stream with
  * a generic placeholder reason) so the specific reason wins.
  */
-export class CompositeTelemetryProvider implements TelemetryProvider {
+export class CompositeTelemetryProvider implements TelemetryProvider, ViewManifestSource {
   constructor(private readonly providers: TelemetryProvider[]) {}
 
   contractVersion(): string {
@@ -943,6 +948,33 @@ export class CompositeTelemetryProvider implements TelemetryProvider {
     }
     return out;
   }
+
+  // ── ViewManifestSource ────────────────────────────────────────────────────
+  // Collect every plugin-declared page; dispatch a panel fill to the provider
+  // that declared it. Plugins without a manifest contribute nothing here — they
+  // get the universal page only.
+
+  viewManifests(): ViewManifest[] {
+    const out: ViewManifest[] = [];
+    for (const p of this.providers) {
+      const m = p.viewManifest?.();
+      if (m) out.push(m);
+    }
+    return out;
+  }
+
+  async panelData(
+    plugin: string,
+    panelId: string,
+    range: DateRange,
+  ): Promise<PanelData | undefined> {
+    for (const p of this.providers) {
+      if (p.viewManifest?.()?.plugin !== plugin) continue;
+      const d = await p.viewData?.(panelId, range);
+      if (d) return d;
+    }
+    return undefined;
+  }
 }
 
 export interface HostTelemetryConfig {
@@ -959,6 +991,18 @@ export interface HostTelemetryConfig {
   sessionProjectsDir?: string;
   /** Hermeticity escape hatch (tests): override the cron-config presence probe. */
   cronConfigProbe?: () => CronConfigPresence;
+  /**
+   * Phase A observability hub: path to the gateway's `mcp.tool_call` audit log.
+   * When set, the universal MCP boundary stream becomes queryable; when absent
+   * the composite advertises it unavailable (no producer wired).
+   */
+  mcpToolCallLog?: string;
+  /**
+   * Phase A observability hub: when set, the tuner declares its view-manifest
+   * (the proposals→outcomes timeline). When absent, the tuner contributes no
+   * specialized page and falls back to the universal page like any plugin.
+   */
+  tunerView?: TunerViewSources;
 }
 
 /**
@@ -984,7 +1028,7 @@ export interface HostTelemetryConfig {
 export function buildHostTelemetryProvider(
   cfg: HostTelemetryConfig = {},
 ): CompositeTelemetryProvider {
-  return new CompositeTelemetryProvider([
+  const providers: TelemetryProvider[] = [
     new CronRunTelemetryProducer({
       journalRunner: cfg.cronJournalRunner,
       costDbPath: cfg.costDbPath,
@@ -997,5 +1041,16 @@ export function buildHostTelemetryProvider(
     new SessionJsonlTelemetryProducer({ projectsDir: cfg.sessionProjectsDir }),
     new JournalTelemetryProducer({ journalPath: cfg.journalPath }),
     new SessionCostTelemetryProvider({ dbPath: cfg.costDbPath }),
-  ]);
+  ];
+  // Phase A: universal MCP boundary stream — wired only when the gateway log is
+  // configured, so existing capability tests (every stream unavailable on an
+  // empty host) stay deterministic and machine-state-independent.
+  if (cfg.mcpToolCallLog) {
+    providers.push(new McpToolCallTelemetryProducer({ logPath: cfg.mcpToolCallLog }));
+  }
+  // Phase A: the tuner declares its own page (proposals→outcomes timeline).
+  if (cfg.tunerView) {
+    providers.push(new TunerViewProvider(cfg.tunerView));
+  }
+  return new CompositeTelemetryProvider(providers);
 }
