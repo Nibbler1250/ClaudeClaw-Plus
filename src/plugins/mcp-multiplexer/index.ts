@@ -35,6 +35,7 @@ import { McpServerProcess, type McpServerConfig } from "../mcp-proxy/server-proc
 import { getSettings } from "../../config.js";
 import { McpHttpHandler } from "./http-handler.js";
 import { getToolCallSink } from "../../observability/tool-call-sink.js";
+import type { AuditPolicy } from "../../observability/tool-call.js";
 import { getMetricsRegistry } from "./metrics.js";
 import { getResponseCache } from "./cache.js";
 import {
@@ -112,6 +113,11 @@ export interface MuxSettingsView {
    *  Default true (zero-config universal capture); opt-out for hosts that don't
    *  want the boundary log. */
   observabilityEnabled: boolean;
+  /** Mandatory-audit policy for the gateway (`settings.mcp.audit`). `enforce`
+   *  refuses any tool call whose synchronous Phase-1 intent append fails ("no
+   *  log → no action"); `best-effort` (default) keeps logging fully async and
+   *  never blocks a call. Regulated → enforce; availability-first → best-effort. */
+  auditPolicy: AuditPolicy;
   /** Issue #69: response cache for idempotent tools. */
   cache: {
     enabled: boolean;
@@ -154,6 +160,9 @@ function _readSettings(): MuxSettingsView {
   const metricsEnabled = mcpObj.metricsEnabled === true;
   // Default-on: only an explicit `false` disables the boundary capture.
   const observabilityEnabled = mcpObj.observabilityEnabled !== false;
+  // Mandatory-audit policy. Default `best-effort` (backward-compatible); only an
+  // explicit `"enforce"` opts into fail-closed "no log → no action".
+  const auditPolicy: AuditPolicy = mcpObj.audit === "enforce" ? "enforce" : "best-effort";
   // Issue #69 cache config from settings.mcp.cache; falls back to a
   // safe disabled default when absent so existing test fixtures keep
   // working.
@@ -191,6 +200,7 @@ function _readSettings(): MuxSettingsView {
     sessionPersistencePath,
     metricsEnabled,
     observabilityEnabled,
+    auditPolicy,
     cache: {
       enabled: cacheEnabled,
       ttlMs: cacheTtlMs,
@@ -301,6 +311,11 @@ export class McpMultiplexerPlugin {
     // Phase A observability: reflect the boundary-capture flag onto the
     // fire-and-forget tool-call sink, same start()-time pattern as metrics.
     getToolCallSink().setEnabled(settings.observabilityEnabled);
+    // Mandatory audit: reflect the resolved policy onto the sink and record it
+    // in the chain at boot (under enforce). enforce makes the Phase-1 intent a
+    // synchronous fail-closed gate; best-effort keeps logging fully async.
+    getToolCallSink().setPolicy(settings.auditPolicy);
+    getToolCallSink().recordPolicy();
 
     // Issue #69: response cache. Same reflection pattern — translate
     // the `cacheable: Record<string, string[]>` from settings into the

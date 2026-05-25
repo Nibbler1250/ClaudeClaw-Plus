@@ -38,6 +38,7 @@ import { _resetMcpBridge, getMcpBridge } from "../plugins/mcp-bridge.js";
 import { _resetIdentityStore } from "../plugins/mcp-multiplexer/pty-identity.js";
 import { __setToolCallSinkForTest, ToolCallSink } from "../observability/tool-call-sink.js";
 import { McpToolCallTelemetryProducer } from "../observability/mcp-tool-call-producer.js";
+import { AuditLog } from "../skills-tuner/core/audit-log.js";
 
 const MOCK_SERVER = fileURLToPath(new URL("./fixtures/mock-mcp-server.ts", import.meta.url));
 const BUN_BIN = process.execPath;
@@ -82,6 +83,7 @@ function makeSettingsView(partial: Partial<MuxSettingsView>): () => MuxSettingsV
     // here (off) and let opt-in tests override via `partial`.
     metricsEnabled: false,
     observabilityEnabled: false,
+    auditPolicy: "best-effort",
     cache: {
       enabled: false,
       ttlMs: 5_000,
@@ -710,6 +712,193 @@ describe("mcp-multiplexer integration — observability boundary capture", () =>
       });
       expect(samples).toHaveLength(1);
       expect(samples[0]!.labels?.plugin).toBe("alpha");
+    } finally {
+      await close();
+    }
+  });
+});
+
+// ── 8) Mandatory audit: enforce (fail-closed) vs best-effort ────────────────
+
+describe("mcp-multiplexer integration — mandatory-audit policy", () => {
+  afterEach(() => {
+    __setToolCallSinkForTest(null);
+  });
+
+  it("enforce: a tool call whose intent CANNOT be logged is REFUSED and never dispatched (no log → no action)", {
+    timeout: 10000,
+  }, async () => {
+    // A sink in enforce mode whose backing chain ALWAYS throws on append.
+    const sink = new ToolCallSink({
+      path: join(tmpDir, "mcp-tool-calls.jsonl"),
+      policy: "enforce",
+      autoFlush: false,
+      logFactory: () => ({
+        append() {
+          throw new Error("audit chain unavailable");
+        },
+      }),
+    });
+    __setToolCallSinkForTest(sink);
+
+    const cfg = writeProxyConfig(tmpDir, ["alpha"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeSettingsView({
+        webEnabled: true,
+        shared: ["alpha"],
+        observabilityEnabled: true,
+        auditPolicy: "enforce",
+      }),
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+
+    // Capture audit events to prove the refusal was recorded out-of-band.
+    const bridge = getMcpBridge();
+    const events: Array<{ event: string; payload: Record<string, unknown> }> = [];
+    const origAudit = bridge.audit.bind(bridge);
+    bridge.audit = (event: string, payload: Record<string, unknown>) => {
+      events.push({ event, payload });
+    };
+
+    const ident = plugin.issueIdentity("pty-enf");
+    const { client, close } = await connectClient({
+      origin: gateway.origin,
+      server: "alpha",
+      ptyId: "pty-enf",
+      bearer: ident.headers.Authorization,
+    });
+
+    try {
+      const result = await client.callTool({
+        name: "echo",
+        arguments: { message: "should-not-run" },
+      });
+      // The call is REFUSED: error result, refusal text, and crucially the
+      // echoed input never came back (the upstream tool was never dispatched).
+      expect(result.isError).toBe(true);
+      const text = (result.content as Array<{ text: string }>)[0]?.text ?? "";
+      expect(text).toContain("refused");
+      expect(text).toContain("enforce");
+      expect(text).not.toContain("should-not-run");
+      // The refusal itself is audited.
+      const refusal = events.find((e) => e.event === "multiplexer_audit_enforced_reject");
+      expect(refusal).toBeDefined();
+      expect(refusal?.payload.reason).toBe("intent_log_failed");
+      expect(refusal?.payload.tool).toBe("echo");
+    } finally {
+      bridge.audit = origAudit;
+      await close();
+    }
+  });
+
+  it("enforce: when the intent CAN be logged, the call proceeds and BOTH intent + result land on the chain", {
+    timeout: 10000,
+  }, async () => {
+    const logPath = join(tmpDir, "mcp-tool-calls.jsonl");
+    const sink = new ToolCallSink({ path: logPath, policy: "enforce", autoFlush: false });
+    __setToolCallSinkForTest(sink);
+
+    const cfg = writeProxyConfig(tmpDir, ["alpha"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeSettingsView({
+        webEnabled: true,
+        shared: ["alpha"],
+        observabilityEnabled: true,
+        auditPolicy: "enforce",
+      }),
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+    const ident = plugin.issueIdentity("pty-enf2");
+    const { client, close } = await connectClient({
+      origin: gateway.origin,
+      server: "alpha",
+      ptyId: "pty-enf2",
+      bearer: ident.headers.Authorization,
+    });
+
+    try {
+      const result = await client.callTool({ name: "echo", arguments: { message: "telemetry" } });
+      const content = (result.content as Array<{ text: string }>)[0];
+      expect(content?.text).toContain("telemetry");
+
+      // Phase 1 intent was written SYNCHRONOUSLY on the call path — the durable
+      // log exists already, BEFORE we flush the buffered Phase-2 result.
+      expect(existsSync(logPath)).toBe(true);
+      // The Phase-2 result is still buffered (fire-and-forget, not awaited).
+      expect(sink.pending()).toHaveLength(1);
+
+      sink.flush();
+      const reread = new AuditLog(logPath);
+      const recs = reread.all();
+      // Boot policy record (enforce) + intent + result.
+      const intents = recs.filter((r) => r.event === "mcp.tool_call_intent");
+      const results = recs.filter((r) => r.event === "mcp.tool_call");
+      const policies = recs.filter((r) => r.event === "mcp.audit_policy");
+      expect(intents).toHaveLength(1);
+      expect(results).toHaveLength(1);
+      expect(policies).toHaveLength(1);
+      expect(policies[0]?.detail).toMatchObject({ policy: "enforce" });
+      // Intent precedes its result, and the chain is intact across both paths.
+      expect(recs.indexOf(intents[0]!)).toBeLessThan(recs.indexOf(results[0]!));
+      expect(reread.verifyChain().ok).toBe(true);
+    } finally {
+      await close();
+    }
+  });
+
+  it("best-effort: a FAILING audit log never blocks or fails the call (current behaviour preserved)", {
+    timeout: 10000,
+  }, async () => {
+    const logPath = join(tmpDir, "mcp-tool-calls.jsonl");
+    // best-effort + a chain that throws on append: the intent path is a no-op
+    // (never touches the chain) and the result flush swallows the failure.
+    const sink = new ToolCallSink({
+      path: logPath,
+      policy: "best-effort",
+      autoFlush: false,
+      logFactory: () => ({
+        append() {
+          throw new Error("audit chain unavailable");
+        },
+      }),
+    });
+    __setToolCallSinkForTest(sink);
+
+    const cfg = writeProxyConfig(tmpDir, ["alpha"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeSettingsView({
+        webEnabled: true,
+        shared: ["alpha"],
+        observabilityEnabled: true,
+        auditPolicy: "best-effort",
+      }),
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+    const ident = plugin.issueIdentity("pty-be");
+    const { client, close } = await connectClient({
+      origin: gateway.origin,
+      server: "alpha",
+      ptyId: "pty-be",
+      bearer: ident.headers.Authorization,
+    });
+
+    try {
+      // Call SUCCEEDS even though the audit chain is broken — availability-first.
+      const result = await client.callTool({ name: "echo", arguments: { message: "telemetry" } });
+      const content = (result.content as Array<{ text: string }>)[0];
+      expect(result.isError).toBeFalsy();
+      expect(content?.text).toContain("telemetry");
+      // No synchronous intent write happened; the result is buffered fire-and-forget.
+      expect(existsSync(logPath)).toBe(false);
+      expect(sink.pending()).toHaveLength(1);
+      // Draining a broken chain is swallowed — never surfaces on any path.
+      expect(() => sink.flush()).not.toThrow();
     } finally {
       await close();
     }

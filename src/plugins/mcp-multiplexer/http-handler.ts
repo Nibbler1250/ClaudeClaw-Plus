@@ -25,7 +25,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { randomUUID } from "node:crypto";
 import { getMcpBridge } from "../mcp-bridge.js";
 import { hashArgs } from "../../observability/tool-call.js";
-import { recordToolCall } from "../../observability/tool-call-sink.js";
+import { recordToolCall, recordToolCallIntent } from "../../observability/tool-call-sink.js";
 import { getMetricsRegistry } from "./metrics.js";
 import { getResponseCache } from "./cache.js";
 import type { McpServerProcess } from "../mcp-proxy/server-process.js";
@@ -550,6 +550,9 @@ export class McpHttpHandler {
       // measures from the same point. `emitToolCall` is fire-and-forget — it
       // only buffers in memory and is never awaited, so it cannot slow dispatch.
       const t0 = performance.now();
+      // Hash once — the non-reversible digest rides both the Phase-1 intent and
+      // the Phase-2 result so a reader can correlate attempt → outcome.
+      const argsHash = hashArgs(args ?? {});
       const emitToolCall = (status: "ok" | "error", error?: string): void => {
         recordToolCall({
           ts: new Date().toISOString(),
@@ -558,10 +561,49 @@ export class McpHttpHandler {
           agent_id: bucketKey,
           status,
           duration_ms: performance.now() - t0,
-          args_hash: hashArgs(args ?? {}),
+          args_hash: argsHash,
           ...(error !== undefined ? { error } : {}),
         });
       };
+
+      // ── Phase 1: mandatory-audit intent, BEFORE dispatch ──────────────
+      // Under `audit: "enforce"` this is a SYNCHRONOUS local append; if it
+      // throws (the chain can't be written), we REFUSE the call and never
+      // dispatch — "no log → no action". Under `best-effort` it is a no-op
+      // and never throws, so the call proceeds exactly as before. The append
+      // is local-only: no awaited network on the call path.
+      try {
+        recordToolCallIntent({
+          ts: new Date().toISOString(),
+          plugin: this.serverName,
+          tool: name,
+          agent_id: bucketKey,
+          args_hash: argsHash,
+        });
+      } catch (err) {
+        getMcpBridge().audit("multiplexer_audit_enforced_reject", {
+          server: this.serverName,
+          tool: name,
+          pty_id: bucketKey,
+          reason: "intent_log_failed",
+          error: err instanceof Error ? err.message : String(err),
+        });
+        // Fail closed. We do NOT also emit a Phase-2 result here: the result
+        // sink targets the same chain that just failed to write, so it would
+        // only be swallowed. The refusal itself is audited above (bridge).
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Error: tool '${name}' refused — the audit log could not be ` +
+                `written and the gateway is in audit=enforce mode (no log → no action)`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
       if (!allowedNames.has(name)) {
         getMcpBridge().audit("multiplexer_tool_rejected", {
           server: this.serverName,
