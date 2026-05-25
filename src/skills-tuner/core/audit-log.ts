@@ -34,7 +34,18 @@ export type AuditEvent =
   // emitted by the gateway (mcp-multiplexer) onto a DEDICATED tool-call chain
   // (never the tuner's outcome chain). subject=plugin; detail carries tool,
   // status, duration_ms, agent_id, args_hash (no raw args).
-  | "mcp.tool_call";
+  | "mcp.tool_call"
+  // Mandatory-audit Phase 1: the INTENT record written synchronously at the
+  // gateway BEFORE a tool dispatches, under `audit: "enforce"`. Distinct event
+  // name (not `mcp.tool_call`) so the metrics producer — which filters on
+  // `mcp.tool_call` — never counts an intent as a completed call. subject=plugin;
+  // detail carries tool, agent_id, args_hash, event_ts (no status/duration — the
+  // call hasn't run yet). Pairs with the later `mcp.tool_call` result record.
+  | "mcp.tool_call_intent"
+  // Boot provenance: the active mandatory-audit policy (enforce|best-effort)
+  // recorded once at multiplexer start under enforce, so an auditor reads
+  // "the gateway operated fail-closed" from the chain itself.
+  | "mcp.audit_policy";
 
 /** The author-supplied content of an audit record (everything but the chain fields). */
 export interface AuditEntry {
