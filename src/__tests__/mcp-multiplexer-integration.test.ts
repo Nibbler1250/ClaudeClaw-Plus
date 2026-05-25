@@ -22,7 +22,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,6 +36,8 @@ import {
 import { _resetHttpGateway, getHttpGateway } from "../plugins/http-gateway.js";
 import { _resetMcpBridge, getMcpBridge } from "../plugins/mcp-bridge.js";
 import { _resetIdentityStore } from "../plugins/mcp-multiplexer/pty-identity.js";
+import { __setToolCallSinkForTest, ToolCallSink } from "../observability/tool-call-sink.js";
+import { McpToolCallTelemetryProducer } from "../observability/mcp-tool-call-producer.js";
 
 const MOCK_SERVER = fileURLToPath(new URL("./fixtures/mock-mcp-server.ts", import.meta.url));
 const BUN_BIN = process.execPath;
@@ -75,6 +77,18 @@ function makeSettingsView(partial: Partial<MuxSettingsView>): () => MuxSettingsV
     sessionPersistenceEnabled: false,
     sessionMaxAgeSeconds: 3600,
     sessionPersistencePath: "",
+    // Issue #68/#69 + Phase A added these to MuxSettingsView after this helper
+    // was first written; start() reads them unconditionally, so default them
+    // here (off) and let opt-in tests override via `partial`.
+    metricsEnabled: false,
+    observabilityEnabled: false,
+    cache: {
+      enabled: false,
+      ttlMs: 5_000,
+      maxEntries: 1_000,
+      cacheable: {},
+      defensiveInvalidation: true,
+    },
     ...partial,
   };
   return () => view;
@@ -625,6 +639,79 @@ describe("mcp-multiplexer integration — crash + health probe transition", () =
       expect(crashAudit?.payload.server).toBe("alpha");
     } finally {
       bridge.audit = origAudit;
+    }
+  });
+});
+
+// ── 7) Phase A observability: gateway boundary capture ──────────────────────
+
+describe("mcp-multiplexer integration — observability boundary capture", () => {
+  afterEach(() => {
+    __setToolCallSinkForTest(null);
+  });
+
+  it("emits exactly one mcp.tool_call event per call, fire-and-forget (not awaited on the call path)", {
+    timeout: 10000,
+  }, async () => {
+    const logPath = join(tmpDir, "mcp-tool-calls.jsonl");
+    // autoFlush:false → the event stays buffered until WE flush, so we can
+    // prove the emit is deferred off the request path (the durable write never
+    // happened during dispatch).
+    const sink = new ToolCallSink({ path: logPath, autoFlush: false });
+    __setToolCallSinkForTest(sink);
+
+    const cfg = writeProxyConfig(tmpDir, ["alpha"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeSettingsView({
+        webEnabled: true,
+        shared: ["alpha"],
+        observabilityEnabled: true,
+      }),
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+    const ident = plugin.issueIdentity("pty-obs");
+
+    const { client, close } = await connectClient({
+      origin: gateway.origin,
+      server: "alpha",
+      ptyId: "pty-obs",
+      bearer: ident.headers.Authorization,
+    });
+
+    try {
+      const result = await client.callTool({ name: "echo", arguments: { message: "telemetry" } });
+      const content = (result.content as Array<{ text: string }>)[0];
+      expect(content?.text).toContain("telemetry");
+
+      // The call returned with NO durable write yet — the emit was buffered,
+      // never awaited, never touched disk on the dispatch path.
+      expect(existsSync(logPath)).toBe(false);
+      const buffered = sink.pending();
+      expect(buffered).toHaveLength(1);
+      expect(buffered[0]).toMatchObject({
+        plugin: "alpha",
+        tool: "echo",
+        agent_id: "pty-obs",
+        status: "ok",
+      });
+      expect(buffered[0]!.args_hash).toMatch(/^[0-9a-f]{16}$/);
+      expect(buffered[0]!.duration_ms).toBeGreaterThanOrEqual(0);
+      // raw args are never carried on the event.
+      expect(JSON.stringify(buffered[0])).not.toContain("telemetry");
+
+      // Flushing lands it on the audited+queryable surface.
+      sink.flush();
+      const producer = new McpToolCallTelemetryProducer({ logPath });
+      const samples = await producer.query("mcp.tool_call", {
+        start: new Date(Date.now() - 60_000),
+        end: new Date(Date.now() + 60_000),
+      });
+      expect(samples).toHaveLength(1);
+      expect(samples[0]!.labels?.plugin).toBe("alpha");
+    } finally {
+      await close();
     }
   });
 });

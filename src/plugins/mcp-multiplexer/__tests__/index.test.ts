@@ -52,6 +52,8 @@ function makeSettingsView(partial: Partial<MuxSettingsView>): () => MuxSettingsV
     sessionPersistencePath: "",
     // Issue #68 — default OFF in tests; opt-in tests set true explicitly.
     metricsEnabled: false,
+    // Phase A observability — default OFF in tests; opt-in tests set true.
+    observabilityEnabled: false,
     // Issue #69 — default OFF in tests; opt-in tests provide cacheable map.
     cache: {
       enabled: false,
