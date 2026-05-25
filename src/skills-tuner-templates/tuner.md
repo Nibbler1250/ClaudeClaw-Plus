@@ -78,6 +78,29 @@ Ask if they want to proceed (yes/no). If no, exit gracefully.
 
 **Drift detection**: Each cron tick, the tuner computes a state hash per subject. Changes to scan_dirs files, plugin registrations, etc. are detected and surfaced in the next `/tuner audit` run. Subjects opt-in by implementing `currentStateHash()` — default is no-op (empty string).
 
+### Step 1.5 — Choose scope (blast radius) — NO silent default
+
+Ask explicitly — do not assume. The tuner reads your config and session
+transcripts; scope decides whether a change can touch your **whole Claude Code
+setup** or **only the agent**:
+
+```
+What should the tuner be allowed to tune?
+
+  all    your whole Claude Code setup (~/.claude/* + all sessions)   [default]
+  agent  only the agent's own surface (~/agent/*, agent-originated rows)
+```
+
+One-line blast-radius note to show the user verbatim: *"`all` optimises
+everything on this machine; `agent` keeps every change inside the agent's own
+skills/hooks/sessions — pick `agent` if this host is shared or you only want the
+autonomous agent tuned."*
+
+Write the choice to `scope:` at the top level of `~/.config/tuner/config.yaml`
+(and `wisecron.scope` if wisecron is enabled). Mention they can override a single
+subject later with `subjects.<name>.scope`. The effective scope of a subject is
+`per-subject ?? global ?? all`.
+
 ### Step 2 — Detect the git repo
 
 The **standard skills path** is `~/.claude/skills/` — the canonical Anthropic Skills

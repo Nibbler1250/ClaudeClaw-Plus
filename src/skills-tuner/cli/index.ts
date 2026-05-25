@@ -393,6 +393,11 @@ program
     console.log(`   wisecron  → ${DEFAULT_SYSTEMD_USER_DIR}`);
     console.log(`   cron      → ${DEFAULT_CRONTAB_DIR}`);
     console.log(`   config    → ${configPath}`);
+    console.log(
+      "\n🔭 Scope defaults to `all` (tunes your whole Claude Code setup). " +
+        "Set `scope: agent` in the config to restrict every subject to the agent's own surface, " +
+        "or run /tuner setup for the interactive choice.",
+    );
     console.log("\nRun 'tuner doctor' to verify, or invoke /tuner inside Claude Code.");
   });
 
