@@ -59,6 +59,7 @@ import {
   type TelemetryStream,
   TELEMETRY_CONTRACT_VERSION,
 } from "../../skills-tuner/core/telemetry.js";
+import { AGENT_SESSION_DIRS_FILTER_KEY } from "../../skills-tuner/core/scope.js";
 
 /** Streams this producer owns (active + the inactive-by-design mode_dispatch). */
 const OWNED_STREAMS: TelemetryStream[] = [
@@ -114,8 +115,13 @@ export class SessionJsonlTelemetryProducer implements TelemetryProvider {
     return TELEMETRY_CONTRACT_VERSION;
   }
 
-  /** Enumerate `<projectsDir>/<enc-cwd>/<session>.jsonl` files. */
-  private sessionFiles(): string[] {
+  /**
+   * Enumerate `<projectsDir>/<enc-cwd>/<session>.jsonl` files. When
+   * `allowedDirPrefixes` is supplied (agent scope), only project dirs whose name
+   * starts with one of the prefixes are scanned — this is how an agent-scoped
+   * query is bounded to agent sessions at the source.
+   */
+  private sessionFiles(allowedDirPrefixes?: string[]): string[] {
     if (!existsSync(this.projectsDir)) return [];
     const out: string[] = [];
     let dirs: string[];
@@ -125,6 +131,7 @@ export class SessionJsonlTelemetryProducer implements TelemetryProvider {
       return [];
     }
     for (const d of dirs) {
+      if (allowedDirPrefixes && !allowedDirPrefixes.some((p) => d.startsWith(p))) continue;
       const sub = join(this.projectsDir, d);
       let files: string[];
       try {
@@ -141,15 +148,16 @@ export class SessionJsonlTelemetryProducer implements TelemetryProvider {
   }
 
   /** Derive all three active streams in a single pass over in-window sessions. */
-  private collect(range: DateRange): Collected {
-    const key = `${range.start.getTime()}|${range.end.getTime()}`;
+  private collect(range: DateRange, allowedDirPrefixes?: string[]): Collected {
+    const dirKey = allowedDirPrefixes ? allowedDirPrefixes.join(",") : "*";
+    const key = `${range.start.getTime()}|${range.end.getTime()}|${dirKey}`;
     const cached = this.memo.get(key);
     if (cached) return cached;
 
     const acc = emptyCollected();
     const startMs = range.start.getTime();
 
-    for (const file of this.sessionFiles()) {
+    for (const file of this.sessionFiles(allowedDirPrefixes)) {
       // A file last modified before the window starts cannot hold an in-range
       // event (lines only append). Skip it without reading — bounds the scan.
       try {
@@ -280,9 +288,17 @@ export class SessionJsonlTelemetryProducer implements TelemetryProvider {
     return caps;
   }
 
-  async query(stream: TelemetryStream, range: DateRange): Promise<MetricSample[]> {
+  async query(
+    stream: TelemetryStream,
+    range: DateRange,
+    filters?: Record<string, string>,
+  ): Promise<MetricSample[]> {
     if (!OWNED_STREAMS.includes(stream)) return [];
     if (stream === "mode_dispatch") return []; // inactive by design
-    return this.collect(range)[stream as ActiveStream];
+    // Agent scope hands us a comma-joined list of agent project-dir prefixes;
+    // when present we only scan transcripts under those dirs.
+    const raw = filters?.[AGENT_SESSION_DIRS_FILTER_KEY];
+    const allowedDirPrefixes = raw ? raw.split(",").filter(Boolean) : undefined;
+    return this.collect(range, allowedDirPrefixes)[stream as ActiveStream];
   }
 }
