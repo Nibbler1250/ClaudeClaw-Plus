@@ -7,6 +7,9 @@ import { BranchManager } from '../git_ops/branches.js';
 import { SkillsSubject, type SkillOverride } from '../subjects/skills.js';
 import { WiseCronSubject } from '../subjects/wisecron.js';
 import type { TunerConfig } from '../core/config.js';
+import { subjectScope } from '../core/config.js';
+import { defaultAgentSurface } from '../core/scope.js';
+import { auditLog } from '../core/security.js';
 
 export interface EngineBundle {
   engine: Engine;
@@ -38,12 +41,40 @@ export function bootstrapEngine(config: TunerConfig): EngineBundle {
 }
 
 function registerNativeSubjects(registry: Registry, config: TunerConfig): void {
+  const surface = defaultAgentSurface();
+  // Record the active scope of each native subject in the engine's audit log so
+  // the provenance ("tuner operated at scope=X") is attributable on this side too.
+  auditLog('scope_registration', {
+    global: config.scope,
+    per_subject: {
+      skills: subjectScope(config, 'skills'),
+      wisecron: subjectScope(config, 'wisecron'),
+    },
+  });
+
   const skillsCfg = config.subjects['skills'];
   if (skillsCfg && skillsCfg.enabled !== false) {
-    const scanDirs = (skillsCfg.scan_dirs ?? []).map(d => d.replace(/^~/, homedir()));
+    const scope = subjectScope(config, 'skills');
+    const explicitScanDirs = (skillsCfg.scan_dirs ?? []).map(d => d.replace(/^~/, homedir()));
+    // Agent scope bounds the scan surface to the agent's own skills dir(s) when
+    // the operator hasn't pinned scan_dirs explicitly, and restricts session
+    // scanning to the agent's project dirs. `all` keeps the general behavior.
+    const scanDirs =
+      explicitScanDirs.length > 0
+        ? explicitScanDirs
+        : scope === 'agent'
+          ? surface.skillsDirs
+          : [];
     const overrides = (skillsCfg.overrides ?? {}) as Record<string, SkillOverride>;
     const language = config.proposer?.language_preference ?? 'en';
-    registry.registerSubject(new SkillsSubject({ scanDirs, overrides, language }));
+    registry.registerSubject(
+      new SkillsSubject({
+        ...(scanDirs.length > 0 ? { scanDirs } : {}),
+        overrides,
+        language,
+        ...(scope === 'agent' ? { sessionProjectDirs: surface.sessionProjectDirs } : {}),
+      }),
+    );
   }
 
   // wisecron: monitors crontab and proposes targeted changes (log redirection,

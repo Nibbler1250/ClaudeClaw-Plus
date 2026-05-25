@@ -112,6 +112,7 @@ async function main(): Promise<void> {
   const gateRegistry = new Registry();
   const settings: WisecronSettings = {
     enabled: true,
+    scope: "all",
     db_path: join(homedir(), ".config", "tuner", "phaseA-gate.db"),
     systemd_unit_prefix: "wisecron-",
     initial_interval_hours: 6,

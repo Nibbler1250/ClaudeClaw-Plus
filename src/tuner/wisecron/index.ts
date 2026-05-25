@@ -15,6 +15,12 @@ import type { TunableSubject } from "../../skills-tuner/core/interfaces.js";
 import type { TelemetryProvider, TelemetryStream } from "../../skills-tuner/core/telemetry.js";
 import { AuditLog } from "../../skills-tuner/core/audit-log.js";
 import { activateFitness } from "../../skills-tuner/core/fitness.js";
+import {
+  type AgentSurface,
+  type Scope,
+  ScopeResolver,
+  defaultAgentSurface,
+} from "../../skills-tuner/core/scope.js";
 import { WisecronStateDB } from "./state-db.js";
 import { AdaptiveScheduler } from "./adaptive-scheduler.js";
 import { ProposalEngine } from "./proposal-engine.js";
@@ -35,6 +41,12 @@ export interface WisecronContext {
   scheduler: AdaptiveScheduler;
   engine: ProposalEngine;
   pipeline: ApplyPipeline;
+  /**
+   * Resolves + applies each subject's effective tuning scope. Pass into the
+   * OutcomeRecorder so agent-scoped subjects measure only agent-originated
+   * telemetry. Built from `settings.scope` + per-subject `scope` overrides.
+   */
+  scopeResolver: ScopeResolver;
 }
 
 /**
@@ -65,6 +77,8 @@ export function registerWisecronSubjects(
     telemetry?: TelemetryProvider;
     /** Audit sink for the gate's fitness_active/inactive records. */
     audit?: AuditLog;
+    /** Agent-surface definition for `agent` scope. Defaults to the `~/agent` layout. */
+    agentSurface?: AgentSurface;
   } = {},
 ): WisecronContext {
   const db = new WisecronStateDB(settings.db_path);
@@ -99,6 +113,27 @@ export function registerWisecronSubjects(
   if (enabled("agent"))
     registerWithProbeCheck(new AgentSubject({ llm: opts.llm, ...cfg("agent") }));
 
+  // Resolve the active tuning scope (global + per-subject overrides) and record
+  // it in the audit chain at registration — the certifier reads "the tuner
+  // operated at scope=X (subject Y at Z)" from one immutable record. Built even
+  // when no telemetry is wired, so scope provenance is always attributable.
+  const perSubjectScope: Record<string, Scope> = {};
+  for (const [name, sc] of Object.entries(settings.subjects ?? {})) {
+    if (sc?.scope) perSubjectScope[name] = sc.scope;
+  }
+  const scopeResolver = new ScopeResolver(
+    settings.scope ?? "all",
+    perSubjectScope,
+    opts.agentSurface ?? defaultAgentSurface(),
+  );
+  if (opts.audit) {
+    const snap = scopeResolver.snapshot(registry.allSubjects().map((s) => s.name));
+    opts.audit.append({
+      event: "scope_registration",
+      detail: { global: snap.global, per_subject: snap.per_subject },
+    });
+  }
+
   // Producer-presence reporting. Default ON; tests can opt-out to keep their
   // console.warn assertions tight. Fire-and-forget — never blocks register.
   if (opts.runHealthChecks !== false) {
@@ -124,7 +159,7 @@ export function registerWisecronSubjects(
     }
   }
 
-  return { db, scheduler, engine, pipeline };
+  return { db, scheduler, engine, pipeline, scopeResolver };
 }
 
 /**
@@ -192,6 +227,15 @@ function warnIfMissingHealthProbe(subject: TunableSubject): void {
 }
 
 export { SUBJECT_STREAM };
+// Scope control surface (config → resolver → scoped telemetry provider).
+export {
+  type AgentSurface,
+  type Scope,
+  ScopeResolver,
+  ScopedTelemetryProvider,
+  defaultAgentSurface,
+  resolveScope,
+} from "../../skills-tuner/core/scope.js";
 // The reference-host telemetry surface. Pass into
 // `registerWisecronSubjects(registry, settings, { telemetry: buildHostTelemetryProvider() })`
 // to run the fitness activation gate and let subjects measure real outcomes.

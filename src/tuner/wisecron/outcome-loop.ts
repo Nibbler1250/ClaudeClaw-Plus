@@ -22,6 +22,7 @@ import {
   type Verdict,
 } from "../../skills-tuner/core/verdict.js";
 import type { AuditLog } from "../../skills-tuner/core/audit-log.js";
+import type { ScopeResolver } from "../../skills-tuner/core/scope.js";
 import type { WisecronStateDB, OutcomeRow } from "./state-db.js";
 
 function windowEndingAt(end: Date, windowDays: number): DateRange {
@@ -45,6 +46,13 @@ export class OutcomeRecorder {
     private readonly provider: TelemetryProvider,
     private readonly audit: AuditLog,
     private readonly now: () => Date = () => new Date(),
+    /**
+     * Optional scope control. When supplied, each subject's `measureFitness`
+     * reads a provider scoped to that subject's effective scope, so an
+     * agent-scoped subject only ever measures agent-originated telemetry. When
+     * omitted, every subject measures unscoped (`all`) — backward-compatible.
+     */
+    private readonly scopeResolver?: ScopeResolver,
   ) {}
 
   /**
@@ -220,8 +228,11 @@ export class OutcomeRecorder {
     // Widest declared window covers all metrics; per-metric reads slice it.
     const widest = metrics.reduce((mx, m) => Math.max(mx, m.windowDays > 0 ? m.windowDays : 1), 1);
     const range = windowEndingAt(asOf, widest);
+    const provider = this.scopeResolver
+      ? this.scopeResolver.scopedProvider(subject.name, this.provider)
+      : this.provider;
     try {
-      return await subject.measureFitness(range, this.provider);
+      return await subject.measureFitness(range, provider);
     } catch {
       return {};
     }
