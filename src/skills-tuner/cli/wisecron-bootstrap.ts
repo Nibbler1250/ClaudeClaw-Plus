@@ -23,12 +23,17 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import yaml from "js-yaml";
 import { Registry } from "../core/registry.js";
 import { AuditLog } from "../core/audit-log.js";
 import { AUDIT_PATH } from "../core/security.js";
 import { DEFAULT_CONFIG_PATH, loadConfig } from "../core/config.js";
 import { makeLLMClient, type LLMClient } from "../core/llm.js";
+import { ExternalProcessSubject } from "../subjects/external_process.js";
+import { activateFitness } from "../core/fitness.js";
+import type { Metric } from "../core/telemetry.js";
+import type { ExternalSubjectSettings } from "../../tuner/wisecron/types.js";
 import {
   registerWisecronSubjects,
   buildHostTelemetryProvider,
@@ -111,6 +116,12 @@ export function bootstrapWisecron(opts: BootstrapWisecronOpts = {}): WisecronBun
     runHealthChecks: opts.runHealthChecks,
   });
 
+  // Config-driven external (subprocess-backed) subjects. Generic: the code
+  // hardcodes none — operators declare them under `wisecron.external_subjects`.
+  // Registered into the SAME registry the recorder/engine/cron-run consult, so
+  // they participate in the full loop with no special-casing downstream.
+  registerExternalSubjects(registry, ctx.scheduler, settings.external_subjects, provider, audit);
+
   const recorder = new OutcomeRecorder(
     registry,
     ctx.db,
@@ -134,4 +145,63 @@ export function bootstrapWisecron(opts: BootstrapWisecronOpts = {}): WisecronBun
     recorder,
     audit,
   };
+}
+
+/** Expand a leading `~` to the home directory. Leaves other paths untouched. */
+function expandHome(p: string): string {
+  return p.startsWith("~") ? p.replace(/^~/, homedir()) : p;
+}
+
+/**
+ * Instantiate + register one ExternalProcessSubject per enabled
+ * `external_subjects` entry. Side-effects: registry.registerSubject,
+ * scheduler.ensureRegistered, and a fitness-activation pass (so the artifact /
+ * stream metrics they declare are logged + audited like the built-in subjects).
+ *
+ * Generic by construction — nothing here names a specific external program.
+ */
+function registerExternalSubjects(
+  registry: Registry,
+  scheduler: AdaptiveScheduler,
+  entries: ExternalSubjectSettings[],
+  provider: TelemetryProvider,
+  audit: AuditLog,
+): void {
+  const registered: ExternalProcessSubject[] = [];
+  for (const e of entries) {
+    if (e.enabled === false) continue;
+    const subject = new ExternalProcessSubject({
+      name: e.name,
+      command: e.command.map(expandHome),
+      cwd: e.cwd ? expandHome(e.cwd) : undefined,
+      env: e.env,
+      allowedRoots: e.allowedRoots?.map(expandHome),
+      riskTier: e.riskTier,
+      autoMergeDefault: e.autoMergeDefault,
+      supportsCreation: e.supportsCreation,
+      orphanMinObservations: e.orphanMinObservations,
+      timeoutMs: e.timeoutMs,
+      config: e.config,
+      fitnessSignals: e.fitnessSignals as Metric[] | undefined,
+    });
+    registry.registerSubject(subject);
+    scheduler.ensureRegistered(subject.name);
+    registered.push(subject);
+  }
+  if (registered.length === 0) return;
+
+  // Fitness activation for the external subjects (the gate ran inside
+  // registerWisecronSubjects before these existed). Artifact-source metrics
+  // always activate; stream metrics degrade per host capabilities — same rules.
+  const activation = activateFitness(registered, provider, audit);
+  for (const a of activation.active) {
+    console.log(
+      `[tuner] external subject '${a.subject}' fitness: active metric='${a.metric.name}' source=${a.metric.source}`,
+    );
+  }
+  for (const i of activation.inactive) {
+    console.log(
+      `[tuner] external subject '${i.subject}' fitness: inactive metric='${i.metric.name}' reason="${i.reason}"`,
+    );
+  }
 }
