@@ -6,6 +6,8 @@
  * upload pipeline (file_ids only); Markdown polish (plain text only).
  */
 
+import { execFile } from "node:child_process";
+
 import type { BusCore, Subscription } from "../../bus/core";
 import {
   CHANNEL_DRIVEN_ORIGINS,
@@ -44,7 +46,24 @@ export interface TelegramAdapterOptions {
   api?: TelegramApi;
   /** Optional structured logger; defaults to `console`. */
   logger?: Pick<Console, "warn" | "info" | "error">;
+  /**
+   * Resolves a `pending:<id>:<value>` approval-button decision. Defaults to
+   * the `pending.py` python runner (via `CLAUDECLAW_PENDING_LIB_PATH`). Tests
+   * inject a fake so the path can be exercised without spawning python.
+   */
+  pendingResolver?: PendingResolver;
 }
+
+/**
+ * Outcome of resolving a pending-action decision.
+ *   `ok`        — `resolve_pending` returned truthy (decision applied)
+ *   `not_found` — action id unknown or already resolved
+ *   `no_lib`    — `CLAUDECLAW_PENDING_LIB_PATH` not set (handler unconfigured)
+ *   `error`     — the runner threw / timed out
+ */
+type PendingResolution = "ok" | "not_found" | "no_lib" | "error";
+
+type PendingResolver = (actionId: string, decision: string) => Promise<PendingResolution>;
 
 /**
  * Per-agent target context. `[react:<emoji>]` UX needs the originating
@@ -93,6 +112,8 @@ export class TelegramAdapter {
   private readonly defaultAgentId: string | undefined;
   private readonly pollIntervalMs: number;
   private readonly logger: Pick<Console, "warn" | "info" | "error">;
+  /** Resolves `pending:<id>:<value>` approval buttons (python runner by default). */
+  private readonly pendingResolver: PendingResolver;
 
   /** getUpdates offset cursor — bumped past the highest processed update_id. */
   private nextOffset = 0;
@@ -153,6 +174,7 @@ export class TelegramAdapter {
     this.defaultAgentId = opts.routing.defaultAgentId;
     this.pollIntervalMs = opts.pollIntervalMs ?? 1000;
     this.logger = opts.logger ?? console;
+    this.pendingResolver = opts.pendingResolver ?? ((id, dec) => this.resolvePendingViaPython(id, dec));
   }
 
   async start(): Promise<void> {
@@ -682,8 +704,13 @@ export class TelegramAdapter {
   }
 
   /**
-   * Handle `perm:<allow|deny>:<id>` (the only pattern this adapter emits).
-   * Legacy file's `btn:`, `pending:`, `sec_yes_` patterns are out of scope.
+   * Handle inline-keyboard callbacks. Two shapes are routed here:
+   *   - `perm:<allow|deny>:<id>` — bus permission prompts (this adapter emits these).
+   *   - `pending:<id>:<value>`   — pending-action approval buttons (proposals,
+   *     email triage, domotique) created by `pending.py`. The legacy PTY
+   *     listener (`src/commands/telegram.ts`) owned this route; under the bus
+   *     runtime it was dropped, so every approval button silently no-op'd.
+   * The legacy `btn:` / `sec_yes_` patterns remain out of scope.
    */
   private async handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> {
     const data = query.data ?? "";
@@ -697,6 +724,15 @@ export class TelegramAdapter {
         callback_query_id: query.id,
         text: "Unauthorized.",
       });
+      return;
+    }
+
+    // Pending-action buttons (`pending:<id>:<value>`). Ported from the legacy
+    // listener — resolve via pending.py, ack, and reflect the decision on the
+    // message. Handled before the perm: path so it never falls into the drop.
+    const pendingMatch = data.match(/^pending:(\d+):(.+)$/);
+    if (pendingMatch) {
+      await this.handlePendingCallback(query, pendingMatch[1] as string, pendingMatch[2] as string);
       return;
     }
 
@@ -732,6 +768,93 @@ export class TelegramAdapter {
     await this.safeAnswerCallback({
       callback_query_id: query.id,
       text: behavior === "allow" ? "✅ Allowed" : "❌ Denied",
+    });
+  }
+
+  /**
+   * Resolve a `pending:<id>:<value>` button: run the resolver, ack the spinner
+   * with a human label, and (on a real outcome) edit the message to record the
+   * decision and strip the keyboard. Mirrors `src/commands/telegram.ts` ~1934.
+   */
+  private async handlePendingCallback(
+    query: TelegramCallbackQuery,
+    actionId: string,
+    decision: string,
+  ): Promise<void> {
+    const resolution = await this.pendingResolver(actionId, decision);
+
+    let ackText: string;
+    switch (resolution) {
+      case "ok": {
+        const dec = decision.toLowerCase();
+        if (dec === "skip") ackText = "⏸ Plus tard";
+        else if (dec === "reject" || dec === "cancel") ackText = "❌ Rejeté";
+        else ackText = "✅ Approuvé";
+        break;
+      }
+      case "not_found":
+        ackText = "⚠️ Action introuvable ou déjà traitée";
+        break;
+      case "no_lib":
+        ackText = "⚠️ Handler non configuré";
+        break;
+      default:
+        ackText = "⚠️ Erreur";
+    }
+
+    // Reflect the decision on the original message + drop the keyboard, but only
+    // once we actually reached the resolver (ok / not_found) — matches legacy.
+    if ((resolution === "ok" || resolution === "not_found") && query.message) {
+      const msg = query.message;
+      const originalText = msg.text ?? "";
+      await this.safe("editMessageText", () =>
+        this.api.editMessageText({
+          chat_id: msg.chat.id,
+          message_id: msg.message_id,
+          text: `${originalText}\n\n› ${ackText}`,
+          reply_markup: { inline_keyboard: [] },
+        }),
+      );
+    }
+
+    await this.safeAnswerCallback({ callback_query_id: query.id, text: ackText });
+  }
+
+  /**
+   * Default pending resolver — shells out to `pending.py:resolve_pending`.
+   * `CLAUDECLAW_PENDING_LIB_PATH` (set in the service env) points at the
+   * directory holding `pending.py`. Returns a `PendingResolution` discriminant
+   * rather than throwing, so the caller renders a stable ack in every case.
+   */
+  private resolvePendingViaPython(actionId: string, decision: string): Promise<PendingResolution> {
+    const pendingLibPath = process.env.CLAUDECLAW_PENDING_LIB_PATH;
+    if (!pendingLibPath) {
+      this.logger.warn(
+        "[telegram-adapter] CLAUDECLAW_PENDING_LIB_PATH not set; cannot resolve pending action. " +
+          "Set it to the directory containing pending.py.",
+      );
+      return Promise.resolve("no_lib");
+    }
+    return new Promise<PendingResolution>((resolve) => {
+      execFile(
+        "python3",
+        [
+          "-c",
+          "import sys; sys.path.insert(0, sys.argv[1]); from pending import resolve_pending; ok = resolve_pending(int(sys.argv[2]), sys.argv[3]); print('ok' if ok else 'not_found')",
+          pendingLibPath,
+          actionId,
+          decision,
+        ],
+        { timeout: 5000 },
+        (err: Error | null, stdout: string) => {
+          if (err) {
+            this.logger.error("[telegram-adapter] resolve_pending failed", err);
+            resolve("error");
+            return;
+          }
+          resolve(stdout.trim() === "ok" ? "ok" : "not_found");
+        },
+      );
     });
   }
 
