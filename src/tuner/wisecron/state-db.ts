@@ -3,7 +3,8 @@ import { existsSync, mkdirSync, renameSync } from "node:fs";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
 import type { RevisionRecord, ScheduleState, AppliedBy } from "./types.js";
-import type { Patch } from "../../skills-tuner/core/types.js";
+import type { Patch, Proposal } from "../../skills-tuner/core/types.js";
+import { ProposalSchema } from "../../skills-tuner/core/types.js";
 
 interface SubjectStateRow {
   subject: string;
@@ -37,6 +38,42 @@ export interface OutcomeRow {
   window_start: string;
   window_end: string;
   verdict: string | null;
+}
+
+/** Persisted proposal lifecycle status. */
+export type ProposalStatus = "pending" | "applied" | "refused";
+
+interface ProposalRow {
+  id: string;
+  subject: string;
+  status: string;
+  proposal_json: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** A persisted proposal: the signed Proposal plus its lifecycle status. */
+export interface StoredProposal {
+  id: string;
+  subject: string;
+  status: ProposalStatus;
+  proposal: Proposal;
+  created_at: Date;
+  updated_at: Date;
+}
+
+function rowToStoredProposal(row: ProposalRow): StoredProposal {
+  return {
+    id: row.id,
+    subject: row.subject,
+    status: row.status as ProposalStatus,
+    // ProposalSchema coerces created_at (string in JSON) back to a Date so the
+    // canonical signature re-derivation (which calls created_at.toISOString())
+    // matches what was signed at persist time.
+    proposal: ProposalSchema.parse(JSON.parse(row.proposal_json)),
+    created_at: new Date(row.created_at),
+    updated_at: new Date(row.updated_at),
+  };
 }
 
 function rowToScheduleState(row: SubjectStateRow): ScheduleState {
@@ -114,6 +151,19 @@ CREATE TABLE IF NOT EXISTS outcomes (
   PRIMARY KEY (proposal_id, metric)
 );
 
+-- Proposal queue. The wisecron ProposalEngine returns proposals but does not
+-- persist them; this table is the durable approve-then-apply file the CLI/notifier
+-- drive. Signed Proposal JSON is stored verbatim so apply-time signature
+-- verification round-trips. status: pending → applied | refused.
+CREATE TABLE IF NOT EXISTS proposals (
+  id            TEXT PRIMARY KEY,
+  subject       TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'pending',
+  proposal_json TEXT NOT NULL,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
+
 -- Phase 2 substrate (generative ranking). Empty + unused in Phase 1.
 CREATE TABLE IF NOT EXISTS priors (
   subject    TEXT NOT NULL,
@@ -124,8 +174,10 @@ CREATE TABLE IF NOT EXISTS priors (
 );
 
 CREATE INDEX IF NOT EXISTS idx_rollback_subject ON rollback_history(subject, applied_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rollback_proposal ON rollback_history(proposal_id, applied_at DESC);
 CREATE INDEX IF NOT EXISTS idx_telemetry_collected ON telemetry_cache(subject, collected_at DESC);
 CREATE INDEX IF NOT EXISTS idx_outcomes_pending ON outcomes(verdict, window_end);
+CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status, created_at DESC);
 `;
 
 export class WisecronStateDB {
@@ -243,6 +295,64 @@ export class WisecronStateDB {
     const cutoff = new Date(Date.now() - retentionDays * 86_400_000).toISOString();
     const result = this.db.prepare("DELETE FROM rollback_history WHERE applied_at < ?").run(cutoff);
     return Number(result.changes);
+  }
+
+  /**
+   * The newest still-applied revision for a proposal (rolled_back_at IS NULL),
+   * or null if none. Used by the maturation pass to map a regressed proposal
+   * back to the revision its defensive revert must replay.
+   */
+  getActiveRevisionByProposal(proposalId: string): RevisionRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM rollback_history
+         WHERE proposal_id = ? AND rolled_back_at IS NULL
+         ORDER BY applied_at DESC LIMIT 1`,
+      )
+      .get(proposalId) as RollbackRow | undefined;
+    return row ? rowToRevisionRecord(row) : null;
+  }
+
+  // ── proposals queue ───────────────────────────────────────────────────────
+
+  /**
+   * Persist a signed proposal as `pending`. Idempotent on re-run: an existing
+   * row (any status) is left untouched, so re-running a cron cycle never
+   * resurrects an applied/refused proposal or clobbers its status.
+   */
+  persistProposal(proposal: Proposal): void {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(`
+      INSERT INTO proposals(id, subject, status, proposal_json, created_at, updated_at)
+      VALUES (?, ?, 'pending', ?, ?, ?)
+      ON CONFLICT(id) DO NOTHING
+    `)
+      .run(String(proposal.id), proposal.subject, JSON.stringify(proposal), now, now);
+  }
+
+  listProposals(status?: ProposalStatus): StoredProposal[] {
+    const rows = (
+      status
+        ? this.db
+            .prepare("SELECT * FROM proposals WHERE status = ? ORDER BY created_at DESC")
+            .all(status)
+        : this.db.prepare("SELECT * FROM proposals ORDER BY created_at DESC").all()
+    ) as ProposalRow[];
+    return rows.map(rowToStoredProposal);
+  }
+
+  getStoredProposal(id: string): StoredProposal | null {
+    const row = this.db.prepare("SELECT * FROM proposals WHERE id = ?").get(id) as
+      | ProposalRow
+      | undefined;
+    return row ? rowToStoredProposal(row) : null;
+  }
+
+  setProposalStatus(id: string, status: ProposalStatus): void {
+    this.db
+      .prepare("UPDATE proposals SET status = ?, updated_at = ? WHERE id = ?")
+      .run(status, new Date().toISOString(), id);
   }
 
   // ── telemetry_cache ───────────────────────────────────────────────────────

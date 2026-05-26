@@ -472,4 +472,155 @@ program
     if (repo) console.log(`   git_repo: ${repo} (commit it with your usual workflow)`);
   });
 
+// ── wisecron (outcome-loop stack — parallel to the legacy cron-run above) ──────
+//
+// Distinct command group driving the 8 wisecron subjects through the full
+// outcome loop (propose → persist → apply → baseline → mature → revert). The
+// legacy `cron-run`/`apply`/`revert` commands above (Engine + ProposalsStore)
+// are untouched — this group reads its own `wisecron:` config block and its own
+// wisecron.db.
+const wisecron = program
+  .command('wisecron')
+  .description('Outcome-loop tuner for the 8 wisecron subjects (cron, claude_md, hook, …)');
+
+wisecron
+  .command('cron-run')
+  .description('Run detect+propose for each enabled subject; persist proposals (no apply)')
+  .option('--since <duration>', 'time window (e.g. 24h, 7d)', '24h')
+  .option('--subject <name>', 'run only this subject')
+  .option('--config <path>', 'config.yaml path (default ~/.config/tuner/config.yaml)')
+  .action(async (opts: { since: string; subject?: string; config?: string }) => {
+    const { bootstrapWisecron } = await import('./wisecron-bootstrap.js');
+    const { computeProposalSignature, loadSecret } = await import('../core/security.js');
+    const { db, engine, registry } = bootstrapWisecron({ configPath: opts.config });
+
+    const since = new Date(Date.now() - parseDuration(opts.since));
+    const names = opts.subject
+      ? [opts.subject]
+      : registry.allSubjects().map((s) => s.name);
+    if (names.length === 0) {
+      console.log('No wisecron subjects enabled. Set wisecron.enabled + subjects in config.yaml.');
+      return;
+    }
+
+    const secret = loadSecret();
+    let totalProposed = 0;
+    for (const name of names) {
+      if (!registry.getSubject(name)) {
+        console.warn(`⚠️  subject '${name}' not registered (enabled in config?) — skipping`);
+        continue;
+      }
+      const result = await engine.runCycle(name, since);
+      for (const unsigned of result.proposals) {
+        const signed = { ...unsigned, signature: computeProposalSignature(unsigned, secret) };
+        db.persistProposal(signed);
+      }
+      totalProposed += result.proposals.length;
+      console.log(
+        `  ${name}: obs=${result.observations} clusters=${result.clusters} ` +
+          `proposed=${result.proposals.length}`,
+      );
+    }
+    console.log(`✅ wisecron cron-run: ${totalProposed} proposal(s) persisted (status=pending)`);
+  });
+
+wisecron
+  .command('pending')
+  .description('List persisted wisecron proposals awaiting apply')
+  .option('--config <path>', 'config.yaml path')
+  .action(async (opts: { config?: string }) => {
+    const { bootstrapWisecron } = await import('./wisecron-bootstrap.js');
+    const { db } = bootstrapWisecron({ configPath: opts.config, runHealthChecks: false });
+    const pending = db.listProposals('pending');
+    if (pending.length === 0) {
+      console.log('No pending wisecron proposals.');
+      return;
+    }
+    console.log(`${pending.length} pending wisecron proposal(s):`);
+    for (const p of pending) {
+      const alts = p.proposal.alternatives.map((a) => a.id).join(', ');
+      console.log(`  #${p.id}  [${p.subject}]  ${p.proposal.target_path}`);
+      console.log(`        kind=${p.proposal.kind}  alternatives: ${alts}`);
+    }
+  });
+
+wisecron
+  .command('apply <id>')
+  .description('Apply a persisted proposal (snapshots a fitness baseline at apply)')
+  .option('--alt <altId>', 'alternative to apply (default: first)')
+  .option('--config <path>', 'config.yaml path')
+  .action(async (id: string, opts: { alt?: string; config?: string }) => {
+    const { bootstrapWisecron } = await import('./wisecron-bootstrap.js');
+    const { db, pipeline, recorder } = bootstrapWisecron({ configPath: opts.config });
+
+    const stored = db.getStoredProposal(id);
+    if (!stored) {
+      console.error(`Proposal #${id} not found (run 'wisecron pending').`);
+      process.exit(1);
+    }
+    if (stored.status !== 'pending') {
+      console.error(`Proposal #${id} is '${stored.status}', not pending — refusing to re-apply.`);
+      process.exit(1);
+    }
+    const altId = opts.alt ?? stored.proposal.alternatives[0]!.id;
+
+    const outcome = await pipeline.apply(stored.proposal, altId, 'cli');
+    db.setProposalStatus(id, 'applied');
+    // The recorder-armed pipeline already fires snapshotBaseline fire-and-forget;
+    // we await it explicitly so the baseline row is durable before this
+    // short-lived CLI exits (the call is idempotent — ON CONFLICT refreshes).
+    await recorder.snapshotBaseline(stored.proposal);
+
+    const rows = db.getOutcomes(id);
+    console.log(`✅ Applied proposal #${id} [${stored.subject}] alt='${altId}'`);
+    console.log(`   revision_id=${outcome.revision.id}  observation_window=${outcome.observation_window_armed}`);
+    if (rows.length === 0) {
+      console.log('   baseline: no active fitness metric for this subject (proposal-only)');
+    } else {
+      for (const r of rows) {
+        console.log(`   baseline: ${r.metric}=${r.baseline} matures_at=${r.window_end}`);
+      }
+    }
+  });
+
+wisecron
+  .command('mature')
+  .description('Run the maturation pass: compute post/delta/verdict for matured baselines, revert regressions defensively')
+  .option('--asof <iso>', 'evaluate as of this ISO timestamp (default: now)')
+  .option('--config <path>', 'config.yaml path')
+  .action(async (opts: { asof?: string; config?: string }) => {
+    const { bootstrapWisecron } = await import('./wisecron-bootstrap.js');
+    const { db, recorder, pipeline } = bootstrapWisecron({ configPath: opts.config });
+
+    const asOf = opts.asof ? new Date(opts.asof) : new Date();
+    if (Number.isNaN(asOf.getTime())) {
+      console.error('--asof must be a valid ISO timestamp');
+      process.exit(1);
+    }
+
+    const results = await recorder.runMaturation({
+      asOf,
+      // Defensive revert: only LOW-risk regressions auto-revert within policy.
+      // medium/high/critical return false → enqueued for human approval (the
+      // OutcomeRecorder audits them as system:enqueued-for-human).
+      revert: async (proposalId, tier) => {
+        if (tier !== 'low') return false;
+        const rev = db.getActiveRevisionByProposal(proposalId);
+        if (!rev) return false;
+        await pipeline.revert(rev.id, 'auto-revert');
+        return true;
+      },
+    });
+
+    if (results.length === 0) {
+      console.log('No matured outcomes to evaluate.');
+      return;
+    }
+    console.log(`Matured ${results.length} outcome(s):`);
+    for (const r of results) {
+      const tail = r.reverted ? ' → auto-reverted' : '';
+      console.log(`  #${r.proposal_id} [${r.subject}] ${r.target_metric}: ${r.verdict}${tail}`);
+    }
+  });
+
 program.parseAsync(process.argv).catch((e: unknown) => { console.error(e instanceof Error ? e.message : String(e)); process.exit(1); });
