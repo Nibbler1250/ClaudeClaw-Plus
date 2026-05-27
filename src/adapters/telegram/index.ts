@@ -107,6 +107,17 @@ export class TelegramAdapter {
 
   /** Last inbound per agent — target for outbound + reaction message id. */
   private readonly lastChatPerAgent = new Map<string, PendingPrompt>();
+  /**
+   * Last-known forum-topic id per chat. Codex review on #139: when chat A
+   * (forum topic 5) and chat B share the same agent and prompts interleave,
+   * `lastChatPerAgent` only holds one chat at a time, so the origin_id route
+   * for the OTHER chat would drop its `message_thread_id` and reply to the
+   * supergroup's general topic instead of the originating thread. Populated
+   * on every inbound; read by {@link targetForOriginOrAgent} when the cache
+   * doesn't match the origin_id chat. Holds `undefined` for non-forum chats
+   * so the difference between "never seen" and "non-threaded" is observable.
+   */
+  private readonly lastTopicPerChat = new Map<number, number | undefined>();
   /** Last outbound bot message per agent — target for edit_message + spinner. */
   private readonly lastBotMessage = new Map<
     string,
@@ -348,6 +359,7 @@ export class TelegramAdapter {
       message_thread_id: message.message_thread_id,
     };
     this.lastChatPerAgent.set(agentId, pending);
+    this.lastTopicPerChat.set(chatId, message.message_thread_id);
 
     // Typing indicator + auto-spinner: the instant a message arrives, post a
     // braille placeholder and animate it so the user sees activity before
@@ -410,7 +422,7 @@ export class TelegramAdapter {
     const rawText = typeof payload?.text === "string" ? payload.text : "";
     if (rawText.length === 0) return;
 
-    const target = this.targetForAgent(agentId);
+    const target = this.targetForOriginOrAgent(agentId, event);
     if (!target) {
       this.logger.warn(
         `[telegram-adapter] no target chat for agent ${agentId}; dropping response.text`,
@@ -620,7 +632,7 @@ export class TelegramAdapter {
     const req = event.payload as PermissionRequest | undefined;
     if (!req || typeof req.request_id !== "string") return;
 
-    const target = this.targetForAgent(agentId);
+    const target = this.targetForOriginOrAgent(agentId, event);
     if (!target) {
       this.logger.warn(
         `[telegram-adapter] no target chat for permission_request on agent ${agentId}`,
@@ -661,7 +673,7 @@ export class TelegramAdapter {
     if (typeof payload?.ask_id !== "string" || typeof payload?.question !== "string") {
       return;
     }
-    const target = this.targetForAgent(agentId);
+    const target = this.targetForOriginOrAgent(agentId, event);
     if (!target) {
       this.logger.warn(`[telegram-adapter] no target chat for request_human on agent ${agentId}`);
       return;
@@ -742,10 +754,67 @@ export class TelegramAdapter {
   }
 
   /**
-   * Pick an outbound chat for the agent. Prefers the last inbound (so
-   * replies thread back); falls back to the first chat routed to the
-   * agent so spontaneous events (cron, background tools) still reach
-   * a surface.
+   * Pick an outbound chat for the agent honoring the event's
+   * `origin_id` when `origin === "telegram"` (issue #139). We always
+   * zero out `source_message_id` because the cache tracks the *most
+   * recent* inbound, not the one this reply corresponds to — letting it
+   * leak would react on a newer (unrelated) message when two prompts
+   * arrive from the same chat before the first response lands.
+   *
+   * For `message_thread_id`: prefer the cached `lastChatPerAgent[agent]`
+   * value when its chat_id matches the origin_id (most accurate — same
+   * agent, same chat, last inbound). Otherwise fall back to
+   * `lastTopicPerChat[origin_id]` so forum threading still works when
+   * two chats sharing the same agent interleave prompts (Codex P2 on
+   * the original #139 commit). A perfect fix would carry the originating
+   * thread id through the bus payload as `origin_thread_id`; that's
+   * upstream work in BusCore + every adapter, and this two-level cache
+   * covers the common-case routing without it.
+   *
+   * Falls back to {@link targetForAgent} for events without an origin
+   * (cron / heartbeat / cli / rest) or when the origin isn't telegram.
+   *
+   * Mirrors Discord (`src/adapters/discord/index.ts` ~L411) and Slack
+   * (`src/adapters/slack/index.ts` ~L615) — see issue #139 for context.
+   */
+  private targetForOriginOrAgent(agentId: string, event: BusEvent): PendingPrompt | null {
+    const payloadWithOrigin = event.payload as { origin?: string; origin_id?: string } | undefined;
+    const origin = payloadWithOrigin?.origin;
+    const originId = payloadWithOrigin?.origin_id;
+    if (origin === "telegram" && typeof originId === "string" && originId.length > 0) {
+      const chatId = Number(originId);
+      // Telegram chat ids are always integers (and can be negative for
+      // groups/channels). `Number.isInteger` rejects NaN, floats, and
+      // Infinity in one check — tighter than `isFinite`.
+      if (Number.isInteger(chatId)) {
+        const cached = this.lastChatPerAgent.get(agentId);
+        const threadId =
+          cached && cached.chat_id === chatId
+            ? cached.message_thread_id
+            : this.lastTopicPerChat.get(chatId);
+        return {
+          chat_id: chatId,
+          source_message_id: 0,
+          ...(threadId !== undefined ? { message_thread_id: threadId } : {}),
+        };
+      }
+    }
+    return this.targetForAgent(agentId);
+  }
+
+  /**
+   * Pick an outbound chat for the agent based purely on routing —
+   * used as the fallback when an event has no origin (cron, heartbeat,
+   * cli, rest) or when origin-derived routing can't pin a chat.
+   *
+   * Prefers the last inbound for the agent (so replies thread back);
+   * otherwise the first routed chat so spontaneous events still reach
+   * a surface. Issue #139: outbound `response.text` /
+   * `channel.permission_request` / `system.request_human` with
+   * `origin === "telegram"` now route via {@link targetForOriginOrAgent}
+   * which prefers `origin_id` over this fan-out cache, so two chats
+   * routed to the same agent no longer cross-wire on interleaved
+   * prompts.
    */
   private targetForAgent(agentId: string): PendingPrompt | null {
     const last = this.lastChatPerAgent.get(agentId);
