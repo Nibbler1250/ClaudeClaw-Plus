@@ -13,7 +13,11 @@ import { writePidFile, cleanupPidFile, checkExistingDaemon } from "../pid";
 import { initConfig, loadSettings, reloadSettings, resolvePrompt, type HeartbeatConfig, type Settings } from "../config";
 import { getDayAndMinuteAtOffset, buildClockPromptPrefix } from "../timezone";
 import { startWebUi, type WebServerHandle } from "../web";
+<<<<<<< HEAD
 import { initializeJobSystem } from "../orchestrator/resumable-jobs";
+=======
+import { getOrCreateWebToken } from "../ui/auth";
+>>>>>>> upstream/master
 import type { Job } from "../jobs";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
 import { PluginManager, setPluginManager } from "../plugins";
@@ -224,6 +228,7 @@ export async function start(args: string[] = []) {
   let hasTriggerFlag = false;
   let telegramFlag = false;
   let discordFlag = false;
+  let slackFlag = false;
   let debugFlag = false;
   let webFlag = false;
   let replaceExistingFlag = false;
@@ -240,6 +245,8 @@ export async function start(args: string[] = []) {
       telegramFlag = true;
     } else if (arg === "--discord") {
       discordFlag = true;
+    } else if (arg === "--slack") {
+      slackFlag = true;
     } else if (arg === "--debug") {
       debugFlag = true;
     } else if (arg === "--web") {
@@ -265,7 +272,7 @@ export async function start(args: string[] = []) {
   }
   const payload = payloadParts.join(" ").trim();
   if (hasPromptFlag && !payload) {
-    console.error("Usage: claudeclaw start --prompt <prompt> [--trigger] [--telegram] [--discord] [--debug] [--web] [--web-port <port>] [--replace-existing]");
+    console.error("Usage: claudeclaw start --prompt <prompt> [--trigger] [--telegram] [--discord] [--slack] [--debug] [--web] [--web-port <port>] [--replace-existing]");
     process.exit(1);
   }
   if (!hasPromptFlag && payload) {
@@ -278,6 +285,10 @@ export async function start(args: string[] = []) {
   }
   if (discordFlag && !hasTriggerFlag) {
     console.error("`--discord` with `start` requires `--trigger`.");
+    process.exit(1);
+  }
+  if (slackFlag && !hasTriggerFlag) {
+    console.error("`--slack` with `start` requires `--trigger`.");
     process.exit(1);
   }
   if (hasPromptFlag && !hasTriggerFlag && (webFlag || webPortFlag !== null)) {
@@ -388,6 +399,7 @@ export async function start(args: string[] = []) {
   await writePidFile();
   let web: WebServerHandle | null = null;
   let discordStopGateway: (() => void) | null = null;
+  let slackStopFn: (() => void) | null = null;
 
   // Plugin system — initialize before gateway start
   const pluginManager = new PluginManager(process.cwd());
@@ -400,6 +412,7 @@ export async function start(args: string[] = []) {
     await pluginManager.stopServices();
     setPluginManager(null);
     if (discordStopGateway) discordStopGateway();
+    if (slackStopFn) slackStopFn();
     if (web) web.stop();
     await teardownStatusline();
     await cleanupPidFile();
@@ -490,6 +503,34 @@ export async function start(args: string[] = []) {
   await initDiscord(currentSettings.discord.token);
   if (!discordToken) console.log("  Discord: not configured");
 
+  // --- Slack ---
+  let slackSendToUser: ((userId: string, text: string) => Promise<void>) | null = null;
+  let slackBotToken = "";
+  let slackAppToken = "";
+
+  async function initSlack(botToken: string, appToken: string) {
+    if (botToken && appToken && (botToken !== slackBotToken || appToken !== slackAppToken)) {
+      const { startSlack, sendMessageToUser: slackSend, stopSlack } = await import("./slack");
+      if (slackBotToken || slackAppToken) stopSlack();
+      startSlack(debugFlag);
+      slackStopFn = stopSlack;
+      slackSendToUser = (userId, text) => slackSend(botToken, userId, text);
+      slackBotToken = botToken;
+      slackAppToken = appToken;
+      console.log(`[${ts()}] Slack: enabled`);
+    } else if ((!botToken || !appToken) && (slackBotToken || slackAppToken)) {
+      if (slackStopFn) slackStopFn();
+      slackStopFn = null;
+      slackSendToUser = null;
+      slackBotToken = "";
+      slackAppToken = "";
+      console.log(`[${ts()}] Slack: disabled`);
+    }
+  }
+
+  await initSlack(currentSettings.slack.botToken, currentSettings.slack.appToken);
+  if (!slackBotToken) console.log("  Slack: not configured");
+
   // Wire channel senders into plugin runtime so plugins can send messages
   if (pluginManager.hasPlugins) {
     pluginManager.setChannelSenders({
@@ -503,6 +544,10 @@ export async function start(args: string[] = []) {
           ? (userId: string, text: string) => discordSendToUser!(userId, text)
           : () => Promise.resolve(),
       },
+      slack: {
+        sendMessageSlack: (userId: string, text: string) =>
+          slackSendToUser ? slackSendToUser(userId, text) : Promise.resolve(),
+      },
     });
     await pluginManager.startServices();
     await pluginManager.emit("gateway_start", {}, { workspaceDir: process.cwd() });
@@ -515,7 +560,7 @@ export async function start(args: string[] = []) {
     return code === "EADDRINUSE" || message.includes("EADDRINUSE");
   }
 
-  function startWebWithFallback(host: string, preferredPort: number): WebServerHandle {
+  function startWebWithFallback(host: string, preferredPort: number, token: string): WebServerHandle {
     const maxAttempts = 10;
     let lastError: unknown;
     for (let i = 0; i < maxAttempts; i++) {
@@ -524,6 +569,7 @@ export async function start(args: string[] = []) {
         return startWebUi({
           host,
           port: candidatePort,
+          token,
           getSnapshot: () => ({
             pid: process.pid,
             startedAt: daemonStartedAt,
@@ -592,11 +638,31 @@ export async function start(args: string[] = []) {
     throw lastError;
   }
 
+  // Allowlists are now fail-closed: an empty list blocks all users rather than allowing all.
+  // Deployments that previously relied on an empty allowedUserIds meaning "allow everyone"
+  // must add explicit IDs to continue working.
+  if (currentSettings.telegram.token && currentSettings.telegram.allowedUserIds.length === 0) {
+    console.error("Refusing to start: telegram.token is set but telegram.allowedUserIds is empty.");
+    console.error("The allowlist is now fail-closed; an empty list blocks all users.");
+    console.error("Add your Telegram user ID(s) to telegram.allowedUserIds in .claude/claudeclaw/settings.json.");
+    console.error("Run `claudeclaw config` for guided setup, or see the README for migration steps.");
+    process.exit(1);
+  }
+
+  if (currentSettings.discord.token && currentSettings.discord.allowedUserIds.length === 0) {
+    console.error("Refusing to start: discord.token is set but discord.allowedUserIds is empty.");
+    console.error("The allowlist is now fail-closed; an empty list blocks all users.");
+    console.error("Add your Discord user ID(s) to discord.allowedUserIds in .claude/claudeclaw/settings.json.");
+    console.error("Run `claudeclaw config` for guided setup, or see the README for migration steps.");
+    process.exit(1);
+  }
+
   if (webEnabled) {
     currentSettings.web.enabled = true;
-    web = startWebWithFallback(currentSettings.web.host, webPort);
+    const webToken = await getOrCreateWebToken();
+    web = startWebWithFallback(currentSettings.web.host, webPort, webToken);
     currentSettings.web.port = web.port;
-    console.log(`[${new Date().toLocaleTimeString()}] Web UI listening on http://${web.host}:${web.port}`);
+    console.log(`[${ts()}] Web UI: http://${web.host}:${web.port}/?token=${webToken}`);
   }
 
   // --- Helpers ---
@@ -636,6 +702,18 @@ export async function start(args: string[] = []) {
     for (const userId of currentSettings.discord.allowedUserIds) {
       discordSendToUser(userId, text).catch((err) =>
         console.error(`[Discord] Failed to forward to ${userId}: ${err}`)
+      );
+    }
+  }
+
+  function forwardToSlack(label: string, result: { exitCode: number; stdout: string; stderr: string }) {
+    if (!slackSendToUser || currentSettings.slack.allowedUserIds.length === 0) return;
+    const text = result.exitCode === 0
+      ? `${label ? `[${label}]\n` : ""}${result.stdout || "(empty)"}`
+      : `${label ? `[${label}] ` : ""}error (exit ${result.exitCode}): ${extractErrorDetail(result) || "Unknown"}`;
+    for (const userId of currentSettings.slack.allowedUserIds) {
+      slackSendToUser(userId, text).catch((err) =>
+        console.error(`[Slack] Failed to forward to ${userId}: ${err}`)
       );
     }
   }
@@ -730,6 +808,7 @@ export async function start(args: string[] = []) {
     console.log(triggerResult.stdout);
     if (telegramFlag) forwardToTelegram("", triggerResult);
     if (discordFlag) forwardToDiscord("", triggerResult);
+    if (slackFlag) forwardToSlack("", triggerResult);
     if (triggerResult.exitCode !== 0) {
       console.error(`[${ts()}] Startup trigger failed (exit ${triggerResult.exitCode}). Daemon will continue running.`);
     }
@@ -795,6 +874,9 @@ export async function start(args: string[] = []) {
 
       // Discord changes
       await initDiscord(newSettings.discord.token);
+
+      // Slack changes
+      await initSlack(newSettings.slack.botToken, newSettings.slack.appToken);
     } catch (err) {
       console.error(`[${ts()}] Hot-reload error:`, err);
     }
