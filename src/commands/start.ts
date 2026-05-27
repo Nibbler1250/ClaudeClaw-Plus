@@ -507,6 +507,14 @@ export async function start(args: string[] = []) {
         bus,
         sessionManager,
         agents: agentConfigs,
+        // Issue #165: defer the agent spawn. The MCP multiplexer identity
+        // issuer is wired AFTER this mount (it depends on
+        // pluginManager.startServices()). Spawning agents now would build
+        // their claude PTYs before the issuer exists, so buildClaudeArgs
+        // would synthesize no `--mcp-config` and every mcp.shared server
+        // would be unreachable for the agent's whole lifetime. We spawn
+        // below, after the multiplexer block, via handle.spawnAgents().
+        deferSpawn: true,
         projectRoot: process.cwd(),
       });
       // The mount succeeded — from here on, ANY error must call
@@ -519,50 +527,12 @@ export async function start(args: string[] = []) {
         }
         handle.attachAdapters(adapters);
 
-        // Sprint 5.2c: wire BusScheduler with heartbeat + jobs against
-        // the first spawned agent (matches legacy single-global-agent
-        // shape). The handle's stop() lifecycle owns scheduler
-        // teardown alongside adapters.
-        const { wireBusScheduler } = await import("../bus/scheduler-wiring");
-        const schedulerHandle = await wireBusScheduler({
-          bus,
-          defaultAgentId: handle.spawnedAgentIds[0] ?? null,
-          heartbeat: settings.heartbeat,
-          jobs,
-          timezoneOffsetMinutes: settings.timezoneOffsetMinutes,
-        });
-        handle.attachScheduler(schedulerHandle);
-
-        // Issue #166: write the daemon-generated architecture doc so the
-        // spawned agent reads its own runtime state at bootstrap.
-        //
-        // Codex P1 on PR #171: must run AFTER all bus startup steps
-        // (including wireBusScheduler) have succeeded. If we wrote earlier
-        // and a later step threw, the outer catch falls back to legacy
-        // surfaces but the on-disk doc still says `Mode: bus` — agents
-        // would diagnose against stale architecture. Place this at the
-        // tail of the try block so the file only persists when the bus
-        // really did boot end-to-end.
-        //
-        // Best-effort: failures here log but do not block startup. A
-        // missing arch doc degrades agent diagnostic quality but doesn't
-        // break operation.
-        try {
-          const { collectArchitectureSnapshot } = await import("../architecture-doc-snapshot");
-          const { writeArchitectureDoc, defaultArchitectureDocPath } = await import(
-            "../architecture-doc"
-          );
-          const snapshot = await collectArchitectureSnapshot({
-            settings,
-            spawnedAgentIds: handle.spawnedAgentIds,
-            adapters: adapters.map((a) => ({ name: a.name })),
-          });
-          const path = defaultArchitectureDocPath(process.cwd());
-          writeArchitectureDoc(snapshot, path);
-          console.log(`[${ts()}] wrote architecture doc: ${path}`);
-        } catch (docErr) {
-          console.warn(`[${ts()}] architecture doc write failed:`, docErr);
-        }
+        // Issue #165: agent spawn, BusScheduler wiring, and the
+        // architecture-doc write all moved to AFTER the MCP multiplexer
+        // block (search "Issue #165: deferred bus agent spawn"). The
+        // scheduler targets the first spawned agent id, and the arch doc
+        // reports the spawned set — both depend on the spawn, which now
+        // happens once the multiplexer issuer is wired.
       } catch (wireErr) {
         // Adapter / scheduler wiring threw — stop the handle (which
         // already owns the bus + agents + whatever was attached
@@ -618,7 +588,11 @@ export async function start(args: string[] = []) {
   // bus's per-agent claude. Sprint 5.2b's old behaviour (skip legacy
   // web) left operators with a "not_found" page because the bus webui
   // adapter at `/health` + `/prompt` is not a dashboard replacement.
-  const skipLegacyAdapters = busRuntimeHandle !== null;
+  // `let`, not `const` (issue #165): if the DEFERRED agent spawn below
+  // fails, we tear the bus down and fall back to legacy command surfaces,
+  // which means flipping this back to false so the legacy adapter + legacy
+  // heartbeat paths re-engage.
+  let skipLegacyAdapters = busRuntimeHandle !== null;
 
   let mcpProxyStarted: Promise<void> = Promise.resolve();
 
@@ -661,10 +635,14 @@ export async function start(args: string[] = []) {
     );
   }
   if (settings.runtime === "bus" && busRuntimeHandle) {
+    // Issue #165: agents spawn AFTER the multiplexer block below, so at
+    // banner time they're declared-but-not-yet-spawned. Report the
+    // declared count here; the per-agent `[bus-runtime] spawned agent=…`
+    // lines confirm the actual spawn a few steps later.
     const agentsLabel =
-      busRuntimeSpawnedAgents.length === 0
+      settings.agents.length === 0
         ? "no agents declared"
-        : `agents=[${busRuntimeSpawnedAgents.join(", ")}]`;
+        : `${settings.agents.length} agent(s) declared (spawn deferred until MCP issuer wired)`;
     const adaptersLabel =
       busRuntimeAdapterNames.length === 0
         ? "no adapters"
@@ -866,6 +844,20 @@ export async function start(args: string[] = []) {
           revoke: (ptyId) => plugin.releaseIdentity(ptyId),
           bridgeBaseUrl: () => plugin.bridgeBaseUrl(),
         });
+        // Issue #165: the legacy PTY supervisor reaches mcp.shared via the
+        // issuer wired just above, but the BUS spawn path has its own
+        // buildClaudeArgs that never synthesized from mcp.shared. Wire the
+        // same issuer into the bus SessionManager so deferred bus agents
+        // (spawned below) get a synthesized --mcp-config too. Only inside
+        // this isActive() branch, so the dormant path stays byte-identical.
+        if (busRuntimeHandle) {
+          busRuntimeHandle.sessionManager.setMcpConfigSynthesizer({
+            issue: (ptyId) => plugin.issueIdentity(ptyId),
+            revoke: (ptyId) => plugin.releaseIdentity(ptyId),
+            bridgeBaseUrl: () => plugin.bridgeBaseUrl(),
+            sharedServers: settings.mcp.shared,
+          });
+        }
         console.log("[mcp-multiplexer] started");
       } else {
         console.warn(
@@ -879,6 +871,82 @@ export async function start(args: string[] = []) {
       console.warn(
         `[mcp-multiplexer] startup failed (non-fatal, falling back to per-PTY MCP discovery): ${msg}`,
       );
+    }
+  }
+
+  // Issue #165: deferred bus agent spawn. The MCP multiplexer issuer is now
+  // wired (or confirmed dormant) above, so spawning here means each agent's
+  // claude PTY is built with the synthesizer in place — buildClaudeArgs/spawn
+  // can attach a --mcp-config for mcp.shared servers. We also wire the
+  // BusScheduler (targets the first spawned agent id) and write the
+  // architecture doc (reports the spawned set) here, since both depend on the
+  // spawn. On failure we tear the bus down and fall back to legacy surfaces,
+  // matching a mount failure (the legacy adapter init was skipped at the gate
+  // because busRuntimeHandle was non-null — re-run it here).
+  if (busRuntimeHandle) {
+    try {
+      await busRuntimeHandle.spawnAgents();
+      busRuntimeSpawnedAgents = busRuntimeHandle.spawnedAgentIds;
+
+      const { wireBusScheduler } = await import("../bus/scheduler-wiring");
+      const schedulerHandle = await wireBusScheduler({
+        bus: busRuntimeHandle.bus,
+        defaultAgentId: busRuntimeHandle.spawnedAgentIds[0] ?? null,
+        heartbeat: currentSettings.heartbeat,
+        jobs: currentJobs,
+        timezoneOffsetMinutes: currentSettings.timezoneOffsetMinutes,
+      });
+      busRuntimeHandle.attachScheduler(schedulerHandle);
+
+      // Issue #166: write the architecture doc only after the bus booted
+      // end-to-end (spawn + scheduler), so a doc on disk always reflects a
+      // genuinely-running bus. Best-effort — a missing doc degrades agent
+      // diagnostics but doesn't break operation.
+      try {
+        const { collectArchitectureSnapshot } = await import("../architecture-doc-snapshot");
+        const { writeArchitectureDoc, defaultArchitectureDocPath } = await import(
+          "../architecture-doc"
+        );
+        const snapshot = await collectArchitectureSnapshot({
+          settings: currentSettings,
+          spawnedAgentIds: busRuntimeHandle.spawnedAgentIds,
+          adapters: busRuntimeAdapterNames.map((name) => ({ name })),
+        });
+        const path = defaultArchitectureDocPath(process.cwd());
+        writeArchitectureDoc(snapshot, path);
+        console.log(`[${ts()}] wrote architecture doc: ${path}`);
+      } catch (docErr) {
+        console.warn(`[${ts()}] architecture doc write failed:`, docErr);
+      }
+    } catch (spawnErr) {
+      console.error(
+        `[${ts()}] Bus runtime: deferred agent spawn failed — tearing down and falling back to legacy command surfaces`,
+        spawnErr,
+      );
+      try {
+        await busRuntimeHandle.stop();
+      } catch (stopErr) {
+        console.error(`[${ts()}] handle.stop() during deferred-spawn rollback failed`, stopErr);
+      }
+      busRuntimeHandle = null;
+      busRuntimeSpawnedAgents = [];
+      busRuntimeAdapterNames = [];
+      busCoreForWebUi = null;
+      skipLegacyAdapters = false;
+      // A prior bus boot may have left a CCPLUS_ARCHITECTURE.md saying
+      // "Mode: bus"; now that we've fallen back to legacy it's misleading.
+      try {
+        const { defaultArchitectureDocPath } = await import("../architecture-doc");
+        const { existsSync: exists, unlinkSync: unlink } = await import("node:fs");
+        const docPath = defaultArchitectureDocPath(process.cwd());
+        if (exists(docPath)) unlink(docPath);
+      } catch {
+        /* best-effort */
+      }
+      // Re-engage the legacy adapters that were skipped at the gate above.
+      await initTelegram(currentSettings.telegram.token, currentSettings.telegram.receiveEnabled);
+      await initDiscord(currentSettings.discord.token);
+      await initSlack(currentSettings.slack.botToken, currentSettings.slack.appToken);
     }
   }
 
