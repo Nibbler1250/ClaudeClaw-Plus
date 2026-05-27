@@ -469,6 +469,100 @@ describe("mountBusRuntime — auto-spawn rollback", () => {
   });
 });
 
+describe("mountBusRuntime — deferred spawn (issue #165)", () => {
+  let handle: BusRuntimeHandle | null = null;
+
+  afterEach(async () => {
+    if (handle) {
+      await handle.stop();
+      handle = null;
+    }
+  });
+
+  it("deferSpawn: true mounts the bus but does NOT spawn any agent", async () => {
+    const bus = createFakeBus();
+    const sm = new FakeSessionManager();
+    handle = await mountBusRuntime({
+      bus,
+      sessionManager: sm,
+      agents: [cfg("triage"), cfg("research")],
+      deferSpawn: true,
+      logger: SILENT_LOGGER,
+    });
+    // The bus is live...
+    expect(bus.startCalls()).toBe(1);
+    // ...but the issuer-before-spawn guarantee means nothing spawned yet.
+    expect(sm.spawnLog).toEqual([]);
+    expect(handle.spawnedAgentIds).toEqual([]);
+  });
+
+  it("handle.spawnAgents() spawns the declared agents in order after mount", async () => {
+    const bus = createFakeBus();
+    const sm = new FakeSessionManager();
+    handle = await mountBusRuntime({
+      bus,
+      sessionManager: sm,
+      agents: [cfg("triage"), cfg("research"), cfg("ops")],
+      deferSpawn: true,
+      logger: SILENT_LOGGER,
+    });
+    expect(sm.spawnLog).toEqual([]);
+
+    await handle.spawnAgents();
+
+    expect(sm.spawnLog.map((r) => r.config.id)).toEqual(["triage", "research", "ops"]);
+    expect(handle.spawnedAgentIds).toEqual(["triage", "research", "ops"]);
+  });
+
+  it("handle.spawnAgents(batch) spawns an explicit batch with an origin override", async () => {
+    const bus = createFakeBus();
+    const sm = new FakeSessionManager();
+    handle = await mountBusRuntime({
+      bus,
+      sessionManager: sm,
+      agents: [cfg("declared")],
+      deferSpawn: true,
+      logger: SILENT_LOGGER,
+    });
+    await handle.spawnAgents([cfg("explicit")], "discord");
+    expect(sm.spawnLog.map((r) => r.config.id)).toEqual(["explicit"]);
+    expect(sm.spawnLog[0]?.origin).toBe("discord");
+  });
+
+  it("handle.spawnAgents() rolls back this batch (reverse order) when a spawn throws", async () => {
+    const bus = createFakeBus();
+    const sm = new FakeSessionManager({ failSpawnAtIndex: 2 });
+    handle = await mountBusRuntime({
+      bus,
+      sessionManager: sm,
+      agents: [cfg("a"), cfg("b"), cfg("c"), cfg("d")],
+      deferSpawn: true,
+      logger: SILENT_LOGGER,
+    });
+    await expect(handle.spawnAgents()).rejects.toThrow(/failed to spawn agent="c"/);
+    // Agents a + b were rolled back in reverse order; none remain registered.
+    expect(sm.stopLog).toEqual(["b", "a"]);
+    expect(handle.spawnedAgentIds).toEqual([]);
+    // The bus is still up — the daemon decides whether to tear it down.
+    expect(bus.stopCalls()).toBe(0);
+  });
+
+  it("handle.spawnAgents() throws once the handle has been stopped", async () => {
+    const bus = createFakeBus();
+    const sm = new FakeSessionManager();
+    handle = await mountBusRuntime({
+      bus,
+      sessionManager: sm,
+      agents: [cfg("a")],
+      deferSpawn: true,
+      logger: SILENT_LOGGER,
+    });
+    await handle.stop();
+    await expect(handle.spawnAgents()).rejects.toThrow(/stopped handle/);
+    handle = null; // already stopped
+  });
+});
+
 describe("mountBusRuntime — stop() with agents", () => {
   it("stops every spawned agent in reverse order before bus.stop", async () => {
     const bus = createFakeBus();

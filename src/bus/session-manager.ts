@@ -34,6 +34,11 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { cleanSpawnEnv, withCleanProcessEnv } from "../runner";
+import {
+  deleteConfigForPty,
+  type PtyIdentity,
+  writeConfigForPty,
+} from "../runner/pty-mcp-config-writer";
 import { createSession } from "../sessions";
 import {
   type AgentProcess,
@@ -101,6 +106,84 @@ export interface SessionManagerOptions {
    * Optional logger override. Defaults to `console`.
    */
   logger?: Pick<Console, "warn" | "info" | "error">;
+}
+
+/**
+ * MCP multiplexer synthesizer seam (issue #165). The daemon injects this
+ * AFTER it has started the MCP multiplexer plugin and confirmed
+ * `plugin.isActive()`, so the bus spawn path can synthesize a per-agent
+ * `--mcp-config` for `mcp.shared` servers — the same servers the legacy
+ * PTY supervisor reaches via `synthesizeMcpConfigIfActive`. Without this
+ * the bus's `buildClaudeArgs` only emits `--mcp-config` for a statically
+ * configured `agent.mcp_config`, so multiplexed servers are unreachable
+ * for every bus agent.
+ *
+ * Left `null` when the multiplexer is dormant (`mcp.shared` empty, web
+ * disabled, or `plugin.isActive() === false`) — synthesis is then skipped
+ * and agents spawn with no `--mcp-config`, byte-identical to the
+ * pre-#165 dormant path.
+ */
+export interface BusMcpConfigSynthesizer {
+  /** Mint the per-agent HMAC identity (headers) for the bridge. */
+  issue: (ptyId: string) => PtyIdentity;
+  /** Drop the per-agent identity when the agent is stopped. Idempotent. */
+  revoke: (ptyId: string) => void | Promise<void>;
+  /** The HTTP base URL the multiplexer bound to, e.g. http://127.0.0.1:4632. */
+  bridgeBaseUrl: () => string;
+  /** Names of the multiplexed shared servers (`settings.mcp.shared`). */
+  sharedServers: readonly string[];
+}
+
+/**
+ * Synthesize a per-agent `--mcp-config` path for the bus spawn path
+ * (issue #165), or `undefined` when synthesis doesn't apply.
+ *
+ * Precedence + dormancy rules (mirrors the supervisor):
+ *   - An operator-supplied static `agent.mcp_config` ALWAYS wins — return
+ *     `undefined` so `buildClaudeArgs`'s own pass-through is the single
+ *     source of that flag (never emit two `--mcp-config`).
+ *   - No synthesizer wired, or zero shared servers → `undefined` (dormant,
+ *     no flag, byte-identical to pre-#165).
+ *
+ * Keys the identity + config file on the STABLE `agent.id` rather than
+ * `agent.session_id`: the session id can rotate on a collision respawn,
+ * which would orphan the issued identity + on-disk file. One agent = one
+ * long-lived PTY = one identity.
+ */
+export function synthesizeBusMcpConfig(
+  agent: AgentConfig,
+  synth: BusMcpConfigSynthesizer | null,
+  cwd: string,
+): string | undefined {
+  if (agent.mcp_config) return undefined;
+  if (!synth) return undefined;
+  if (synth.sharedServers.length === 0) return undefined;
+
+  const identity = synth.issue(agent.id);
+  // Roll back the just-minted identity if the on-disk write fails
+  // (EACCES, ENOSPC, EROFS, mkdir failure). Without this, the throw
+  // escapes the spawn-dispatch try/catch in `spawnAgentInternal`
+  // because `mcpConfigCwd` is only assigned AFTER this function
+  // returns — `cleanupAgentMcpConfig(undefined, ...)` then short-
+  // circuits via its `if (!cwd) return` guard and the identity stays
+  // alive in the issuer's registry.
+  let path: string;
+  try {
+    ({ path } = writeConfigForPty({
+      ptyId: agent.id,
+      cwd,
+      sharedServers: synth.sharedServers.map((name) => ({ name })),
+      perPtyServers: [],
+      bridgeBaseUrl: synth.bridgeBaseUrl(),
+      identity,
+    }));
+  } catch (err) {
+    Promise.resolve(synth.revoke(agent.id)).catch(() => {
+      // Fire-and-forget; the throw below is the operator-visible signal.
+    });
+    throw err;
+  }
+  return path.length > 0 ? path : undefined;
 }
 
 /* ───────────────────────────────────────────────────────────────────── */
@@ -364,14 +447,32 @@ interface AgentRecord {
   origin: BusOrigin;
   mode: SupervisionMode;
   proc: PtyAgentProcess | ChildAgentProcess;
+  /**
+   * Set to the agent's cwd when this spawn synthesized a multiplexer
+   * `--mcp-config` (issue #165). Presence drives identity revoke + config
+   * file cleanup on stop(). Absent when no synthesis happened (static
+   * `agent.mcp_config`, or dormant multiplexer).
+   */
+  mcpConfigCwd?: string;
 }
 
 export class SessionManager {
   private readonly options: SessionManagerOptions;
   private readonly agents = new Map<string, AgentRecord>();
+  private mcpSynth: BusMcpConfigSynthesizer | null = null;
 
   constructor(options: SessionManagerOptions = {}) {
     this.options = options;
+  }
+
+  /**
+   * Wire (or clear) the MCP multiplexer synthesizer (issue #165). The
+   * daemon calls this AFTER the multiplexer issuer is wired and BEFORE it
+   * spawns agents, so every subsequently-spawned agent gets a synthesized
+   * `--mcp-config` for `mcp.shared` servers. Pass `null` to disable.
+   */
+  setMcpConfigSynthesizer(synth: BusMcpConfigSynthesizer | null): void {
+    this.mcpSynth = synth;
   }
 
   async spawnAgent(agent: AgentConfig, origin: BusOrigin): Promise<AgentProcess> {
@@ -411,15 +512,40 @@ export class SessionManager {
     const env = buildChildEnv(agent, busSock);
     const args = this.options.argsOverride ?? buildClaudeArgs(agent, mode);
 
+    // Issue #165: synthesize the multiplexer `--mcp-config` for this agent
+    // when the daemon has wired a synthesizer (active multiplexer) and the
+    // agent has no static `mcp_config`. Skipped when `argsOverride` is set
+    // — that test seam replaces the entire args list with a stand-in
+    // process's flags, so appending claude flags would corrupt it.
+    let mcpConfigCwd: string | undefined;
+    if (this.options.argsOverride === undefined) {
+      const synthesizedPath = synthesizeBusMcpConfig(agent, this.mcpSynth, realCwd);
+      if (synthesizedPath) {
+        args.push("--mcp-config", synthesizedPath);
+        mcpConfigCwd = realCwd;
+      }
+    }
+
+    // Issue #165 (PR #184 re-review): the synthesized identity + 0600
+    // bearer file are minted ABOVE, before the spawn primitive runs. If the
+    // primitive throws (bun-pty native fault, ENOENT on commandOverride,
+    // tmux not on PATH), unwinding skips registry insertion + the onExit
+    // cleanup, so without this the just-failed agent's identity is never
+    // revoked and its file never deleted. Clean up then re-throw.
     let proc: PtyAgentProcess | ChildAgentProcess;
-    if (mode === "pty-stdin") {
-      proc = await this.spawnPty(agent, args, env, realCwd);
-    } else if (mode === "process-stream-json" || mode === "process") {
-      proc = this.spawnChild(agent, mode, args, env, realCwd);
-    } else if (mode === "tmux") {
-      proc = this.spawnTmux(agent, args, env, realCwd);
-    } else {
-      throw new Error(`unsupported supervision mode: ${mode satisfies never}`);
+    try {
+      if (mode === "pty-stdin") {
+        proc = await this.spawnPty(agent, args, env, realCwd);
+      } else if (mode === "process-stream-json" || mode === "process") {
+        proc = this.spawnChild(agent, mode, args, env, realCwd);
+      } else if (mode === "tmux") {
+        proc = this.spawnTmux(agent, args, env, realCwd);
+      } else {
+        throw new Error(`unsupported supervision mode: ${mode satisfies never}`);
+      }
+    } catch (err) {
+      this.cleanupAgentMcpConfig(mcpConfigCwd, agent.id);
+      throw err;
     }
 
     // Register the proc + attach the cleanup `onExit` BEFORE awaiting
@@ -431,12 +557,18 @@ export class SessionManager {
     // `ChildAgentProcess.onExit` are push-only and don't replay past
     // exits. The cleanup never fires, leaving a dead entry in
     // `this.agents` that breaks the next `already spawned` guard.
-    const record: AgentRecord = { agent, origin, mode, proc };
+    const record: AgentRecord = { agent, origin, mode, proc, mcpConfigCwd };
     this.agents.set(agent.id, record);
     // Auto-cleanup: drop registry entry on exit so restart() can reuse the id.
     proc.onExit(() => {
       const current = this.agents.get(agent.id);
       if (current && current.proc === proc) {
+        // Issue #165 (PR #184 re-review): a natural exit (crash, OOM,
+        // claude-side auth failure, operator kill) never routes through
+        // stop(), so release the multiplexer identity + delete the 0600
+        // bearer file here too. Idempotent, so it's safe if stop() also
+        // ran (e.g. stop() racing the process's own exit).
+        this.cleanupAgentMcpConfig(current.mcpConfigCwd, agent.id);
         this.agents.delete(agent.id);
       }
     });
@@ -467,6 +599,12 @@ export class SessionManager {
         ((agentId: string, sessionId: string) => createSession(sessionId, agentId));
       await persist(agent.id, fresh);
       agent.session_id = fresh;
+      // Issue #165 (PR #184 review): this attempt may have synthesized an
+      // --mcp-config (minted a multiplexer identity + wrote a 0600 file).
+      // The retry below re-synthesizes from scratch, so revoke this
+      // attempt's identity + delete its file first — otherwise the identity
+      // leaks and a stale file lingers if the retry fails before rewriting.
+      this.cleanupAgentMcpConfig(mcpConfigCwd, agent.id);
       // The proc that emitted the collision marker has exited; clear
       // its registry slot so the recursive respawn doesn't trip the
       // `already spawned` guard (the `onExit` cleanup above may not
@@ -480,7 +618,8 @@ export class SessionManager {
     if (collision) {
       // Retried once and still colliding — surface a real error so the
       // operator notices instead of silently looping. Same registry-
-      // slot cleanup as the rotation path.
+      // slot + MCP-config cleanup as the rotation path.
+      this.cleanupAgentMcpConfig(mcpConfigCwd, agent.id);
       const current = this.agents.get(agent.id);
       if (current && current.proc === proc) {
         this.agents.delete(agent.id);
@@ -625,6 +764,35 @@ export class SessionManager {
   }
 
   /**
+   * Release the multiplexer identity + delete the synthesized per-agent
+   * `--mcp-config` (0600 bearer-token file) for an agent that synthesized
+   * one (issue #165). `cwd` is the agent's resolved cwd, or undefined when
+   * no config was synthesized (then this is a no-op). Best-effort: revoke
+   * is documented idempotent and `deleteConfigForPty` swallows ENOENT, so a
+   * double-call (e.g. stop() racing the onExit auto-cleanup, or a
+   * collision-retry followed by stop()) is safe.
+   */
+  private cleanupAgentMcpConfig(cwd: string | undefined, agentId: string): void {
+    if (!cwd) return;
+    try {
+      deleteConfigForPty(cwd, agentId);
+    } catch (err) {
+      (this.options.logger ?? console).warn(
+        `[bus-session] agent=${agentId} mcp-config cleanup failed`,
+        err,
+      );
+    }
+    if (this.mcpSynth) {
+      Promise.resolve(this.mcpSynth.revoke(agentId)).catch((err) =>
+        (this.options.logger ?? console).warn(
+          `[bus-session] agent=${agentId} mcp identity revoke failed`,
+          err,
+        ),
+      );
+    }
+  }
+
+  /**
    * Stop an agent. Per Spike 0.5: write `/quit` via the active supervision
    * channel; observe process exit; the caller (Bus core) publishes
    * `session.end` AFTER the process exit fires — not before.
@@ -634,6 +802,9 @@ export class SessionManager {
     if (!record) return Promise.resolve();
     return new Promise<void>((resolve) => {
       const finalise = (): void => {
+        // Issue #165: release the multiplexer identity + delete the
+        // synthesized per-agent --mcp-config when this spawn had one.
+        this.cleanupAgentMcpConfig(record.mcpConfigCwd, agent_id);
         // Drop from registry (the onExit handler installed in spawnAgent()
         // will also do this; harmless to do twice).
         this.agents.delete(agent_id);

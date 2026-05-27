@@ -471,7 +471,6 @@ export async function start(args: string[] = []) {
     try {
       const { mountBusRuntime, resolveDaemonSocketPath } = await import("../bus/runtime-mount");
       const { resolveBusAgentConfigs } = await import("../bus/agent-resolver");
-      const { wireBusAdapters } = await import("../bus/adapter-wiring");
       const { BusCoreImpl } = await import("../bus/core");
       const { SessionManager } = await import("../bus/session-manager");
 
@@ -487,19 +486,19 @@ export async function start(args: string[] = []) {
         .map((r) => r.config)
         .filter((c): c is NonNullable<typeof c> => c !== null);
 
-      // Boot order matters. PR #123 Codex P1+P2 fold-in:
+      // Boot order matters. PR #123 Codex P1+P2 + issue #165:
       //   1. Build BusCore + SessionManager (no I/O yet).
-      //   2. mountBusRuntime — starts the IPC server + spawns agents.
-      //      Bus is now live and addressable.
-      //   3. wireBusAdapters — adapters call `adapter.start()` which
-      //      kicks off their poll loops / opens HTTP listeners.
-      //      MUST come AFTER step 2 so prompts that arrive during the
-      //      adapter's first poll have a live bus + agents to dispatch
-      //      to (Codex P2: prompt-loss race).
-      //   4. handle.attachAdapters — the handle's stop() lifecycle now
-      //      owns the adapters; any error in step 5+ that falls
-      //      through to the catch tears them down (Codex P1: adapter
-      //      leak on partial mount failure).
+      //   2. mountBusRuntime with `deferSpawn: true` — starts the IPC
+      //      server + slash relay + orphan scan, but does NOT spawn agents
+      //      yet. The bus is live and addressable; no agents registered.
+      //   3. (after the MCP multiplexer block below) wire the synthesizer,
+      //      `handle.spawnAgents()`, THEN `wireBusAdapters` +
+      //      `handle.attachAdapters`. Issue #165: agents must spawn after
+      //      the multiplexer issuer is wired (so they get `--mcp-config`),
+      //      and adapters must start AFTER agents exist (Codex P2:
+      //      prompt-loss race — adapters polling with zero registered
+      //      agents would silently drop inbound prompts).
+      // Search "Issue #165: deferred bus agent spawn" for step 3.
       const socketPath = resolveDaemonSocketPath();
       const bus = new BusCoreImpl({ socketPath });
       const sessionManager = new SessionManager({ busSocketPath: socketPath });
@@ -507,76 +506,12 @@ export async function start(args: string[] = []) {
         bus,
         sessionManager,
         agents: agentConfigs,
+        deferSpawn: true,
         projectRoot: process.cwd(),
       });
-      // The mount succeeded — from here on, ANY error must call
-      // handle.stop() before falling through to legacy, otherwise the
-      // bus IPC server + spawned agents leak.
-      try {
-        const { adapters, errors } = await wireBusAdapters({ bus, settings });
-        for (const [name, msg] of Object.entries(errors)) {
-          console.warn(`[${ts()}] Bus adapter "${name}" failed to mount: ${msg}`);
-        }
-        handle.attachAdapters(adapters);
-
-        // Sprint 5.2c: wire BusScheduler with heartbeat + jobs against
-        // the first spawned agent (matches legacy single-global-agent
-        // shape). The handle's stop() lifecycle owns scheduler
-        // teardown alongside adapters.
-        const { wireBusScheduler } = await import("../bus/scheduler-wiring");
-        const schedulerHandle = await wireBusScheduler({
-          bus,
-          defaultAgentId: handle.spawnedAgentIds[0] ?? null,
-          heartbeat: settings.heartbeat,
-          jobs,
-          timezoneOffsetMinutes: settings.timezoneOffsetMinutes,
-        });
-        handle.attachScheduler(schedulerHandle);
-
-        // Issue #166: write the daemon-generated architecture doc so the
-        // spawned agent reads its own runtime state at bootstrap.
-        //
-        // Codex P1 on PR #171: must run AFTER all bus startup steps
-        // (including wireBusScheduler) have succeeded. If we wrote earlier
-        // and a later step threw, the outer catch falls back to legacy
-        // surfaces but the on-disk doc still says `Mode: bus` — agents
-        // would diagnose against stale architecture. Place this at the
-        // tail of the try block so the file only persists when the bus
-        // really did boot end-to-end.
-        //
-        // Best-effort: failures here log but do not block startup. A
-        // missing arch doc degrades agent diagnostic quality but doesn't
-        // break operation.
-        try {
-          const { collectArchitectureSnapshot } = await import("../architecture-doc-snapshot");
-          const { writeArchitectureDoc, defaultArchitectureDocPath } = await import(
-            "../architecture-doc"
-          );
-          const snapshot = await collectArchitectureSnapshot({
-            settings,
-            spawnedAgentIds: handle.spawnedAgentIds,
-            adapters: adapters.map((a) => ({ name: a.name })),
-          });
-          const path = defaultArchitectureDocPath(process.cwd());
-          writeArchitectureDoc(snapshot, path);
-          console.log(`[${ts()}] wrote architecture doc: ${path}`);
-        } catch (docErr) {
-          console.warn(`[${ts()}] architecture doc write failed:`, docErr);
-        }
-      } catch (wireErr) {
-        // Adapter / scheduler wiring threw — stop the handle (which
-        // already owns the bus + agents + whatever was attached
-        // before this throw) before re-throwing to the outer catch.
-        try {
-          await handle.stop();
-        } catch (stopErr) {
-          console.error(`[${ts()}] handle.stop() during wire rollback failed`, stopErr);
-        }
-        throw wireErr;
-      }
       busRuntimeHandle = handle;
-      busRuntimeSpawnedAgents = handle.spawnedAgentIds;
-      busRuntimeAdapterNames = handle.mountedAdapterNames;
+      busRuntimeSpawnedAgents = handle.spawnedAgentIds; // [] until deferred spawn
+      busRuntimeAdapterNames = handle.mountedAdapterNames; // [] until adapters wired
       busCoreForWebUi = bus;
     } catch (err) {
       console.error(
@@ -618,7 +553,20 @@ export async function start(args: string[] = []) {
   // bus's per-agent claude. Sprint 5.2b's old behaviour (skip legacy
   // web) left operators with a "not_found" page because the bus webui
   // adapter at `/health` + `/prompt` is not a dashboard replacement.
-  const skipLegacyAdapters = busRuntimeHandle !== null;
+  // `let`, not `const` (issue #165): if the DEFERRED agent spawn below
+  // fails, we tear the bus down and fall back to legacy command surfaces,
+  // which means flipping this back to false so the legacy adapter + legacy
+  // heartbeat paths re-engage.
+  let skipLegacyAdapters = busRuntimeHandle !== null;
+
+  // Issue #165: bus adapters are now wired AFTER the deferred agent spawn
+  // (below the multiplexer block), so `busRuntimeAdapterNames` is still
+  // empty at the startup-banner + legacy-skip logs above this point. Use
+  // the configured-intent list (same token/busRouting predicates
+  // wireBusAdapters uses) so those logs report the right platforms.
+  const configuredBusAdapters: readonly string[] = busRuntimeHandle
+    ? (await import("../bus/adapter-wiring")).configuredBusAdapterNames(settings)
+    : [];
 
   let mcpProxyStarted: Promise<void> = Promise.resolve();
 
@@ -661,14 +609,18 @@ export async function start(args: string[] = []) {
     );
   }
   if (settings.runtime === "bus" && busRuntimeHandle) {
+    // Issue #165: agents spawn AFTER the multiplexer block below, so at
+    // banner time they're declared-but-not-yet-spawned. Report the
+    // declared count here; the per-agent `[bus-runtime] spawned agent=…`
+    // lines confirm the actual spawn a few steps later.
     const agentsLabel =
-      busRuntimeSpawnedAgents.length === 0
+      settings.agents.length === 0
         ? "no agents declared"
-        : `agents=[${busRuntimeSpawnedAgents.join(", ")}]`;
+        : `${settings.agents.length} agent(s) declared (spawn deferred until MCP issuer wired)`;
     const adaptersLabel =
-      busRuntimeAdapterNames.length === 0
-        ? "no adapters"
-        : `adapters=[${busRuntimeAdapterNames.join(", ")}]`;
+      configuredBusAdapters.length === 0
+        ? "no adapters configured"
+        : `adapters=[${configuredBusAdapters.join(", ")}] (wired after agents)`;
     console.log(`  Runtime: bus (Bus stack mounted, ${agentsLabel}, ${adaptersLabel})`);
   } else if (settings.runtime === "bus") {
     console.log(`  Runtime: bus (Bus mount failed; legacy surfaces only)`);
@@ -734,7 +686,7 @@ export async function start(args: string[] = []) {
 
   if (skipLegacyAdapters) {
     console.log(
-      `  Telegram: handled by Bus adapter${busRuntimeAdapterNames.includes("telegram") ? "" : " (not configured)"}`,
+      `  Telegram: handled by Bus adapter${configuredBusAdapters.includes("telegram") ? "" : " (not configured)"}`,
     );
   } else {
     await initTelegram(currentSettings.telegram.token, currentSettings.telegram.receiveEnabled);
@@ -776,7 +728,7 @@ export async function start(args: string[] = []) {
 
   if (skipLegacyAdapters) {
     console.log(
-      `  Discord: handled by Bus adapter${busRuntimeAdapterNames.includes("discord") ? "" : " (not configured)"}`,
+      `  Discord: handled by Bus adapter${configuredBusAdapters.includes("discord") ? "" : " (not configured)"}`,
     );
   } else {
     await initDiscord(currentSettings.discord.token);
@@ -810,7 +762,7 @@ export async function start(args: string[] = []) {
 
   if (skipLegacyAdapters) {
     console.log(
-      `  Slack: handled by Bus adapter${busRuntimeAdapterNames.includes("slack") ? "" : " (not configured)"}`,
+      `  Slack: handled by Bus adapter${configuredBusAdapters.includes("slack") ? "" : " (not configured)"}`,
     );
   } else {
     await initSlack(currentSettings.slack.botToken, currentSettings.slack.appToken);
@@ -866,6 +818,30 @@ export async function start(args: string[] = []) {
           revoke: (ptyId) => plugin.releaseIdentity(ptyId),
           bridgeBaseUrl: () => plugin.bridgeBaseUrl(),
         });
+        // Issue #165: the legacy PTY supervisor reaches mcp.shared via the
+        // issuer wired just above, but the BUS spawn path has its own
+        // buildClaudeArgs that never synthesized from mcp.shared. Wire the
+        // same issuer into the bus SessionManager so deferred bus agents
+        // (spawned below) get a synthesized --mcp-config too. Only inside
+        // this isActive() branch, so the dormant path stays byte-identical.
+        if (busRuntimeHandle) {
+          // Codex P2 on PR #184: use the ACTUALLY claimed server names, not
+          // the operator's requested list. When the multiplexer starts
+          // partially (e.g. one shared server failed to claim, another
+          // succeeded), `plugin.isActive()` is true as soon as any one
+          // claimed, but `settings.mcp.shared` still lists the failures.
+          // Writing those names into bus agents' --mcp-config would point
+          // them at /mcp/<server> routes that were never registered. The
+          // multiplexer already caches the claimed set explicitly for this
+          // case (see `sharedServerNames()` + the "ACTUALLY claimed"
+          // comment in src/plugins/mcp-multiplexer/index.ts).
+          busRuntimeHandle.sessionManager.setMcpConfigSynthesizer({
+            issue: (ptyId) => plugin.issueIdentity(ptyId),
+            revoke: (ptyId) => plugin.releaseIdentity(ptyId),
+            bridgeBaseUrl: () => plugin.bridgeBaseUrl(),
+            sharedServers: plugin.sharedServerNames(),
+          });
+        }
         console.log("[mcp-multiplexer] started");
       } else {
         console.warn(
@@ -879,6 +855,108 @@ export async function start(args: string[] = []) {
       console.warn(
         `[mcp-multiplexer] startup failed (non-fatal, falling back to per-PTY MCP discovery): ${msg}`,
       );
+    }
+  } else if (settings.mcp.shared.length > 0 && !settings.web.enabled) {
+    // Issue #165 (PR #184 review): mcp.shared is configured but web is
+    // disabled, so the multiplexer never starts and the synthesizer is
+    // never wired — bus agents launch with NO --mcp-config and every
+    // mcp.shared server is silently unreachable. Warn loudly so the
+    // operator isn't left with the exact silent-failure mode this fix
+    // set out to kill. (Enable web, or clear mcp.shared.)
+    console.warn(
+      `[mcp-multiplexer] settings.mcp.shared is set (${settings.mcp.shared.join(", ")}) but web.enabled is false — the multiplexer cannot mount its HTTP routes, so bus agents will spawn WITHOUT --mcp-config and these servers will be unreachable. Set web.enabled: true to use mcp.shared.`,
+    );
+  }
+
+  // Issue #165: deferred bus agent spawn. The MCP multiplexer issuer is now
+  // wired (or confirmed dormant) above, so spawning here means each agent's
+  // claude PTY is built with the synthesizer in place — buildClaudeArgs/spawn
+  // can attach a --mcp-config for mcp.shared servers. We also wire the
+  // BusScheduler (targets the first spawned agent id) and write the
+  // architecture doc (reports the spawned set) here, since both depend on the
+  // spawn. On failure we tear the bus down and fall back to legacy surfaces,
+  // matching a mount failure (the legacy adapter init was skipped at the gate
+  // because busRuntimeHandle was non-null — re-run it here).
+  if (busRuntimeHandle) {
+    try {
+      await busRuntimeHandle.spawnAgents();
+      busRuntimeSpawnedAgents = busRuntimeHandle.spawnedAgentIds;
+
+      // Issue #165 / PR #123 Codex P2: wire adapters AFTER agents are
+      // spawned. Adapters call adapter.start() (poll loops / HTTP
+      // listeners) on mount, so wiring them before any agent is registered
+      // would let an inbound prompt hit a live bus with zero targets and be
+      // silently dropped during the multiplexer-start window.
+      const { wireBusAdapters } = await import("../bus/adapter-wiring");
+      const { adapters, errors } = await wireBusAdapters({
+        bus: busRuntimeHandle.bus,
+        settings: currentSettings,
+      });
+      for (const [name, msg] of Object.entries(errors)) {
+        console.warn(`[${ts()}] Bus adapter "${name}" failed to mount: ${msg}`);
+      }
+      busRuntimeHandle.attachAdapters(adapters);
+      busRuntimeAdapterNames = busRuntimeHandle.mountedAdapterNames;
+
+      const { wireBusScheduler } = await import("../bus/scheduler-wiring");
+      const schedulerHandle = await wireBusScheduler({
+        bus: busRuntimeHandle.bus,
+        defaultAgentId: busRuntimeHandle.spawnedAgentIds[0] ?? null,
+        heartbeat: currentSettings.heartbeat,
+        jobs: currentJobs,
+        timezoneOffsetMinutes: currentSettings.timezoneOffsetMinutes,
+      });
+      busRuntimeHandle.attachScheduler(schedulerHandle);
+
+      // Issue #166: write the architecture doc only after the bus booted
+      // end-to-end (spawn + scheduler), so a doc on disk always reflects a
+      // genuinely-running bus. Best-effort — a missing doc degrades agent
+      // diagnostics but doesn't break operation.
+      try {
+        const { collectArchitectureSnapshot } = await import("../architecture-doc-snapshot");
+        const { writeArchitectureDoc, defaultArchitectureDocPath } = await import(
+          "../architecture-doc"
+        );
+        const snapshot = await collectArchitectureSnapshot({
+          settings: currentSettings,
+          spawnedAgentIds: busRuntimeHandle.spawnedAgentIds,
+          adapters: busRuntimeAdapterNames.map((name) => ({ name })),
+        });
+        const path = defaultArchitectureDocPath(process.cwd());
+        writeArchitectureDoc(snapshot, path);
+        console.log(`[${ts()}] wrote architecture doc: ${path}`);
+      } catch (docErr) {
+        console.warn(`[${ts()}] architecture doc write failed:`, docErr);
+      }
+    } catch (spawnErr) {
+      console.error(
+        `[${ts()}] Bus runtime: deferred agent spawn failed — tearing down and falling back to legacy command surfaces`,
+        spawnErr,
+      );
+      try {
+        await busRuntimeHandle.stop();
+      } catch (stopErr) {
+        console.error(`[${ts()}] handle.stop() during deferred-spawn rollback failed`, stopErr);
+      }
+      busRuntimeHandle = null;
+      busRuntimeSpawnedAgents = [];
+      busRuntimeAdapterNames = [];
+      busCoreForWebUi = null;
+      skipLegacyAdapters = false;
+      // A prior bus boot may have left a CCPLUS_ARCHITECTURE.md saying
+      // "Mode: bus"; now that we've fallen back to legacy it's misleading.
+      try {
+        const { defaultArchitectureDocPath } = await import("../architecture-doc");
+        const { existsSync: exists, unlinkSync: unlink } = await import("node:fs");
+        const docPath = defaultArchitectureDocPath(process.cwd());
+        if (exists(docPath)) unlink(docPath);
+      } catch {
+        /* best-effort */
+      }
+      // Re-engage the legacy adapters that were skipped at the gate above.
+      await initTelegram(currentSettings.telegram.token, currentSettings.telegram.receiveEnabled);
+      await initDiscord(currentSettings.discord.token);
+      await initSlack(currentSettings.slack.botToken, currentSettings.slack.appToken);
     }
   }
 
