@@ -19,6 +19,7 @@ import {
   CHANNEL_BASE_CAPABILITY,
   CHANNEL_PERMISSION_CAPABILITY,
   buildMcpServer,
+  decidePermission,
   type IpcTransport,
 } from "../mcp-server.js";
 import { REQUEST_ID_PATTERN, type IpcMessage } from "../types.js";
@@ -107,10 +108,10 @@ interface Harness {
   close(): Promise<void>;
 }
 
-async function makeHarness(agentId = "test-agent"): Promise<Harness> {
+async function makeHarness(agentId = "test-agent", permissionMode?: string): Promise<Harness> {
   const ipc = makeFakeIpc();
   const mcp = buildMcpServer();
-  const bus = new BusMcpServer({ agentId, ipc, mcp });
+  const bus = new BusMcpServer({ agentId, ipc, mcp, permissionMode });
 
   const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
 
@@ -182,6 +183,69 @@ describe("BusMcpServer — handshake", () => {
     expect(hello.capabilities).toContain(CHANNEL_BASE_CAPABILITY);
     expect(hello.capabilities).toContain(CHANNEL_PERMISSION_CAPABILITY);
     expect(hello.capabilities.length).toBe(2);
+  });
+
+  it("sendHello() emits both capabilities regardless of permission_mode (#172 — core-ipc gate is mandatory)", async () => {
+    for (const mode of ["bypassPermissions", "dontAsk", "acceptEdits", "plan", "default", "auto"]) {
+      const localH = await makeHarness("agent-mode-test", mode);
+      localH.bus.sendHello();
+      const hello = take(localH.ipc.sent[0], "hello");
+      if (hello.type !== "hello") throw new Error("type narrowing");
+      expect(hello.capabilities).toContain(CHANNEL_BASE_CAPABILITY);
+      expect(hello.capabilities).toContain(CHANNEL_PERMISSION_CAPABILITY);
+      expect(hello.capabilities.length).toBe(2);
+      await localH.close();
+    }
+  });
+});
+
+describe("decidePermission — tool-aware mode routing (#172, Codex P1 on #173)", () => {
+  // The IpcHello capability set is fixed at both required strings (Bus core
+  // gates the handshake on both — see core-ipc.ts:REQUIRED_MCP_CAPABILITIES).
+  // The mode + tool gate is applied inside the permission_request
+  // notification handler. These tests pin the helper logic that drives it.
+
+  it("bypassPermissions → allow for every tool", () => {
+    expect(decidePermission("bypassPermissions", "Edit")).toBe("allow");
+    expect(decidePermission("bypassPermissions", "Bash")).toBe("allow");
+    expect(decidePermission("bypassPermissions", "WebFetch")).toBe("allow");
+    expect(decidePermission("bypassPermissions", "UnknownTool")).toBe("allow");
+  });
+
+  it("dontAsk → deny for every tool", () => {
+    expect(decidePermission("dontAsk", "Edit")).toBe("deny");
+    expect(decidePermission("dontAsk", "Bash")).toBe("deny");
+    expect(decidePermission("dontAsk", "WebFetch")).toBe("deny");
+    expect(decidePermission("dontAsk", "UnknownTool")).toBe("deny");
+  });
+
+  it("acceptEdits → allow ONLY for edit-class tools; forward shell/network/other", () => {
+    // Edit-class tools auto-allowed.
+    expect(decidePermission("acceptEdits", "Edit")).toBe("allow");
+    expect(decidePermission("acceptEdits", "Write")).toBe("allow");
+    expect(decidePermission("acceptEdits", "NotebookEdit")).toBe("allow");
+    expect(decidePermission("acceptEdits", "MultiEdit")).toBe("allow");
+    expect(decidePermission("acceptEdits", "Update")).toBe("allow");
+    // Shell / network / other tools must still go to the operator.
+    expect(decidePermission("acceptEdits", "Bash")).toBe("forward");
+    expect(decidePermission("acceptEdits", "WebFetch")).toBe("forward");
+    expect(decidePermission("acceptEdits", "WebSearch")).toBe("forward");
+    expect(decidePermission("acceptEdits", "Read")).toBe("forward");
+    expect(decidePermission("acceptEdits", "UnknownTool")).toBe("forward");
+  });
+
+  it("default / plan / auto / unset / unrecognised → forward for every tool", () => {
+    for (const mode of [undefined, "default", "plan", "auto", "nonsense"]) {
+      expect(decidePermission(mode, "Edit")).toBe("forward");
+      expect(decidePermission(mode, "Bash")).toBe("forward");
+    }
+  });
+
+  it("BusMcpServer stores the permissionMode for handler-time decisions", () => {
+    const ipc = makeFakeIpc();
+    const mcp = buildMcpServer();
+    const bus = new BusMcpServer({ agentId: "a", ipc, mcp, permissionMode: "acceptEdits" });
+    expect(bus.permissionMode).toBe("acceptEdits");
   });
 });
 
@@ -400,6 +464,144 @@ describe("BusMcpServer — permission flow", () => {
     const params = take(h.permissionNotifs[0], "permission notification").params;
     expect(Object.keys(params).sort()).toEqual(["behavior", "request_id"]);
     expect(params.behavior).toBe("deny");
+  });
+
+  it("short-circuits (auto-allow, no IPC forward) when permission_mode=bypassPermissions (#172)", async () => {
+    await h.close(); // close the default-mode harness from beforeEach
+    const localH = await makeHarness("agent-bypass", "bypassPermissions");
+    await localH.client.notification({
+      method: "notifications/claude/channel/permission_request",
+      params: {
+        request_id: "abcde",
+        tool_name: "Bash",
+        description: "x",
+        input_preview: "{}",
+      },
+    });
+    // Wait for the auto-allow notification round-trip.
+    const start = Date.now();
+    while (localH.permissionNotifs.length < 1) {
+      if (Date.now() - start > 1000) throw new Error("auto-allow notification not delivered");
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    // Must NOT have been forwarded to Bus core.
+    expect(localH.ipc.sent.length).toBe(0);
+    // Must have auto-responded `allow`.
+    const params = take(localH.permissionNotifs[0], "permission notification").params;
+    expect(params.request_id).toBe("abcde");
+    expect(params.behavior).toBe("allow");
+    h = localH; // afterEach will close
+  });
+
+  it("short-circuits with `deny` when permission_mode=dontAsk (#172)", async () => {
+    await h.close();
+    const localH = await makeHarness("agent-dontask", "dontAsk");
+    await localH.client.notification({
+      method: "notifications/claude/channel/permission_request",
+      params: {
+        request_id: "qwert",
+        tool_name: "Write",
+        description: "x",
+        input_preview: "{}",
+      },
+    });
+    const start = Date.now();
+    while (localH.permissionNotifs.length < 1) {
+      if (Date.now() - start > 1000) throw new Error("auto-deny notification not delivered");
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(localH.ipc.sent.length).toBe(0);
+    const params = take(localH.permissionNotifs[0], "permission notification").params;
+    expect(params.behavior).toBe("deny");
+    h = localH;
+  });
+
+  it("acceptEdits short-circuits with `allow` for edit tools (Edit)", async () => {
+    await h.close();
+    const localH = await makeHarness("agent-accept", "acceptEdits");
+    await localH.client.notification({
+      method: "notifications/claude/channel/permission_request",
+      params: {
+        request_id: "fghij",
+        tool_name: "Edit",
+        description: "x",
+        input_preview: "{}",
+      },
+    });
+    const start = Date.now();
+    while (localH.permissionNotifs.length < 1) {
+      if (Date.now() - start > 1000) throw new Error("auto-allow notification not delivered");
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(localH.ipc.sent.length).toBe(0);
+    const params = take(localH.permissionNotifs[0], "permission notification").params;
+    expect(params.behavior).toBe("allow");
+    h = localH;
+  });
+
+  it("acceptEdits FORWARDS shell/network tools to Bus core (Codex P1 on #173)", async () => {
+    // Critical: under acceptEdits mode, only file-edit tools are
+    // auto-allowed. Bash, WebFetch, etc. must still go to the operator.
+    // A blanket short-circuit would silently widen acceptEdits to act
+    // like bypassPermissions for shell + network.
+    await h.close();
+    const localH = await makeHarness("agent-accept-bash", "acceptEdits");
+    await localH.client.notification({
+      method: "notifications/claude/channel/permission_request",
+      params: {
+        request_id: "bashm",
+        tool_name: "Bash",
+        description: "rm -rf /tmp/cache",
+        input_preview: '{"command":"rm -rf /tmp/cache"}',
+      },
+    });
+    await localH.ipc.awaitSent(1);
+    // Forwarded to Bus core, NOT auto-responded.
+    const out = take(localH.ipc.sent[0], "permission_request");
+    expect(out.type).toBe("permission_request");
+    if (out.type !== "permission_request") throw new Error("type narrowing");
+    expect(out.request.tool_name).toBe("Bash");
+    expect(out.request.request_id).toBe("bashm");
+    // No auto-response — operator must decide.
+    expect(localH.permissionNotifs.length).toBe(0);
+    h = localH;
+  });
+
+  it("acceptEdits forwards WebFetch (network tool) to Bus core", async () => {
+    await h.close();
+    const localH = await makeHarness("agent-accept-net", "acceptEdits");
+    await localH.client.notification({
+      method: "notifications/claude/channel/permission_request",
+      params: {
+        request_id: "fetcm",
+        tool_name: "WebFetch",
+        description: "fetch example.com",
+        input_preview: '{"url":"https://example.com"}',
+      },
+    });
+    await localH.ipc.awaitSent(1);
+    expect(localH.permissionNotifs.length).toBe(0);
+    h = localH;
+  });
+
+  it("short-circuit path also rejects a permission_request with invalid request_id charset", async () => {
+    await h.close();
+    const localH = await makeHarness("agent-bypass-bad", "bypassPermissions");
+    await localH.client.notification({
+      method: "notifications/claude/channel/permission_request",
+      params: {
+        // Contains 'l' (excluded by REQUEST_ID_PATTERN) and is too long.
+        request_id: "BAD\nINJECT",
+        tool_name: "Bash",
+        description: "x",
+        input_preview: "{}",
+      },
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    // Must be dropped — no IPC forward AND no echo-back notification.
+    expect(localH.ipc.sent.length).toBe(0);
+    expect(localH.permissionNotifs.length).toBe(0);
+    h = localH;
   });
 
   it("rejects a permission_request with a request_id outside the [a-km-z]{5} charset", async () => {

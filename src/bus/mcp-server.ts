@@ -21,10 +21,13 @@
  * `plugin:plus-bus@local` no longer works.
  *
  * Env vars (set by Session Manager when spawning claude):
- *   CCAW_AGENT_ID  — stable slug for the agent; tags every outbound IPC frame
- *   CCAW_BUS_SOCK  — absolute UDS path (preferred)
- *   CCAW_BUS_PORT  — fallback TCP port (used only if CCAW_BUS_SOCK is unset)
- *   CCAW_BUS_TOKEN — required for TCP fallback (HMAC handshake; TODO Sprint 2)
+ *   CCAW_AGENT_ID        — stable slug for the agent; tags every outbound IPC frame
+ *   CCAW_BUS_SOCK        — absolute UDS path (preferred)
+ *   CCAW_BUS_PORT        — fallback TCP port (used only if CCAW_BUS_SOCK is unset)
+ *   CCAW_BUS_TOKEN       — required for TCP fallback (HMAC handshake; TODO Sprint 2)
+ *   CCAW_PERMISSION_MODE — agent's permission_mode (issue #172); controls whether
+ *                          permission_request notifications are forwarded to Bus
+ *                          core or short-circuited locally
  *
  * This file is gated by `runtime: bus` config — DO NOT import from
  * `src/runner.ts` or `src/commands/start.ts` (spec §12.5 plugin shim is
@@ -283,8 +286,84 @@ const RequestHumanArgsSchema = z.object({
 export interface BusMcpServerOptions {
   agentId: string;
   ipc: IpcTransport;
+  /**
+   * Agent's permission_mode. Controls how `permission_request` MCP
+   * notifications arriving at this plugin are routed: forwarded to Bus
+   * core (operator approval card) or short-circuited with a native
+   * auto-response. Issue #172 + Codex P1 on PR #173.
+   *
+   * Decisions per (mode, tool) pair are made by `decidePermission()`:
+   * - `bypassPermissions` → `"allow"` for every tool.
+   * - `dontAsk` → `"deny"` for every tool.
+   * - `acceptEdits` → `"allow"` for edit-class tools (Edit, Write,
+   *   NotebookEdit, MultiEdit, Update); `"forward"` for everything else
+   *   (Bash, WebFetch, etc.) — matching native CLI semantics. A blanket
+   *   short-circuit here would silently widen `acceptEdits` to bypass
+   *   permissions for shell / network calls.
+   * - `default` / `plan` / `auto` / unset → forward to Bus core for the
+   *   human-in-the-loop approval card.
+   *
+   * The IPC `IpcHello` always advertises both `claude/channel` and
+   * `claude/channel/permission` (Bus core's handshake gate in `core-ipc.ts`
+   * treats both as mandatory). The mode + tool gate is applied only inside
+   * the notification handler — keeping the wire contract stable while
+   * letting the plugin obey operator intent.
+   */
+  permissionMode?: string;
   /** Optional injected MCP server (tests pass a Server bound to InMemoryTransport). */
   mcp?: Server;
+}
+
+/**
+ * Tool names that `--permission-mode acceptEdits` is documented to
+ * auto-allow without prompting. Anything outside this set under
+ * `acceptEdits` mode must still go through the operator approval flow
+ * — that's the whole point of `acceptEdits` vs `bypassPermissions`.
+ * Source: claude CLI docs ("acceptEdits auto-allows file edits but
+ * still prompts for shell/network").
+ */
+const ACCEPT_EDITS_AUTO_ALLOW_TOOLS = new Set([
+  "Edit",
+  "Write",
+  "NotebookEdit",
+  "MultiEdit",
+  "Update",
+]);
+
+export type PermissionDecision = "forward" | "allow" | "deny";
+
+/**
+ * Decide what the plus-bus plugin should do with a `permission_request`
+ * notification for `toolName` under the given `permissionMode`. Returns:
+ *
+ * - `"forward"` — forward to Bus core for the human-in-the-loop card.
+ * - `"allow"` — short-circuit; auto-respond `behavior: "allow"`.
+ * - `"deny"` — short-circuit; auto-respond `behavior: "deny"`.
+ *
+ * Mode semantics mirror claude's native `--permission-mode` flag:
+ * - `bypassPermissions` → `"allow"` for every tool.
+ * - `dontAsk` → `"deny"` for every tool.
+ * - `acceptEdits` → `"allow"` for edit-class tools (Edit/Write/
+ *   NotebookEdit/MultiEdit/Update), `"forward"` for everything else.
+ *   This is the Codex P1 fix on PR #173: a blanket short-circuit
+ *   silently widened `acceptEdits` to bypass permissions for shell /
+ *   network tools.
+ * - `default` / `plan` / `auto` / unset / unrecognised → `"forward"`
+ *   (fail-safe to human-in-the-loop).
+ *
+ * Exported so tests pin behaviour to a single source of truth across
+ * the helper and the constructor's notification handler.
+ */
+export function decidePermission(
+  permissionMode: string | undefined,
+  toolName: string,
+): PermissionDecision {
+  if (permissionMode === "bypassPermissions") return "allow";
+  if (permissionMode === "dontAsk") return "deny";
+  if (permissionMode === "acceptEdits") {
+    return ACCEPT_EDITS_AUTO_ALLOW_TOOLS.has(toolName) ? "allow" : "forward";
+  }
+  return "forward";
 }
 
 /**
@@ -302,12 +381,14 @@ export class BusMcpServer {
   readonly mcp: Server;
   readonly ipc: IpcTransport;
   readonly agentId: string;
+  readonly permissionMode: string | undefined;
 
   private readonly pendingAnswers = new Map<string, PendingAnswer>();
 
   constructor(opts: BusMcpServerOptions) {
     this.agentId = opts.agentId;
     this.ipc = opts.ipc;
+    this.permissionMode = opts.permissionMode;
     this.mcp = opts.mcp ?? buildMcpServer();
     this.wireMcp();
     this.wireIpc();
@@ -315,7 +396,10 @@ export class BusMcpServer {
 
   /**
    * Run the handshake — call once after MCP transport is connected. Sends
-   * `IpcHello` declaring both capability strings (Spike 0.1).
+   * `IpcHello` declaring both required channel capabilities. Bus core's
+   * `core-ipc.ts:REQUIRED_MCP_CAPABILITIES` treats both as mandatory, so the
+   * advertised set is fixed regardless of `permission_mode`. The mode-based
+   * short-circuit is applied at the notification handler (issue #172).
    */
   sendHello(): void {
     const hello: IpcHello = {
@@ -366,6 +450,40 @@ export class BusMcpServer {
 
     // Permission flow inbound — forwarded to Bus core (§5.1).
     this.mcp.setNotificationHandler(PermissionRequestNotificationSchema, async ({ params }) => {
+      // Issue #172 + Codex P1 on PR #173: route the permission_request
+      // based on the agent's permission_mode AND the requested tool. For
+      // bypassPermissions / dontAsk we short-circuit every tool. For
+      // acceptEdits we short-circuit only edit-class tools (Edit, Write,
+      // NotebookEdit, MultiEdit, Update) and forward shell / network /
+      // other tools to Bus core for operator approval — matching claude's
+      // native `--permission-mode acceptEdits` semantics. Everything else
+      // (default, plan, auto, unset) forwards.
+      const decision = decidePermission(this.permissionMode, params.tool_name);
+      if (decision !== "forward") {
+        // Same charset check the forward path applies — claude generates
+        // request_ids per `[a-km-z]{5}` (REQUEST_ID_PATTERN). If a malformed
+        // id arrives here (control chars, log-injection bytes) drop it
+        // without echoing back so neither stderr nor the auto-response
+        // carries unvalidated content.
+        if (!REQUEST_ID_PATTERN.test(params.request_id)) {
+          process.stderr.write(
+            `Bus MCP: short-circuit: dropping permission_request with invalid request_id (length=${params.request_id.length}).\n`,
+          );
+          return;
+        }
+        process.stderr.write(
+          `Bus MCP: short-circuiting permission_request "${params.request_id}" tool="${params.tool_name}" with behavior="${decision}" (permission_mode="${this.permissionMode ?? ""}").\n`,
+        );
+        void this.mcp
+          .notification({
+            method: "notifications/claude/channel/permission",
+            params: { request_id: params.request_id, behavior: decision },
+          })
+          .catch((err: unknown) => {
+            process.stderr.write(`Bus MCP: short-circuit notification failed: ${String(err)}\n`);
+          });
+        return;
+      }
       // Defence-in-depth: assert charset before forwarding so a malformed
       // upstream request fails fast with a useful Bus-side error instead
       // of polluting the audit log.
@@ -630,8 +748,9 @@ export async function startBusMcpServer(
   if (!agentId) {
     throw new Error("Bus MCP: CCAW_AGENT_ID env var is required");
   }
+  const permissionMode = env.CCAW_PERMISSION_MODE?.trim() || undefined;
   const ipc = await connectBusIpc(env);
-  const bus = new BusMcpServer({ agentId, ipc });
+  const bus = new BusMcpServer({ agentId, ipc, permissionMode });
   const transport = new StdioServerTransport();
   await bus.mcp.connect(transport);
   bus.sendHello();
