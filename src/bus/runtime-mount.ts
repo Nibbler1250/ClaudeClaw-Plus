@@ -58,6 +58,18 @@ export interface BusRuntimeHandle {
    */
   mountedAdapterNames: readonly MountedAdapter["name"][];
   /**
+   * Spawn agents after mount (issue #165). Used with `deferSpawn: true`:
+   * the daemon mounts the bus, wires the MCP multiplexer identity issuer,
+   * then calls this so the spawned `claude` PTYs get a synthesized
+   * `--mcp-config` for `mcp.shared` servers.
+   *
+   * `batch` defaults to the `agents` passed at mount. Spawns sequentially;
+   * on the first failure rolls back the agents THIS call spawned and
+   * re-throws (the daemon's catch then calls `handle.stop()` + falls back
+   * to legacy surfaces). Throws if the handle has already been stopped.
+   */
+  spawnAgents(batch?: readonly AgentConfig[], spawnOriginOverride?: BusOrigin): Promise<void>;
+  /**
    * Register adapters with the handle's stop lifecycle. Sprint 5.2b
    * (PR #123) Codex P1/P2 fold-in: callers wire adapters AFTER the
    * bus is mounted; this method lets the handle own teardown even
@@ -114,6 +126,24 @@ export interface MountBusRuntimeOptions {
    * they need to.
    */
   agents?: readonly AgentConfig[];
+  /**
+   * Defer the eager agent spawn (issue #165). When true, `mountBusRuntime`
+   * brings up the bus + slash relay + orphan scan but does NOT spawn the
+   * `agents` at mount time — the caller spawns them later via
+   * `handle.spawnAgents()`, once the MCP multiplexer issuer is wired.
+   *
+   * Why this exists: the daemon wires the multiplexer identity issuer
+   * AFTER `mountBusRuntime` (it depends on `pluginManager.startServices()`).
+   * If agents spawn at mount, their `claude` PTYs are built before the
+   * issuer exists, so `buildClaudeArgs` synthesizes no `--mcp-config` and
+   * every `mcp.shared` server is unreachable for the agent's whole life.
+   * Deferring the spawn lets the daemon wire the issuer first.
+   *
+   * `agents` is still passed (so the orphan-agent scan + startup log see
+   * the full declared set); only the spawn is held back. Backward
+   * compatible: callers that don't set this keep the eager-spawn behaviour.
+   */
+  deferSpawn?: boolean;
   /**
    * `BusOrigin` tag passed to `sessionManager.spawnAgent(agent, origin)`.
    * The agent's resolved `supervision` field takes precedence over the
@@ -215,30 +245,50 @@ export async function mountBusRuntime(
       }
     });
 
-    // Auto-spawn declared agents. Sequential rather than parallel so
-    // log output stays readable + spawn failures surface against a
-    // known agent id rather than an unrelated parallel reject.
-    for (const agent of opts.agents ?? []) {
-      try {
-        await sessionManager.spawnAgent(agent, origin);
-        spawned.push(agent.id);
-        logger.info(`[bus-runtime] spawned agent=${agent.id}`);
-      } catch (err) {
-        // Stop any already-spawned agents in reverse order before
-        // bubbling. The outer catch handles bus teardown.
-        for (let i = spawned.length - 1; i >= 0; i--) {
-          try {
-            await sessionManager.stop(spawned[i]);
-          } catch (stopErr) {
-            logger.error(`[bus-runtime] rollback: failed to stop agent=${spawned[i]}`, stopErr);
+    const declaredAgents = opts.agents ?? [];
+
+    // Spawn a batch of agents sequentially (readable logs + failures
+    // surface against a known id rather than an unrelated parallel
+    // reject). On the first failure, roll back ONLY the agents this batch
+    // spawned (reverse order) and re-throw — agents from an earlier
+    // successful batch stay up; the caller decides whether to tear the
+    // whole handle down. Shared by the eager mount path and the deferred
+    // `handle.spawnAgents()` path (issue #165).
+    async function spawnAgentBatch(
+      batch: readonly AgentConfig[],
+      batchOrigin: BusOrigin,
+    ): Promise<void> {
+      const spawnedThisBatch: string[] = [];
+      for (const agent of batch) {
+        try {
+          await sessionManager.spawnAgent(agent, batchOrigin);
+          spawned.push(agent.id);
+          spawnedThisBatch.push(agent.id);
+          logger.info(`[bus-runtime] spawned agent=${agent.id}`);
+        } catch (err) {
+          for (let i = spawnedThisBatch.length - 1; i >= 0; i--) {
+            const id = spawnedThisBatch[i];
+            try {
+              await sessionManager.stop(id);
+            } catch (stopErr) {
+              logger.error(`[bus-runtime] rollback: failed to stop agent=${id}`, stopErr);
+            }
+            const idx = spawned.lastIndexOf(id);
+            if (idx >= 0) spawned.splice(idx, 1);
           }
+          throw new Error(
+            `[bus-runtime] failed to spawn agent="${agent.id}": ${err instanceof Error ? err.message : String(err)}`,
+            { cause: err },
+          );
         }
-        spawned.length = 0;
-        throw new Error(
-          `[bus-runtime] failed to spawn agent="${agent.id}": ${err instanceof Error ? err.message : String(err)}`,
-          { cause: err },
-        );
       }
+    }
+
+    // Eager spawn unless the caller deferred it (issue #165). When
+    // deferred, the daemon calls `handle.spawnAgents()` after wiring the
+    // MCP multiplexer issuer.
+    if (!opts.deferSpawn) {
+      await spawnAgentBatch(declaredAgents, origin);
     }
 
     // Adapters list is now MUTABLE — Sprint 5.2b (PR #123) Codex P2
@@ -270,6 +320,12 @@ export async function mountBusRuntime(
       },
       get mountedAdapterNames() {
         return adapters.map((a) => a.name);
+      },
+      async spawnAgents(batch, spawnOriginOverride) {
+        if (stopped) {
+          throw new Error("[bus-runtime] spawnAgents called on a stopped handle");
+        }
+        await spawnAgentBatch(batch ?? declaredAgents, spawnOriginOverride ?? origin);
       },
       attachAdapters(more) {
         if (stopped) {

@@ -507,6 +507,10 @@ export async function start(args: string[] = []) {
         bus,
         sessionManager,
         agents: agentConfigs,
+        // Issue #165: defer the agent spawn until after the MCP multiplexer
+        // issuer is wired (below), so the spawned claude PTYs get a
+        // synthesized --mcp-config for mcp.shared servers.
+        deferSpawn: true,
       });
       // The mount succeeded — from here on, ANY error must call
       // handle.stop() before falling through to legacy, otherwise the
@@ -518,19 +522,9 @@ export async function start(args: string[] = []) {
         }
         handle.attachAdapters(adapters);
 
-        // Sprint 5.2c: wire BusScheduler with heartbeat + jobs against
-        // the first spawned agent (matches legacy single-global-agent
-        // shape). The handle's stop() lifecycle owns scheduler
-        // teardown alongside adapters.
-        const { wireBusScheduler } = await import("../bus/scheduler-wiring");
-        const schedulerHandle = await wireBusScheduler({
-          bus,
-          defaultAgentId: handle.spawnedAgentIds[0] ?? null,
-          heartbeat: settings.heartbeat,
-          jobs,
-          timezoneOffsetMinutes: settings.timezoneOffsetMinutes,
-        });
-        handle.attachScheduler(schedulerHandle);
+        // Issue #165: agent spawn + BusScheduler wiring moved to AFTER the
+        // MCP multiplexer block (the scheduler targets the first spawned
+        // agent id, which now exists only after the deferred spawn).
       } catch (wireErr) {
         // Adapter / scheduler wiring threw — stop the handle (which
         // already owns the bus + agents + whatever was attached
@@ -570,7 +564,9 @@ export async function start(args: string[] = []) {
   // bus's per-agent claude. Sprint 5.2b's old behaviour (skip legacy
   // web) left operators with a "not_found" page because the bus webui
   // adapter at `/health` + `/prompt` is not a dashboard replacement.
-  const skipLegacyAdapters = busRuntimeHandle !== null;
+  // `let` (issue #165): if the DEFERRED spawn below fails we fall back to
+  // legacy surfaces, which means flipping this back to false.
+  let skipLegacyAdapters = busRuntimeHandle !== null;
 
   let mcpProxyStarted: Promise<void> = Promise.resolve();
 
@@ -613,10 +609,12 @@ export async function start(args: string[] = []) {
     );
   }
   if (settings.runtime === "bus" && busRuntimeHandle) {
+    // Issue #165: agents spawn after the multiplexer block; report the
+    // declared count here.
     const agentsLabel =
-      busRuntimeSpawnedAgents.length === 0
+      settings.agents.length === 0
         ? "no agents declared"
-        : `agents=[${busRuntimeSpawnedAgents.join(", ")}]`;
+        : `${settings.agents.length} agent(s) declared (spawn deferred until MCP issuer wired)`;
     const adaptersLabel =
       busRuntimeAdapterNames.length === 0
         ? "no adapters"
@@ -818,6 +816,16 @@ export async function start(args: string[] = []) {
           revoke: (ptyId) => plugin.releaseIdentity(ptyId),
           bridgeBaseUrl: () => plugin.bridgeBaseUrl(),
         });
+        // Issue #165: wire the same issuer into the bus SessionManager so
+        // deferred bus agents get a synthesized --mcp-config for mcp.shared.
+        if (busRuntimeHandle) {
+          busRuntimeHandle.sessionManager.setMcpConfigSynthesizer({
+            issue: (ptyId) => plugin.issueIdentity(ptyId),
+            revoke: (ptyId) => plugin.releaseIdentity(ptyId),
+            bridgeBaseUrl: () => plugin.bridgeBaseUrl(),
+            sharedServers: settings.mcp.shared,
+          });
+        }
         console.log("[mcp-multiplexer] started");
       } else {
         console.warn(
@@ -831,6 +839,46 @@ export async function start(args: string[] = []) {
       console.warn(
         `[mcp-multiplexer] startup failed (non-fatal, falling back to per-PTY MCP discovery): ${msg}`,
       );
+    }
+  }
+
+  // Issue #165: deferred bus agent spawn. The MCP multiplexer issuer is now
+  // wired (or confirmed dormant) above, so each agent's claude PTY is built
+  // with the synthesizer in place and gets a --mcp-config for mcp.shared
+  // servers. The BusScheduler (targets the first spawned agent id) is wired
+  // here too. On failure we tear the bus down and fall back to legacy.
+  if (busRuntimeHandle) {
+    try {
+      await busRuntimeHandle.spawnAgents();
+      busRuntimeSpawnedAgents = busRuntimeHandle.spawnedAgentIds;
+
+      const { wireBusScheduler } = await import("../bus/scheduler-wiring");
+      const schedulerHandle = await wireBusScheduler({
+        bus: busRuntimeHandle.bus,
+        defaultAgentId: busRuntimeHandle.spawnedAgentIds[0] ?? null,
+        heartbeat: currentSettings.heartbeat,
+        jobs: currentJobs,
+        timezoneOffsetMinutes: currentSettings.timezoneOffsetMinutes,
+      });
+      busRuntimeHandle.attachScheduler(schedulerHandle);
+    } catch (spawnErr) {
+      console.error(
+        `[${ts()}] Bus runtime: deferred agent spawn failed — tearing down and falling back to legacy command surfaces`,
+        spawnErr,
+      );
+      try {
+        await busRuntimeHandle.stop();
+      } catch (stopErr) {
+        console.error(`[${ts()}] handle.stop() during deferred-spawn rollback failed`, stopErr);
+      }
+      busRuntimeHandle = null;
+      busRuntimeSpawnedAgents = [];
+      busRuntimeAdapterNames = [];
+      busCoreForWebUi = null;
+      skipLegacyAdapters = false;
+      await initTelegram(currentSettings.telegram.token, currentSettings.telegram.receiveEnabled);
+      await initDiscord(currentSettings.discord.token);
+      await initSlack(currentSettings.slack.botToken, currentSettings.slack.appToken);
     }
   }
 
