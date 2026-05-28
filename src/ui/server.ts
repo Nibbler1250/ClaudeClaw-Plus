@@ -107,6 +107,46 @@ function getOrCreateSessionId(req: Request): { sessionId: string; setCookie?: st
   };
 }
 
+/**
+ * Hostname allowlist check for DNS-rebinding defense (issue #164 item 2,
+ * hotfixed after #189). Compares the Host header's HOSTNAME only (port
+ * stripped) against the loopback names + the configured bind host. A
+ * wildcard bind (0.0.0.0 / ::) returns `true` unconditionally — the
+ * operator opted into remote access.
+ *
+ * Port is deliberately ignored: DNS-rebinding hinges on the hostname,
+ * and matching the port broke tunnelled access (the Host carries the
+ * client-side forwarded port, not the bind port).
+ *
+ * Exported for unit testing.
+ */
+export function isHostAllowed(hostHeader: string, bindHost: string): boolean {
+  if (bindHost === "0.0.0.0" || bindHost === "::") return true;
+  const hostname = hostnameOf(hostHeader);
+  const allowed = new Set(["127.0.0.1", "localhost", "[::1]", "::1", bindHost.toLowerCase()]);
+  return allowed.has(hostname);
+}
+
+/**
+ * Extract the hostname from a Host header, dropping the optional `:port`.
+ * IPv6-aware so a bare `::1` or a LAN bind like `fe80::1` isn't mangled
+ * by a naive `:\d+$` strip (which would turn `::1` into `:`):
+ *   - `[::1]:4632` / `[::1]`     → `[::1]`   (bracketed IPv6; strip after `]`)
+ *   - `::1` / `fe80::1`          → unchanged (bare IPv6 — 2+ colons, no port)
+ *   - `localhost:8080` / `1.2.3.4:80` / `host` → port stripped if present
+ */
+function hostnameOf(hostHeader: string): string {
+  const h = hostHeader.toLowerCase();
+  if (h.startsWith("[")) {
+    const close = h.indexOf("]");
+    return close === -1 ? h : h.slice(0, close + 1);
+  }
+  // A valid Host header never carries a port on a bare (unbracketed) IPv6,
+  // so 2+ colons means bare IPv6 — leave it intact.
+  if ((h.match(/:/g)?.length ?? 0) > 1) return h;
+  return h.replace(/:\d+$/, "");
+}
+
 /** Returns a 403 Response if the CSRF token is missing or invalid, otherwise null. */
 function requireCsrf(req: Request): Response | null {
   const csrfToken = req.headers.get(CSRF_HEADER_NAME);
@@ -132,22 +172,21 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
       // validation. A wildcard bind (0.0.0.0 / ::) means the operator
       // opted into remote access and the browser Host won't match the
       // bind address, so the check is skipped there. For a specific
-      // bind (loopback / LAN IP) we enforce an allowlist. Runs before
-      // the plugin gateway so /mcp/* and /api/plugin/* are covered too;
-      // the local MCP bridge calls with Host `127.0.0.1:<port>`, which
-      // is in the allowlist.
+      // bind (loopback / LAN IP) we enforce a HOSTNAME allowlist.
+      //
+      // We compare the hostname ONLY, ignoring the port — DNS-rebinding
+      // turns on the malicious HOSTNAME (attacker.com resolving to
+      // 127.0.0.1), never the port, so the port is irrelevant to the
+      // defense. Matching host:port (the original #189 port) broke every
+      // tunnelled / port-forwarded deployment: an `ssh -L 8080:…:4632`
+      // or VS Code forward sends the CLIENT-side port (8080) in Host,
+      // not the bind port (4632), so the daemon 421'd its own dashboard.
+      // Runs before the plugin gateway so /mcp/* and /api/plugin/* are
+      // covered too; the local MCP bridge calls with Host
+      // `127.0.0.1:<port>`, whose hostname (127.0.0.1) is allowlisted.
       const host = req.headers.get("host") ?? "";
-      const isWildcardBind = opts.host === "0.0.0.0" || opts.host === "::";
-      if (!isWildcardBind) {
-        const expectedHosts = new Set([
-          `127.0.0.1:${opts.port}`,
-          `localhost:${opts.port}`,
-          `[::1]:${opts.port}`,
-          `${opts.host}:${opts.port}`,
-        ]);
-        if (!expectedHosts.has(host)) {
-          return new Response("Bad Host", { status: 421 });
-        }
+      if (!isHostAllowed(host, opts.host)) {
+        return new Response("Bad Host", { status: 421 });
       }
 
       // Issue #164 item 3: CSRF defense-in-depth — reject cross-origin
