@@ -15,11 +15,17 @@ import { runUserMessage } from "../runner";
 import { readKanban, writeKanban, type KanbanBoard } from "./services/kanban";
 import { getHttpGateway } from "../plugins/http-gateway.js";
 
-// --- Security: CSRF Protection ---
-// NOTE: The Web UI has no built-in authentication. CSRF protection prevents
-// cross-origin browser attacks but does not prevent direct API access.
-// For production use, deploy behind a reverse proxy with authentication
-// (e.g. Cloudflare Access, nginx basic auth, or OAuth2 proxy).
+// --- Security: layered defenses ---
+// The Web UI has several layers:
+//   - Per-session CSRF tokens (below) on state-changing routes.
+//   - Host-header validation + cross-origin POST/DELETE rejection in the
+//     fetch handler (issue #164 items 2/3).
+//   - A persisted 256-bit web token (`getOrCreateWebToken`, issue #164
+//     item 1) with byte-safe `checkToken`. NOTE: as of PR A the token is
+//     generated but NOT yet enforced on `/api/*` — enforcement + the
+//     dashboard auto-token UX land in PR B. Until then, treat direct
+//     `/api/*` access as unauthenticated and, for untrusted networks,
+//     still deploy behind a reverse proxy with authentication.
 const CSRF_HEADER_NAME = "X-CSRF-Token";
 const MAX_CSRF_TOKENS = 10000;
 
@@ -121,6 +127,43 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
     idleTimeout: 0,
     fetch: async (req) => {
       const url = new URL(req.url);
+
+      // Issue #164 item 2: DNS-rebinding defense via Host header
+      // validation. A wildcard bind (0.0.0.0 / ::) means the operator
+      // opted into remote access and the browser Host won't match the
+      // bind address, so the check is skipped there. For a specific
+      // bind (loopback / LAN IP) we enforce an allowlist. Runs before
+      // the plugin gateway so /mcp/* and /api/plugin/* are covered too;
+      // the local MCP bridge calls with Host `127.0.0.1:<port>`, which
+      // is in the allowlist.
+      const host = req.headers.get("host") ?? "";
+      const isWildcardBind = opts.host === "0.0.0.0" || opts.host === "::";
+      if (!isWildcardBind) {
+        const expectedHosts = new Set([
+          `127.0.0.1:${opts.port}`,
+          `localhost:${opts.port}`,
+          `[::1]:${opts.port}`,
+          `${opts.host}:${opts.port}`,
+        ]);
+        if (!expectedHosts.has(host)) {
+          return new Response("Bad Host", { status: 421 });
+        }
+      }
+
+      // Issue #164 item 3: CSRF defense-in-depth — reject cross-origin
+      // state-changing requests. Only fires when an Origin header is
+      // present (browsers set it on POST/DELETE; the local MCP bridge
+      // and CLI clients don't, so they pass). This layers under the
+      // existing per-session CSRF-token check (PR #75).
+      if (req.method === "POST" || req.method === "DELETE") {
+        const origin = req.headers.get("origin");
+        if (origin) {
+          const allowedOrigins = new Set([`http://${host}`, `https://${host}`]);
+          if (!allowedOrigins.has(origin)) {
+            return new Response("Bad Origin", { status: 403 });
+          }
+        }
+      }
 
       // Plugin HTTP gateway — handles /api/plugin/* routes and
       // /mcp/<server>/* multiplexer routes (registered by the
