@@ -76,20 +76,36 @@ export class PtyAgentProcess implements AgentProcess {
   /** Serializes the write/settle/CR sequence so concurrent prompts can't
    *  interleave in the PTY input buffer (review #141 P1). */
   private writeChain: Promise<void> = Promise.resolve();
-  /** Boot dialog-dismiss CR timers, owned so we can cancel them once a real
-   *  prompt is dispatched (review #141 P2). */
-  private dialogDismissTimers: ReturnType<typeof setTimeout>[];
+  /** Boot-dialog watcher state (issue #193). Claude shows interactive
+   *  confirmation dialogs at startup (the dev-channels prompt, and the newer
+   *  "Bypass Permissions mode" prompt). We answer them by inspecting early PTY
+   *  output and sending the correct key per dialog. The watcher stays engaged
+   *  until claude actually reaches the REPL (detected via the footer marker) or
+   *  a bounded timeout — NOT until the first prompt. Codex P2 on PR #195: a
+   *  dialog can render AFTER an early heartbeat/scheduler prompt on a slow
+   *  fresh-install boot, so disengaging on first-prompt left late dialogs
+   *  unanswered and the agent stuck at "No, exit". */
+  private bootDialogActive = true;
+  private bootDialogBuffer = "";
+  private answeredBypassPrompt = false;
+  private answeredDevChannelsPrompt = false;
+  /** Hard cap on the boot-dialog watch window (issue #193 / Codex P2). If no
+   *  REPL-ready marker is observed within this window (e.g. a future CLI
+   *  changes the footer text), the watcher disengages anyway so it never
+   *  buffers PTY output for the whole process lifetime. */
+  private static readonly BOOT_DIALOG_MAX_MS = 15_000;
+  private bootDialogTimer: ReturnType<typeof setTimeout> | undefined;
 
-  constructor(
-    agent_id: string,
-    pty: PtyHandle,
-    dialogDismissTimers: ReturnType<typeof setTimeout>[] = [],
-  ) {
+  constructor(agent_id: string, pty: PtyHandle) {
     this.agent_id = agent_id;
     this.pty = pty;
     this.pid = pty.pid;
-    this.dialogDismissTimers = dialogDismissTimers;
+    this.bootDialogTimer = setTimeout(
+      () => this.endBootDialogPhase(),
+      PtyAgentProcess.BOOT_DIALOG_MAX_MS,
+    );
     pty.onData((chunk) => {
+      if (this.bootDialogActive) this.handleBootDialog(chunk);
       // Crash-signal observation ONLY (spec §5.3). Never parsed as model output.
       for (const h of this.dataHandlers) {
         try {
@@ -122,10 +138,15 @@ export class PtyAgentProcess implements AgentProcess {
 
   send_prompt_stream(line: string): Promise<void> {
     if (this._exited) return Promise.reject(new Error(`agent ${this.agent_id} has exited`));
-    // A real prompt means claude has reached the REPL, so the boot dialog (if
-    // any) is already dismissed. Cancel the pending dialog-dismiss CR writes
-    // so a late one can't submit this prompt — or a follow-up — mid-turn.
-    this.cancelDialogDismissTimers();
+    // NOTE (Codex P2 on PR #195): we deliberately do NOT disengage the
+    // boot-dialog watcher here. An early heartbeat/scheduler prompt can be
+    // dispatched before a slow fresh-install boot has rendered its
+    // bypass-permissions dialog; disengaging on first-prompt left that later
+    // dialog unanswered (default "No, exit") and killed the agent. The watcher
+    // now disengages on the REPL-ready footer marker or the bounded timeout
+    // instead (see handleBootDialog / endBootDialogPhase). The watcher only
+    // ever writes in response to specific dialog text, so leaving it engaged
+    // cannot inject keys mid-turn once the REPL is up.
     // Deliver an inbound prompt by typing it into claude's REPL via the PTY.
     //
     // Why not rely on `notifications/claude/channel` (the MCP path)? In a
@@ -157,10 +178,66 @@ export class PtyAgentProcess implements AgentProcess {
     return run;
   }
 
-  /** Cancel any pending boot dialog-dismiss timers. Idempotent. */
-  private cancelDialogDismissTimers(): void {
-    for (const t of this.dialogDismissTimers) clearTimeout(t);
-    this.dialogDismissTimers = [];
+  /** Stop answering boot dialogs — called when the REPL-ready footer marker is
+   *  observed, the bounded timeout fires, or on kill. Idempotent. */
+  private endBootDialogPhase(): void {
+    if (!this.bootDialogActive) return;
+    this.bootDialogActive = false;
+    this.bootDialogBuffer = "";
+    if (this.bootDialogTimer) {
+      clearTimeout(this.bootDialogTimer);
+      this.bootDialogTimer = undefined;
+    }
+  }
+
+  /** Answer claude's interactive startup confirmation dialogs by inspecting
+   *  early PTY output (issue #193). Sends the *correct* key per dialog: Enter
+   *  for the dev-channels confirmation (whose default IS the accept option),
+   *  and Down+Enter for the "Bypass Permissions mode" dialog (whose default is
+   *  "No, exit" — a blind Enter would select exit and kill the agent). Matches
+   *  on text unique to each dialog so the REPL footer (which contains the
+   *  "shift+tab to cycle" hint) cannot false-trigger. */
+  private handleBootDialog(chunk: string): void {
+    this.bootDialogBuffer = (this.bootDialogBuffer + chunk).slice(-4000);
+    const buf = this.bootDialogBuffer;
+    if (!this.answeredBypassPrompt && buf.includes("Yes, I accept")) {
+      this.answeredBypassPrompt = true;
+      try {
+        this.pty.write("\x1b[B"); // move selection to "2. Yes, I accept"
+        setTimeout(() => {
+          try {
+            this.pty.write("\r");
+          } catch {
+            /* pty may have exited — non-fatal */
+          }
+        }, 200);
+      } catch {
+        /* pty may have exited — non-fatal */
+      }
+      return;
+    }
+    if (!this.answeredDevChannelsPrompt && buf.includes("development channels")) {
+      this.answeredDevChannelsPrompt = true;
+      try {
+        this.pty.write("\r");
+      } catch {
+        /* pty may have exited — non-fatal */
+      }
+      return;
+    }
+    // REPL-ready marker (issue #193 / Codex P2 ×2). Every REPL mode footer
+    // ends with the "shift+tab to cycle" mode-cycler hint, regardless of the
+    // agent's permission_mode ("bypass permissions on", "plan mode on",
+    // "accept edits on", etc.). Matching the generic hint — rather than the
+    // bypass-specific footer — means the watcher disengages promptly in ALL
+    // modes, not only bypass. (The bypass-only marker left non-bypass agents
+    // watching until the 15s timeout, during which a stray "Yes, I accept"
+    // model echo could inject Down/Enter into a live REPL.) No dialog contains
+    // this hint, so it cannot false-trigger. Disengaging stops buffering +
+    // cancels the timeout; writes nothing.
+    if (buf.includes("shift+tab to cycle")) {
+      this.endBootDialogPhase();
+    }
   }
 
   onExit(handler: ExitHandler): void {
@@ -173,7 +250,7 @@ export class PtyAgentProcess implements AgentProcess {
 
   /** Internal — called by SessionManager.stop(). */
   _kill(signal?: string): void {
-    this.cancelDialogDismissTimers();
+    this.endBootDialogPhase();
     try {
       this.pty.kill(signal);
     } catch {

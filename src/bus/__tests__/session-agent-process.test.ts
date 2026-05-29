@@ -3,7 +3,8 @@
  *
  * Uses a fake `PtyHandle` that records every `write` so we can assert:
  *   - concurrent `send_prompt_stream` calls serialise (no byte interleave),
- *   - a real prompt cancels the pending boot dialog-dismiss CR timers.
+ *   - the boot-dialog watcher answers late dialogs and disengages on the
+ *     REPL-ready marker, not on first prompt (issue #193 / Codex P2 on #195).
  */
 import { describe, expect, it } from "bun:test";
 import { PtyAgentProcess, type PtyHandle } from "../session-agent-process";
@@ -38,22 +39,44 @@ describe("PtyAgentProcess.send_prompt_stream", () => {
     expect(writes).toEqual(["first", "\r", "second", "\r"]);
   });
 
-  it("cancels pending dialog-dismiss timers on the first prompt", async () => {
-    const { handle, writes } = fakePty();
-    let stray = 0;
-    const timers = [10, 20, 30].map((ms) =>
-      setTimeout(() => {
-        stray += 1;
-        handle.write("\r");
-      }, ms),
-    );
-    const proc = new PtyAgentProcess("alpha", handle, timers);
+  it("keeps answering dialogs after an early prompt until the REPL is ready, then disengages (Codex P2 on #195)", async () => {
+    const writes: string[] = [];
+    let dataCb: ((d: string) => void) | null = null;
+    const handle: PtyHandle = {
+      pid: 1234,
+      onData: (cb) => {
+        dataCb = cb;
+        return { dispose() {} };
+      },
+      onExit: () => ({ dispose() {} }),
+      write: (data: string) => {
+        writes.push(data);
+      },
+      kill: () => {},
+    };
+    const proc = new PtyAgentProcess("alpha", handle);
 
+    // An early prompt is dispatched BEFORE the boot dialog renders (slow
+    // fresh-install boot). The old code disengaged the watcher here, leaving
+    // the later dialog unanswered. The watcher must stay engaged.
     await proc.send_prompt_stream("hi");
-    // Wait well past the longest timer; none should have fired.
-    await new Promise((r) => setTimeout(r, 60));
+    writes.length = 0;
 
-    expect(stray).toBe(0);
-    expect(writes).toEqual(["hi", "\r"]);
+    // The bypass dialog renders AFTER the prompt — it must still be answered.
+    dataCb?.("WARNING: Bypass Permissions mode\n  2. Yes, I accept\n");
+    expect(writes).toContain("\x1b[B"); // watcher still active -> Down
+    await new Promise((r) => setTimeout(r, 260));
+    expect(writes).toContain("\r"); // then Enter
+
+    // Once the REPL footer appears the watcher disengages — and the marker is
+    // mode-independent (Codex P2 #2 on #195): a non-bypass agent shows a
+    // mode-specific footer like "plan mode on", but every mode footer carries
+    // the "shift+tab to cycle" hint. A later dialog-looking chunk must then be
+    // ignored (no keys injected into a live REPL).
+    dataCb?.("⏸ plan mode on (shift+tab to cycle)");
+    writes.length = 0;
+    dataCb?.("stray redraw with 2. Yes, I accept text");
+    await new Promise((r) => setTimeout(r, 60));
+    expect(writes).toEqual([]);
   });
 });
