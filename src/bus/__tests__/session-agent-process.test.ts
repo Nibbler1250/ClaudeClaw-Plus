@@ -3,7 +3,8 @@
  *
  * Uses a fake `PtyHandle` that records every `write` so we can assert:
  *   - concurrent `send_prompt_stream` calls serialise (no byte interleave),
- *   - a real prompt disengages the boot-dialog watcher (issue #193).
+ *   - the boot-dialog watcher answers late dialogs and disengages on the
+ *     REPL-ready marker, not on first prompt (issue #193 / Codex P2 on #195).
  */
 import { describe, expect, it } from "bun:test";
 import { PtyAgentProcess, type PtyHandle } from "../session-agent-process";
@@ -38,7 +39,7 @@ describe("PtyAgentProcess.send_prompt_stream", () => {
     expect(writes).toEqual(["first", "\r", "second", "\r"]);
   });
 
-  it("disengages the boot-dialog watcher once a real prompt is dispatched", async () => {
+  it("keeps answering dialogs after an early prompt until the REPL is ready, then disengages (Codex P2 on #195)", async () => {
     const writes: string[] = [];
     let dataCb: ((d: string) => void) | null = null;
     const handle: PtyHandle = {
@@ -55,11 +56,23 @@ describe("PtyAgentProcess.send_prompt_stream", () => {
     };
     const proc = new PtyAgentProcess("alpha", handle);
 
-    await proc.send_prompt_stream("hi"); // claude has reached the REPL
+    // An early prompt is dispatched BEFORE the boot dialog renders (slow
+    // fresh-install boot). The old code disengaged the watcher here, leaving
+    // the later dialog unanswered. The watcher must stay engaged.
+    await proc.send_prompt_stream("hi");
     writes.length = 0;
-    // A dialog-looking chunk arriving AFTER the first prompt must be ignored —
-    // the watcher disengages so it can't inject keys mid-session.
-    dataCb?.("...\u276f 2. Yes, I accept...");
+
+    // The bypass dialog renders AFTER the prompt — it must still be answered.
+    dataCb?.("WARNING: Bypass Permissions mode\n  2. Yes, I accept\n");
+    expect(writes).toContain("\x1b[B"); // watcher still active -> Down
+    await new Promise((r) => setTimeout(r, 260));
+    expect(writes).toContain("\r"); // then Enter
+
+    // Once the REPL footer marker appears, the watcher disengages — a later
+    // dialog-looking chunk must be ignored (no keys injected mid-session).
+    dataCb?.("bypass permissions on (shift+tab to cycle)");
+    writes.length = 0;
+    dataCb?.("stray redraw with 2. Yes, I accept text");
     await new Promise((r) => setTimeout(r, 60));
     expect(writes).toEqual([]);
   });

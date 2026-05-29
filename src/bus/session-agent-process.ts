@@ -79,17 +79,31 @@ export class PtyAgentProcess implements AgentProcess {
   /** Boot-dialog watcher state (issue #193). Claude shows interactive
    *  confirmation dialogs at startup (the dev-channels prompt, and the newer
    *  "Bypass Permissions mode" prompt). We answer them by inspecting early PTY
-   *  output and sending the correct key per dialog, then disengage once a real
-   *  prompt is dispatched. */
+   *  output and sending the correct key per dialog. The watcher stays engaged
+   *  until claude actually reaches the REPL (detected via the footer marker) or
+   *  a bounded timeout — NOT until the first prompt. Codex P2 on PR #195: a
+   *  dialog can render AFTER an early heartbeat/scheduler prompt on a slow
+   *  fresh-install boot, so disengaging on first-prompt left late dialogs
+   *  unanswered and the agent stuck at "No, exit". */
   private bootDialogActive = true;
   private bootDialogBuffer = "";
   private answeredBypassPrompt = false;
   private answeredDevChannelsPrompt = false;
+  /** Hard cap on the boot-dialog watch window (issue #193 / Codex P2). If no
+   *  REPL-ready marker is observed within this window (e.g. a future CLI
+   *  changes the footer text), the watcher disengages anyway so it never
+   *  buffers PTY output for the whole process lifetime. */
+  private static readonly BOOT_DIALOG_MAX_MS = 15_000;
+  private bootDialogTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(agent_id: string, pty: PtyHandle) {
     this.agent_id = agent_id;
     this.pty = pty;
     this.pid = pty.pid;
+    this.bootDialogTimer = setTimeout(
+      () => this.endBootDialogPhase(),
+      PtyAgentProcess.BOOT_DIALOG_MAX_MS,
+    );
     pty.onData((chunk) => {
       if (this.bootDialogActive) this.handleBootDialog(chunk);
       // Crash-signal observation ONLY (spec §5.3). Never parsed as model output.
@@ -124,10 +138,15 @@ export class PtyAgentProcess implements AgentProcess {
 
   send_prompt_stream(line: string): Promise<void> {
     if (this._exited) return Promise.reject(new Error(`agent ${this.agent_id} has exited`));
-    // A real prompt means claude has reached the REPL, so the boot dialog (if
-    // any) is already dismissed. Cancel the pending dialog-dismiss CR writes
-    // so a late one can't submit this prompt — or a follow-up — mid-turn.
-    this.endBootDialogPhase();
+    // NOTE (Codex P2 on PR #195): we deliberately do NOT disengage the
+    // boot-dialog watcher here. An early heartbeat/scheduler prompt can be
+    // dispatched before a slow fresh-install boot has rendered its
+    // bypass-permissions dialog; disengaging on first-prompt left that later
+    // dialog unanswered (default "No, exit") and killed the agent. The watcher
+    // now disengages on the REPL-ready footer marker or the bounded timeout
+    // instead (see handleBootDialog / endBootDialogPhase). The watcher only
+    // ever writes in response to specific dialog text, so leaving it engaged
+    // cannot inject keys mid-turn once the REPL is up.
     // Deliver an inbound prompt by typing it into claude's REPL via the PTY.
     //
     // Why not rely on `notifications/claude/channel` (the MCP path)? In a
@@ -159,11 +178,16 @@ export class PtyAgentProcess implements AgentProcess {
     return run;
   }
 
-  /** Stop answering boot dialogs — called once a real prompt is dispatched
-   *  (claude has reached the REPL) or on kill. Idempotent. */
+  /** Stop answering boot dialogs — called when the REPL-ready footer marker is
+   *  observed, the bounded timeout fires, or on kill. Idempotent. */
   private endBootDialogPhase(): void {
+    if (!this.bootDialogActive) return;
     this.bootDialogActive = false;
     this.bootDialogBuffer = "";
+    if (this.bootDialogTimer) {
+      clearTimeout(this.bootDialogTimer);
+      this.bootDialogTimer = undefined;
+    }
   }
 
   /** Answer claude's interactive startup confirmation dialogs by inspecting
@@ -199,6 +223,15 @@ export class PtyAgentProcess implements AgentProcess {
       } catch {
         /* pty may have exited — non-fatal */
       }
+      return;
+    }
+    // REPL-ready marker (issue #193 / Codex P2). The REPL footer shows
+    // "bypass permissions on" once claude has reached the prompt — distinct
+    // from the dialog's "Yes, I accept". Seeing it means any startup dialog is
+    // already dismissed, so disengage the watcher (stops buffering + cancels
+    // the timeout). Writes nothing.
+    if (buf.includes("bypass permissions on")) {
+      this.endBootDialogPhase();
     }
   }
 
