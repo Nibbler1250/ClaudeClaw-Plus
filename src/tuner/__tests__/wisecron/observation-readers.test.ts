@@ -5,9 +5,11 @@ import { join } from "node:path";
 import {
   makeMcpToolCallReader,
   makeModeDispatchReader,
+  hookExecReader,
 } from "../../wisecron/observation-readers.js";
 import { McpPluginSubject } from "../../subjects/mcp-plugin-subject.js";
 import { ModelRoutingSubject } from "../../subjects/model-routing-subject.js";
+import { HookSubject } from "../../subjects/hook-subject.js";
 
 const SINCE = new Date("2026-05-20T00:00:00Z");
 const IN_TS = "2026-05-21T12:00:00.000Z";
@@ -126,5 +128,39 @@ describe("makeModeDispatchReader", () => {
 
   it("returns [] for a missing journal", () => {
     expect(makeModeDispatchReader(join(dir, "nope.jsonl"))(SINCE)).toEqual([]);
+  });
+});
+
+describe("hookExecReader", () => {
+  it("reads exec-log.jsonl (not just *.log) into the HookLogEntry shape", () => {
+    const path = join(dir, "exec-log.jsonl");
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ ts: IN_TS, hook: "exec-log", exit_code: 0, duration_ms: 29, event: "PostToolUse" }),
+        JSON.stringify({ ts: IN_TS, hook: "guard", exit_code: 1, duration_ms: 1200, event: "PreToolUse" }),
+        JSON.stringify({ ts: OLD_TS, hook: "old", exit_code: 0, duration_ms: 5, event: "Stop" }),
+      ].join("\n"),
+    );
+    const entries = hookExecReader(dir, SINCE);
+    expect(entries).toHaveLength(2); // old filtered out
+    expect(entries[0]).toMatchObject({ hook: "exec-log", exitCode: 0, durationMs: 29, eventType: "PostToolUse" });
+    expect(entries[1]).toMatchObject({ hook: "guard", exitCode: 1, durationMs: 1200 });
+    expect(entries[0]!.timestamp).toBeInstanceOf(Date);
+  });
+
+  it("feeds HookSubject.collectObservations so a crash surfaces obs > 0", async () => {
+    const path = join(dir, "exec-log.jsonl");
+    writeFileSync(
+      path,
+      JSON.stringify({ ts: IN_TS, hook: "boom", exit_code: 1, duration_ms: 10, event: "PreToolUse" }),
+    );
+    const subject = new HookSubject({ hooksDir: dir, logReader: hookExecReader });
+    const obs = await subject.collectObservations(SINCE);
+    expect(obs.length).toBeGreaterThan(0);
+  });
+
+  it("returns [] for a missing hooks dir", () => {
+    expect(hookExecReader(join(dir, "nope"), SINCE)).toEqual([]);
   });
 });

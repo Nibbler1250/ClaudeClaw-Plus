@@ -16,8 +16,9 @@
  * Wired in `registerWisecronSubjects`; each subject keeps its injectable seam,
  * so tests can still override with fixtures.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { DEFAULT_TOOL_CALL_LOG } from "../../observability/tool-call-sink.js";
 import { DEFAULT_MODE_DISPATCH_LOG } from "../../governance/mode-dispatch-journal.js";
 
@@ -119,4 +120,63 @@ export function makeModeDispatchReader(
     }
     return out;
   };
+}
+
+/** Shape of HookSubject's HookLogEntry (kept structural — the subject's interface
+ * is internal; this matches it field-for-field). */
+interface HookLogEntryShape {
+  hook: string;
+  exitCode: number;
+  durationMs: number;
+  eventType: string;
+  timestamp: Date;
+}
+
+/**
+ * `HookSubject.logReader` adapter. The subject's default reader only scans
+ * `*.log` files, but the canonical exec-logger sink is `exec-log.jsonl` (written
+ * by `~/.claude/hooks/exec-log.sh`), so collectObservations read 0 entries → 0
+ * obs even with a 48KB log present. This reads `exec-log.jsonl` AND any legacy
+ * `*.log` files in the hooks dir, mapping `{ ts, hook, exit_code, duration_ms,
+ * event }` to the HookLogEntry shape and filtering by `since`.
+ */
+export function hookExecReader(dir: string, since: Date): HookLogEntryShape[] {
+  const hooksDir = expandHome(dir);
+  if (!existsSync(hooksDir)) return [];
+  let files: string[];
+  try {
+    files = readdirSync(hooksDir).filter((f) => f === "exec-log.jsonl" || f.endsWith(".log"));
+  } catch {
+    return [];
+  }
+  const out: HookLogEntryShape[] = [];
+  for (const f of files) {
+    let content: string;
+    try {
+      content = readFileSync(join(hooksDir, f), "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const o = JSON.parse(trimmed) as Record<string, unknown>;
+        if (typeof o !== "object" || o === null) continue;
+        const tsRaw = o.ts as string | number | undefined;
+        const ts = tsRaw ? new Date(tsRaw) : new Date();
+        if (Number.isNaN(ts.getTime()) || ts < since) continue;
+        out.push({
+          hook: (o.hook as string) ?? f.replace(/\.(jsonl|log)$/, ""),
+          exitCode: Number(o.exit_code ?? 0),
+          durationMs: Number(o.duration_ms ?? 0),
+          eventType: (o.event as string) ?? "unknown",
+          timestamp: ts,
+        });
+      } catch {
+        /* skip malformed line */
+      }
+    }
+  }
+  return out;
 }

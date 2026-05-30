@@ -35,7 +35,11 @@ import { ModelRoutingSubject } from "../subjects/model-routing-subject.js";
 import { PromptTemplateSubject } from "../subjects/prompt-template-subject.js";
 import { MemorySubject } from "../subjects/memory-subject.js";
 import { AgentSubject } from "../subjects/agent-subject.js";
-import { makeMcpToolCallReader, makeModeDispatchReader } from "./observation-readers.js";
+import {
+  makeMcpToolCallReader,
+  makeModeDispatchReader,
+  hookExecReader,
+} from "./observation-readers.js";
 
 export interface WisecronContext {
   db: WisecronStateDB;
@@ -102,7 +106,16 @@ export function registerWisecronSubjects(
   if (enabled("cron")) registerWithProbeCheck(new CronSubject({ llm: opts.llm, ...cfg("cron") }));
   if (enabled("claude_md"))
     registerWithProbeCheck(new ClaudeMdSubject({ llm: opts.llm, ...cfg("claude_md") }));
-  if (enabled("hook")) registerWithProbeCheck(new HookSubject({ llm: opts.llm, ...cfg("hook") }));
+  if (enabled("hook"))
+    registerWithProbeCheck(
+      new HookSubject({
+        llm: opts.llm,
+        ...cfg("hook"),
+        // Read observations from exec-log.jsonl (the canonical exec-logger sink);
+        // the default reader only scans *.log files → obs=0 despite a live log.
+        logReader: hookExecReader,
+      }),
+    );
   if (enabled("mcp_plugin"))
     registerWithProbeCheck(
       new McpPluginSubject({
