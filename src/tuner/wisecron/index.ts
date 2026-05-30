@@ -35,6 +35,7 @@ import { ModelRoutingSubject } from "../subjects/model-routing-subject.js";
 import { PromptTemplateSubject } from "../subjects/prompt-template-subject.js";
 import { MemorySubject } from "../subjects/memory-subject.js";
 import { AgentSubject } from "../subjects/agent-subject.js";
+import { makeMcpToolCallReader, makeModeDispatchReader } from "./observation-readers.js";
 
 export interface WisecronContext {
   db: WisecronStateDB;
@@ -103,9 +104,27 @@ export function registerWisecronSubjects(
     registerWithProbeCheck(new ClaudeMdSubject({ llm: opts.llm, ...cfg("claude_md") }));
   if (enabled("hook")) registerWithProbeCheck(new HookSubject({ llm: opts.llm, ...cfg("hook") }));
   if (enabled("mcp_plugin"))
-    registerWithProbeCheck(new McpPluginSubject({ llm: opts.llm, ...cfg("mcp_plugin") }));
+    registerWithProbeCheck(
+      new McpPluginSubject({
+        llm: opts.llm,
+        ...cfg("mcp_plugin"),
+        // Read observations from the dedicated mcp.tool_call log (the legacy
+        // default — operations.jsonl — never carries these events → obs=0).
+        auditReader: makeMcpToolCallReader(cfg("mcp_plugin").observation_log as string | undefined),
+      }),
+    );
   if (enabled("model_routing"))
-    registerWithProbeCheck(new ModelRoutingSubject({ llm: opts.llm, ...cfg("model_routing") }));
+    registerWithProbeCheck(
+      new ModelRoutingSubject({
+        llm: opts.llm,
+        ...cfg("model_routing"),
+        // Read observations from the dedicated mode_dispatch journal (the
+        // subject's default dispatchReader is `() => []` → obs=0).
+        dispatchReader: makeModeDispatchReader(
+          cfg("model_routing").observation_log as string | undefined,
+        ),
+      }),
+    );
   if (enabled("prompt_template"))
     registerWithProbeCheck(new PromptTemplateSubject({ llm: opts.llm, ...cfg("prompt_template") }));
   if (enabled("memory"))
