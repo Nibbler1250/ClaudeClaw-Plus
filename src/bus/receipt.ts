@@ -96,7 +96,7 @@ export interface ReceiptStoreOptions {
 /** Compute a short, stable hash of a prompt string. Short on purpose — the
  *  receipt should not let the full prompt leak into observability logs. */
 export function hashPrompt(text: string): string {
-  return "sha256:" + createHash("sha256").update(text).digest("hex").slice(0, 16);
+  return `sha256:${createHash("sha256").update(text).digest("hex").slice(0, 16)}`;
 }
 
 export function defaultReceiptLogPath(): string {
@@ -120,7 +120,7 @@ export function createReceiptStore(opts: ReceiptStoreOptions = {}): ReceiptStore
 
   async function appendRecord(rec: ReceiptRecord): Promise<void> {
     try {
-      await appendFile(logPath, JSON.stringify(rec) + "\n", "utf8");
+      await appendFile(logPath, `${JSON.stringify(rec)}\n`, "utf8");
     } catch (err) {
       onError(err as Error, "append");
     }
