@@ -23,7 +23,21 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 /** Terminal states a receipt can land on. The first four are normal flow;
- *  the rest are failure surfaces we want to make countable. */
+ *  the rest are failure surfaces we want to make countable.
+ *
+ *  Vocabulary note vs issue #207 (where the chain was originally
+ *  specified): #207 used `wedged_prompt` to mean `stdin_written` ✓ but
+ *  `turn_observed` never fires within the timeout window — what this
+ *  implementation calls `timeout`. Here, `wedged_prompt` is reserved
+ *  for the narrower failure of `bus.sendPrompt` itself rejecting at
+ *  entry (route was resolvable but the bus refused the prompt). Keep
+ *  this mapping in mind when cross-reading #207 against `receipts.jsonl`.
+ *
+ *  Caveat on `turn_observed`: this state is *bridge-inferred* from an
+ *  `intent: "final"` event on `response.text` — it means "the bridge
+ *  thinks the turn happened". It is NOT yet tailer-confirmed via
+ *  `claude_jsonl_path` + `turn_event_offset` (follow-up). Treat it as
+ *  a strong-but-not-authoritative signal until that wire lands. */
 export type ReceiptFinalState =
   | "message_polled"
   | "route_resolved"
