@@ -161,4 +161,46 @@ describe("sessions agent-scoped", () => {
     await Bun.write(sessionPath, JSON.stringify({ sessionId: "", turnCount: 0 }, null, 2));
     expect(await getSession(name)).toBeNull();
   });
+
+  it("createSession preserves createdAt + counters when called again with same sessionId", async () => {
+    const name = uniq("preserve");
+    await mkdir(join(AGENTS_DIR, name), { recursive: true });
+
+    // First create — fresh record with a known createdAt.
+    await createSession("sid-preserve", name);
+    const first = await peekSession(name);
+    expect(first).not.toBeNull();
+    const firstCreatedAt = first!.createdAt;
+
+    // Simulate a bump on the record (a turn happened, a message was counted).
+    await incrementTurn(name);
+
+    // Re-call createSession with the SAME sessionId (the daemon-restart case).
+    // createdAt must be preserved; turnCount/messageCount must NOT be reset.
+    await new Promise((r) => setTimeout(r, 5));
+    await createSession("sid-preserve", name);
+    const second = await peekSession(name);
+    expect(second).not.toBeNull();
+    expect(second!.createdAt).toBe(firstCreatedAt);
+    expect(second!.turnCount).toBe(1);
+  });
+
+  it("createSession resets createdAt + counters when sessionId changes", async () => {
+    const name = uniq("rotate");
+    await mkdir(join(AGENTS_DIR, name), { recursive: true });
+
+    await createSession("sid-old", name);
+    await incrementTurn(name);
+    const before = await peekSession(name);
+    expect(before!.turnCount).toBe(1);
+
+    // Different sessionId — this IS a genuinely new session; counters
+    // should reset, createdAt should advance.
+    await new Promise((r) => setTimeout(r, 5));
+    await createSession("sid-new", name);
+    const after = await peekSession(name);
+    expect(after!.sessionId).toBe("sid-new");
+    expect(after!.createdAt).not.toBe(before!.createdAt);
+    expect(after!.turnCount).toBe(0);
+  });
 });
