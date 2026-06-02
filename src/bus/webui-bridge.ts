@@ -18,6 +18,9 @@
 
 import type { BusCore } from "./core";
 import type { BusOrigin } from "./types";
+import { incrementMessageCount, peekSession } from "../sessions";
+import { needsRotation, rotateSession } from "../rotation";
+import { getSettings } from "../config";
 
 /**
  * Per-agent mutex tail used to serialize `streamBusPrompt` calls. Codex
@@ -107,7 +110,36 @@ export async function streamBusPrompt(
     }
   }
   try {
-    return await runPrompt(bus, agentId, message, opts);
+    const result = await runPrompt(bus, agentId, message, opts);
+    if (result.ok) {
+      // Mirror runner.ts bookkeeping (`incrementMessageCount` + rotation
+      // check on the legacy path): the bus path was missing this, so
+      // `session.messageCount` stayed frozen forever and `needsRotation()`
+      // never triggered on bus-mode deployments. Best-effort: a tracking
+      // failure here must never break the prompt flow the caller awaits.
+      try {
+        await incrementMessageCount();
+        // `getSettings()` throws when called before `loadSettings()` —
+        // happens in early boot and in unit tests. Skip rotation in that
+        // case; the increment alone is still useful, and the next call
+        // after settings are loaded will pick it up.
+        let sessionConfig: ReturnType<typeof getSettings>["session"] | null = null;
+        try {
+          sessionConfig = getSettings().session;
+        } catch {
+          /* settings not loaded yet — skip rotation, keep increment */
+        }
+        if (sessionConfig?.autoRotate) {
+          const peeked = await peekSession();
+          if (peeked && needsRotation(peeked, sessionConfig)) {
+            await rotateSession(sessionConfig);
+          }
+        }
+      } catch (e) {
+        console.error(`[${new Date().toLocaleTimeString()}] bus rotation tracking failed:`, e);
+      }
+    }
+    return result;
   } finally {
     // Only clear the tail slot if no other call has chained onto us;
     // chained callers will overwrite the map entry themselves.
