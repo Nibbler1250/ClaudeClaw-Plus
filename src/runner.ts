@@ -135,7 +135,7 @@ const CLAUDE_EXECUTABLE = resolveClaudeExecutable();
  *  Other versions may still work — the parser also has a turnIdleTimeoutMs
  *  safety net — but a mismatch here means we cannot guarantee turn-boundary
  *  detection. Add a version after empirical validation. */
-const KNOWN_GOOD_CLAUDE_VERSIONS = ["2.1.141"];
+const KNOWN_GOOD_CLAUDE_VERSIONS = ["2.1.141", "2.1.144", "2.1.160", "2.1.161"];
 
 /** Probe `claude --version` at daemon startup and log the result. Warns if the
  *  installed version isn't in the known-good list — does NOT block startup. */
