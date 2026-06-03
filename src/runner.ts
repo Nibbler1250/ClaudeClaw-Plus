@@ -129,13 +129,22 @@ function resolveClaudeExecutable(): string {
 }
 const CLAUDE_EXECUTABLE = resolveClaudeExecutable();
 
-/** Versions of the Claude Code CLI whose interactive TTY output the PTY parser
- *  has been validated against (see .planning/pty-migration/SPEC.md §2 and the
- *  golden fixture at .planning/pty-migration/fixtures/turn-boundary-sample.txt).
- *  Other versions may still work — the parser also has a turnIdleTimeoutMs
- *  safety net — but a mismatch here means we cannot guarantee turn-boundary
- *  detection. Add a version after empirical validation. */
-const KNOWN_GOOD_CLAUDE_VERSIONS = ["2.1.141", "2.1.144", "2.1.160", "2.1.161"];
+/** Pinned last-known-good Claude Code CLI version. The daemon probes the
+ *  installed `claude --version` at startup and WARNs (non-blocking) on a
+ *  mismatch. Pinned to 2.1.158: 2.1.159/.160 shipped regressions observed on
+ *  live deployments (anthropic/claude-code#64508, #64496) — skip them until
+ *  those are confirmed fixed.
+ *
+ *  What the warning is about: response-text EXTRACTION is version-sensitive
+ *  (the TUI's CUF/CHA inter-word spacing + ANSI framing the parser strips), so
+ *  a newer CLI may regress it. Turn-boundary DETECTION is NOT version-sensitive
+ *  — it is a sentinel-echo round-trip independent of CLI chrome. Per #207 the
+ *  intermittent wedge is compaction-starvation, not a parser/version issue, so
+ *  this warning deliberately does NOT imply a wedge. Re-pin only after
+ *  validating extraction against the golden fixture
+ *  (.planning/pty-migration/fixtures/turn-boundary-sample.txt). */
+export const PINNED_KNOWN_GOOD_CLI = "2.1.158";
+const KNOWN_GOOD_CLAUDE_VERSIONS = [PINNED_KNOWN_GOOD_CLI];
 
 /** Probe `claude --version` at daemon startup and log the result. Warns if the
  *  installed version isn't in the known-good list — does NOT block startup. */

@@ -16,6 +16,7 @@ import {
   wasRateLimitNotified,
   markRateLimitNotified,
   probeClaudeCliVersion,
+  PINNED_KNOWN_GOOD_CLI,
 } from "../runner";
 import {
   initGatewayProcessor,
@@ -605,7 +606,10 @@ export async function start(args: string[] = []) {
     console.log(`  Claude CLI: ${cliProbe.version} (validated)`);
   } else {
     console.warn(
-      `  Claude CLI: ${cliProbe.version} (NOT in PTY parser's known-good list; turn-boundary detection may degrade — check .planning/pty-migration/SPEC.md §2)`,
+      `  Claude CLI ${cliProbe.version} ≠ pinned last-known-good ${PINNED_KNOWN_GOOD_CLI}. ` +
+        `Newer releases have shipped regressions (anthropic/claude-code#64508, #64496) and ` +
+        `response-text extraction is version-sensitive — pin to ${PINNED_KNOWN_GOOD_CLI} if replies look garbled. ` +
+        `Non-blocking; turn-boundary detection is version-independent.`,
     );
   }
   if (settings.runtime === "bus" && busRuntimeHandle) {
