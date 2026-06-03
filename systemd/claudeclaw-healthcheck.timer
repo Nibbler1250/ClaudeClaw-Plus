@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the ClaudeClaw+ health/wedge watchdog every 60s
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+AccuracySec=10
+Unit=claudeclaw-healthcheck.service
+
+[Install]
+WantedBy=timers.target

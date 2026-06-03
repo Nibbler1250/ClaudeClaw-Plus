@@ -1,0 +1,12 @@
+[Unit]
+Description=ClaudeClaw+ external health/wedge watchdog (pings /api/health; restarts on daemon death or agent wedge)
+# Oneshot: invoked on a cadence by the companion .timer.
+
+[Service]
+Type=oneshot
+# Adjust the path to wherever you install the script.
+ExecStart=%h/.local/bin/claudeclaw-healthcheck.sh
+# Optional overrides:
+# Environment=CLAUDECLAW_SERVICE=claudeclaw
+# Environment=CLAUDECLAW_HEALTH_URL=http://localhost:4632/api/health
+# Environment=CLAUDECLAW_WD_COOLDOWN=900
