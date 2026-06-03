@@ -11,6 +11,7 @@ import { createReceiptStore, hashPrompt, type ReceiptRecord, type ReceiptStore }
 import {
   type AgentProcessLike,
   createPromptStreamHandler,
+  openInboundReceipt,
   unwrapChannelText,
 } from "../receipt-wiring";
 
@@ -176,5 +177,40 @@ describe("createPromptStreamHandler", () => {
     );
     await expect(handler("alpha", "no-receipt")).rejects.toThrow("boom");
     expect(readReceipts()).toHaveLength(0);
+  });
+});
+
+describe("openInboundReceipt (#211 — adapter boundary open)", () => {
+  test("opens at message_polled with raw prompt_hash + origin notes", () => {
+    const raw = "what's the weather";
+    const receipt = openInboundReceipt({
+      store,
+      messageId: "tg-7",
+      agentId: "triage",
+      rawText: raw,
+      origin: "telegram",
+      originId: "100",
+    });
+    expect(receipt.record.message_id).toBe("tg-7");
+    expect(receipt.record.final_state).toBe("message_polled");
+    expect(receipt.record.agent_id).toBe("triage");
+    expect(receipt.record.selected_route).toBe("agent=triage");
+    // Hash invariant: computed on the RAW text (pre-<channel> wrapper), so the
+    // bus -> PTY seam's findByPromptHash (which unwraps first) hits the same one.
+    expect(receipt.record.prompt_hash).toBe(hashPrompt(raw));
+    expect(receipt.record.notes).toMatchObject({ origin: "telegram", origin_id: "100" });
+  });
+
+  test("findByPromptHash on the raw text resolves the open receipt", () => {
+    const raw = "deploy the thing";
+    openInboundReceipt({
+      store,
+      messageId: "tg-8",
+      agentId: "a1",
+      rawText: raw,
+      origin: "telegram",
+      originId: "1",
+    });
+    expect(store.findByPromptHash(hashPrompt(raw))?.record.message_id).toBe("tg-8");
   });
 });
