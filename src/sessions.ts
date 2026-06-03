@@ -94,15 +94,29 @@ export async function getSession(
   return null;
 }
 
-/** Save a session ID obtained from Claude Code's output. */
+/** Save a session ID obtained from Claude Code's output.
+ *
+ *  Preserves `createdAt`, `turnCount`, `compactWarned`, and `messageCount`
+ *  across same-sessionId calls so that age-based rotation policies
+ *  (`maxAgeHours`) can actually reach their threshold and the bookkeeping
+ *  counters keep accumulating. Without this, every daemon restart calls
+ *  `createSession()` again, resetting `createdAt` to "now" — so a daemon
+ *  that bounces more often than `maxAgeHours` (e.g. every few hours)
+ *  never accumulates enough age to trigger rotation. Fresh values are
+ *  written only for a genuinely new session (different `sessionId`, or
+ *  no prior record). */
 export async function createSession(sessionId: string, agentName?: string): Promise<void> {
+  const existing = await loadSession(agentName);
+  const now = new Date().toISOString();
+  const isSameSession = existing?.sessionId === sessionId;
   await saveSession(
     {
       sessionId,
-      createdAt: new Date().toISOString(),
-      lastUsedAt: new Date().toISOString(),
-      turnCount: 0,
-      compactWarned: false,
+      createdAt: isSameSession && existing?.createdAt ? existing.createdAt : now,
+      lastUsedAt: now,
+      turnCount: isSameSession ? (existing?.turnCount ?? 0) : 0,
+      compactWarned: isSameSession ? (existing?.compactWarned ?? false) : false,
+      messageCount: isSameSession ? (existing?.messageCount ?? 0) : 0,
     },
     agentName,
   );
