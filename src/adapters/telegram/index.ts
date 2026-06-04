@@ -7,6 +7,8 @@
  */
 
 import { execFile } from "node:child_process";
+import { mkdir } from "node:fs/promises";
+import { join } from "node:path";
 
 import type { BusCore, Subscription } from "../../bus/core";
 import {
@@ -107,6 +109,7 @@ function eventBelongsToTelegram(event: BusEvent): boolean {
 export class TelegramAdapter {
   private readonly bus: BusCore;
   private readonly api: TelegramApi;
+  private readonly token: string;
   private readonly allowedUserIds: ReadonlySet<number>;
   private readonly routingChats: Record<string, string>;
   private readonly defaultAgentId: string | undefined;
@@ -169,12 +172,14 @@ export class TelegramAdapter {
 
     this.bus = opts.bus;
     this.api = opts.api ?? createTelegramApi(opts.token);
+    this.token = opts.token;
     this.allowedUserIds = new Set(opts.allowedUserIds);
     this.routingChats = { ...opts.routing.chats };
     this.defaultAgentId = opts.routing.defaultAgentId;
     this.pollIntervalMs = opts.pollIntervalMs ?? 1000;
     this.logger = opts.logger ?? console;
-    this.pendingResolver = opts.pendingResolver ?? ((id, dec) => this.resolvePendingViaPython(id, dec));
+    this.pendingResolver =
+      opts.pendingResolver ?? ((id, dec) => this.resolvePendingViaPython(id, dec));
   }
 
   async start(): Promise<void> {
@@ -355,12 +360,30 @@ export class TelegramAdapter {
       return;
     }
 
+    // Inbound images: Telegram only hands us a `file_id`, which the agent
+    // cannot resolve on its own. Download attached photos / image documents
+    // to a local inbox and inject their paths into the prompt so claude can
+    // Read (see) them. Best-effort — a download failure must never stop the
+    // text message from going through.
+    let promptText = text;
+    try {
+      const imagePaths = await this.downloadInboundImages(message, chatId);
+      if (imagePaths.length > 0) {
+        const refs = imagePaths
+          .map((p) => `[The user attached an image — open it with the Read tool to see it: ${p}]`)
+          .join("\n");
+        promptText = promptText.length > 0 ? `${promptText}\n\n${refs}` : refs;
+      }
+    } catch (err) {
+      this.logger.error("[telegram-adapter] inbound image download failed", err);
+    }
+
     await this.bus.sendPrompt({
       agent_id: agentId,
       origin: "telegram",
       origin_id: String(chatId),
       user_id: String(userId),
-      text,
+      text: promptText,
       metadata,
     });
 
@@ -399,6 +422,65 @@ export class TelegramAdapter {
     } catch (err) {
       this.logger.error(`[telegram-adapter] placeholder sendMessage failed`, err);
     }
+  }
+
+  /**
+   * Download inbound photos / image documents to a local inbox and return
+   * their absolute paths. Telegram hands us only `file_id`s; the agent has no
+   * Telegram access, so we resolve + fetch the bytes here. Best-effort:
+   * per-file failures are logged and skipped.
+   */
+  private async downloadInboundImages(
+    message: TelegramMessage,
+    chatId: number,
+  ): Promise<string[]> {
+    const fileIds: string[] = [];
+    if (message.photo && message.photo.length > 0) {
+      const largest = [...message.photo].sort((a, b) => {
+        const sa = a.file_size ?? a.width * a.height;
+        const sb = b.file_size ?? b.width * b.height;
+        return sb - sa;
+      })[0];
+      if (largest) fileIds.push(largest.file_id);
+    }
+    if (message.document && (message.document.mime_type ?? "").startsWith("image/")) {
+      fileIds.push(message.document.file_id);
+    }
+    if (fileIds.length === 0) return [];
+
+    const dir = join(process.cwd(), ".claude", "claudeclaw", "inbox", "telegram");
+    await mkdir(dir, { recursive: true });
+
+    const out: string[] = [];
+    for (const fileId of fileIds) {
+      try {
+        const metaRes = await fetch(`https://api.telegram.org/bot${this.token}/getFile`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ file_id: fileId }),
+        });
+        const meta = (await metaRes.json()) as {
+          ok?: boolean;
+          result?: { file_path?: string };
+        };
+        const remotePath = meta?.result?.file_path;
+        if (!meta.ok || !remotePath) continue;
+        const dl = await fetch(`https://api.telegram.org/file/bot${this.token}/${remotePath}`);
+        if (!dl.ok) continue;
+        const bytes = new Uint8Array(await dl.arrayBuffer());
+        if (bytes.byteLength > 25 * 1024 * 1024) continue; // 25MB cap
+        const ext = (remotePath.match(/\.[a-zA-Z0-9]+$/)?.[0] ?? ".jpg").toLowerCase();
+        const localPath = join(
+          dir,
+          `${chatId}-${message.message_id}-${fileId.slice(-8)}${ext}`,
+        );
+        await Bun.write(localPath, bytes);
+        out.push(localPath);
+      } catch (err) {
+        this.logger.error(`[telegram-adapter] failed to download file_id=${fileId}`, err);
+      }
+    }
+    return out;
   }
 
   /** Subscribe to the §5.5.2 topics for `agentId` (response, edit, perm, ask). */
@@ -723,6 +805,34 @@ export class TelegramAdapter {
       await this.safeAnswerCallback({
         callback_query_id: query.id,
         text: "Unauthorized.",
+      });
+      return;
+    }
+
+    // Wedge dossier actions (`wedge:<analyze|send>:<id>`) — operator taps from
+    // a watchdog alert. The helper sanitizes, runs an Opus 4.8 analysis, and
+    // (on confirm) posts to anthropics/claude-code#64496. It can take 30s+, so
+    // fire-and-forget and ack immediately; nothing is sent without the operator
+    // tapping confirm.
+    const wedgeMatch = data.match(/^wedge:(analyze|send):([A-Za-z0-9._-]+)$/);
+    if (wedgeMatch) {
+      const wedgeScript =
+        process.env.CLAUDECLAW_WEDGE_ACTION ?? `${process.env.HOME}/agent/scripts/wedge-action.sh`;
+      try {
+        Bun.spawn([wedgeScript, wedgeMatch[1] as string, wedgeMatch[2] as string], {
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+      } catch (err) {
+        this.logger.error("[telegram-adapter] wedge action spawn failed", err);
+      }
+      await this.safeAnswerCallback({
+        callback_query_id: query.id,
+        text:
+          wedgeMatch[1] === "analyze"
+            ? "\u{1F52C} Analyse Opus 4.8\u2026"
+            : "\u{1F4E4} Envoi\u2026",
       });
       return;
     }
