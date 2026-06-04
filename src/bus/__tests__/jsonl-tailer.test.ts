@@ -795,3 +795,64 @@ describe("JsonlTailer — real fixtures", () => {
     expect(topics.has("session.pr_link")).toBe(true);
   });
 });
+
+describe("startAt: 'end' (issue #215 runtime wiring)", () => {
+  function endTurn(text: string, ts = "2026-06-02T10:00:00.000Z"): object {
+    return {
+      type: "assistant",
+      message: {
+        role: "assistant",
+        id: "msg_ST",
+        content: [{ type: "text", text }],
+        stop_reason: "end_turn",
+      },
+      timestamp: ts,
+      sessionId: SESSION_ID,
+    };
+  }
+
+  it("does NOT replay historical turn_end, but live-tails new ones", async () => {
+    // History present before start() — must be skipped (would otherwise
+    // re-synthesize a stale reply when wired into the runtime).
+    writeFileSync(sessionPath, jsonl(endTurn("old historical turn")));
+    const { bus, events } = createMockBus();
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      startAt: "end",
+      onError: () => undefined,
+    });
+    await tailer.start();
+    expect(events.some((e) => e.topic === "response.turn_end")).toBe(false);
+
+    // A turn appended AFTER start is delivered.
+    await appendFile(sessionPath, jsonl(endTurn("fresh live turn", "2026-06-02T10:01:00.000Z")));
+    await waitFor(events, (e) => e.some((x) => x.topic === "response.turn_end"));
+    const te = events.find((e) => e.topic === "response.turn_end");
+    expect((te?.payload as { text: string }).text).toBe("fresh live turn");
+  });
+
+  it("attaches to a session file that appears AFTER start (fresh session)", async () => {
+    // File does not exist at start() — the common runtime case (claude
+    // writes the JSONL lazily on the first turn). The pre-fix tailer just
+    // logged the ENOENT and never tailed.
+    const { bus, events } = createMockBus();
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      startAt: "end",
+      onError: () => undefined,
+    });
+    await tailer.start();
+    await writeFile(sessionPath, jsonl(endTurn("first turn of a brand new session")));
+    await waitFor(events, (e) => e.some((x) => x.topic === "response.turn_end"));
+    const te = events.find((e) => e.topic === "response.turn_end");
+    expect((te?.payload as { text: string }).text).toBe("first turn of a brand new session");
+  });
+});

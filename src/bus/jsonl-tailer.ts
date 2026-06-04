@@ -105,6 +105,15 @@ export interface JsonlTailerOptions {
   projectsDir?: string;
   /** Surfaced via schema-probe cache (Sprint 2 Agent B). */
   schemaVersion?: string;
+  /**
+   * Where to begin tailing when the session file already exists.
+   * `"begin"` (default) replays from byte 0 — used by tests and any
+   * consumer that wants historical events. `"end"` seeks to EOF and
+   * live-tails new lines only — used by the runtime wiring (issue #215)
+   * so a resumed session never re-emits historical `response.turn_end`
+   * events (which could synthesize a stale reply).
+   */
+  startAt?: "begin" | "end";
   /** Error sink. Defaults to console.error. */
   onError?: (err: unknown, ctx?: Record<string, unknown>) => void;
 }
@@ -118,12 +127,15 @@ export class JsonlTailer {
   private readonly schemaVersion: string;
   private readonly onError: (err: unknown, ctx?: Record<string, unknown>) => void;
   private readonly filePath: string;
+  private readonly startAt: "begin" | "end";
 
   private offset = 0;
   private buffer = "";
   /** Set true once the first non-empty line emits `session.init`. */
   private initEmitted = false;
   private watcher: FSWatcher | null = null;
+  /** Set while polling for a not-yet-created session file. Cleared by stop(). */
+  private createPollTimer: ReturnType<typeof setTimeout> | null = null;
   private started = false;
   private stopped = false;
   /**
@@ -140,6 +152,7 @@ export class JsonlTailer {
     this.projectsDir = opts.projectsDir ?? join(homedir(), ".claude", "projects");
     this.schemaVersion = opts.schemaVersion ?? SCHEMA_VERSION;
     this.onError = opts.onError ?? ((err, ctx) => console.error("[jsonl-tailer]", err, ctx));
+    this.startAt = opts.startAt ?? "begin";
     this.filePath = join(
       this.projectsDir,
       encodeCwdForProjectsDir(this.cwd),
@@ -164,31 +177,75 @@ export class JsonlTailer {
     // emit the replay-done marker (with offset=0) and the live-tail
     // path picks up the first byte when it appears.
     if (existsSync(this.filePath)) {
-      await this.drainFromOffset();
+      if (this.startAt === "end") {
+        // Issue #215 runtime wiring: live-tail NEW turns only. Replaying
+        // from byte 0 on a resumed session would re-emit historical
+        // `response.turn_end` events and, with a prompt in flight, could
+        // synthesize a stale reply. Seek to EOF and watch forward.
+        try {
+          this.offset = statSync(this.filePath).size;
+        } catch (err) {
+          this.onError(err, { ctx: "start-eof-stat" });
+        }
+      } else {
+        await this.drainFromOffset();
+      }
+      this.emitReplayDone();
+      this.attachFileWatcher();
+      return;
     }
-    this.emitReplayDone();
 
-    // Live tail. fs.watch on macOS is generally reliable for append-only
-    // files in our scenarios; if we ever see drops on Linux network FS
-    // we'll fall back to fs.watchFile polling. Spec §5.2 explicitly
-    // allows either.
+    // File not created yet. A fresh agent session has claude write the
+    // JSONL lazily (on the first turn), so at spawn time the path — and
+    // even its parent dir — may not exist. Emit replay-done at offset 0,
+    // then poll for the file's appearance and attach. Without this the
+    // tailer is inert for every fresh session (issue #215 runtime wiring:
+    // the common case — the original code only logged the ENOENT from
+    // `watch()` and gave up, so no events ever flowed in production).
+    this.emitReplayDone();
+    this.awaitFileCreation();
+  }
+
+  /** Attach the live fs.watch to an already-existing session file. */
+  private attachFileWatcher(): void {
+    if (this.stopped || this.watcher) return;
     try {
       this.watcher = watch(this.filePath, { persistent: false }, () => {
         this.scheduleDrain();
       });
       this.watcher.on("error", (err) => this.onError(err, { ctx: "fs-watch" }));
     } catch (err) {
-      // ENOENT — file not yet created. Poll the parent dir minimally:
-      // schedule a one-shot retry. In practice Session Manager has
-      // already spawned `claude` and the file appears within ms.
       this.onError(err, { ctx: "watch-setup", path: this.filePath });
     }
+  }
+
+  /**
+   * Poll (unref'd) until the session file appears, then attach the watcher
+   * and drain whatever has been written. A brand-new file has offset 0 ==
+   * EOF, so `startAt: "end"` and `"begin"` coincide for it. Cleared by stop().
+   */
+  private awaitFileCreation(): void {
+    const poll = (): void => {
+      if (this.stopped) return;
+      if (existsSync(this.filePath)) {
+        this.attachFileWatcher();
+        this.scheduleDrain();
+        return;
+      }
+      this.createPollTimer = setTimeout(poll, 150);
+      this.createPollTimer.unref?.();
+    };
+    poll();
   }
 
   /** Stop and release watchers. Idempotent. */
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
+    if (this.createPollTimer) {
+      clearTimeout(this.createPollTimer);
+      this.createPollTimer = null;
+    }
     if (this.watcher) {
       this.watcher.close();
       this.watcher = null;
