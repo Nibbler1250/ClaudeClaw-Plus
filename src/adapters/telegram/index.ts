@@ -7,6 +7,8 @@
  */
 
 import type { BusCore, Subscription } from "../../bus/core";
+import { openInboundReceipt } from "../../bus/receipt-wiring";
+import { getDefaultReceiptStore, type OpenReceipt, type ReceiptStore } from "../../bus/receipt";
 import {
   CHANNEL_DRIVEN_ORIGINS,
   type BusEvent,
@@ -40,6 +42,12 @@ export interface TelegramAdapterOptions {
   };
   /** Poll interval ms between successive `getUpdates` calls. Default 1000. */
   pollIntervalMs?: number;
+  /** Milliseconds before an unanswered turn's receipt (#211) auto-closes as
+   *  `timeout`. Defaults to 5 min (RECEIPT_TIMEOUT_MS). Lowered in tests. */
+  receiptTimeoutMs?: number;
+  /** Receipt store (#211). Defaults to the process-wide singleton; tests
+   *  inject an isolated store so they never touch the real receipts.jsonl. */
+  receiptStore?: ReceiptStore;
   /** Override the API client (tests inject a fake). */
   api?: TelegramApi;
   /** Optional structured logger; defaults to `console`. */
@@ -92,6 +100,8 @@ export class TelegramAdapter {
   private readonly routingChats: Record<string, string>;
   private readonly defaultAgentId: string | undefined;
   private readonly pollIntervalMs: number;
+  private readonly receiptTimeoutMs: number;
+  private readonly receiptStore: ReceiptStore;
   private readonly logger: Pick<Console, "warn" | "info" | "error">;
 
   /** getUpdates offset cursor — bumped past the highest processed update_id. */
@@ -136,6 +146,19 @@ export class TelegramAdapter {
   >();
   /** Agents with a live turn message (placeholder/progress) the next reply edits in place. */
   private readonly turnActive = new Set<string>();
+
+  /** Open per-message receipts (#211) keyed by convKey. Closed on the
+   *  first final reply (`turn_observed`) or by timeout (`timeout`), so an
+   *  unanswered Telegram turn becomes legible in receipts.jsonl instead of
+   *  the opaque silence that motivated #207. */
+  private readonly openReceipts = new Map<
+    string,
+    { receipt: OpenReceipt; timer: ReturnType<typeof setTimeout> }
+  >();
+
+  /** Mirror of webui-bridge's DEFAULT_PROMPT_TIMEOUT_MS — a turn that never
+   *  produces a final reply closes its receipt as `timeout` after this. */
+  private static readonly RECEIPT_TIMEOUT_MS = 5 * 60 * 1000;
   /** request_id → context; callback_query routes back to `ingestPermissionDecision`. */
   private readonly pendingPermissions = new Map<string, { agent_id: string; chat_id: number }>();
   /** chat_id → pending ask. The next plain-text reply resolves it. */
@@ -163,6 +186,8 @@ export class TelegramAdapter {
     this.routingChats = { ...opts.routing.chats };
     this.defaultAgentId = opts.routing.defaultAgentId;
     this.pollIntervalMs = opts.pollIntervalMs ?? 1000;
+    this.receiptTimeoutMs = opts.receiptTimeoutMs ?? TelegramAdapter.RECEIPT_TIMEOUT_MS;
+    this.receiptStore = opts.receiptStore ?? getDefaultReceiptStore();
     this.logger = opts.logger ?? console;
   }
 
@@ -220,6 +245,12 @@ export class TelegramAdapter {
     this.lastBotMessage.clear();
     for (const id of Array.from(this.spinnerState.keys())) this.stopSpinner(id);
     this.turnActive.clear();
+    // Receipt (#211): close any still-open receipts so their watchdog
+    // timers do not leak across a stop->start cycle; the log records the
+    // turn was cut short by adapter shutdown, not a silent hang.
+    for (const key of Array.from(this.openReceipts.keys())) {
+      this.closeTelegramReceipt(key, "timeout", { reason: "adapter_stopped" });
+    }
 
     if (this.loopPromise) {
       try {
@@ -270,14 +301,14 @@ export class TelegramAdapter {
   private async dispatchUpdate(update: TelegramUpdate): Promise<void> {
     const message = update.message ?? update.edited_message;
     if (message) {
-      await this.handleMessage(message);
+      await this.handleMessage(message, update.update_id);
     }
     if (update.callback_query) {
       await this.handleCallbackQuery(update.callback_query);
     }
   }
 
-  private async handleMessage(message: TelegramMessage): Promise<void> {
+  private async handleMessage(message: TelegramMessage, updateId: number): Promise<void> {
     const chatId = message.chat.id;
     const userId = message.from?.id;
 
@@ -343,6 +374,11 @@ export class TelegramAdapter {
     if (text.length === 0 && (!attachments || attachments.length === 0)) {
       return;
     }
+
+    // Receipt (#211): open at the adapter boundary BEFORE delegating to the
+    // bus. hashPrompt runs on the raw `text` (pre-<channel> wrapper) so the
+    // bus -> PTY seam's findByPromptHash still hits the same receipt.
+    this.openTelegramReceipt(agentId, chatId, updateId, text);
 
     await this.bus.sendPrompt({
       agent_id: agentId,
@@ -438,6 +474,15 @@ export class TelegramAdapter {
     const key = this.convKey(agentId, target.chat_id);
     // Every new reply replaces the active animated message — stop any prior spinner.
     this.stopSpinner(key);
+    // Receipt (#211): a non-progress response.text is the turn-final
+    // delivery — close as `turn_observed`. Closed even when cleanedText is
+    // empty (a reaction-only final), since the turn WAS observed; the empty
+    // rawText case already returned above. Idempotent (second final no-op);
+    // progress replies leave it open; unprompted replies (cron/heartbeat)
+    // with no open receipt no-op.
+    if (intent !== "progress") {
+      this.closeTelegramReceipt(key, "turn_observed");
+    }
     if (cleanedText.length === 0) {
       // nothing textual; fall through to reactions.
     } else if (this.turnActive.has(key)) {
@@ -623,6 +668,49 @@ export class TelegramAdapter {
    * chat A's placeholder. Compose with `chat_id` so each conversation tracks
    * its own outbound message.
    */
+  /** Open an inbound receipt for a Telegram turn and arm its timeout. */
+  private openTelegramReceipt(
+    agentId: string,
+    chatId: number,
+    updateId: number,
+    rawText: string,
+  ): void {
+    const key = this.convKey(agentId, chatId);
+    // A new prompt arrived before the previous turn replied — close the
+    // stale receipt as `timeout` (note `superseded`) so it doesn't leak,
+    // distinct from a genuine no-reply timeout.
+    this.closeTelegramReceipt(key, "timeout", { superseded: true });
+    const receipt = openInboundReceipt({
+      store: this.receiptStore,
+      messageId: `tg-${updateId}`,
+      agentId,
+      rawText,
+      origin: "telegram",
+      originId: String(chatId),
+    });
+    const timer = setTimeout(() => {
+      this.closeTelegramReceipt(key, "timeout", {
+        reason: "no_final_reply_within_timeout",
+      });
+    }, this.receiptTimeoutMs);
+    // Never keep the event loop alive solely for this watchdog timer.
+    if (typeof timer.unref === "function") timer.unref();
+    this.openReceipts.set(key, { receipt, timer });
+  }
+
+  /** Close (idempotently) the open receipt for a conversation, if any. */
+  private closeTelegramReceipt(
+    key: string,
+    state: "turn_observed" | "timeout",
+    notes?: Record<string, unknown>,
+  ): void {
+    const entry = this.openReceipts.get(key);
+    if (!entry) return;
+    this.openReceipts.delete(key);
+    clearTimeout(entry.timer);
+    void entry.receipt.close(state, notes);
+  }
+
   private convKey(agentId: string, chatId: number): string {
     return `${agentId}:${chatId}`;
   }

@@ -22,6 +22,15 @@ import type {
   SubscriptionHandler,
 } from "../../../bus/core-subscription";
 import type { BusEvent } from "../../../bus/types";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  createReceiptStore,
+  hashPrompt,
+  type ReceiptRecord,
+  type ReceiptStore,
+} from "../../../bus/receipt";
 import type {
   TelegramApi,
   TelegramGetUpdatesResult,
@@ -236,6 +245,9 @@ const SILENT_LOGGER = {
 let bus: FakeBus;
 let api: FakeTelegramApi;
 let adapter: TelegramAdapter | null = null;
+let receiptStore: ReceiptStore;
+let receiptDir: string;
+let receiptPath: string;
 
 async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -257,6 +269,7 @@ async function startAdapter(
     api,
     logger: SILENT_LOGGER,
     pollIntervalMs: 5,
+    receiptStore,
     ...opts,
   });
   await a.start();
@@ -266,6 +279,12 @@ async function startAdapter(
 beforeEach(() => {
   bus = new FakeBus();
   api = new FakeTelegramApi();
+  // Isolated receipt store per test — keeps every adapter test (these and
+  // the pre-existing ones that exercise handleMessage) off the real
+  // ~/.claude/claudeclaw/receipts.jsonl.
+  receiptDir = mkdtempSync(join(tmpdir(), "cc-rcpt-"));
+  receiptPath = join(receiptDir, "receipts.jsonl");
+  receiptStore = createReceiptStore({ path: receiptPath });
 });
 
 afterEach(async () => {
@@ -273,6 +292,7 @@ afterEach(async () => {
     await adapter.stop();
     adapter = null;
   }
+  rmSync(receiptDir, { recursive: true, force: true });
 });
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -1087,5 +1107,113 @@ describe("TelegramAdapter — poll loop recovers from a timed-out getUpdates", (
     expect(bus.prompts[0]?.text).toBe("after recovery");
     // The timeout surfaced in the logs (observability), it wasn't swallowed.
     expect(errors.some((a) => String(a[0]).includes("getUpdates failed"))).toBe(true);
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* Inbound receipts (#211)                                                  */
+/* ────────────────────────────────────────────────────────────────────── */
+
+describe("TelegramAdapter — inbound receipts (#211)", () => {
+  // Store + cleanup come from the top-level harness (isolated temp store
+  // per test); closedReceipts reads the lines flushed to that store.
+  function closedReceipts(): ReceiptRecord[] {
+    if (!existsSync(receiptPath)) return [];
+    return readFileSync(receiptPath, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as ReceiptRecord);
+  }
+
+  async function feed(text: string, messageId = 50): Promise<number> {
+    const before = bus.prompts.length;
+    api.enqueueUpdates([
+      {
+        message: {
+          message_id: messageId,
+          from: { id: 42 },
+          chat: { id: 100, type: "private" },
+          text,
+        },
+      },
+    ]);
+    await waitFor(() => bus.prompts.length > before);
+    return bus.prompts.length;
+  }
+
+  it("opens a tg-<update_id> receipt at message_polled with the raw prompt_hash", async () => {
+    adapter = await startAdapter();
+    await feed("hello world"); // first update_id === 1 → tg-1, still open (no reply yet)
+    const open = receiptStore.find("tg-1");
+    expect(open).toBeDefined();
+    expect(open?.record.agent_id).toBe("triage");
+    expect(open?.record.prompt_hash).toBe(hashPrompt("hello world"));
+    expect(open?.record.notes).toMatchObject({ origin: "telegram", origin_id: "100" });
+  });
+
+  it("closes the receipt turn_observed on a final reply", async () => {
+    adapter = await startAdapter();
+    await feed("ping");
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "pong", intent: "final" },
+    });
+    await waitFor(() => closedReceipts().some((r) => r.message_id === "tg-1"));
+    expect(closedReceipts().find((r) => r.message_id === "tg-1")?.final_state).toBe(
+      "turn_observed",
+    );
+  });
+
+  it("auto-closes the receipt as timeout when no reply arrives", async () => {
+    adapter = await startAdapter({ receiptTimeoutMs: 15 });
+    await feed("are you there");
+    await waitFor(() =>
+      closedReceipts().some((r) => r.message_id === "tg-1" && r.final_state === "timeout"),
+    );
+    expect(closedReceipts().find((r) => r.message_id === "tg-1")?.notes?.reason).toBe(
+      "no_final_reply_within_timeout",
+    );
+  });
+
+  it("supersedes a still-open receipt when a new prompt arrives first", async () => {
+    adapter = await startAdapter();
+    await feed("first", 50); // tg-1
+    await feed("second", 51); // tg-2 — supersedes tg-1
+    await waitFor(() => closedReceipts().some((r) => r.message_id === "tg-1"));
+    const r = closedReceipts().find((r) => r.message_id === "tg-1");
+    expect(r?.final_state).toBe("timeout");
+    expect(r?.notes?.superseded).toBe(true);
+  });
+
+  it("drains open receipts as timeout(adapter_stopped) on stop()", async () => {
+    adapter = await startAdapter();
+    await feed("lingering");
+    const a = adapter;
+    await a.stop();
+    await waitFor(() => closedReceipts().some((r) => r.message_id === "tg-1"));
+    const r = closedReceipts().find((r) => r.message_id === "tg-1");
+    expect(r?.final_state).toBe("timeout");
+    expect(r?.notes?.reason).toBe("adapter_stopped");
+    // adapter already stopped; null it so afterEach doesn't re-stop.
+    adapter = null;
+  });
+
+  it("closes turn_observed on a reaction-only final (empty cleanedText)", async () => {
+    adapter = await startAdapter();
+    await feed("react please");
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "[react:\u{1F44D}]", intent: "final" },
+    });
+    await waitFor(() => closedReceipts().some((r) => r.message_id === "tg-1"));
+    expect(closedReceipts().find((r) => r.message_id === "tg-1")?.final_state).toBe(
+      "turn_observed",
+    );
   });
 });

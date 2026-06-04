@@ -6,7 +6,8 @@
  * and rolling back to `stale_session` on PTY error — can be unit-tested
  * without booting the full bus runtime.
  */
-import { getDefaultReceiptStore, hashPrompt, type ReceiptStore } from "./receipt";
+import { getDefaultReceiptStore, hashPrompt, type OpenReceipt, type ReceiptStore } from "./receipt";
+import type { BusOrigin } from "./types";
 
 /**
  * Recover the original prompt text from the `<channel source=... chat_id=...
@@ -25,6 +26,39 @@ export function unwrapChannelText(text: string): string {
   // covers `&`, `<`, `>`. Decode in reverse application order so an
   // already-encoded `&amp;` isn't double-unescaped.
   return m[1].replace(/&gt;/g, ">").replace(/&lt;/g, "<").replace(/&amp;/g, "&");
+}
+
+export interface OpenInboundReceiptParams {
+  /** Adapter-side id, e.g. `tg-<update_id>`, `discord-<msg_id>`, `webui:inject:<nonce>`. */
+  messageId: string;
+  agentId: string;
+  /** The RAW prompt text, hashed BEFORE the bus's `<channel ...>` wrapper is
+   *  applied. The bus -> PTY seam unwraps the channel block before hashing
+   *  (see `unwrapChannelText`), so hashing the raw text here keeps
+   *  `findByPromptHash` hitting the same receipt. */
+  rawText: string;
+  origin: BusOrigin;
+  originId: string;
+  store?: ReceiptStore;
+}
+
+/**
+ * Open an inbound receipt at the adapter boundary (the `message_polled`
+ * surface), mirroring the open in `webui-bridge.ts`. Adapters and
+ * `/api/inject` call `bus.sendPrompt` directly, bypassing `streamBusPrompt`,
+ * so without this they never open a receipt and #207's headline symptom
+ * (intermittent Telegram "no reply") stays uninstrumented. The returned
+ * `OpenReceipt` is closed by the caller when it observes the outbound reply
+ * (`turn_observed`) or when its own timeout fires (`timeout`).
+ */
+export function openInboundReceipt(params: OpenInboundReceiptParams): OpenReceipt {
+  const store = params.store ?? getDefaultReceiptStore();
+  return store.open(params.messageId, {
+    selected_route: `agent=${params.agentId}`,
+    agent_id: params.agentId,
+    prompt_hash: hashPrompt(params.rawText),
+    notes: { origin: params.origin, origin_id: params.originId },
+  });
 }
 
 /** Structural view of the bits an `AgentProcess` exposes that we touch.
