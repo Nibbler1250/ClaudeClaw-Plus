@@ -90,6 +90,52 @@ export interface ObservationWindowResult {
   errors_detected: string[];
 }
 
+// ── External (subprocess-backed) subjects ───────────────────────────────────
+//
+// A subject whose logic lives in an out-of-process program speaking the
+// ExternalProcessSubject JSON-RPC protocol. ClaudeClaw stays GENERIC: the code
+// hardcodes no specific external program. Operators declare their own under
+// `wisecron.external_subjects` in their PRIVATE config.yaml (command + cwd +
+// allowedRoots + fitnessSignals). This keeps the upstream-shippable code free of
+// any one operator's tool while still enabling subprocess subjects.
+
+/** Mirrors `Metric` in ../../skills-tuner/core/telemetry.ts. `source` is a
+ *  TelemetryStream name or the literal "artifact" — kept as a free string so
+ *  new streams need no schema bump; the activation gate degrades unknowns. */
+export const MetricConfigSchema = z.object({
+  name: z.string(),
+  source: z.string(),
+  kind: z.enum(["verifiable", "judge", "proxy_state"]).default("verifiable"),
+  direction: z.enum(["lower_is_better", "higher_is_better"]),
+  windowDays: z.number().int().min(0),
+  guardrails: z.array(z.string()).optional(),
+});
+
+export const ExternalSubjectSettingsSchema = z.object({
+  /** Unique subject name (registry key). */
+  name: z.string(),
+  /** Enabled flag (parallels per-subject enabled). */
+  enabled: z.boolean().default(true),
+  /** argv of the subprocess; command[0] is the executable. */
+  command: z.array(z.string()).min(1),
+  /** Working directory for the subprocess. */
+  cwd: z.string().optional(),
+  /** Extra environment variables merged over the parent process env. */
+  env: z.record(z.string(), z.string()).optional(),
+  /** Write-zone allowlist for apply() patches (REQUIRED before any apply). */
+  allowedRoots: z.array(z.string()).optional(),
+  riskTier: z.enum(["low", "medium", "high", "critical"]).optional(),
+  autoMergeDefault: z.boolean().optional(),
+  supportsCreation: z.boolean().optional(),
+  orphanMinObservations: z.number().int().min(0).optional(),
+  timeoutMs: z.number().int().min(1).optional(),
+  /** Opaque config object forwarded verbatim in every RPC envelope. */
+  config: z.record(z.string(), z.unknown()).optional(),
+  /** Static fitness declaration (sync, no RPC) — see ExternalProcessConfig. */
+  fitnessSignals: z.array(MetricConfigSchema).optional(),
+});
+export type ExternalSubjectSettings = z.infer<typeof ExternalSubjectSettingsSchema>;
+
 // ── Wisecron settings (extends TunerConfig.wisecron section) ────────────────
 
 export const WisecronSettingsSchema = z.object({
@@ -130,5 +176,11 @@ export const WisecronSettingsSchema = z.object({
       require_confirm_on_rollback: z.boolean().default(true),
     })
     .default({}),
+  /**
+   * Subprocess-backed subjects (ExternalProcessSubject). Empty by default, so
+   * the generic upstream build registers none. Operators add their own in their
+   * private config.yaml. See ExternalSubjectSettingsSchema.
+   */
+  external_subjects: z.array(ExternalSubjectSettingsSchema).default([]),
 });
 export type WisecronSettings = z.infer<typeof WisecronSettingsSchema>;
