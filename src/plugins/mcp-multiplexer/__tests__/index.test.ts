@@ -7,6 +7,10 @@ import { McpMultiplexerPlugin, _resetMcpMultiplexer, type MuxSettingsView } from
 import { _resetHttpGateway, getHttpGateway } from "../../http-gateway.js";
 import { _resetMcpBridge, getMcpBridge } from "../../mcp-bridge.js";
 import { _resetIdentityStore } from "../pty-identity.js";
+import {
+  __setToolCallSinkForTest,
+  ToolCallSink,
+} from "../../../observability/tool-call-sink.js";
 
 const MOCK_SERVER = fileURLToPath(
   new URL("../../../__tests__/fixtures/mock-mcp-server.ts", import.meta.url),
@@ -52,6 +56,11 @@ function makeSettingsView(partial: Partial<MuxSettingsView>): () => MuxSettingsV
     sessionPersistencePath: "",
     // Issue #68 — default OFF in tests; opt-in tests set true explicitly.
     metricsEnabled: false,
+    // Phase A observability — default OFF in tests; opt-in tests set true.
+    observabilityEnabled: false,
+    // Mandatory audit — default best-effort (backward-compatible); enforce
+    // tests set it explicitly.
+    auditPolicy: "best-effort",
     // Issue #69 — default OFF in tests; opt-in tests provide cacheable map.
     cache: {
       enabled: false,
@@ -134,6 +143,51 @@ describe("McpMultiplexerPlugin — activation", () => {
     });
     await plugin.start();
     expect(plugin.isActive()).toBe(false);
+    await plugin.stop();
+  });
+});
+
+// ── Mandatory-audit policy reflection ─────────────────────────────────────────
+
+describe("McpMultiplexerPlugin — audit policy reflection", () => {
+  afterEach(() => {
+    __setToolCallSinkForTest(null);
+  });
+
+  it("reflects auditPolicy 'enforce' onto the tool-call sink at start()", async () => {
+    const sink = new ToolCallSink({ path: join(tmpDir, "tc.jsonl"), autoFlush: false });
+    __setToolCallSinkForTest(sink);
+    const cfgPath = writeProxyConfig(tmpDir, ["alpha"]);
+    const plugin = new McpMultiplexerPlugin({
+      configPath: cfgPath,
+      settingsView: makeSettingsView({
+        webEnabled: true,
+        shared: ["alpha"],
+        observabilityEnabled: true,
+        auditPolicy: "enforce",
+      }),
+    });
+    await plugin.start();
+    expect(sink.getPolicy()).toBe("enforce");
+    await plugin.stop();
+  });
+
+  it("defaults the sink to best-effort when auditPolicy is best-effort", async () => {
+    const sink = new ToolCallSink({ path: join(tmpDir, "tc.jsonl"), autoFlush: false });
+    sink.setPolicy("enforce"); // ensure start() actively resets it, not just leaves it
+    __setToolCallSinkForTest(sink);
+    const cfgPath = writeProxyConfig(tmpDir, ["alpha"]);
+    const plugin = new McpMultiplexerPlugin({
+      configPath: cfgPath,
+      settingsView: makeSettingsView({
+        webEnabled: true,
+        shared: ["alpha"],
+        observabilityEnabled: true,
+        auditPolicy: "best-effort",
+      }),
+    });
+    await plugin.start();
+    expect(sink.getPolicy()).toBe("best-effort");
     await plugin.stop();
   });
 });

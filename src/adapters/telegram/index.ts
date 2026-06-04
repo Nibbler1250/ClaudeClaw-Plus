@@ -6,6 +6,10 @@
  * upload pipeline (file_ids only); Markdown polish (plain text only).
  */
 
+import { execFile } from "node:child_process";
+import { mkdir } from "node:fs/promises";
+import { join } from "node:path";
+
 import type { BusCore, Subscription } from "../../bus/core";
 import { openInboundReceipt } from "../../bus/receipt-wiring";
 import { getDefaultReceiptStore, type OpenReceipt, type ReceiptStore } from "../../bus/receipt";
@@ -52,7 +56,24 @@ export interface TelegramAdapterOptions {
   api?: TelegramApi;
   /** Optional structured logger; defaults to `console`. */
   logger?: Pick<Console, "warn" | "info" | "error">;
+  /**
+   * Resolves a `pending:<id>:<value>` approval-button decision. Defaults to
+   * the `pending.py` python runner (via `CLAUDECLAW_PENDING_LIB_PATH`). Tests
+   * inject a fake so the path can be exercised without spawning python.
+   */
+  pendingResolver?: PendingResolver;
 }
+
+/**
+ * Outcome of resolving a pending-action decision.
+ *   `ok`        — `resolve_pending` returned truthy (decision applied)
+ *   `not_found` — action id unknown or already resolved
+ *   `no_lib`    — `CLAUDECLAW_PENDING_LIB_PATH` not set (handler unconfigured)
+ *   `error`     — the runner threw / timed out
+ */
+type PendingResolution = "ok" | "not_found" | "no_lib" | "error";
+
+type PendingResolver = (actionId: string, decision: string) => Promise<PendingResolution>;
 
 /**
  * Per-agent target context. `[react:<emoji>]` UX needs the originating
@@ -96,6 +117,7 @@ function eventBelongsToTelegram(event: BusEvent): boolean {
 export class TelegramAdapter {
   private readonly bus: BusCore;
   private readonly api: TelegramApi;
+  private readonly token: string;
   private readonly allowedUserIds: ReadonlySet<number>;
   private readonly routingChats: Record<string, string>;
   private readonly defaultAgentId: string | undefined;
@@ -103,6 +125,8 @@ export class TelegramAdapter {
   private readonly receiptTimeoutMs: number;
   private readonly receiptStore: ReceiptStore;
   private readonly logger: Pick<Console, "warn" | "info" | "error">;
+  /** Resolves `pending:<id>:<value>` approval buttons (python runner by default). */
+  private readonly pendingResolver: PendingResolver;
 
   /** getUpdates offset cursor — bumped past the highest processed update_id. */
   private nextOffset = 0;
@@ -182,6 +206,7 @@ export class TelegramAdapter {
 
     this.bus = opts.bus;
     this.api = opts.api ?? createTelegramApi(opts.token);
+    this.token = opts.token;
     this.allowedUserIds = new Set(opts.allowedUserIds);
     this.routingChats = { ...opts.routing.chats };
     this.defaultAgentId = opts.routing.defaultAgentId;
@@ -189,6 +214,8 @@ export class TelegramAdapter {
     this.receiptTimeoutMs = opts.receiptTimeoutMs ?? TelegramAdapter.RECEIPT_TIMEOUT_MS;
     this.receiptStore = opts.receiptStore ?? getDefaultReceiptStore();
     this.logger = opts.logger ?? console;
+    this.pendingResolver =
+      opts.pendingResolver ?? ((id, dec) => this.resolvePendingViaPython(id, dec));
   }
 
   async start(): Promise<void> {
@@ -379,13 +406,30 @@ export class TelegramAdapter {
     // bus. hashPrompt runs on the raw `text` (pre-<channel> wrapper) so the
     // bus -> PTY seam's findByPromptHash still hits the same receipt.
     this.openTelegramReceipt(agentId, chatId, updateId, text);
+    // Inbound images: Telegram only hands us a `file_id`, which the agent
+    // cannot resolve on its own. Download attached photos / image documents
+    // to a local inbox and inject their paths into the prompt so claude can
+    // Read (see) them. Best-effort — a download failure must never stop the
+    // text message from going through.
+    let promptText = text;
+    try {
+      const imagePaths = await this.downloadInboundImages(message, chatId);
+      if (imagePaths.length > 0) {
+        const refs = imagePaths
+          .map((p) => `[The user attached an image — open it with the Read tool to see it: ${p}]`)
+          .join("\n");
+        promptText = promptText.length > 0 ? `${promptText}\n\n${refs}` : refs;
+      }
+    } catch (err) {
+      this.logger.error("[telegram-adapter] inbound image download failed", err);
+    }
 
     await this.bus.sendPrompt({
       agent_id: agentId,
       origin: "telegram",
       origin_id: String(chatId),
       user_id: String(userId),
-      text,
+      text: promptText,
       metadata,
     });
 
@@ -425,6 +469,65 @@ export class TelegramAdapter {
     } catch (err) {
       this.logger.error(`[telegram-adapter] placeholder sendMessage failed`, err);
     }
+  }
+
+  /**
+   * Download inbound photos / image documents to a local inbox and return
+   * their absolute paths. Telegram hands us only `file_id`s; the agent has no
+   * Telegram access, so we resolve + fetch the bytes here. Best-effort:
+   * per-file failures are logged and skipped.
+   */
+  private async downloadInboundImages(
+    message: TelegramMessage,
+    chatId: number,
+  ): Promise<string[]> {
+    const fileIds: string[] = [];
+    if (message.photo && message.photo.length > 0) {
+      const largest = [...message.photo].sort((a, b) => {
+        const sa = a.file_size ?? a.width * a.height;
+        const sb = b.file_size ?? b.width * b.height;
+        return sb - sa;
+      })[0];
+      if (largest) fileIds.push(largest.file_id);
+    }
+    if (message.document && (message.document.mime_type ?? "").startsWith("image/")) {
+      fileIds.push(message.document.file_id);
+    }
+    if (fileIds.length === 0) return [];
+
+    const dir = join(process.cwd(), ".claude", "claudeclaw", "inbox", "telegram");
+    await mkdir(dir, { recursive: true });
+
+    const out: string[] = [];
+    for (const fileId of fileIds) {
+      try {
+        const metaRes = await fetch(`https://api.telegram.org/bot${this.token}/getFile`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ file_id: fileId }),
+        });
+        const meta = (await metaRes.json()) as {
+          ok?: boolean;
+          result?: { file_path?: string };
+        };
+        const remotePath = meta?.result?.file_path;
+        if (!meta.ok || !remotePath) continue;
+        const dl = await fetch(`https://api.telegram.org/file/bot${this.token}/${remotePath}`);
+        if (!dl.ok) continue;
+        const bytes = new Uint8Array(await dl.arrayBuffer());
+        if (bytes.byteLength > 25 * 1024 * 1024) continue; // 25MB cap
+        const ext = (remotePath.match(/\.[a-zA-Z0-9]+$/)?.[0] ?? ".jpg").toLowerCase();
+        const localPath = join(
+          dir,
+          `${chatId}-${message.message_id}-${fileId.slice(-8)}${ext}`,
+        );
+        await Bun.write(localPath, bytes);
+        out.push(localPath);
+      } catch (err) {
+        this.logger.error(`[telegram-adapter] failed to download file_id=${fileId}`, err);
+      }
+    }
+    return out;
   }
 
   /** Subscribe to the §5.5.2 topics for `agentId` (response, edit, perm, ask). */
@@ -782,8 +885,13 @@ export class TelegramAdapter {
   }
 
   /**
-   * Handle `perm:<allow|deny>:<id>` (the only pattern this adapter emits).
-   * Legacy file's `btn:`, `pending:`, `sec_yes_` patterns are out of scope.
+   * Handle inline-keyboard callbacks. Two shapes are routed here:
+   *   - `perm:<allow|deny>:<id>` — bus permission prompts (this adapter emits these).
+   *   - `pending:<id>:<value>`   — pending-action approval buttons (proposals,
+   *     email triage, domotique) created by `pending.py`. The legacy PTY
+   *     listener (`src/commands/telegram.ts`) owned this route; under the bus
+   *     runtime it was dropped, so every approval button silently no-op'd.
+   * The legacy `btn:` / `sec_yes_` patterns remain out of scope.
    */
   private async handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> {
     const data = query.data ?? "";
@@ -797,6 +905,43 @@ export class TelegramAdapter {
         callback_query_id: query.id,
         text: "Unauthorized.",
       });
+      return;
+    }
+
+    // Wedge dossier actions (`wedge:<analyze|send>:<id>`) — operator taps from
+    // a watchdog alert. The helper sanitizes, runs an Opus 4.8 analysis, and
+    // (on confirm) posts to anthropics/claude-code#64496. It can take 30s+, so
+    // fire-and-forget and ack immediately; nothing is sent without the operator
+    // tapping confirm.
+    const wedgeMatch = data.match(/^wedge:(analyze|send):([A-Za-z0-9._-]+)$/);
+    if (wedgeMatch) {
+      const wedgeScript =
+        process.env.CLAUDECLAW_WEDGE_ACTION ?? `${process.env.HOME}/agent/scripts/wedge-action.sh`;
+      try {
+        Bun.spawn([wedgeScript, wedgeMatch[1] as string, wedgeMatch[2] as string], {
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+      } catch (err) {
+        this.logger.error("[telegram-adapter] wedge action spawn failed", err);
+      }
+      await this.safeAnswerCallback({
+        callback_query_id: query.id,
+        text:
+          wedgeMatch[1] === "analyze"
+            ? "\u{1F52C} Analyse Opus 4.8\u2026"
+            : "\u{1F4E4} Envoi\u2026",
+      });
+      return;
+    }
+
+    // Pending-action buttons (`pending:<id>:<value>`). Ported from the legacy
+    // listener — resolve via pending.py, ack, and reflect the decision on the
+    // message. Handled before the perm: path so it never falls into the drop.
+    const pendingMatch = data.match(/^pending:(\d+):(.+)$/);
+    if (pendingMatch) {
+      await this.handlePendingCallback(query, pendingMatch[1] as string, pendingMatch[2] as string);
       return;
     }
 
@@ -832,6 +977,93 @@ export class TelegramAdapter {
     await this.safeAnswerCallback({
       callback_query_id: query.id,
       text: behavior === "allow" ? "✅ Allowed" : "❌ Denied",
+    });
+  }
+
+  /**
+   * Resolve a `pending:<id>:<value>` button: run the resolver, ack the spinner
+   * with a human label, and (on a real outcome) edit the message to record the
+   * decision and strip the keyboard. Mirrors `src/commands/telegram.ts` ~1934.
+   */
+  private async handlePendingCallback(
+    query: TelegramCallbackQuery,
+    actionId: string,
+    decision: string,
+  ): Promise<void> {
+    const resolution = await this.pendingResolver(actionId, decision);
+
+    let ackText: string;
+    switch (resolution) {
+      case "ok": {
+        const dec = decision.toLowerCase();
+        if (dec === "skip") ackText = "⏸ Plus tard";
+        else if (dec === "reject" || dec === "cancel") ackText = "❌ Rejeté";
+        else ackText = "✅ Approuvé";
+        break;
+      }
+      case "not_found":
+        ackText = "⚠️ Action introuvable ou déjà traitée";
+        break;
+      case "no_lib":
+        ackText = "⚠️ Handler non configuré";
+        break;
+      default:
+        ackText = "⚠️ Erreur";
+    }
+
+    // Reflect the decision on the original message + drop the keyboard, but only
+    // once we actually reached the resolver (ok / not_found) — matches legacy.
+    if ((resolution === "ok" || resolution === "not_found") && query.message) {
+      const msg = query.message;
+      const originalText = msg.text ?? "";
+      await this.safe("editMessageText", () =>
+        this.api.editMessageText({
+          chat_id: msg.chat.id,
+          message_id: msg.message_id,
+          text: `${originalText}\n\n› ${ackText}`,
+          reply_markup: { inline_keyboard: [] },
+        }),
+      );
+    }
+
+    await this.safeAnswerCallback({ callback_query_id: query.id, text: ackText });
+  }
+
+  /**
+   * Default pending resolver — shells out to `pending.py:resolve_pending`.
+   * `CLAUDECLAW_PENDING_LIB_PATH` (set in the service env) points at the
+   * directory holding `pending.py`. Returns a `PendingResolution` discriminant
+   * rather than throwing, so the caller renders a stable ack in every case.
+   */
+  private resolvePendingViaPython(actionId: string, decision: string): Promise<PendingResolution> {
+    const pendingLibPath = process.env.CLAUDECLAW_PENDING_LIB_PATH;
+    if (!pendingLibPath) {
+      this.logger.warn(
+        "[telegram-adapter] CLAUDECLAW_PENDING_LIB_PATH not set; cannot resolve pending action. " +
+          "Set it to the directory containing pending.py.",
+      );
+      return Promise.resolve("no_lib");
+    }
+    return new Promise<PendingResolution>((resolve) => {
+      execFile(
+        "python3",
+        [
+          "-c",
+          "import sys; sys.path.insert(0, sys.argv[1]); from pending import resolve_pending; ok = resolve_pending(int(sys.argv[2]), sys.argv[3]); print('ok' if ok else 'not_found')",
+          pendingLibPath,
+          actionId,
+          decision,
+        ],
+        { timeout: 5000 },
+        (err: Error | null, stdout: string) => {
+          if (err) {
+            this.logger.error("[telegram-adapter] resolve_pending failed", err);
+            resolve("error");
+            return;
+          }
+          resolve(stdout.trim() === "ok" ? "ok" : "not_found");
+        },
+      );
     });
   }
 

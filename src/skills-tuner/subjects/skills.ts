@@ -87,6 +87,15 @@ export interface SkillsSubjectConfig {
   positivePatterns?: RegExp[];
   // Skills-tuner-specific metadata for Anthropic-format skills (no frontmatter pollution)
   overrides?: Record<string, SkillOverride>;
+  /**
+   * Agent-scope bound: when set, session scanning is restricted to
+   * `~/.claude/projects/<dir>` whose name starts with one of these prefixes
+   * (the agent's encoded project dirs). Omit (= all scope) to scan every
+   * project's sessions. See core/scope.ts `AgentSurface.sessionProjectDirs`.
+   */
+  sessionProjectDirs?: string[];
+  /** Session-transcript root. Defaults to `~/.claude/projects`. Injectable for tests. */
+  projectsDir?: string;
 }
 
 function combineRegex(patterns: RegExp[]): RegExp {
@@ -115,6 +124,8 @@ export class SkillsSubject extends BaseSubject {
   private readonly posRe: RegExp;
   private readonly emotRe: RegExp;
   private readonly overrides: Record<string, SkillOverride>;
+  private readonly sessionProjectDirs?: string[];
+  private readonly projectsDir: string;
   private skillsCache: Map<string, SkillEntry> | null = null;
 
   constructor(opts: SkillsSubjectConfig = {}) {
@@ -125,6 +136,11 @@ export class SkillsSubject extends BaseSubject {
     this.posRe = combineRegex(opts.positivePatterns ?? DEFAULT_POSITIVE_PATTERNS);
     this.emotRe = combineRegex(opts.emotionalPatterns ?? DEFAULT_EMOTIONAL_PATTERNS);
     this.overrides = opts.overrides ?? {};
+    this.sessionProjectDirs =
+      opts.sessionProjectDirs && opts.sessionProjectDirs.length > 0
+        ? opts.sessionProjectDirs
+        : undefined;
+    this.projectsDir = opts.projectsDir ?? join(homedir(), ".claude", "projects");
   }
 
   async collectObservations(since: Date): Promise<Observation[]> {
@@ -414,13 +430,18 @@ export class SkillsSubject extends BaseSubject {
   private async findSessionFiles(since: Date): Promise<string[]> {
     const files: string[] = [];
 
-    const home = homedir();
-    const projectsDir = join(home, ".claude", "projects");
+    const projectsDir = this.projectsDir;
     if (existsSync(projectsDir)) {
       try {
         const projects = await readdir(projectsDir, { withFileTypes: true });
         for (const project of projects) {
           if (!project.isDirectory()) continue;
+          // Agent scope: only the agent's own project dirs are scanned.
+          if (
+            this.sessionProjectDirs &&
+            !this.sessionProjectDirs.some((p) => project.name.startsWith(p))
+          )
+            continue;
           const projectPath = join(projectsDir, project.name);
           const direct = await readdir(projectPath).catch(() => [] as string[]);
           for (const f of direct) {
