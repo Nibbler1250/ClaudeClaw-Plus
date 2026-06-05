@@ -24,7 +24,7 @@ import {
 } from "../receipt";
 import { streamBusPrompt } from "../webui-bridge";
 import { createSession, peekSession, incrementMessageCount } from "../../sessions";
-import { reloadSettings } from "../../config";
+import { reloadSettings, _setSettingsFileForTests } from "../../config";
 
 // Redirect the process-wide default receipt store to a throwaway path for the
 // duration of this file so the existing 11 streamBusPrompt tests (which
@@ -357,7 +357,8 @@ describe("streamBusPrompt — per-agent bookkeeping (#213, split per #218)", () 
   // getAgentsDir() resolves from the live process.cwd(), so chdir'ing into a
   // temp dir isolates each test's agent session files (removed with the temp
   // dir). config's SETTINGS_FILE is frozen at import-time cwd, so the
-  // rotation-gate test writes there explicitly and cleans up.
+  // rotation-gate test redirects it into the temp dir via
+  // _setSettingsFileForTests() instead of touching the real settings.json.
   let frozenCwd: string;
   let tmp: string;
 
@@ -378,6 +379,9 @@ describe("streamBusPrompt — per-agent bookkeeping (#213, split per #218)", () 
   });
 
   afterEach(() => {
+    // Restore the default settings path and clear the cache so neither the
+    // override nor cached settings leak into later tests in this file.
+    _setSettingsFileForTests();
     process.chdir(frozenCwd);
     rmSync(tmp, { recursive: true, force: true });
   });
@@ -390,19 +394,22 @@ describe("streamBusPrompt — per-agent bookkeeping (#213, split per #218)", () 
   });
 
   it("WARNs and defers to #227 when the agent crosses the threshold — without rotating", async () => {
-    const settingsFile = join(frozenCwd, ".claude", "claudeclaw", "settings.json");
-    mkdirSync(join(frozenCwd, ".claude", "claudeclaw"), { recursive: true });
+    // Point config at a settings file inside this test's temp dir (removed in
+    // afterEach) so we never read or write the developer's real settings.json.
+    const settingsFile = join(tmp, ".claude", "claudeclaw", "settings.json");
+    mkdirSync(join(tmp, ".claude", "claudeclaw"), { recursive: true });
     writeFileSync(settingsFile, JSON.stringify({ session: { autoRotate: true, maxMessages: 2 } }));
+    _setSettingsFileForTests(settingsFile);
+
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
     try {
       await reloadSettings();
       await createSession("22222222-2222-2222-2222-222222222222", "beta");
       await incrementMessageCount("beta"); // 0 -> 1; the next turn trips the gate
-      const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
 
       await driveOneTurn("beta"); // 1 -> 2, needsRotation(2 >= 2) === true
 
       const warned = warnSpy.mock.calls.some((c) => String(c[0]).includes("deferred to #227"));
-      warnSpy.mockRestore();
       expect(warned).toBe(true);
 
       // The rotation MECHANISM is not wired: the session is counted, not reset.
@@ -410,7 +417,7 @@ describe("streamBusPrompt — per-agent bookkeeping (#213, split per #218)", () 
       expect(after?.messageCount).toBe(2);
       expect(after?.sessionId).toBe("22222222-2222-2222-2222-222222222222");
     } finally {
-      rmSync(settingsFile, { force: true });
+      warnSpy.mockRestore();
     }
   });
 
