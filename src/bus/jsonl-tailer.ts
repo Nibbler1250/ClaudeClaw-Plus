@@ -437,7 +437,21 @@ export class JsonlTailer {
     for (const block of blocks) {
       switch (block.type) {
         case "text":
-          this.publish("response.text", { text: (block as { text?: string }).text ?? "" }, line);
+          // Regression fix 2026-06-06: assistant text blocks are mirrored on the
+          // OBSERVABILITY topic `response.assistant_text`, NOT `response.text`. The
+          // chat adapters (telegram/slack/discord) and the webui /api/chat stream
+          // subscribe to `response.text` as a DELIVERY topic; once the tailer was
+          // wired into prod (attachBus / 801c9d6), mirroring text blocks onto
+          // `response.text` double-delivered alongside the `reply` tool (and leaked
+          // the trailing reasoning text as a bogus "message sent" confirmation).
+          // The dashboard WS subscribes to ALL topics, so it still sees this raw
+          // stream. Delivery stays owned by the `reply` tool (core.ingestReply) and,
+          // for silent-drop turns, by the `response.turn_end` synthesize net below.
+          this.publish(
+            "response.assistant_text",
+            { text: (block as { text?: string }).text ?? "" },
+            line,
+          );
           break;
         case "tool_use":
           this.publish(
