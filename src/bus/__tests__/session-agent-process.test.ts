@@ -79,4 +79,58 @@ describe("PtyAgentProcess.send_prompt_stream", () => {
     await new Promise((r) => setTimeout(r, 60));
     expect(writes).toEqual([]);
   });
+
+  it("answers the dev-channels dialog with Enter, retrying after the plain-text banner (the prompt isn't interactive yet)", async () => {
+    const writes: string[] = [];
+    let dataCb: ((d: string) => void) | null = null;
+    const handle: PtyHandle = {
+      pid: 1234,
+      onData: (cb) => {
+        dataCb = cb;
+        return { dispose() {} };
+      },
+      onExit: () => ({ dispose() {} }),
+      write: (data: string) => {
+        writes.push(data);
+      },
+      kill: () => {},
+    };
+    new PtyAgentProcess("alpha", handle);
+
+    // The "WARNING: Loading development channels" banner renders BEFORE the
+    // interactive selection prompt is ready. A single immediate Enter is lost
+    // (it landed on the banner) — the watcher must retry so one Enter lands once
+    // the dialog accepts keys.
+    dataCb?.("WARNING: Loading development channels\n");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(writes.filter((w) => w === "\r").length).toBeGreaterThanOrEqual(1); // first attempt
+    await new Promise((r) => setTimeout(r, 800));
+    expect(writes.filter((w) => w === "\r").length).toBeGreaterThanOrEqual(2); // retried later
+  });
+
+  it("stops retrying the dev-channels Enter once the REPL footer disengages the watcher", async () => {
+    const writes: string[] = [];
+    let dataCb: ((d: string) => void) | null = null;
+    const handle: PtyHandle = {
+      pid: 1234,
+      onData: (cb) => {
+        dataCb = cb;
+        return { dispose() {} };
+      },
+      onExit: () => ({ dispose() {} }),
+      write: (data: string) => {
+        writes.push(data);
+      },
+      kill: () => {},
+    };
+    new PtyAgentProcess("alpha", handle);
+
+    dataCb?.("WARNING: Loading development channels\n");
+    // REPL becomes ready before the scheduled retries fire → watcher disengages;
+    // queued retries must be gated off so no stray Enter injects into the live REPL.
+    dataCb?.("⏵⏵ bypass permissions on (shift+tab to cycle)");
+    const before = writes.filter((w) => w === "\r").length;
+    await new Promise((r) => setTimeout(r, 800));
+    expect(writes.filter((w) => w === "\r").length).toBe(before);
+  });
 });

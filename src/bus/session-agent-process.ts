@@ -218,10 +218,28 @@ export class PtyAgentProcess implements AgentProcess {
     }
     if (!this.answeredDevChannelsPrompt && buf.includes("development channels")) {
       this.answeredDevChannelsPrompt = true;
-      try {
-        this.pty.write("\r");
-      } catch {
-        /* pty may have exited — non-fatal */
+      // The plain-text "WARNING: Loading development channels" banner prints
+      // BEFORE the interactive selection prompt ("❯ 1. I am using this for
+      // local development / Enter to confirm") is ready to accept keys. On
+      // claude 2.1.167 (and under load — many restarts + parallel CLIs slow the
+      // render) a single immediate Enter landed on the banner, was lost, and the
+      // agent hung at the dialog forever: prompts typed into the PTY were never
+      // consumed (deaf agent — confirmed live via strace: read(fd0)=0, no turn).
+      // Match on the reliable plain-text banner (the option text is TUI-rendered
+      // with interleaved escapes, so it isn't a dependable substring), but RETRY
+      // Enter on a short schedule so one lands once the dialog is interactive.
+      // Any extra Enter after the dialog is dismissed is an empty REPL submit (a
+      // no-op); the `bootDialogActive` gate stops retries once the REPL footer
+      // disengages the watcher, so they can never inject into a live turn.
+      for (const delay of [0, 250, 700, 1400]) {
+        setTimeout(() => {
+          if (!this.bootDialogActive) return;
+          try {
+            this.pty.write("\r");
+          } catch {
+            /* pty may have exited — non-fatal */
+          }
+        }, delay);
       }
       return;
     }
