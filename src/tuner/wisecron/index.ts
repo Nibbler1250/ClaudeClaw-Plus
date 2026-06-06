@@ -39,6 +39,7 @@ import {
   makeMcpToolCallReader,
   makeModeDispatchReader,
   hookExecReader,
+  makeCronLogRunner,
 } from "./observation-readers.js";
 
 export interface WisecronContext {
@@ -103,7 +104,17 @@ export function registerWisecronSubjects(
     warnIfMissingHealthProbe(subject);
   };
 
-  if (enabled("cron")) registerWithProbeCheck(new CronSubject({ llm: opts.llm, ...cfg("cron") }));
+  if (enabled("cron"))
+    registerWithProbeCheck(
+      new CronSubject({
+        llm: opts.llm,
+        ...cfg("cron"),
+        // The scheduled jobs are crontab entries logging to ~/agent/logs/*.log,
+        // not `wisecron-*.service` units — the default journalctl runner errors
+        // with "No data available" → obs=0. Read the real source (the log files).
+        journalRunner: makeCronLogRunner({ logDir: cfg("cron").log_dir as string | undefined }),
+      }),
+    );
   if (enabled("claude_md"))
     registerWithProbeCheck(new ClaudeMdSubject({ llm: opts.llm, ...cfg("claude_md") }));
   if (enabled("hook"))

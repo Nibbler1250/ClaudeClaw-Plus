@@ -16,7 +16,7 @@
  * Wired in `registerWisecronSubjects`; each subject keeps its injectable seam,
  * so tests can still override with fixtures.
  */
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_TOOL_CALL_LOG } from "../../observability/tool-call-sink.js";
@@ -179,4 +179,111 @@ export function hookExecReader(dir: string, since: Date): HookLogEntryShape[] {
     }
   }
   return out;
+}
+
+/**
+ * `CronSubject.journalRunner` adapter over the crontab **log files**.
+ *
+ * The scheduled tuner/wisecron jobs are POSIX crontab entries that redirect
+ * stdout/stderr to `~/agent/logs/*.log` — they are NOT systemd units, so the
+ * subject's default `journalctl --user -u 'wisecron-*.service'` runner errors
+ * with "No data available" and collectObservations reads 0 entries (producer
+ * not found). This reader points the same seam at the real source.
+ *
+ * Each log file maps to one cron "unit" (`<basename>` without `.log`). Lines
+ * are classified by deterministic markers into per-run terminal entries, then
+ * re-serialised as journalctl JSON lines so the subject's existing
+ * `parseJournalJsonLines` + `aggregateHealth` path is reused unchanged:
+ *   - failure marker  → `EXIT_STATUS:"1"` (hard run failure)
+ *   - success marker  → `EXIT_STATUS:"0"` (clean run completion)
+ * `__REALTIME_TIMESTAMP` is the file's mtime (the logs carry no per-line
+ * timestamps); a file whose mtime predates `since` is skipped wholesale.
+ *
+ * Marker sets are intentionally narrow to avoid the tuner's own diagnostic
+ * vocabulary (`*_failure_rate` metric names, the `journalctl runner failed`
+ * self-report) registering as job failures.
+ */
+const CRON_FAILURE_MARKER =
+  /error: Module not found|Traceback \(most recent call last\)|\bexited [1-9]\d*\b|❌|command not found|No such file or directory/;
+const CRON_SUCCESS_MARKER = /^Proposed: \d+|✅|No matured outcomes|wisecron cron-run: \d+ proposal/;
+// Tuner self-diagnostic lines that contain failure-adjacent words but are NOT
+// job failures — excluded so the cron subject never flags itself.
+const CRON_FALSE_POSITIVE = /_rate'|runner failed|fitness: active metric|health: producer_found/;
+
+export interface CronLogRunnerOpts {
+  /** Directory holding the crontab logs. Default `~/agent/logs`. */
+  logDir?: string;
+  /**
+   * Selects which files in `logDir` are cron units. Default: `tuner-skills.log`
+   * plus every `wisecron-*.log`.
+   */
+  fileFilter?: (name: string) => boolean;
+}
+
+const defaultCronLogFilter = (name: string): boolean =>
+  name === "tuner-skills.log" || (name.startsWith("wisecron-") && name.endsWith(".log"));
+
+export function makeCronLogRunner(
+  opts: CronLogRunnerOpts = {},
+): (args: string[]) => Promise<string> {
+  const logDir = expandHome(opts.logDir ?? "~/agent/logs");
+  const fileFilter = opts.fileFilter ?? defaultCronLogFilter;
+  return async (args: string[]) => {
+    // The subject embeds the window as `--since <ISO>` in the journalctl args.
+    let since: Date | null = null;
+    const i = args.indexOf("--since");
+    if (i >= 0 && args[i + 1]) {
+      const d = new Date(args[i + 1] as string);
+      if (!Number.isNaN(d.getTime())) since = d;
+    }
+
+    if (!existsSync(logDir)) return "";
+    let files: string[];
+    try {
+      files = readdirSync(logDir).filter(fileFilter);
+    } catch {
+      return "";
+    }
+
+    const lines: string[] = [];
+    for (const f of files) {
+      const path = join(logDir, f);
+      let mtimeMs: number;
+      try {
+        mtimeMs = statSync(path).mtimeMs;
+      } catch {
+        continue;
+      }
+      // The whole file shares the mtime timestamp; skip it if the last write
+      // predates the window (the job has not run inside `since`).
+      if (since && mtimeMs < since.getTime()) continue;
+
+      let content: string;
+      try {
+        content = readFileSync(path, "utf8");
+      } catch {
+        continue;
+      }
+
+      const unit = f.replace(/\.log$/, "");
+      const tsUsec = String(Math.floor(mtimeMs * 1000));
+      for (const raw of content.split("\n")) {
+        const line = raw.trim();
+        if (!line || CRON_FALSE_POSITIVE.test(line)) continue;
+        let exitStatus: string | null = null;
+        if (CRON_FAILURE_MARKER.test(line)) exitStatus = "1";
+        else if (CRON_SUCCESS_MARKER.test(line)) exitStatus = "0";
+        if (exitStatus === null) continue;
+        lines.push(
+          JSON.stringify({
+            _SYSTEMD_USER_UNIT: unit,
+            __REALTIME_TIMESTAMP: tsUsec,
+            EXIT_STATUS: exitStatus,
+            MESSAGE: line.slice(0, 200),
+          }),
+        );
+      }
+    }
+    return lines.join("\n");
+  };
 }
