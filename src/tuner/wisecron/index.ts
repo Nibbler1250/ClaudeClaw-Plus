@@ -36,10 +36,10 @@ import { PromptTemplateSubject } from "../subjects/prompt-template-subject.js";
 import { MemorySubject } from "../subjects/memory-subject.js";
 import { AgentSubject } from "../subjects/agent-subject.js";
 import {
-  makeMcpToolCallReader,
   makeModeDispatchReader,
   hookExecReader,
   makeCronLogRunner,
+  makeSessionToolCallReader,
 } from "./observation-readers.js";
 
 export interface WisecronContext {
@@ -132,9 +132,10 @@ export function registerWisecronSubjects(
       new McpPluginSubject({
         llm: opts.llm,
         ...cfg("mcp_plugin"),
-        // Read observations from the dedicated mcp.tool_call log (the legacy
-        // default — operations.jsonl — never carries these events → obs=0).
-        auditReader: makeMcpToolCallReader(cfg("mcp_plugin").observation_log as string | undefined),
+        // EXPERIMENT (Task 3): read from the live SESSION TRANSCRIPTS, not the
+        // dedicated mcp-tool-calls.jsonl sink (stale since 2026-05-28 → obs=0).
+        // Reverts to makeMcpToolCallReader(...) if this proves no better.
+        auditReader: makeSessionToolCallReader(),
       }),
     );
   if (enabled("model_routing"))

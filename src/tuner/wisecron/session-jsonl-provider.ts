@@ -293,6 +293,20 @@ export class SessionJsonlTelemetryProducer implements TelemetryProvider {
     range: DateRange,
     filters?: Record<string, string>,
   ): Promise<MetricSample[]> {
+    return this.collectSamples(stream, range, filters);
+  }
+
+  /**
+   * Synchronous twin of `query`. The transcript scan is fully synchronous; the
+   * only async surface is the `TelemetryProvider.query` contract. A subject's
+   * `collectObservations` reader seam (e.g. `McpPluginSubject.auditReader`) is
+   * synchronous and cannot await, so it consumes the samples through here.
+   */
+  collectSamples(
+    stream: TelemetryStream,
+    range: DateRange,
+    filters?: Record<string, string>,
+  ): MetricSample[] {
     if (!OWNED_STREAMS.includes(stream)) return [];
     if (stream === "mode_dispatch") return []; // inactive by design
     // Agent scope hands us a comma-joined list of agent project-dir prefixes;

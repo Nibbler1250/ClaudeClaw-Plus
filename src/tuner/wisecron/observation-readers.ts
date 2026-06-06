@@ -21,6 +21,10 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_TOOL_CALL_LOG } from "../../observability/tool-call-sink.js";
 import { DEFAULT_MODE_DISPATCH_LOG } from "../../governance/mode-dispatch-journal.js";
+import {
+  type SessionJsonlProducerConfig,
+  SessionJsonlTelemetryProducer,
+} from "./session-jsonl-provider.js";
 
 function expandHome(p: string): string {
   return p.startsWith("~") ? p.replace(/^~/, homedir()) : p;
@@ -84,6 +88,54 @@ export function makeMcpToolCallReader(
         success: status === "ok" || status === "success",
         blocked: status === "blocked" || status === "denied",
         ts: entry.ts,
+      });
+    }
+    return out;
+  };
+}
+
+/**
+ * EXPERIMENT (Task 3 — 1-reader de-risk): `McpPluginSubject.auditReader` over
+ * the SESSION TRANSCRIPTS instead of the dedicated `mcp-tool-calls.jsonl` sink.
+ *
+ * The dedicated sink stopped being written (stale since 2026-05-28), so the
+ * legacy reader time-filters every entry out → obs=0. The session transcripts
+ * (`~/.claude/projects/<enc-cwd>/<session>.jsonl`) are the abundant, live source
+ * of `tool_use` events. This reuses `SessionJsonlTelemetryProducer` (which in
+ * turn consumes the Bus's read-only `jsonl-line-types` helpers) and maps its
+ * `tool_call` MetricSamples into the `{ type:"mcp_tool_call", server, tool,
+ * success, blocked, ts }` shape `collectObservations` expects. Only MCP tools
+ * (`mcp__<server>__<tool>` → non-empty server) are surfaced; bare harness tools
+ * (Read/Bash/…) are not mcp_plugin telemetry and are dropped.
+ *
+ * If this yields obs>0 the same pattern generalises to `model_routing`'s
+ * `mode_dispatch` — but mode_dispatch is NOT derivable from a transcript (the
+ * provider advertises it inactive-by-design), so that generalisation is bounded.
+ */
+export function makeSessionToolCallReader(
+  cfg: SessionJsonlProducerConfig = {},
+): (path: string, since: Date) => Array<Record<string, unknown>> {
+  const producer = new SessionJsonlTelemetryProducer(cfg);
+  return (_legacyPath: string, since: Date) => {
+    const range = { start: since, end: new Date() };
+    const out: Array<Record<string, unknown>> = [];
+    for (const s of producer.collectSamples("tool_call", range)) {
+      const server = String(s.labels?.server ?? "");
+      if (!server) continue; // MCP tools only — bare harness tools aren't plugins.
+      // provider labels.tool is the full `mcp__<server>__<tool>` name; strip the
+      // prefix to the bare tool, matching the dedicated-sink reader's shape.
+      const fullName = String(s.labels?.tool ?? "unknown");
+      const tool = fullName.startsWith("mcp__")
+        ? fullName.split("__").slice(2).join("__")
+        : fullName;
+      out.push({
+        type: "mcp_tool_call",
+        server,
+        tool,
+        // provider encodes failure as value=1 (matched tool_result is_error).
+        success: s.value === 0,
+        blocked: s.labels?.blocked === "true",
+        ts: s.ts instanceof Date ? s.ts.toISOString() : s.ts,
       });
     }
     return out;
