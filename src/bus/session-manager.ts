@@ -497,6 +497,23 @@ export class SessionManager {
     this.mcpSynth = synth;
   }
 
+  /**
+   * Wire the session-event bus (issue #215) post-construction. Callers that
+   * build the SessionManager eagerly and the BusCore separately (e.g.
+   * `start.ts`, which constructs both then hands them to `mountBusRuntime`)
+   * would otherwise leave `options.bus` undefined, so every spawn skips the
+   * `JsonlTailer` block in `spawnAgentInternal` and the silent-drop safety
+   * net never observes a single `response.turn_end`. Idempotent + set-if-unset:
+   * a SessionManager already constructed with a bus is left untouched, so a
+   * mismatched second bus can't clobber the wired one. Must be called BEFORE
+   * any `spawnAgent` (the daemon spawns deferred, so the mount path satisfies
+   * this). Mirrors `setMcpConfigSynthesizer`'s pre-spawn wiring contract.
+   */
+  attachBus(bus: BusCore): void {
+    if (this.options.bus) return;
+    this.options.bus = bus;
+  }
+
   async spawnAgent(agent: AgentConfig, origin: BusOrigin): Promise<AgentProcess> {
     return this.spawnAgentInternal(agent, origin, /* retry */ 0);
   }

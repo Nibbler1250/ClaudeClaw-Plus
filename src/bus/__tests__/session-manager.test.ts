@@ -632,4 +632,103 @@ describe("JSONL tailer wiring (issue #215)", () => {
     expect(proc.agent_id).toBe("nobus-agent");
     await noBus.stop(agent.id);
   });
+
+  it("attachBus() wires a bus-less SessionManager so the tailer fires (issue #215 — the prod regression: start.ts built the SM without a bus, so the net was inert)", async () => {
+    // Reproduce the live daemon's construction order: SessionManager built
+    // WITHOUT a bus (start.ts), bus attached afterward (what mountBusRuntime
+    // now does). Without attachBus the spawn skips the JsonlTailer and no
+    // reply is ever synthesized.
+    const lateMgr = new SessionManager({
+      commandOverride: "/bin/cat",
+      argsOverride: [],
+      busSocketPath: "/tmp/test-bus.sock",
+      sessionCollisionDetectMs: 0,
+      projectsDir,
+      // bus intentionally omitted
+    });
+    lateMgr.attachBus(bus);
+
+    const replies: { text: string }[] = [];
+    bus.subscribe({ agent_id: "late-agent", topics: ["response.text"] }, (e) => {
+      const p = e.payload as { text?: string; intent?: string };
+      if (p?.intent === "final") replies.push({ text: p.text ?? "" });
+    });
+
+    const agent = mkAgent({ id: "late-agent", cwd: agentCwd, session_id: SID });
+    await lateMgr.spawnAgent(agent, "telegram");
+    try {
+      await bus.sendPrompt({
+        agent_id: "late-agent",
+        origin: "telegram",
+        origin_id: "tg-late",
+        user_id: "u1",
+        text: "allo",
+      });
+      await writeFile(
+        sessionPath,
+        `${JSON.stringify({
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "msg-late",
+            content: [{ type: "text", text: "Wired late!" }],
+            stop_reason: "end_turn",
+          },
+          timestamp: new Date().toISOString(),
+          sessionId: SID,
+        })}\n`,
+      );
+      await waitUntil(() => replies.length > 0, 2500);
+      expect(replies[0].text).toBe("Wired late!");
+    } finally {
+      await lateMgr.stop(agent.id);
+    }
+  });
+
+  it("attachBus() is set-if-unset — a SessionManager built with a bus ignores a second bus", async () => {
+    // Guards the idempotency contract: a mismatched second bus must not
+    // clobber the one the SM was constructed with.
+    const other = createBusCore({ eventLogAppend: (async () => ({})) as never });
+    let otherSawEvent = false;
+    other.subscribe({ agent_id: "preset-agent", topics: ["response.text"] }, () => {
+      otherSawEvent = true;
+    });
+    const replies: { text: string }[] = [];
+    bus.subscribe({ agent_id: "preset-agent", topics: ["response.text"] }, (e) => {
+      const p = e.payload as { text?: string; intent?: string };
+      if (p?.intent === "final") replies.push({ text: p.text ?? "" });
+    });
+
+    // `mgr` (from beforeEach) was constructed WITH `bus`. Attaching `other`
+    // afterward must be a no-op.
+    mgr.attachBus(other);
+
+    const agent = mkAgent({ id: "preset-agent", cwd: agentCwd, session_id: SID });
+    await mgr.spawnAgent(agent, "telegram");
+    spawned.push(agent.id);
+    await bus.sendPrompt({
+      agent_id: "preset-agent",
+      origin: "telegram",
+      origin_id: "tg-preset",
+      user_id: "u1",
+      text: "allo",
+    });
+    await writeFile(
+      sessionPath,
+      `${JSON.stringify({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          id: "msg-preset",
+          content: [{ type: "text", text: "Original bus!" }],
+          stop_reason: "end_turn",
+        },
+        timestamp: new Date().toISOString(),
+        sessionId: SID,
+      })}\n`,
+    );
+    await waitUntil(() => replies.length > 0, 2500);
+    expect(replies[0].text).toBe("Original bus!");
+    expect(otherSawEvent).toBe(false);
+  });
 });

@@ -190,6 +190,13 @@ export class JsonlTailer {
       } else {
         await this.drainFromOffset();
       }
+      // Forensic (issue #215 tailer-binding): record which file/offset this
+      // tailer bound to, so a wedge dossier can compare bound-vs-real and
+      // tell seek-past (#2) from wrong-file/resume (#1/#3). console.error →
+      // daemon stderr → telegram*.log, where the wedge probe greps it.
+      console.error(
+        `[jsonl-tailer] attach agent=${this.agent_id} session=${this.session_id} file=${this.filePath} startOffset=${this.offset} startAt=${this.startAt} existed=true`,
+      );
       this.emitReplayDone();
       this.attachFileWatcher();
       return;
@@ -202,6 +209,9 @@ export class JsonlTailer {
     // tailer is inert for every fresh session (issue #215 runtime wiring:
     // the common case — the original code only logged the ENOENT from
     // `watch()` and gave up, so no events ever flowed in production).
+    console.error(
+      `[jsonl-tailer] attach agent=${this.agent_id} session=${this.session_id} file=${this.filePath} startOffset=0 startAt=${this.startAt} existed=false awaiting-file`,
+    );
     this.emitReplayDone();
     this.awaitFileCreation();
   }

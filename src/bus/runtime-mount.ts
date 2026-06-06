@@ -236,6 +236,14 @@ export async function mountBusRuntime(
   const bus: BusCore = opts.bus ?? new BusCoreImpl({ socketPath });
   const sessionManager: SessionManager =
     opts.sessionManager ?? new SessionManager({ busSocketPath: socketPath, bus });
+  // Issue #215: a caller-supplied SessionManager (start.ts builds it eagerly,
+  // without a bus, then passes it here) bypasses the bus-wired fallback above,
+  // so its `options.bus` stays undefined and every spawn skips the JsonlTailer
+  // — leaving the silent-drop safety net inert in production. Guarantee the
+  // SessionManager this mount drives is wired to the same bus. Idempotent
+  // (set-if-unset) and runs before the deferred agent spawn, so the tailer
+  // attaches on the first spawn.
+  sessionManager.attachBus(bus);
 
   let busStarted = false;
   const spawned: string[] = [];
