@@ -9,7 +9,7 @@
  * directory to catch framing / chmod regressions.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -162,6 +162,17 @@ describe("mountBusRuntime — happy path (injected fakes)", () => {
     expect(handle.bus).toBe(bus);
     expect(handle.sessionManager).toBe(sm);
     expect(handle.socketPath.length).toBeGreaterThan(0);
+  });
+
+  it("wires the provided bus into the caller-supplied SessionManager (issue #215 — start.ts builds the SM without a bus, so the JsonlTailer was never created in prod)", async () => {
+    const bus = createFakeBus();
+    // Exactly the start.ts construction: SessionManager built with no bus.
+    const sm = new SessionManager();
+    const spy = spyOn(sm, "attachBus");
+    handle = await mountBusRuntime({ bus, sessionManager: sm, logger: SILENT_LOGGER });
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0][0]).toBe(bus);
   });
 
   it("stop() detaches the slash handler before tearing down BusCore", async () => {
