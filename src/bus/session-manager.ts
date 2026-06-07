@@ -29,7 +29,7 @@
 
 import { spawn as nodeSpawnChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,6 +41,7 @@ import {
 } from "../runner/pty-mcp-config-writer";
 import { createSession } from "../sessions";
 import type { BusCore } from "./core";
+import { encodeCwdForProjectsDir } from "./jsonl-line-types";
 import { JsonlTailer } from "./jsonl-tailer";
 import {
   type AgentProcess,
@@ -421,7 +422,37 @@ function detectSessionIdCollision(proc: AgentProcess, windowMs: number): Promise
  *
  * Operator-supplied `agent.mcp_config` is passed through unchanged.
  */
-export function buildClaudeArgs(agent: AgentConfig, mode: SupervisionMode): string[] {
+/**
+ * True iff a non-empty JSONL transcript already exists for this session — i.e.
+ * there is a real conversation to RESUME. Drives the spawn-flag choice in
+ * `buildClaudeArgs`:
+ *   - resume=true  → `--resume <id>`     : continue the existing session. This
+ *     preserves context across daemon restarts AND sidesteps the
+ *     `--session-id` "Session ID X is already in use" collision → rotation
+ *     path. That rotation was the strongest correlate of the chronic wedge
+ *     (a respawned agent whose REPL never read its PTY stdin → prompts lost).
+ *   - resume=false → `--session-id <id>` : pin a specific id for a brand-new
+ *     session (first spawn, or a freshly-minted id that has no transcript yet).
+ *
+ * Uses the SAME projects-dir/cwd encoding the JsonlTailer binds with, so the
+ * "does a transcript exist" question is answered against the exact file claude
+ * would append to.
+ */
+export function hasResumableSession(cwd: string, sessionId: string, projectsDir: string): boolean {
+  try {
+    const path = join(projectsDir, encodeCwdForProjectsDir(cwd), `${sessionId}.jsonl`);
+    return statSync(path).size > 0;
+  } catch {
+    // ENOENT (no transcript yet) or any stat error → not resumable.
+    return false;
+  }
+}
+
+export function buildClaudeArgs(
+  agent: AgentConfig,
+  mode: SupervisionMode,
+  resume = false,
+): string[] {
   const args: string[] = [];
   if (mode === "process-stream-json") {
     args.push("-p", "--input-format=stream-json", "--output-format=stream-json", "--verbose");
@@ -450,7 +481,15 @@ export function buildClaudeArgs(agent: AgentConfig, mode: SupervisionMode): stri
   if (agent.system_prompt_file) {
     args.push("--append-system-prompt", agent.system_prompt_file);
   }
-  args.push("--session-id", agent.session_id);
+  // Resume an existing conversation vs start a pinned new one. Mutually
+  // exclusive — NEVER both: passing `--session-id` alongside `--resume` is the
+  // `--fork-session` shape, which mints a NEW id and would desync the tailer +
+  // session.json binding from the conversation claude actually writes.
+  if (resume) {
+    args.push("--resume", agent.session_id);
+  } else {
+    args.push("--session-id", agent.session_id);
+  }
   return args;
 }
 
@@ -549,7 +588,14 @@ export class SessionManager {
     }
 
     const env = buildChildEnv(agent, busSock);
-    const args = this.options.argsOverride ?? buildClaudeArgs(agent, mode);
+    // Resume the existing transcript when one exists (continuity across daemon
+    // restarts + avoids the `--session-id` collision→rotation that bred deaf
+    // agents). A freshly-minted id (first spawn, or the rotation retry below)
+    // has no transcript → falls back to `--session-id`. Same projects-dir the
+    // tailer binds with, so the check matches the file claude appends to.
+    const projectsDir = this.options.projectsDir ?? join(homedir(), ".claude", "projects");
+    const resume = hasResumableSession(realCwd, agent.session_id, projectsDir);
+    const args = this.options.argsOverride ?? buildClaudeArgs(agent, mode, resume);
 
     // Issue #165: synthesize the multiplexer `--mcp-config` for this agent
     // when the daemon has wired a synthesizer (active multiplexer) and the

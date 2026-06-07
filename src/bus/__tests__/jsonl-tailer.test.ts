@@ -287,12 +287,18 @@ describe("JsonlTailer — assistant lines", () => {
     tailer = makeTailer(bus);
     await tailer.start();
 
-    const text = events.find((e) => e.topic === "response.text");
+    // Regression fix 2026-06-06: assistant text blocks surface on the
+    // observability topic `response.assistant_text`, NOT the delivery topic
+    // `response.text` (which the chat adapters consume — mirroring there
+    // double-delivered alongside the `reply` tool).
+    const text = events.find((e) => e.topic === "response.assistant_text");
+    const deliveredText = events.find((e) => e.topic === "response.text");
     const thinking = events.find((e) => e.topic === "response.thinking");
     const tool = events.find((e) => e.topic === "response.tool_use");
     const usage = events.find((e) => e.topic === "usage");
 
     expect((text?.payload as { text: string }).text).toBe("Here is the answer.");
+    expect(deliveredText).toBeUndefined();
     expect((thinking?.payload as { thinking: string }).thinking).toBe("let me think");
     expect((tool?.payload as { name: string }).name).toBe("Read");
     expect((tool?.payload as { id: string }).id).toBe("toolu_X");
@@ -650,9 +656,12 @@ describe("JsonlTailer — live tail", () => {
       }),
     );
 
-    await waitFor(events, (e) => e.some((x) => x.topic === "response.text"));
+    // The tailer mirrors assistant text on the observability topic
+    // `response.assistant_text` (not the `response.text` delivery topic);
+    // still proves the live fs.watch append was picked up.
+    await waitFor(events, (e) => e.some((x) => x.topic === "response.assistant_text"));
     expect(events.length).toBeGreaterThan(before);
-    const live = events.find((e) => e.topic === "response.text");
+    const live = events.find((e) => e.topic === "response.assistant_text");
     expect((live?.payload as { text: string }).text).toBe("live!");
   });
 

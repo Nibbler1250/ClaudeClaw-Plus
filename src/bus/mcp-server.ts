@@ -132,6 +132,14 @@ export function flattenChannelMeta(meta: Record<string, unknown>): Record<string
 export interface IpcTransport {
   send(msg: IpcMessage): void;
   onMessage(handler: (msg: IpcMessage) => void): void;
+  /**
+   * Register a callback fired on every (re)connect of the underlying socket
+   * AFTER the first one — the owner re-runs its handshake here (re-sends
+   * `IpcHello`) so Bus core re-registers the agent (issue #222). Optional so
+   * in-memory test fakes need not implement it; the production reconnecting
+   * transport always does.
+   */
+  onConnect?(handler: () => void): void;
   close(): Promise<void>;
 }
 
@@ -143,20 +151,41 @@ const LENGTH_PREFIX_BYTES = 4;
 const MAX_FRAME_BYTES = 16 * 1024 * 1024; // 16 MiB sanity cap
 
 /**
+ * Reconnect backoff (issue #222). The bus core UDS is stable for a daemon's
+ * whole lifetime, so a drop is almost always a transient peer event (core
+ * bouncing a connection, claude restarting the transport, an EPIPE) that
+ * heals on a fresh dial. Bounded exponential backoff keeps a genuinely-down
+ * core from spinning the CPU. No jitter: a single client per agent means no
+ * thundering herd to spread.
+ */
+const RECONNECT_BASE_MS = 250;
+const RECONNECT_MAX_MS = 5000;
+
+/**
  * Open an IPC connection to Bus core. Prefers UDS (`CCAW_BUS_SOCK`); falls
  * back to TCP (`CCAW_BUS_PORT`) if UDS is unset. TCP path is stubbed for
  * Sprint 1 — HMAC token validation is TODO Sprint 2 (spec §5.4).
+ *
+ * The returned transport is RECONNECTING (issue #222): the original code
+ * connected once and, on a socket drop, only logged the error — leaving the
+ * mcp-server process alive but its IPC link to Bus core severed forever.
+ * Bus core's `connectionsByAgent` then dropped the agent on close, so every
+ * subsequent `sendPrompt` returned false ("No MCP connection") AND every
+ * outbound `reply` frame wrote into a dead socket — the agent went silent in
+ * both directions until claude happened to respawn the whole process. The
+ * transport now re-dials with backoff and re-handshakes (Bus core's
+ * "second hello wins" path replaces any stale registration).
  */
 export async function connectBusIpc(env: NodeJS.ProcessEnv = process.env): Promise<IpcTransport> {
   const sock = env.CCAW_BUS_SOCK?.trim();
   const port = env.CCAW_BUS_PORT?.trim();
 
   if (sock) {
-    return await openSocketTransport({ path: sock });
+    return await openReconnectingTransport({ path: sock });
   }
   if (port) {
     // TODO(Sprint 2): integrate CCAW_BUS_TOKEN HMAC handshake (§5.4).
-    return await openSocketTransport({ port: Number(port), host: "127.0.0.1" });
+    return await openReconnectingTransport({ port: Number(port), host: "127.0.0.1" });
   }
   throw new Error("Bus MCP: neither CCAW_BUS_SOCK nor CCAW_BUS_PORT set — cannot reach Bus core");
 }
@@ -167,65 +196,213 @@ interface SocketOpts {
   host?: string;
 }
 
-function openSocketTransport(opts: SocketOpts): Promise<IpcTransport> {
-  return new Promise((resolve, reject) => {
-    const sock: Socket = connect(opts as Parameters<typeof connect>[0]);
-    sock.once("error", reject);
-    sock.once("connect", () => {
-      // Replace the connect-time `reject` handler with a post-connect handler
-      // that surfaces socket errors instead of letting them become unhandled
-      // 'error' events that crash the plugin process. Codex P1 on PR #110:
-      // after the connect listener removed the only error handler, an
-      // emitted socket error (Bus core restart, UDS unlinked, peer reset)
-      // would propagate unhandled and tear the process down.
-      sock.removeListener("error", reject);
-      sock.on("error", (err) => {
-        process.stderr.write(`Bus MCP: IPC socket error: ${String(err)}\n`);
-      });
-      resolve(wrapSocket(sock));
-    });
-  });
-}
-
 /**
- * Wrap a connected socket with length-prefixed JSON framing.
- * Frame: `<uint32-be length><utf8 json>`.
+ * Length-prefixed JSON frame parser bound to one socket. Returns a `push`
+ * to feed inbound chunks; complete frames are delivered to `deliver`. Buffer
+ * is per-parser, so a reconnect (new socket → new parser) starts clean and a
+ * partial frame from a dead socket can't corrupt the next connection's stream.
  */
-export function wrapSocket(sock: Socket): IpcTransport {
+function makeFrameParser(
+  deliver: (msg: IpcMessage) => void,
+  onFatal: (err: Error) => void,
+): (chunk: Buffer) => void {
   let buffer = Buffer.alloc(0);
-  const handlers: Array<(msg: IpcMessage) => void> = [];
-
-  sock.on("data", (chunk: Buffer) => {
+  return (chunk: Buffer) => {
     buffer = Buffer.concat([buffer, chunk]);
     while (buffer.length >= LENGTH_PREFIX_BYTES) {
       const len = buffer.readUInt32BE(0);
       if (len === 0 || len > MAX_FRAME_BYTES) {
-        // Bad framing — drop the connection rather than risk OOM.
-        sock.destroy(new Error(`Bus MCP: invalid frame length ${len}`));
+        onFatal(new Error(`Bus MCP: invalid frame length ${len}`));
         return;
       }
       if (buffer.length < LENGTH_PREFIX_BYTES + len) return; // wait for more
       const json = buffer.subarray(LENGTH_PREFIX_BYTES, LENGTH_PREFIX_BYTES + len).toString("utf8");
       buffer = buffer.subarray(LENGTH_PREFIX_BYTES + len);
       try {
-        const msg = JSON.parse(json) as IpcMessage;
-        for (const h of handlers) h(msg);
+        deliver(JSON.parse(json) as IpcMessage);
       } catch (err) {
         process.stderr.write(`Bus MCP: dropped malformed IPC frame: ${String(err)}\n`);
       }
     }
+  };
+}
+
+function encodeIpcFrame(msg: IpcMessage): Buffer {
+  const json = Buffer.from(JSON.stringify(msg), "utf8");
+  const frame = Buffer.allocUnsafe(LENGTH_PREFIX_BYTES + json.length);
+  frame.writeUInt32BE(json.length, 0);
+  json.copy(frame, LENGTH_PREFIX_BYTES);
+  return frame;
+}
+
+/**
+ * Production transport: connects to Bus core and transparently reconnects on
+ * drop (issue #222). Resolves once the FIRST connect succeeds (preserving the
+ * old startup contract: a never-reachable core still rejects boot via the
+ * caller's await); after that, drops are healed in the background.
+ */
+function openReconnectingTransport(opts: SocketOpts): Promise<IpcTransport> {
+  const messageHandlers: Array<(msg: IpcMessage) => void> = [];
+  const connectHandlers: Array<() => void> = [];
+  let current: Socket | null = null;
+  let closed = false;
+  let attempt = 0;
+  let firstConnectSettled = false;
+
+  return new Promise<IpcTransport>((resolve, reject) => {
+    const dial = (): void => {
+      if (closed) return;
+      const sock: Socket = connect(opts as Parameters<typeof connect>[0]);
+      const parse = makeFrameParser(
+        (msg) => {
+          for (const h of messageHandlers) h(msg);
+        },
+        (err) => sock.destroy(err),
+      );
+
+      const onFirstError = (err: Error): void => {
+        // Only the very first connect rejects the boot promise; later dials
+        // retry silently. After the first success, errors fall through to the
+        // post-connect handler installed below.
+        if (!firstConnectSettled) {
+          firstConnectSettled = true;
+          reject(err);
+        }
+      };
+      sock.once("error", onFirstError);
+
+      sock.once("connect", () => {
+        sock.removeListener("error", onFirstError);
+        attempt = 0;
+        current = sock;
+        sock.on("data", (chunk: Buffer) => parse(chunk));
+        // Surface (don't crash on) post-connect socket errors — Codex P1 on
+        // PR #110: a bus-core restart / UDS unlink / peer reset would
+        // otherwise become an unhandled 'error' event that tears the process
+        // down. The 'close' that follows drives the reconnect.
+        sock.on("error", (err) => {
+          process.stderr.write(`Bus MCP: IPC socket error: ${String(err)}\n`);
+        });
+        sock.on("close", () => {
+          if (current === sock) current = null;
+          if (closed) return;
+          scheduleRedial();
+        });
+        if (!firstConnectSettled) {
+          firstConnectSettled = true;
+          resolve(transport);
+        } else {
+          // A reconnect: the owner must re-handshake so Bus core re-registers.
+          for (const h of connectHandlers) {
+            try {
+              h();
+            } catch (err) {
+              process.stderr.write(`Bus MCP: onConnect handler threw: ${String(err)}\n`);
+            }
+          }
+          process.stderr.write("Bus MCP: IPC reconnected — re-handshaking.\n");
+        }
+      });
+    };
+
+    const scheduleRedial = (): void => {
+      const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** attempt);
+      attempt += 1;
+      const timer = setTimeout(dial, delay);
+      // Don't keep the process alive solely for a reconnect timer.
+      (timer as { unref?: () => void }).unref?.();
+    };
+
+    const transport: IpcTransport = {
+      send(msg: IpcMessage) {
+        const sock = current;
+        if (!sock || sock.destroyed || sock.writableEnded) {
+          // No live link. Drop with a loud log rather than throwing into the
+          // synchronous MCP tool handler (which would surface as a tool error
+          // or unhandled rejection). The reconnect + re-hello restores the
+          // channel; a frame lost in the gap is the documented trade-off.
+          process.stderr.write(
+            `Bus MCP: dropping ${msg.type} — no live IPC connection (reconnecting).\n`,
+          );
+          return;
+        }
+        sock.write(encodeIpcFrame(msg));
+      },
+      onMessage(handler) {
+        messageHandlers.push(handler);
+      },
+      onConnect(handler) {
+        connectHandlers.push(handler);
+      },
+      close() {
+        closed = true;
+        const sock = current;
+        current = null;
+        return new Promise((res) => {
+          // Resolve immediately if there's nothing live to drain — a socket
+          // mid-backoff (current already null) or one the peer already
+          // half-closed must not hang shutdown waiting for an end-callback
+          // that will never fire.
+          if (!sock || sock.destroyed || sock.writableEnded) {
+            res();
+            return;
+          }
+          let done = false;
+          const finish = (): void => {
+            if (done) return;
+            done = true;
+            try {
+              sock.destroy();
+            } catch {
+              /* already gone */
+            }
+            res();
+          };
+          sock.once("close", finish);
+          sock.end();
+          // Bounded fallback: a peer that leaves the socket half-open never
+          // emits 'close', so don't wait on it forever — force-destroy and
+          // resolve. The process is shutting down this transport anyway.
+          const timer = setTimeout(finish, 250);
+          (timer as { unref?: () => void }).unref?.();
+        });
+      },
+    };
+
+    dial();
   });
+}
+
+/**
+ * Wrap an already-connected socket with length-prefixed JSON framing. Used by
+ * tests (and any caller holding a live socket) — the production path uses the
+ * reconnecting transport. `onConnect` is a no-op here: the socket is already
+ * connected and this wrapper does not redial.
+ * Frame: `<uint32-be length><utf8 json>`.
+ */
+export function wrapSocket(sock: Socket): IpcTransport {
+  const handlers: Array<(msg: IpcMessage) => void> = [];
+  const parse = makeFrameParser(
+    (msg) => {
+      for (const h of handlers) h(msg);
+    },
+    (err) => sock.destroy(err),
+  );
+  sock.on("data", (chunk: Buffer) => parse(chunk));
 
   return {
     send(msg: IpcMessage) {
-      const json = Buffer.from(JSON.stringify(msg), "utf8");
-      const frame = Buffer.allocUnsafe(LENGTH_PREFIX_BYTES + json.length);
-      frame.writeUInt32BE(json.length, 0);
-      json.copy(frame, LENGTH_PREFIX_BYTES);
-      sock.write(frame);
+      if (sock.destroyed || sock.writableEnded) {
+        process.stderr.write(`Bus MCP: dropping ${msg.type} — socket not writable.\n`);
+        return;
+      }
+      sock.write(encodeIpcFrame(msg));
     },
     onMessage(handler) {
       handlers.push(handler);
+    },
+    onConnect() {
+      // Already connected; no redial in this wrapper.
     },
     close() {
       return new Promise((resolve) => {
@@ -511,6 +688,11 @@ export class BusMcpServer {
   /* ── IPC → MCP plumbing ─────────────────────────────────────────── */
 
   private wireIpc(): void {
+    // Re-handshake on every reconnect (issue #222). The FIRST hello is sent
+    // explicitly by `startBusMcpServer` after construction; this covers later
+    // reconnects, where Bus core needs a fresh `IpcHello` to re-register the
+    // agent (its "second hello wins" path evicts any stale connection).
+    this.ipc.onConnect?.(() => this.sendHello());
     this.ipc.onMessage((msg) => {
       switch (msg.type) {
         case "prompt":

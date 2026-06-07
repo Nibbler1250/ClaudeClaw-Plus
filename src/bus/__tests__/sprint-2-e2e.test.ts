@@ -115,7 +115,7 @@ describe("Sprint 2 e2e — Tailer → BusCore → WebUI WS", () => {
     await h.cleanup();
   });
 
-  it("a JSONL assistant line is delivered to a WS subscriber as response.text", async () => {
+  it("a JSONL assistant line is delivered to a WS subscriber as response.assistant_text", async () => {
     // Connect a WS client, subscribe to all events for the agent.
     const ws = new WebSocket(h.webuiWsUrl);
     const received: Array<{ topic: string; payload: unknown }> = [];
@@ -152,18 +152,19 @@ describe("Sprint 2 e2e — Tailer → BusCore → WebUI WS", () => {
     });
     appendFileSync(h.jsonlPath, `${assistantLine}\n`);
 
-    // Wait for the response.text event to flow through.
+    // Wait for the response.assistant_text event to flow through.
     let waited = 0;
     while (
       waited < 1500 &&
       !received.find(
-        (e) => e.topic === "response.text" && JSON.stringify(e.payload).includes("hello e2e"),
+        (e) =>
+          e.topic === "response.assistant_text" && JSON.stringify(e.payload).includes("hello e2e"),
       )
     ) {
       await new Promise((r) => setTimeout(r, 20));
       waited += 20;
     }
-    const textEvent = received.find((e) => e.topic === "response.text");
+    const textEvent = received.find((e) => e.topic === "response.assistant_text");
     expect(textEvent).toBeDefined();
     expect(JSON.stringify(textEvent?.payload)).toContain("hello e2e");
 

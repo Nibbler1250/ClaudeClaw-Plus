@@ -69,6 +69,11 @@ export function defaultSupervisionFor(origin: BusOrigin): SupervisionMode {
 export type BusEventTopic =
   | "prompt"
   | "response.text"
+  // Observability-only mirror of assistant text blocks from the JSONL tailer.
+  // Distinct from `response.text` (the DELIVERY topic owned by the reply tool +
+  // turn_end synthesize) so chat adapters don't double-deliver. Dashboard WS
+  // (subscribes to all topics) still observes it. See jsonl-tailer dispatchAssistant.
+  | "response.assistant_text"
   | "response.tool_use"
   | "response.edit_text"
   | "response.thinking"
