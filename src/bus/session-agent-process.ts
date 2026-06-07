@@ -197,9 +197,24 @@ export class PtyAgentProcess implements AgentProcess {
    *  "No, exit" — a blind Enter would select exit and kill the agent). Matches
    *  on text unique to each dialog so the REPL footer (which contains the
    *  "shift+tab to cycle" hint) cannot false-trigger. */
+  /** Strip ANSI/OSC/control escapes so dialog text survives substring matching.
+   *  The daemon runs claude in an xterm-256color PTY whose TUI interleaves
+   *  styling escapes through the dialog text — `buf.includes("development
+   *  channels")` then fails (confirmed live: the watcher never matched and the
+   *  dev-channels dialog hung, eating the first prompts of every spawn until an
+   *  incoming prompt's own CR happened to dismiss it). Matching on the cleaned
+   *  text makes the watcher actually fire. */
+  private static stripAnsiForMatch(s: string): string {
+    return s
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "") // OSC … BEL/ST
+      .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "") // CSI … final
+      .replace(/\x1b[@-Z\\-_]/g, "") // single-char ESC
+      .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, ""); // stray control bytes
+  }
+
   private handleBootDialog(chunk: string): void {
     this.bootDialogBuffer = (this.bootDialogBuffer + chunk).slice(-4000);
-    const buf = this.bootDialogBuffer;
+    const buf = PtyAgentProcess.stripAnsiForMatch(this.bootDialogBuffer);
     if (!this.answeredBypassPrompt && buf.includes("Yes, I accept")) {
       this.answeredBypassPrompt = true;
       try {
@@ -216,7 +231,7 @@ export class PtyAgentProcess implements AgentProcess {
       }
       return;
     }
-    if (!this.answeredDevChannelsPrompt && buf.includes("development channels")) {
+    if (!this.answeredDevChannelsPrompt && buf.includes("development channel")) {
       this.answeredDevChannelsPrompt = true;
       // The plain-text "WARNING: Loading development channels" banner prints
       // BEFORE the interactive selection prompt ("❯ 1. I am using this for
