@@ -48,6 +48,7 @@ import type {
   IpcPrompt,
   PermissionResponse,
 } from "./types";
+import { CHANNEL_DRIVEN_ORIGINS } from "./types";
 
 /** Escape XML text content (`&`, `<`, `>`) so a `</channel>` in user text
  *  can't close the wrapper element early and inject sibling markup. */
@@ -457,6 +458,16 @@ export class BusCoreImpl implements BusCore {
         `[bus] silent-drop detected for agent=${agentId} (turn ended with text but no reply); ` +
           `no lastPromptOrigin to route to — dropping silently as before.`,
       );
+      return;
+    }
+    // Only channel-driven origins (telegram/webui/discord/slack) have a
+    // user waiting on a reply. Scheduled/ambient origins (cron, heartbeat,
+    // cli, rest) legitimately end turns with text WITHOUT calling `reply`
+    // — that's not a silent drop, and there's no adapter to deliver the
+    // synthesized reply to anyway. Synthesizing for them would spam a
+    // bogus "recovered" warning and emit an undeliverable response.text on
+    // every scheduled tick. Skip them.
+    if (!CHANNEL_DRIVEN_ORIGINS.has(origin.origin)) {
       return;
     }
     console.warn(

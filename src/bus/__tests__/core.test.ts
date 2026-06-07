@@ -1004,6 +1004,33 @@ describe("BusCore IPC", () => {
       expect(replies.length).toBe(0);
     });
 
+    it("does NOT synthesize for a scheduled origin (cron) even though it set lastPromptOrigin", async () => {
+      const b = makeBus();
+      const replies = captureReplies(b, "alpha");
+
+      // A cron/heartbeat tick DOES go through sendPrompt and records an
+      // origin — but those origins aren't channel-driven (no user waiting,
+      // no adapter to deliver to). Ending such a turn with text without
+      // calling `reply` is normal, not a silent drop.
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "cron",
+        origin_id: "cron-1",
+        user_id: "system",
+        text: "scheduled job",
+      });
+
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "",
+        topic: "response.turn_end",
+        payload: { stop_reason: "end_turn", text: "Cost tracker ran — total 30j $2183." },
+      });
+
+      expect(replies.length).toBe(0);
+    });
+
     it("resets the per-turn flag on each new prompt (single-flight per prompt)", async () => {
       const b = makeBus();
       const replies = captureReplies(b, "alpha");
