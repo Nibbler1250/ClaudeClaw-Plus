@@ -197,24 +197,9 @@ export class PtyAgentProcess implements AgentProcess {
    *  "No, exit" — a blind Enter would select exit and kill the agent). Matches
    *  on text unique to each dialog so the REPL footer (which contains the
    *  "shift+tab to cycle" hint) cannot false-trigger. */
-  /** Strip ANSI/OSC/control escapes so dialog text survives substring matching.
-   *  The daemon runs claude in an xterm-256color PTY whose TUI interleaves
-   *  styling escapes through the dialog text — `buf.includes("development
-   *  channels")` then fails (confirmed live: the watcher never matched and the
-   *  dev-channels dialog hung, eating the first prompts of every spawn until an
-   *  incoming prompt's own CR happened to dismiss it). Matching on the cleaned
-   *  text makes the watcher actually fire. */
-  private static stripAnsiForMatch(s: string): string {
-    return s
-      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "") // OSC … BEL/ST
-      .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "") // CSI … final
-      .replace(/\x1b[@-Z\\-_]/g, "") // single-char ESC
-      .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, ""); // stray control bytes
-  }
-
   private handleBootDialog(chunk: string): void {
     this.bootDialogBuffer = (this.bootDialogBuffer + chunk).slice(-4000);
-    const buf = PtyAgentProcess.stripAnsiForMatch(this.bootDialogBuffer);
+    const buf = this.bootDialogBuffer;
     if (!this.answeredBypassPrompt && buf.includes("Yes, I accept")) {
       this.answeredBypassPrompt = true;
       try {
@@ -231,30 +216,12 @@ export class PtyAgentProcess implements AgentProcess {
       }
       return;
     }
-    if (!this.answeredDevChannelsPrompt && buf.includes("development channel")) {
+    if (!this.answeredDevChannelsPrompt && buf.includes("development channels")) {
       this.answeredDevChannelsPrompt = true;
-      // The plain-text "WARNING: Loading development channels" banner prints
-      // BEFORE the interactive selection prompt ("❯ 1. I am using this for
-      // local development / Enter to confirm") is ready to accept keys. On
-      // claude 2.1.167 (and under load — many restarts + parallel CLIs slow the
-      // render) a single immediate Enter landed on the banner, was lost, and the
-      // agent hung at the dialog forever: prompts typed into the PTY were never
-      // consumed (deaf agent — confirmed live via strace: read(fd0)=0, no turn).
-      // Match on the reliable plain-text banner (the option text is TUI-rendered
-      // with interleaved escapes, so it isn't a dependable substring), but RETRY
-      // Enter on a short schedule so one lands once the dialog is interactive.
-      // Any extra Enter after the dialog is dismissed is an empty REPL submit (a
-      // no-op); the `bootDialogActive` gate stops retries once the REPL footer
-      // disengages the watcher, so they can never inject into a live turn.
-      for (const delay of [0, 250, 700, 1400]) {
-        setTimeout(() => {
-          if (!this.bootDialogActive) return;
-          try {
-            this.pty.write("\r");
-          } catch {
-            /* pty may have exited — non-fatal */
-          }
-        }, delay);
+      try {
+        this.pty.write("\r");
+      } catch {
+        /* pty may have exited — non-fatal */
       }
       return;
     }
