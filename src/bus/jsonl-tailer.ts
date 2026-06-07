@@ -192,6 +192,16 @@ export class JsonlTailer {
       }
       this.emitReplayDone();
       this.attachFileWatcher();
+      // Close the startup TOCTOU on the existing-file path (review #217).
+      // `fs.watch` only fires on changes AFTER it attaches, so bytes written
+      // in the window between the `statSync` seek-to-EOF above and
+      // `attachFileWatcher()` are not delivered by the watcher and stay unread
+      // until the NEXT write triggers `scheduleDrain`. If those missed bytes
+      // contain an `end_turn` line and the agent then goes idle — the exact
+      // pattern this safety net exists to recover — synthesis is delayed
+      // indefinitely. Schedule a follow-up drain to sweep the gap immediately,
+      // mirroring what `awaitFileCreation` already does after its attach.
+      this.scheduleDrain();
       return;
     }
 

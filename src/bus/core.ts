@@ -187,6 +187,14 @@ export class BusCoreImpl implements BusCore {
    * this is still `false` and the turn produced non-empty text, the
    * agent ended the turn without delivering — we synthesize an
    * `ingestReply` so the user actually receives the response.
+   *
+   * Single-slot per agent, last-write-wins — the same limitation
+   * `lastPromptOrigin` carries above (and this map depends on
+   * `lastPromptOrigin` for routing the synthesized reply). Interleaving two
+   * in-flight prompts on one agent would let the second `sendPrompt` reset
+   * the flag mid-turn for the first; the webui-bridge mutex serialising
+   * prompt→reply per agent is the workaround for the path that would
+   * otherwise violate the one-turn-at-a-time assumption.
    */
   private readonly currentTurnReplied = new Map<string, boolean>();
 
