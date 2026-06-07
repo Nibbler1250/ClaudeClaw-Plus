@@ -427,12 +427,9 @@ export class BusCoreImpl implements BusCore {
     //   - `permission_request` IPC handler (origin on channel.permission_request)
     if (req.intent === "final") {
       this.lastPromptOrigin.delete(req.agent_id);
-    }
-    // Silent-drop safety net (#215): the agent called `reply` with a
-    // final intent → mark this turn as delivered. The
-    // `response.turn_end` handler will skip the synthetic-delivery
-    // fallback for this turn.
-    if (req.intent === "final") {
+      // Silent-drop safety net (#215): the agent called `reply` with a final
+      // intent → mark this turn as delivered, so the `response.turn_end`
+      // handler skips the synthetic-delivery fallback for this turn.
       this.currentTurnReplied.set(req.agent_id, true);
     }
   }

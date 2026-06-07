@@ -130,6 +130,15 @@ export class JsonlTailer {
   private readonly startAt: "begin" | "end";
 
   private offset = 0;
+  /**
+   * Set when the startup seek-to-EOF (`startAt: "end"`) could not `statSync`
+   * the file (transient perm flip / NFS hiccup / rotation). While true, the
+   * next `drainFromOffset` re-seeks to current EOF instead of reading from
+   * offset 0 — otherwise it would replay the entire history and synthesize a
+   * stale reply, the exact failure `startAt: "end"` exists to prevent
+   * (#217 review).
+   */
+  private seekToEndPending = false;
   private buffer = "";
   /** Set true once the first non-empty line emits `session.init`. */
   private initEmitted = false;
@@ -186,6 +195,11 @@ export class JsonlTailer {
           this.offset = statSync(this.filePath).size;
         } catch (err) {
           this.onError(err, { ctx: "start-eof-stat" });
+          // Couldn't establish EOF. Do NOT let the follow-up drain read from
+          // offset 0 — that replays the whole history and synthesizes a stale
+          // reply. Defer the seek: the next drainFromOffset re-seeks to the
+          // then-current EOF and tails forward (#217 review).
+          this.seekToEndPending = true;
         }
       } else {
         await this.drainFromOffset();
@@ -289,6 +303,14 @@ export class JsonlTailer {
       // re-fire when bytes appear (or won't, if the file truly never
       // gets created — that's a higher-layer concern).
       this.onError(err, { ctx: "drain-stat" });
+      return;
+    }
+    if (this.seekToEndPending) {
+      // Startup seek-to-EOF was deferred because the initial statSync failed.
+      // Establish EOF now and tail forward — a startAt:"end" tailer must never
+      // replay history (#217 review).
+      this.offset = size;
+      this.seekToEndPending = false;
       return;
     }
     if (size <= this.offset) return;
