@@ -888,3 +888,98 @@ describe("BusCore IPC", () => {
     client.close();
   });
 });
+
+describe("BusCore delivery gate (session.init / replay_done)", () => {
+  let bus: BusCore;
+  afterEach(async () => {
+    await bus?.stop();
+  });
+
+  const initEvt = (agent: string): BusEvent => ({
+    ts: 1,
+    agent_id: agent,
+    session_id: "s",
+    topic: "session.init",
+    payload: {},
+  });
+  const replayEvt = (agent: string): BusEvent => ({
+    ts: 1,
+    agent_id: agent,
+    session_id: "s",
+    topic: "bus.events.replay_done",
+    payload: {},
+  });
+  const prompt = (agent: string, text: string) =>
+    bus.sendPrompt({ agent_id: agent, origin: "webui", origin_id: "i", user_id: "u", text });
+
+  it("holds a PTY prompt that arrives while the session is (re)initialising", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "hello");
+    expect(delivered).toHaveLength(0); // held, not swallowed by a not-yet-ready TUI
+  });
+
+  it("flushes held prompts in FIFO order on replay_done", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "one");
+    await prompt("alpha", "two");
+    expect(delivered).toHaveLength(0);
+    bus.ingestSessionEvent(replayEvt("alpha"));
+    expect(delivered).toHaveLength(2);
+    expect(delivered[0]).toContain("one");
+    expect(delivered[1]).toContain("two");
+  });
+
+  it("delivers immediately when the session is not initialising", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    await prompt("alpha", "now");
+    expect(delivered).toHaveLength(1);
+    // after a full init->replay cycle, back to immediate delivery
+    bus.ingestSessionEvent(initEvt("alpha"));
+    bus.ingestSessionEvent(replayEvt("alpha"));
+    await prompt("alpha", "again");
+    expect(delivered).toHaveLength(2);
+  });
+
+  it("backstop flushes held prompts if replay_done never arrives (never strands)", async () => {
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 20,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "held");
+    expect(delivered).toHaveLength(0);
+    await new Promise((r) => setTimeout(r, 45)); // > backstop
+    expect(delivered).toHaveLength(1); // flushed despite no replay_done
+  });
+
+  it("gates per-agent: one agent initialising doesn't hold another", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    const delivered: Array<[string, string]> = [];
+    bus.setStreamPromptHandler(async (a, text) => {
+      delivered.push([a, text]);
+    });
+    bus.ingestSessionEvent(initEvt("alpha")); // only alpha initialising
+    await prompt("beta", "beta-now");
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0][0]).toBe("beta");
+  });
+});

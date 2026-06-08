@@ -121,6 +121,10 @@ export interface BusCoreOptions {
   eventLogAppend?: EventLogAppendFn;
   /** Ringbuffer cap per subscriber. */
   ringbufferCapacity?: number;
+  /** Backstop (ms) for the delivery gate: max time a prompt is held while the
+   *  agent's session (re)initialises before it's flushed even without a
+   *  `replay_done`. Defaults to 4000. Lowered in tests. */
+  deliveryBackstopMs?: number;
   /** Slash-command delegate (Agent C wires this). */
   slashCommandHandler?: SlashCommandHandler;
   /** REPL prompt delegate for PTY-stdin agents. Wired by the Session Manager. */
@@ -178,9 +182,24 @@ export class BusCoreImpl implements BusCore {
    */
   private readonly lastPromptOrigin = new Map<string, { origin: BusOrigin; origin_id: string }>();
 
+  /**
+   * Delivery gate. A prompt typed into a PTY-resident agent while its session
+   * is (re)initialising — `session.init` seen but `bus.events.replay_done` not
+   * yet — is swallowed by the not-yet-ready TUI and never starts a turn
+   * (observed as an intermittent "prompt delivered, no reply"). Such prompts
+   * are held and flushed on `replay_done`, or after a backstop timeout so a
+   * missed `replay_done` can never strand a prompt (worst case = the previous
+   * deliver-immediately behaviour). `agentInitializing` maps an agent to its
+   * backstop timer; `deliveryQueue` holds the wrapped prompts awaiting flush.
+   */
+  private readonly agentInitializing = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly deliveryQueue = new Map<string, string[]>();
+  private readonly deliveryBackstopMs: number;
+
   constructor(opts: BusCoreOptions = {}) {
     this.socketPath = opts.socketPath ?? null;
     this.ringbufferCapacity = opts.ringbufferCapacity ?? DEFAULT_RINGBUFFER_CAPACITY;
+    this.deliveryBackstopMs = opts.deliveryBackstopMs ?? 4000;
     this.eventLogAppend = opts.eventLogAppend ?? eventLogAppend;
     this.slashCommandHandler = opts.slashCommandHandler ?? null;
     this.streamPromptHandler = opts.streamPromptHandler ?? null;
@@ -222,6 +241,9 @@ export class BusCoreImpl implements BusCore {
     }
     this.subscribers.clear();
     this.connectedAgents.clear();
+    for (const timer of this.agentInitializing.values()) clearTimeout(timer);
+    this.agentInitializing.clear();
+    this.deliveryQueue.clear();
   }
 
   /* ─────────────────────────────── prompts ─────────────────────────────── */
@@ -300,11 +322,60 @@ export class BusCoreImpl implements BusCore {
         }
       }
       const wrapped = `<channel ${attrs.join(" ")}>${escapeXmlText(req.text)}</channel>`;
-      void this.streamPromptHandler(req.agent_id, wrapped).catch((err) =>
-        this.onError(err, { ctx: "streamPromptHandler", agent_id: req.agent_id }),
-      );
+      this.deliverOrQueuePrompt(req.agent_id, wrapped);
     }
     return { promise_id };
+  }
+
+  /** Deliver a PTY-stdin prompt, or hold it if the agent's session is
+   *  (re)initialising (the not-yet-ready TUI would swallow the keystroke).
+   *  Held prompts flush on `replay_done` (`markAgentReady`) or the backstop. */
+  private deliverOrQueuePrompt(agent_id: string, wrapped: string): void {
+    if (!this.streamPromptHandler) return;
+    if (this.agentInitializing.has(agent_id)) {
+      const q = this.deliveryQueue.get(agent_id) ?? [];
+      q.push(wrapped);
+      this.deliveryQueue.set(agent_id, q);
+      return;
+    }
+    this.streamDeliver(agent_id, wrapped);
+  }
+
+  private streamDeliver(agent_id: string, wrapped: string): void {
+    if (!this.streamPromptHandler) return;
+    void this.streamPromptHandler(agent_id, wrapped).catch((err) =>
+      this.onError(err, { ctx: "streamPromptHandler", agent_id }),
+    );
+  }
+
+  /** `session.init` → start holding PTY-stdin prompts for this agent. The
+   *  backstop force-flushes if `replay_done` never arrives, so a held prompt is
+   *  never stranded; it's re-armed on each `session.init`. */
+  private markAgentInitializing(agent_id: string): void {
+    // Keep the EARLIEST deadline: don't re-arm if already holding. Otherwise a
+    // rapid `session.init` churn (< backstop interval, e.g. an IPC-reconnect
+    // storm) would keep pushing the deadline out and strand held prompts. The
+    // backstop must fire within `deliveryBackstopMs` of the FIRST init.
+    if (this.agentInitializing.has(agent_id)) return;
+    const timer = setTimeout(() => {
+      this.onError(
+        new Error(`replay_done not seen within backstop; flushing held prompts for agent_id=${agent_id}`),
+        { ctx: "deliveryBackstop", agent_id },
+      );
+      this.markAgentReady(agent_id);
+    }, this.deliveryBackstopMs);
+    this.agentInitializing.set(agent_id, timer);
+  }
+
+  /** `replay_done` (or backstop) → session ready: flush held prompts in order. */
+  private markAgentReady(agent_id: string): void {
+    const timer = this.agentInitializing.get(agent_id);
+    if (timer) clearTimeout(timer);
+    this.agentInitializing.delete(agent_id);
+    const q = this.deliveryQueue.get(agent_id);
+    if (!q || q.length === 0) return;
+    this.deliveryQueue.delete(agent_id);
+    for (const wrapped of q) this.streamDeliver(agent_id, wrapped);
   }
 
   async invokeSlashCommand(agent_id: string, cmd: string): Promise<void> {
@@ -405,6 +476,13 @@ export class BusCoreImpl implements BusCore {
   }
 
   ingestSessionEvent(e: BusEvent): void {
+    // Delivery gate: hold PTY-stdin prompts while the agent's session is
+    // (re)initialising so a keystroke isn't swallowed by a not-yet-ready TUI,
+    // and release them once it's live.
+    if (e.agent_id) {
+      if (e.topic === "session.init") this.markAgentInitializing(e.agent_id);
+      else if (e.topic === "bus.events.replay_done") this.markAgentReady(e.agent_id);
+    }
     this.publish(e);
   }
 
