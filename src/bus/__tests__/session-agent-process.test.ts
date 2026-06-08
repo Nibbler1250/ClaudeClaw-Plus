@@ -80,3 +80,86 @@ describe("PtyAgentProcess.send_prompt_stream", () => {
     expect(writes).toEqual([]);
   });
 });
+
+function bootPty(): { handle: PtyHandle; writes: string[]; emit: (d: string) => void } {
+  const writes: string[] = [];
+  let dataCb: ((d: string) => void) | null = null;
+  const handle: PtyHandle = {
+    pid: 4321,
+    onData: (cb) => {
+      dataCb = cb;
+      return { dispose() {} };
+    },
+    onExit: () => ({ dispose() {} }),
+    write: (data: string) => {
+      writes.push(data);
+    },
+    kill: () => {},
+  };
+  return { handle, writes, emit: (d) => dataCb?.(d) };
+}
+
+describe("PtyAgentProcess boot-dialog watcher (structural / ANSI-resilient)", () => {
+  it("answers a confirm dialog whose title is split by a cursor-move escape (the 2.1.x regression)", () => {
+    const { handle, writes, emit } = bootPty();
+    new PtyAgentProcess("alpha", handle);
+    // Raw PTY: ESC[32G is interleaved INSIDE the title, so a literal
+    // "development channels" match on the raw buffer fails — exactly the bug
+    // that wedged boots after a CLI auto-update. The structural match (selected
+    // option + "Enter to confirm") must still confirm the proceed default.
+    emit(
+      "WARNING: Loading development\x1b[32Gchannels\r\n" +
+        " ❯ 1. I am using this for local development\r\n" +
+        "   2. Exit\r\n Enter to confirm · Esc to cancel",
+    );
+    expect(writes).toEqual(["\r"]);
+  });
+
+  it("answers the new trust-folder dialog with Enter (default = trust)", () => {
+    const { handle, writes, emit } = bootPty();
+    new PtyAgentProcess("beta", handle);
+    emit(
+      "Quick safety check: Is this a project you trust?\r\n" +
+        " ❯ 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm · Esc to cancel",
+    );
+    expect(writes).toEqual(["\r"]);
+  });
+
+  it("sends one Enter per distinct dialog, not per render chunk", () => {
+    const { handle, writes, emit } = bootPty();
+    new PtyAgentProcess("gamma", handle);
+    const trust = " ❯ 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm";
+    emit(trust);
+    emit(trust); // same dialog re-rendered across chunks -> no second Enter
+    expect(writes).toEqual(["\r"]);
+    emit(" ❯ 1. I am using this for local development\r\n   2. Exit\r\n Enter to confirm"); // distinct dialog
+    expect(writes).toEqual(["\r", "\r"]);
+  });
+
+  it("does NOT auto-answer an unknown dialog whose default is destructive; warns once", () => {
+    const { handle, writes, emit } = bootPty();
+    new PtyAgentProcess("delta", handle);
+    const origErr = console.error;
+    let warned = "";
+    console.error = (...a: unknown[]) => {
+      warned = a.map(String).join(" ");
+    };
+    try {
+      emit(" ❯ 2. No, exit\r\n   1. Delete everything\r\n Enter to confirm");
+    } finally {
+      console.error = origErr;
+    }
+    expect(writes).toEqual([]); // no blind keypress on a destructive default
+    expect(warned).toContain("destructive default");
+  });
+
+  it("disengages on the REPL footer and ignores later dialog-looking text", async () => {
+    const { handle, writes, emit } = bootPty();
+    new PtyAgentProcess("epsilon", handle);
+    emit("⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents");
+    writes.length = 0;
+    emit(" ❯ 1. I am using this for local development\r\n Enter to confirm");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(writes).toEqual([]); // disengaged -> no key into a live REPL
+  });
+});
