@@ -359,7 +359,9 @@ export class BusCoreImpl implements BusCore {
     if (this.agentInitializing.has(agent_id)) return;
     const timer = setTimeout(() => {
       this.onError(
-        new Error(`replay_done not seen within backstop; flushing held prompts for agent_id=${agent_id}`),
+        new Error(
+          `replay_done not seen within backstop; flushing held prompts for agent_id=${agent_id}`,
+        ),
         { ctx: "deliveryBackstop", agent_id },
       );
       this.markAgentReady(agent_id);
