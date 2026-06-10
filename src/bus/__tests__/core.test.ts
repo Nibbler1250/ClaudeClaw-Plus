@@ -524,6 +524,57 @@ describe("BusCore IPC", () => {
     client.close();
   });
 
+  it("drops held prompts and cancels the backstop on IPC disconnect (#243 review)", async () => {
+    // A prompt held during (re)init must NOT be flushed into a restart that
+    // reuses the same agent_id: when the subprocess IPC socket drops, onClose
+    // tears down the gate timer + queue so the backstop can never inject a
+    // stale keystroke into the new process.
+    const sockPath = join(tempDir, "bus.sock");
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      deliveryBackstopMs: 100,
+      onError: () => {},
+    });
+    await bus.start();
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+
+    const client = await connectIpcClient(sockPath);
+    client.send({
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(bus.state().connectedAgents).toContain("alpha");
+
+    // Arm the gate and queue a held prompt, then drop the socket BEFORE replay_done.
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "session.init",
+      payload: {},
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "webui",
+      origin_id: "i",
+      user_id: "u",
+      text: "held",
+    });
+    expect(delivered).toHaveLength(0);
+    client.close();
+
+    // Past the backstop: without the onClose teardown the held prompt would
+    // flush here; with it, nothing is delivered.
+    await new Promise((r) => setTimeout(r, 160));
+    expect(delivered).toHaveLength(0);
+  });
+
   it("sendPrompt forwards an IpcPrompt to the right MCP connection", async () => {
     const sockPath = join(tempDir, "bus.sock");
     bus = createBusCore({
@@ -1154,5 +1205,173 @@ describe("BusCore IPC", () => {
       expect(replies.length).toBe(1);
       expect(replies[0].text).toBe("the answer");
     });
+  });
+});
+
+describe("BusCore delivery gate (session.init / replay_done)", () => {
+  let bus: BusCore;
+  afterEach(async () => {
+    await bus?.stop();
+  });
+
+  const initEvt = (agent: string): BusEvent => ({
+    ts: 1,
+    agent_id: agent,
+    session_id: "s",
+    topic: "session.init",
+    payload: {},
+  });
+  const replayEvt = (agent: string): BusEvent => ({
+    ts: 1,
+    agent_id: agent,
+    session_id: "s",
+    topic: "bus.events.replay_done",
+    payload: {},
+  });
+  const prompt = (agent: string, text: string) =>
+    bus.sendPrompt({ agent_id: agent, origin: "webui", origin_id: "i", user_id: "u", text });
+
+  it("holds a PTY prompt that arrives while the session is (re)initialising", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "hello");
+    expect(delivered).toHaveLength(0); // held, not swallowed by a not-yet-ready TUI
+  });
+
+  it("flushes held prompts in FIFO order on replay_done", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "one");
+    await prompt("alpha", "two");
+    expect(delivered).toHaveLength(0);
+    bus.ingestSessionEvent(replayEvt("alpha"));
+    expect(delivered).toHaveLength(2);
+    expect(delivered[0]).toContain("one");
+    expect(delivered[1]).toContain("two");
+  });
+
+  it("delivers immediately when the session is not initialising", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    await prompt("alpha", "now");
+    expect(delivered).toHaveLength(1);
+    // after a full init->replay cycle, back to immediate delivery
+    bus.ingestSessionEvent(initEvt("alpha"));
+    bus.ingestSessionEvent(replayEvt("alpha"));
+    await prompt("alpha", "again");
+    expect(delivered).toHaveLength(2);
+  });
+
+  it("backstop flushes held prompts if replay_done never arrives (never strands)", async () => {
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 20,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "held");
+    expect(delivered).toHaveLength(0);
+    await new Promise((r) => setTimeout(r, 45)); // > backstop
+    expect(delivered).toHaveLength(1); // flushed despite no replay_done
+  });
+
+  it("gates per-agent: one agent initialising doesn't hold another", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    const delivered: Array<[string, string]> = [];
+    bus.setStreamPromptHandler(async (a, text) => {
+      delivered.push([a, text]);
+    });
+    bus.ingestSessionEvent(initEvt("alpha")); // only alpha initialising
+    await prompt("beta", "beta-now");
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0][0]).toBe("beta");
+  });
+
+  // Real producer order for a fresh/restart/rotation session: the tailer's
+  // start() emits `replay_done` BEFORE the model writes the first line that
+  // triggers `session.init`. The gate must stay order-independent — a prompt
+  // arriving after this real order must deliver IMMEDIATELY (not wait for the
+  // backstop), since the session is already live by `replay_done`.
+  it("delivers immediately on the real producer order (replay_done then session.init)", async () => {
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 1000, // long: a backstop-driven flush would be a bug here
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    // Fresh/empty file: tailer emits replay_done first, then a late session.init.
+    bus.ingestSessionEvent(replayEvt("alpha"));
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "fresh");
+    expect(delivered).toHaveLength(1); // not held until the backstop
+    expect(delivered[0]).toContain("fresh");
+  });
+
+  // A late session.init for an already-live generation is a no-op: a prompt
+  // that arrives between replay_done and the late init must still flow.
+  it("a late session.init for the live generation does not re-arm the hold", async () => {
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 1000,
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(replayEvt("alpha")); // session live (generation "s")
+    await prompt("alpha", "p1");
+    expect(delivered).toHaveLength(1);
+    bus.ingestSessionEvent(initEvt("alpha")); // late init for SAME generation "s"
+    await prompt("alpha", "p2");
+    expect(delivered).toHaveLength(2); // p2 not held
+  });
+
+  // A genuinely new generation arriving init-first (existing/non-empty file at
+  // start of the new tailer) must still arm the hold even though a PRIOR
+  // generation was already live.
+  it("a new generation's session.init (init before replay) still arms the hold", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    // Generation "s" goes live, then a new generation "s2" reinitialises with
+    // an existing file → init("s2") arrives BEFORE replay_done("s2").
+    bus.ingestSessionEvent(replayEvt("alpha")); // gen "s" live
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s2",
+      topic: "session.init",
+      payload: {},
+    });
+    await prompt("alpha", "held");
+    expect(delivered).toHaveLength(0); // held: new gen is (re)initialising
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s2",
+      topic: "bus.events.replay_done",
+      payload: {},
+    });
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toContain("held");
   });
 });
