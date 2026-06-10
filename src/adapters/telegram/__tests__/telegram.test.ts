@@ -1206,12 +1206,13 @@ describe("TelegramAdapter — inbound receipts (#211)", () => {
   });
 
   it("closes as timeout(max_turn_budget_exceeded) when activity never stops past the absolute ceiling", async () => {
-    // Ceiling = MAX_TURN_BUDGET_MULTIPLIER (4) * receiptTimeoutMs. With 30ms
-    // that is ~120ms from received_at. Emit progress every 20ms (always under
+    // Ceiling = receiptMaxBudgetMultiplier * receiptTimeoutMs. Pin both small
+    // (4 * 30ms = ~120ms from received_at) so the test is deterministic under
+    // the generous production default. Emit progress every 20ms (always under
     // the inactivity budget) for longer than the ceiling: the inactivity rearm
     // alone would keep the receipt open forever, but the ceiling forces a close
     // with a DISTINCT reason so a chatty-but-wedged agent stays visible.
-    adapter = await startAdapter({ receiptTimeoutMs: 30 });
+    adapter = await startAdapter({ receiptTimeoutMs: 30, receiptMaxBudgetMultiplier: 4 });
     await feed("forever-chatty wedge");
     const stop = Date.now() + 220;
     while (Date.now() < stop && !closedReceipts().some((r) => r.message_id === "tg-1")) {
