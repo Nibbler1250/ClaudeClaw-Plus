@@ -236,18 +236,24 @@ export class PtyAgentProcess implements AgentProcess {
 
     // REPL is up — disengage FIRST so we never inject a key into a live REPL.
     // Every REPL mode footer carries the mode-cycler hint ("shift+tab to
-    // cycle" / "to cycle permission modes"); "to cycle" is its version-stable
-    // core and appears in no dialog.
-    if (buf.includes("to cycle")) {
+    // cycle" / a future "tab to cycle permission modes"); "tab to cycle" is its
+    // version-stable core and — unlike the bare "to cycle" — cannot trip on
+    // arbitrary boot prose, which would disengage early and re-expose #195.
+    if (buf.includes("tab to cycle")) {
       this.endBootDialogPhase();
       return;
     }
 
     // Bypass-permissions dialog — DEFAULT is "No, exit"; a blind Enter selects
     // exit and kills the agent, so move the selection to the accept row first.
-    if (!this.answeredBypassPrompt && buf.includes("Yes, I accept")) {
-      this.answeredBypassPrompt = true;
-      this.sendBootKeys("\x1b[B", "\r"); // Down, then Enter
+    if (buf.includes("Yes, I accept")) {
+      if (!this.answeredBypassPrompt) {
+        this.answeredBypassPrompt = true;
+        this.sendBootKeys("\x1b[B", "\r"); // Down, then Enter
+      }
+      // The bypass dialog is still on screen (re-rendered after the Down): do
+      // NOT fall through to the generic confirm branch, which would fire a
+      // second, blind Enter racing the deferred one above (Codex F3 / #195).
       return;
     }
 
@@ -274,17 +280,25 @@ export class PtyAgentProcess implements AgentProcess {
       .trim()
       .toLowerCase();
     if (selected === this.lastConfirmSig) return; // same dialog still rendering
-    const destructiveDefault = /\b(exit|cancel|abort|quit|decline|reject)\b/.test(selected);
-    if (!destructiveDefault) {
+    // Fail-safe ALLOWLIST: only auto-press Enter when the selected ("❯") option
+    // affirmatively reads as a proceed/accept action. This subsumes the old
+    // destructive-blocklist (which both blind-Entered destructive defaults
+    // phrased delete/discard/… and false-wedged on benign labels that merely
+    // mentioned "exit"): an unrecognised default now degrades to "stuck + a
+    // one-time warning" rather than "blindly pressed the wrong button".
+    const label = selected.replace(/^❯\s*\d*[.):]?\s*/, ""); // strip "❯ N." prefix
+    const proceedDefault =
+      /\b(yes|accept|trust|continue|proceed|allow|enable|confirm|ok|i am using this)\b/.test(label);
+    if (proceedDefault) {
       this.lastConfirmSig = selected;
-      this.sendBootKeys("\r"); // default is the proceed option
+      this.sendBootKeys("\r"); // default is a recognised proceed option
     } else if (!this.warnedUnhandledDialog) {
-      // Unknown dialog with a destructive default — don't guess which key is
+      // Default does not read as a proceed action — don't guess which key is
       // safe. Surface it so the drift is visible (the watchdog / a follow-up
-      // can react) instead of silently wedging.
+      // can react) instead of silently pressing the wrong button.
       this.warnedUnhandledDialog = true;
       console.error(
-        `[boot-dialog] agent=${this.agent_id}: confirm dialog with destructive default ` +
+        `[boot-dialog] agent=${this.agent_id}: confirm dialog with non-proceed default ` +
           `not auto-answered (selected="${selected.trim().slice(0, 60)}"). REPL may stall.`,
       );
     }
