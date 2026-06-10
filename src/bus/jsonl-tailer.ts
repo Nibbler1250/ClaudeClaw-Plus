@@ -252,6 +252,10 @@ export class JsonlTailer {
     const poll = (): void => {
       if (this.stopped) return;
       if (existsSync(this.filePath)) {
+        // File appeared — the await-creation poll is done; clear its handle so
+        // the tailer's state isn't misleading and stop() doesn't clear a stale
+        // timer (Copilot review #217).
+        this.createPollTimer = null;
         this.attachFileWatcher();
         this.scheduleDrain();
         return;
