@@ -132,11 +132,16 @@ export function createMcpReconciler(
     }
 
     s.inFlight = true;
-    const attemptNo = s.restartHistory.length + 1;
+    // Count the ATTEMPT, not the success: record the timestamp at dispatch so
+    // the cooldown and attempt-cap apply even when restart() REJECTS (e.g. the
+    // Session Manager throwing on its own crash-loop rate-limit). Otherwise a
+    // perpetually-failing restart() leaves restartHistory empty and storms
+    // restart() every confirmMs with no backoff, and reconcile-giveup never fires.
+    s.restartHistory.push(now());
+    const attemptNo = s.restartHistory.length;
     deps.log("reconcile-restart", { agent: agentId, attempt: attemptNo, reason });
     Promise.resolve(deps.restart(agentId))
       .then(() => {
-        s.restartHistory.push(now());
         deps.log("reconcile-restart-ok", { agent: agentId, attempt: attemptNo });
       })
       .catch((err) => {
@@ -148,6 +153,22 @@ export function createMcpReconciler(
   }
 
   return function onMcpSendFailed(agentId: string, ctx: { reason: string }): void {
+    // Opportunistic prune so `states` does not grow one stale entry per
+    // ever-signalled agent_id for the daemon lifetime: drop fully-idle agents
+    // whose restart history has aged out of the window. A pruned agent that
+    // signals again just gets fresh state — an aged-out empty history carries
+    // no live cooldown/cap meaning (attempt() window-filters it anyway).
+    const tprune = now();
+    for (const [id, st] of states) {
+      if (
+        id !== agentId &&
+        !st.pendingConfirm &&
+        !st.inFlight &&
+        !st.restartHistory.some((ts) => tprune - ts < windowMs)
+      ) {
+        states.delete(id);
+      }
+    }
     const s = stateFor(agentId);
     if (s.pendingConfirm || s.inFlight) return; // coalesce
     s.pendingConfirm = true;

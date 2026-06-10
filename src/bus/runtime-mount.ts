@@ -422,6 +422,7 @@ export async function mountBusRuntime(
         try {
           bus.setSlashCommandHandler(null);
           bus.setStreamPromptHandler(null);
+          bus.setMcpSendFailedHandler(null);
         } catch (err) {
           logger.error("[bus-runtime] setSlashCommandHandler(null) failed", err);
         }
@@ -452,6 +453,7 @@ export async function mountBusRuntime(
       try {
         bus.setSlashCommandHandler(null);
         bus.setStreamPromptHandler(null);
+        bus.setMcpSendFailedHandler(null);
       } catch {
         /* ignore — surfacing the original error matters more. */
       }
