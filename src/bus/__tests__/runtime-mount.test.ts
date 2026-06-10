@@ -59,6 +59,7 @@ function createFakeBus(opts: FakeBusOptions = {}): FakeBus {
   let detachCalls = 0;
   let installed = false;
   let detached = false;
+  let mcpDetached = false;
   const events: string[] = [];
   return {
     async sendPrompt() {
@@ -82,6 +83,14 @@ function createFakeBus(opts: FakeBusOptions = {}): FakeBus {
     // care about ordering observe via the `events` buffer in
     // setSlashCommandHandler.
     setStreamPromptHandler() {},
+    // #222 reconciliation contract — runtime-mount installs the reconciler
+    // signal handler on start. No-op fake.
+    setMcpSendFailedHandler(h) {
+      if (h === null) mcpDetached = true;
+    },
+    isAgentConnected() {
+      return false;
+    },
     setSlashCommandHandler(h) {
       if (h === null) {
         detachCalls += 1;
@@ -119,6 +128,9 @@ function createFakeBus(opts: FakeBusOptions = {}): FakeBus {
     },
     slashHandlerDetached() {
       return detached;
+    },
+    mcpHandlerDetached() {
+      return mcpDetached;
     },
     startCalls() {
       return starts;
@@ -181,6 +193,8 @@ describe("mountBusRuntime — happy path (injected fakes)", () => {
     expect(detachIdx).toBeGreaterThanOrEqual(0);
     expect(stopIdx).toBeGreaterThanOrEqual(0);
     expect(detachIdx).toBeLessThan(stopIdx);
+    // #237: the reconciler signal handler is detached too (symmetry).
+    expect(bus.mcpHandlerDetached()).toBe(true);
   });
 
   it("stop() swallows errors from bus.stop() and bus.setSlashCommandHandler", async () => {
