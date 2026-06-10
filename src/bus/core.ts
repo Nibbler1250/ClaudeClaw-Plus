@@ -48,6 +48,7 @@ import type {
   IpcPrompt,
   PermissionResponse,
 } from "./types";
+import { CHANNEL_DRIVEN_ORIGINS } from "./types";
 
 /** Escape XML text content (`&`, `<`, `>`) so a `</channel>` in user text
  *  can't close the wrapper element early and inject sibling markup. */
@@ -121,6 +122,10 @@ export interface BusCoreOptions {
   eventLogAppend?: EventLogAppendFn;
   /** Ringbuffer cap per subscriber. */
   ringbufferCapacity?: number;
+  /** Backstop (ms) for the delivery gate: max time a prompt is held while the
+   *  agent's session (re)initialises before it's flushed even without a
+   *  `replay_done`. Defaults to 4000. Lowered in tests. */
+  deliveryBackstopMs?: number;
   /** Slash-command delegate (Agent C wires this). */
   slashCommandHandler?: SlashCommandHandler;
   /** REPL prompt delegate for PTY-stdin agents. Wired by the Session Manager. */
@@ -200,9 +205,82 @@ export class BusCoreImpl implements BusCore {
    */
   private readonly lastPromptOrigin = new Map<string, { origin: BusOrigin; origin_id: string }>();
 
+  /**
+   * Delivery gate. A prompt typed into a PTY-resident agent while its session
+   * is (re)initialising — `session.init` seen but `bus.events.replay_done` not
+   * yet — is swallowed by the not-yet-ready TUI and never starts a turn
+   * (observed as an intermittent "prompt delivered, no reply"). Such prompts
+   * are held and flushed on `replay_done`, or after a backstop timeout so a
+   * missed `replay_done` can never strand a prompt (worst case = the previous
+   * deliver-immediately behaviour). `agentInitializing` maps an agent to its
+   * backstop timer; `deliveryQueue` holds the wrapped prompts awaiting flush.
+   *
+   * The gate is ORDER-INDEPENDENT. The JSONL tailer emits `replay_done` for
+   * every session generation, but `session.init` only when the model writes
+   * the first line of a previously-empty file. For a fresh / restart /
+   * `/clear`-rotated session the file is empty at `start()`, so the tailer
+   * emits `replay_done` FIRST and `session.init` LATER (once the model
+   * writes). Treating `session.init` as an unconditional "arm" would then hold
+   * an already-live session until the backstop fires — penalising exactly the
+   * (re)init path this gate is meant to protect. So `replay_done`
+   * unconditionally marks the agent READY for its session generation
+   * (`agentLiveSession`) and flushes; a `session.init` for an already-live
+   * generation is a no-op. `session.init` only arms a hold when the agent is
+   * NOT already past `replay_done` for the current generation (the real
+   * init→replay order, i.e. an existing/non-empty file at `start()`).
+   */
+  private readonly agentInitializing = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly deliveryQueue = new Map<string, string[]>();
+  /**
+   * Per-agent session generation (the `replay_done` `session_id`) that has
+   * already reached `replay_done` and is therefore live. Makes the gate
+   * order-independent: a late `session.init` carrying this same generation
+   * must not re-arm a hold on a session that is already running.
+   */
+  private readonly agentLiveSession = new Map<string, string>();
+  private readonly deliveryBackstopMs: number;
+  /**
+   * Silent-drop safety net (issue #215): tracks per-agent whether the
+   * current turn has called the `reply` MCP tool with `intent: "final"`.
+   * Reset on every new inbound prompt (`sendPrompt`), set to `true` when
+   * an `intent: "final"` `ingestReply` lands. On `response.turn_end`
+   * (emitted by the JSONL tailer when `stop_reason === "end_turn"`), if
+   * this is still `false` and the turn produced non-empty text, the
+   * agent ended the turn without delivering — we synthesize an
+   * `ingestReply` so the user actually receives the response.
+   *
+   * Single-slot per agent, last-write-wins — the same limitation
+   * `lastPromptOrigin` carries above (and this map depends on
+   * `lastPromptOrigin` for routing the synthesized reply). Interleaving two
+   * in-flight prompts on one agent would let the second `sendPrompt` reset
+   * the flag mid-turn for the first; the webui-bridge mutex serialising
+   * prompt→reply per agent is the workaround for the path that would
+   * otherwise violate the one-turn-at-a-time assumption. The residual
+   * cross-channel stale/misroute race this leaves open (a lagged turn_end
+   * synthesizing the wrong prompt's text to the wrong surface) is tracked
+   * as deferred follow-up #239 — see the note in `handleTurnEnd`.
+   */
+  private readonly currentTurnReplied = new Map<string, boolean>();
+
+  /**
+   * Cross-transport dedup for the silent-drop net (#217, finding 2).
+   * `currentTurnReplied` is reset to `false` on every `sendPrompt` and set
+   * to `true` once a final lands — but a real `reply` (IPC) and the
+   * synthesized recovery (`response.turn_end` via the fs.watch tailer)
+   * travel on two independent, unordered async channels. If the tailer
+   * wins the race, `handleTurnEnd` synthesizes+delivers a final, then the
+   * real `ingestReply(final)` IPC arrives and would deliver the SAME text
+   * a second time. This per-turn flag records that a final `response.text`
+   * was already PUBLISHED for the in-flight turn so the loser of the race
+   * is suppressed. Set in both `ingestReply(final)` and the synthesizer;
+   * cleared alongside `currentTurnReplied` on prompt / disconnect / cancel.
+   */
+  private readonly currentTurnFinalPublished = new Map<string, boolean>();
+
   constructor(opts: BusCoreOptions = {}) {
     this.socketPath = opts.socketPath ?? null;
     this.ringbufferCapacity = opts.ringbufferCapacity ?? DEFAULT_RINGBUFFER_CAPACITY;
+    this.deliveryBackstopMs = opts.deliveryBackstopMs ?? 4000;
     this.eventLogAppend = opts.eventLogAppend ?? eventLogAppend;
     this.slashCommandHandler = opts.slashCommandHandler ?? null;
     this.streamPromptHandler = opts.streamPromptHandler ?? null;
@@ -246,6 +324,19 @@ export class BusCoreImpl implements BusCore {
           // agent (after a reconnect) would inherit the dead session's
           // origin and misroute (5-agent review on PR #138, A1 finding).
           this.lastPromptOrigin.delete(agentId);
+          this.currentTurnReplied.delete(agentId);
+          this.currentTurnFinalPublished.delete(agentId);
+          // The subprocess is gone -- tear down this agent's delivery-gate
+          // state too, so a held prompt plus an armed backstop timer can never
+          // flush a stale keystroke into a restart that reuses this agent_id.
+          // NOT agentLiveSession: clearing it would let a late session.init
+          // arm a hold on the resumed (already-live) session -- the very
+          // anti-pattern the order-independent gate avoids -- and the new
+          // tailer re-emits replay_done which sets it again anyway.
+          const heldInitTimer = this.agentInitializing.get(agentId);
+          if (heldInitTimer) clearTimeout(heldInitTimer);
+          this.agentInitializing.delete(agentId);
+          this.deliveryQueue.delete(agentId);
           this.logIpc("close", {
             agent: agentId,
             connections: this.ipcServer?.connectionCount() ?? 0,
@@ -269,6 +360,10 @@ export class BusCoreImpl implements BusCore {
     }
     this.subscribers.clear();
     this.connectedAgents.clear();
+    for (const timer of this.agentInitializing.values()) clearTimeout(timer);
+    this.agentInitializing.clear();
+    this.deliveryQueue.clear();
+    this.agentLiveSession.clear();
   }
 
   /* ─────────────────────────────── prompts ─────────────────────────────── */
@@ -310,6 +405,13 @@ export class BusCoreImpl implements BusCore {
       origin: req.origin,
       origin_id: req.origin_id,
     });
+    // Silent-drop safety net (#215): new prompt → reset the "did this
+    // turn call reply?" flag. If the agent ends the turn (response.turn_end)
+    // without ever setting this to true, we'll synthesize delivery.
+    this.currentTurnReplied.set(req.agent_id, false);
+    // #217 finding 2: a new turn starts undelivered — clear the
+    // cross-transport "final already published" dedup flag.
+    this.currentTurnFinalPublished.set(req.agent_id, false);
 
     const ipcMsg: IpcPrompt = {
       type: "prompt",
@@ -364,11 +466,74 @@ export class BusCoreImpl implements BusCore {
         }
       }
       const wrapped = `<channel ${attrs.join(" ")}>${escapeXmlText(req.text)}</channel>`;
-      void this.streamPromptHandler(req.agent_id, wrapped).catch((err) =>
-        this.onError(err, { ctx: "streamPromptHandler", agent_id: req.agent_id }),
-      );
+      this.deliverOrQueuePrompt(req.agent_id, wrapped);
     }
     return { promise_id };
+  }
+
+  /** Deliver a PTY-stdin prompt, or hold it if the agent's session is
+   *  (re)initialising (the not-yet-ready TUI would swallow the keystroke).
+   *  Held prompts flush on `replay_done` (`markAgentReady`) or the backstop. */
+  private deliverOrQueuePrompt(agent_id: string, wrapped: string): void {
+    if (!this.streamPromptHandler) return;
+    if (this.agentInitializing.has(agent_id)) {
+      const q = this.deliveryQueue.get(agent_id) ?? [];
+      q.push(wrapped);
+      this.deliveryQueue.set(agent_id, q);
+      return;
+    }
+    this.streamDeliver(agent_id, wrapped);
+  }
+
+  private streamDeliver(agent_id: string, wrapped: string): void {
+    if (!this.streamPromptHandler) return;
+    void this.streamPromptHandler(agent_id, wrapped).catch((err) =>
+      this.onError(err, { ctx: "streamPromptHandler", agent_id }),
+    );
+  }
+
+  /** `session.init` → start holding PTY-stdin prompts for this agent, UNLESS
+   *  the agent is already past `replay_done` for this session generation (the
+   *  fresh/restart/rotation path emits `replay_done` BEFORE `session.init`, so
+   *  the session is already live and must not be re-held). The backstop
+   *  force-flushes if `replay_done` never arrives, so a held prompt is never
+   *  stranded; the hold is re-armed on each fresh-generation `session.init`. */
+  private markAgentInitializing(agent_id: string, session_id?: string): void {
+    // Order-independence: if `replay_done` for this generation was already
+    // observed, the session is live — a (late) `session.init` for it must not
+    // arm a fresh hold. A missing/unknown session_id falls through to arming,
+    // bounded by the backstop, so worst case = the previous behaviour.
+    if (session_id && this.agentLiveSession.get(agent_id) === session_id) return;
+    // Keep the EARLIEST deadline: don't re-arm if already holding. Otherwise a
+    // rapid `session.init` churn (< backstop interval, e.g. an IPC-reconnect
+    // storm) would keep pushing the deadline out and strand held prompts. The
+    // backstop must fire within `deliveryBackstopMs` of the FIRST init.
+    if (this.agentInitializing.has(agent_id)) return;
+    const timer = setTimeout(() => {
+      this.onError(
+        new Error(
+          `replay_done not seen within backstop; flushing held prompts for agent_id=${agent_id}`,
+        ),
+        { ctx: "deliveryBackstop", agent_id },
+      );
+      this.markAgentReady(agent_id);
+    }, this.deliveryBackstopMs);
+    this.agentInitializing.set(agent_id, timer);
+  }
+
+  /** `replay_done` (or backstop) → session ready: record the live generation
+   *  (so a late `session.init` for it can't re-arm a hold), clear any pending
+   *  hold, and flush held prompts in order. Called unconditionally on
+   *  `replay_done`, which the tailer emits for every session generation. */
+  private markAgentReady(agent_id: string, session_id?: string): void {
+    if (session_id) this.agentLiveSession.set(agent_id, session_id);
+    const timer = this.agentInitializing.get(agent_id);
+    if (timer) clearTimeout(timer);
+    this.agentInitializing.delete(agent_id);
+    const q = this.deliveryQueue.get(agent_id);
+    if (!q || q.length === 0) return;
+    this.deliveryQueue.delete(agent_id);
+    for (const wrapped of q) this.streamDeliver(agent_id, wrapped);
   }
 
   async invokeSlashCommand(agent_id: string, cmd: string): Promise<void> {
@@ -430,7 +595,22 @@ export class BusCoreImpl implements BusCore {
 
   /* ─────────────────────────────── ingest ─────────────────────────────── */
 
-  ingestReply(req: IngestReplyRequest): void {
+  ingestReply(req: IngestReplyRequest, opts?: { synthetic?: boolean }): void {
+    // Cross-transport dedup (#217 finding 2): a final reply can arrive both
+    // as the agent's real `reply` IPC AND as the synthesized recovery from
+    // `response.turn_end` (the JSONL tailer). They race on two unordered
+    // channels; whichever lands first publishes and sets
+    // `currentTurnFinalPublished`. The loser is suppressed here so the same
+    // turn never delivers two finals. `synthetic` calls (from
+    // `handleTurnEnd`) bypass the check — they only run AFTER confirming no
+    // final has published yet, and must be allowed to publish the first.
+    if (
+      req.intent === "final" &&
+      !opts?.synthetic &&
+      this.currentTurnFinalPublished.get(req.agent_id) === true
+    ) {
+      return;
+    }
     const topic: BusEventTopic =
       req.intent === "tool_status" ? "response.tool_use" : "response.text";
     // Attach the originating surface so adapters can route the reply
@@ -475,10 +655,105 @@ export class BusCoreImpl implements BusCore {
     //   - `permission_request` IPC handler (origin on channel.permission_request)
     if (req.intent === "final") {
       this.lastPromptOrigin.delete(req.agent_id);
+      // Silent-drop safety net (#215): the agent called `reply` with a final
+      // intent → mark this turn as delivered, so the `response.turn_end`
+      // handler skips the synthetic-delivery fallback for this turn.
+      this.currentTurnReplied.set(req.agent_id, true);
+      // #217 finding 2: record that a final was published for this turn so
+      // the cross-transport race loser (real reply vs synthesized) is
+      // suppressed above.
+      this.currentTurnFinalPublished.set(req.agent_id, true);
     }
   }
 
+  /**
+   * Silent-drop safety net handler (issue #215). Wired by
+   * `ingestSessionEvent`/JSONL tailer when it observes a `response.turn_end`
+   * with `stop_reason: "end_turn"`. If the agent ended the turn with
+   * non-empty text but never called the `reply` tool for this prompt,
+   * synthesize an `ingestReply` so the user actually receives the
+   * response. Without this, the text sits in the session `.jsonl` and
+   * the user-facing surface gets nothing — confirmed live 2x in 12h
+   * on a real bus-mode deployment after issue #215 was filed.
+   */
+  private handleTurnEnd(agentId: string, text: string): void {
+    if (this.currentTurnReplied.get(agentId) === true) return;
+    // #217 finding 2: if a final already published for this turn (e.g. the
+    // real reply IPC landed first), don't synthesize a duplicate.
+    if (this.currentTurnFinalPublished.get(agentId) === true) return;
+    if (!text || text.trim().length === 0) return;
+    // RESIDUAL RACE (#217 finding 3 → deferred #239): `lastPromptOrigin` and
+    // the per-turn flags are single-slot, keyed by agent_id only, with no
+    // prompt/turn identity. The JSONL tailer's `response.turn_end` is
+    // delivered asynchronously (fs.watch + drain), so on a cross-channel
+    // interleave — P1(telegram) ends → reply → P2(webui) arrives (resets the
+    // flag, rewrites origin=webui) → P1's lagged turn_end lands here — this
+    // can route P1's text to P2's origin (webui). The flag-reset path is
+    // largely covered by the webui-bridge mutex serialising prompt→reply per
+    // agent, but cross-surface interleave is NOT fully closed. A complete fix
+    // threads the originating prompt_id onto the turn_end event and matches
+    // it to the in-flight prompt before synthesizing; that requires the
+    // tailer to carry prompt identity and is tracked as deferred follow-up
+    // #239 to avoid destabilizing this safety-net PR.
+    const origin = this.lastPromptOrigin.get(agentId);
+    if (!origin) {
+      // No origin to route to (cron tick / unprompted ambient turn).
+      // Log so operators can correlate; don't fabricate delivery.
+      console.warn(
+        `[bus] silent-drop detected for agent=${agentId} (turn ended with text but no reply); ` +
+          `no lastPromptOrigin to route to — dropping silently as before.`,
+      );
+      return;
+    }
+    // Only channel-driven origins (telegram/webui/discord/slack) have a
+    // user waiting on a reply. Scheduled/ambient origins (cron, heartbeat,
+    // cli, rest) legitimately end turns with text WITHOUT calling `reply`
+    // — that's not a silent drop, and there's no adapter to deliver the
+    // synthesized reply to anyway. Synthesizing for them would spam a
+    // bogus "recovered" warning and emit an undeliverable response.text on
+    // every scheduled tick. Skip them.
+    if (!CHANNEL_DRIVEN_ORIGINS.has(origin.origin)) {
+      return;
+    }
+    console.warn(
+      `[bus] silent-drop recovered for agent=${agentId} (origin=${origin.origin}, ` +
+        `chars=${text.length}): the turn ended with text but the agent did not call the ` +
+        `reply tool — synthesizing ingestReply to deliver. See issue #215.`,
+    );
+    // Mark BEFORE the recursive ingestReply so the synthetic call itself
+    // doesn't trigger another safety-net pass (it would no-op anyway
+    // because we set the flag here, but the explicit ordering makes the
+    // single-fire intent clearer).
+    this.currentTurnReplied.set(agentId, true);
+    // `synthetic: true` lets this first delivery through the cross-transport
+    // dedup (#217 finding 2); it sets `currentTurnFinalPublished`, so a
+    // later real `reply` IPC for the same turn is suppressed.
+    this.ingestReply(
+      {
+        agent_id: agentId,
+        text,
+        intent: "final",
+      },
+      { synthetic: true },
+    );
+  }
+
   ingestSessionEvent(e: BusEvent): void {
+    // Delivery gate: hold PTY-stdin prompts while the agent's session is
+    // (re)initialising so a keystroke isn't swallowed by a not-yet-ready TUI,
+    // and release them once it's live.
+    if (e.agent_id) {
+      if (e.topic === "session.init") this.markAgentInitializing(e.agent_id, e.session_id);
+      else if (e.topic === "bus.events.replay_done") this.markAgentReady(e.agent_id, e.session_id);
+    }
+    // Silent-drop safety net (#215): the JSONL tailer publishes a
+    // `response.turn_end` event when claude stops with `end_turn`. Hook
+    // into it before the generic publish so we can synthesize a
+    // delivery for turns that produced text but never called reply.
+    if (e.topic === "response.turn_end" && e.agent_id) {
+      const payload = e.payload as { text?: string };
+      this.handleTurnEnd(e.agent_id, payload?.text ?? "");
+    }
     this.publish(e);
   }
 
@@ -623,6 +898,11 @@ export class BusCoreImpl implements BusCore {
         // this agent doesn't inherit it and misroute (5-agent review
         // on PR #138, A1 finding).
         this.lastPromptOrigin.delete(agentId);
+        // Silent-drop safety net (#215): cancelled turn won't produce
+        // a real reply OR a `response.turn_end` event — drop the
+        // tracking flag to keep the map bounded.
+        this.currentTurnReplied.delete(agentId);
+        this.currentTurnFinalPublished.delete(agentId);
         break;
       case "request_human": {
         // Forward the correlation id along with the question. Without
@@ -677,6 +957,10 @@ export class BusCoreImpl implements BusCore {
         // scheduler events for this agent don't inherit the stale
         // origin (5-agent review on PR #138, A1 finding).
         this.lastPromptOrigin.delete(agentId);
+        // Silent-drop safety net (#215): error path won't produce a
+        // turn_end either — clear tracking too.
+        this.currentTurnReplied.delete(agentId);
+        this.currentTurnFinalPublished.delete(agentId);
         break;
       // hello already handled in the IPC layer; outbound types (prompt,
       // permission_response, ask_answer) shouldn't arrive from MCP.
