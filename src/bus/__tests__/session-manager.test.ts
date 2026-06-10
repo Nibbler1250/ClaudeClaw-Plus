@@ -22,6 +22,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { encodeCwdForProjectsDir } from "../jsonl-line-types";
@@ -33,6 +34,7 @@ import {
   type AgentProcess,
 } from "../session-manager";
 import type { AgentConfig, BusOrigin } from "../types";
+import { createBusCore, type BusCore } from "../core";
 
 const IS_DARWIN = process.platform === "darwin";
 const IS_UNIX = process.platform !== "win32";
@@ -803,5 +805,117 @@ describe("session-id collision rotation", () => {
     const proc2 = await mgr.spawnAgent(agent, "cron");
     expect(proc2).toBeDefined();
     await new Promise((r) => setTimeout(r, 50));
+  });
+});
+
+async function waitUntil(pred: () => boolean, timeoutMs = 2000): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (pred()) return;
+    await new Promise((r) => setTimeout(r, 15));
+  }
+  throw new Error("waitUntil timed out");
+}
+
+describe("JSONL tailer wiring (issue #215)", () => {
+  if (!IS_UNIX) {
+    it.skip("skipped on non-Unix (no bun-pty)", () => {});
+    return;
+  }
+
+  const SID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  let tempRoot: string;
+  let projectsDir: string;
+  let agentCwd: string;
+  let sessionPath: string;
+  let bus: BusCore;
+  let mgr: SessionManager;
+  const spawned: string[] = [];
+
+  beforeEach(() => {
+    tempRoot = mkdtempSync(join(tmpdir(), "ccaw-tailer-wire-"));
+    projectsDir = join(tempRoot, "projects");
+    agentCwd = mkdtempSync(join(tmpdir(), "ccaw-tailer-cwd-"));
+    const enc = encodeCwdForProjectsDir(realpathSync(agentCwd));
+    mkdirSync(join(projectsDir, enc), { recursive: true });
+    sessionPath = join(projectsDir, enc, `${SID}.jsonl`);
+    bus = createBusCore({ eventLogAppend: (async () => ({})) as never });
+    mgr = new SessionManager({
+      commandOverride: "/bin/cat",
+      argsOverride: [],
+      busSocketPath: "/tmp/test-bus.sock",
+      sessionCollisionDetectMs: 0,
+      bus,
+      projectsDir,
+    });
+  });
+
+  afterEach(async () => {
+    for (const id of spawned) {
+      try {
+        await mgr.stop(id);
+      } catch {
+        /* ignore */
+      }
+    }
+    spawned.length = 0;
+    rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  it("synthesizes a reply from a real turn_end JSONL line (proves the runtime wiring)", async () => {
+    const replies: { text: string; origin?: string }[] = [];
+    bus.subscribe({ agent_id: "wired-agent", topics: ["response.text"] }, (e) => {
+      const p = e.payload as { text?: string; intent?: string; origin?: string };
+      if (p?.intent === "final") replies.push({ text: p.text ?? "", origin: p.origin });
+    });
+
+    const agent = mkAgent({ id: "wired-agent", cwd: agentCwd, session_id: SID });
+    const proc = await mgr.spawnAgent(agent, "telegram");
+    spawned.push(agent.id);
+    expect(proc.agent_id).toBe("wired-agent");
+
+    // A prompt is in flight: origin recorded, reply not yet seen.
+    await bus.sendPrompt({
+      agent_id: "wired-agent",
+      origin: "telegram",
+      origin_id: "tg-1",
+      user_id: "u1",
+      text: "allo",
+    });
+
+    // The agent ends its turn with final text but never calls `reply`
+    // (issue #215). claude appends the line to the live session JSONL.
+    await writeFile(
+      sessionPath,
+      `${JSON.stringify({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          id: "msg1",
+          content: [{ type: "text", text: "Allo Simon!" }],
+          stop_reason: "end_turn",
+        },
+        timestamp: new Date().toISOString(),
+        sessionId: SID,
+      })}\n`,
+    );
+
+    await waitUntil(() => replies.length > 0, 2500);
+    expect(replies[0].text).toBe("Allo Simon!");
+    expect(replies[0].origin).toBe("telegram");
+  });
+
+  it("spawns cleanly when no bus is configured (tailer wiring is opt-in)", async () => {
+    const noBus = new SessionManager({
+      commandOverride: "/bin/cat",
+      argsOverride: [],
+      busSocketPath: "/tmp/test-bus.sock",
+      sessionCollisionDetectMs: 0,
+      projectsDir,
+    });
+    const agent = mkAgent({ id: "nobus-agent", cwd: agentCwd, session_id: SID });
+    const proc = await noBus.spawnAgent(agent, "telegram");
+    expect(proc.agent_id).toBe("nobus-agent");
+    await noBus.stop(agent.id);
   });
 });

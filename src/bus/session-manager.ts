@@ -40,6 +40,8 @@ import {
   writeConfigForPty,
 } from "../runner/pty-mcp-config-writer";
 import { createSession } from "../sessions";
+import type { BusCore } from "./core";
+import { JsonlTailer } from "./jsonl-tailer";
 import { capturePostMortem, type PostMortemOptions } from "./post-mortem";
 import type { ReceiptRecord } from "./receipt";
 import {
@@ -108,6 +110,20 @@ export interface SessionManagerOptions {
    * Optional logger override. Defaults to `console`.
    */
   logger?: Pick<Console, "warn" | "info" | "error">;
+  /**
+   * Bus core to feed session JSONL events into (issue #215). When set,
+   * every spawned agent gets a `JsonlTailer` bound to its live session
+   * that forwards `response.turn_end` (etc.) via `bus.ingestSessionEvent`,
+   * which powers the silent-drop safety net. Absent in unit tests that
+   * don't exercise the tailer. The daemon (`runtime-mount`) wires it.
+   */
+  bus?: BusCore;
+  /**
+   * Override the `~/.claude/projects` root the per-agent `JsonlTailer`
+   * reads (issue #215). Defaults to the tailer's own default. Tests point
+   * it at a temp dir so they never touch the real projects directory.
+   */
+  projectsDir?: string;
   /**
    * Clock seam for the `restart()` rate-limiter (tests). Returns epoch ms.
    * Defaults to `Date.now`.
@@ -507,6 +523,12 @@ interface AgentRecord {
    * `agent.mcp_config`, or dormant multiplexer).
    */
   mcpConfigCwd?: string;
+  /**
+   * Live session JSONL tailer (issue #215). Present when `options.bus`
+   * is set; feeds `response.turn_end` events so the bus can synthesize a
+   * reply the agent forgot to send. Stopped on agent exit / stop().
+   */
+  tailer?: JsonlTailer;
 }
 
 export class SessionManager {
@@ -634,6 +656,8 @@ export class SessionManager {
     proc.onExit(() => {
       const current = this.agents.get(agent.id);
       if (current && current.proc === proc) {
+        // Issue #215: tear down the session tailer on natural exit too.
+        void current.tailer?.stop();
         // Issue #165 (PR #184 re-review): a natural exit (crash, OOM,
         // claude-side auth failure, operator kill) never routes through
         // stop(), so release the multiplexer identity + delete the 0600
@@ -702,6 +726,34 @@ export class SessionManager {
       throw new Error(
         `agent ${agent.id}: session-id collision persisted after rotation (id=${agent.session_id}) — manual intervention required`,
       );
+    }
+
+    // Issue #215: wire a JSONL tailer to this agent's live session so the
+    // bus observes `response.turn_end` and can synthesize a reply when a
+    // turn ends with text but the agent never called the `reply` tool.
+    // Without this the safety net in BusCore.handleTurnEnd is inert (no
+    // events are ever produced in the runtime). Created here — after any
+    // session-id rotation — so it binds the FINAL session_id. start() is
+    // fire-and-forget: it must not block returning the proc, and a tail
+    // failure must never fail the spawn.
+    if (this.options.bus) {
+      const tailer = new JsonlTailer({
+        bus: this.options.bus,
+        agent_id: agent.id,
+        session_id: agent.session_id,
+        cwd: realCwd,
+        startAt: "end",
+        projectsDir: this.options.projectsDir,
+      });
+      record.tailer = tailer;
+      void tailer
+        .start()
+        .catch((err) =>
+          (this.options.logger ?? console).warn(
+            `[bus-session] agent=${agent.id} jsonl tailer start failed`,
+            err,
+          ),
+        );
     }
 
     return proc;
@@ -858,6 +910,8 @@ export class SessionManager {
     if (!record) return Promise.resolve();
     return new Promise<void>((resolve) => {
       const finalise = (): void => {
+        // Issue #215: tear down the session tailer.
+        void record.tailer?.stop();
         // Issue #165: release the multiplexer identity + delete the
         // synthesized per-agent --mcp-config when this spawn had one.
         this.cleanupAgentMcpConfig(record.mcpConfigCwd, agent_id);
