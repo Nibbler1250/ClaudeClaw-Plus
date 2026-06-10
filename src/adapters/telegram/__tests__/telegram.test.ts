@@ -1205,6 +1205,33 @@ describe("TelegramAdapter — inbound receipts (#211)", () => {
     );
   });
 
+  it("closes as timeout(max_turn_budget_exceeded) when activity never stops past the absolute ceiling", async () => {
+    // Ceiling = MAX_TURN_BUDGET_MULTIPLIER (4) * receiptTimeoutMs. With 30ms
+    // that is ~120ms from received_at. Emit progress every 20ms (always under
+    // the inactivity budget) for longer than the ceiling: the inactivity rearm
+    // alone would keep the receipt open forever, but the ceiling forces a close
+    // with a DISTINCT reason so a chatty-but-wedged agent stays visible.
+    adapter = await startAdapter({ receiptTimeoutMs: 30 });
+    await feed("forever-chatty wedge");
+    const stop = Date.now() + 220;
+    while (Date.now() < stop && !closedReceipts().some((r) => r.message_id === "tg-1")) {
+      bus.emit({
+        ts: Date.now(),
+        agent_id: "triage",
+        session_id: "s1",
+        topic: "response.text",
+        payload: { text: "still working...", intent: "progress" },
+      });
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    await waitFor(() =>
+      closedReceipts().some((r) => r.message_id === "tg-1" && r.final_state === "timeout"),
+    );
+    expect(closedReceipts().find((r) => r.message_id === "tg-1")?.notes?.reason).toBe(
+      "max_turn_budget_exceeded",
+    );
+  });
+
   it("supersedes a still-open receipt when a new prompt arrives first", async () => {
     adapter = await startAdapter();
     await feed("first", 50); // tg-1
