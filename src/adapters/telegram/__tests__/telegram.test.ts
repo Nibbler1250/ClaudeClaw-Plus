@@ -1178,6 +1178,33 @@ describe("TelegramAdapter — inbound receipts (#211)", () => {
     );
   });
 
+  it("rearms the inactivity timeout on every turn activity — a long working turn is not falsely timed out", async () => {
+    adapter = await startAdapter({ receiptTimeoutMs: 100 });
+    await feed("long agentic task");
+    // Emit progress activity every 25ms (well under the 100ms inactivity budget)
+    // for ~150ms total — longer than the budget, so a fixed wall-clock timer
+    // armed at prompt arrival would already have fired. Each progress rearms it.
+    for (let i = 0; i < 6; i++) {
+      bus.emit({
+        ts: Date.now(),
+        agent_id: "triage",
+        session_id: "s1",
+        topic: "response.text",
+        payload: { text: `working ${i}...`, intent: "progress" },
+      });
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    // Activity kept rearming: still open though elapsed (~150ms) > budget (100ms).
+    expect(closedReceipts().some((r) => r.message_id === "tg-1")).toBe(false);
+    // Once silent, it closes as a genuine inactivity timeout.
+    await waitFor(() =>
+      closedReceipts().some((r) => r.message_id === "tg-1" && r.final_state === "timeout"),
+    );
+    expect(closedReceipts().find((r) => r.message_id === "tg-1")?.notes?.reason).toBe(
+      "no_final_reply_within_timeout",
+    );
+  });
+
   it("supersedes a still-open receipt when a new prompt arrives first", async () => {
     adapter = await startAdapter();
     await feed("first", 50); // tg-1

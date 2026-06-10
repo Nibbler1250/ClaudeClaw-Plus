@@ -472,6 +472,12 @@ export class TelegramAdapter {
     const isProgress = intent === "progress";
     const FRAMES = TelegramAdapter.SPINNER_FRAMES;
     const key = this.convKey(agentId, target.chat_id);
+    // Receipt timeout is INACTIVITY-based, not a wall-clock budget: any assistant
+    // output for this turn — progress OR final — proves the turn is alive, so
+    // rearm the timeout. A long, actively-working turn (subagents, tool calls)
+    // is never closed as a false no-reply timeout; only a genuinely silent turn
+    // (deaf agent / model hang) lets it fire.
+    this.armReceiptTimeout(key);
     // Every new reply replaces the active animated message — stop any prior spinner.
     this.stopSpinner(key);
     // Receipt (#211): a non-progress response.text is the turn-final
@@ -696,6 +702,24 @@ export class TelegramAdapter {
     // Never keep the event loop alive solely for this watchdog timer.
     if (typeof timer.unref === "function") timer.unref();
     this.openReceipts.set(key, { receipt, timer });
+  }
+
+  /** (Re)arm the inactivity timeout for an open receipt. Called on every
+   *  observed turn output so the receipt closes as `timeout` only after
+   *  `receiptTimeoutMs` of NO activity — not a fixed wall-clock budget from
+   *  prompt arrival, which would falsely time out a long but actively-working
+   *  turn. No-op when no receipt is open. */
+  private armReceiptTimeout(key: string): void {
+    const entry = this.openReceipts.get(key);
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    const timer = setTimeout(() => {
+      this.closeTelegramReceipt(key, "timeout", {
+        reason: "no_final_reply_within_timeout",
+      });
+    }, this.receiptTimeoutMs);
+    if (typeof timer.unref === "function") timer.unref();
+    entry.timer = timer;
   }
 
   /** Close (idempotently) the open receipt for a conversation, if any. */
