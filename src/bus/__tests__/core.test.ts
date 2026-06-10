@@ -524,6 +524,57 @@ describe("BusCore IPC", () => {
     client.close();
   });
 
+  it("drops held prompts and cancels the backstop on IPC disconnect (#243 review)", async () => {
+    // A prompt held during (re)init must NOT be flushed into a restart that
+    // reuses the same agent_id: when the subprocess IPC socket drops, onClose
+    // tears down the gate timer + queue so the backstop can never inject a
+    // stale keystroke into the new process.
+    const sockPath = join(tempDir, "bus.sock");
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      deliveryBackstopMs: 100,
+      onError: () => {},
+    });
+    await bus.start();
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+
+    const client = await connectIpcClient(sockPath);
+    client.send({
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(bus.state().connectedAgents).toContain("alpha");
+
+    // Arm the gate and queue a held prompt, then drop the socket BEFORE replay_done.
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "session.init",
+      payload: {},
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "webui",
+      origin_id: "i",
+      user_id: "u",
+      text: "held",
+    });
+    expect(delivered).toHaveLength(0);
+    client.close();
+
+    // Past the backstop: without the onClose teardown the held prompt would
+    // flush here; with it, nothing is delivered.
+    await new Promise((r) => setTimeout(r, 160));
+    expect(delivered).toHaveLength(0);
+  });
+
   it("sendPrompt forwards an IpcPrompt to the right MCP connection", async () => {
     const sockPath = join(tempDir, "bus.sock");
     bus = createBusCore({

@@ -286,6 +286,17 @@ export class BusCoreImpl implements BusCore {
           this.lastPromptOrigin.delete(agentId);
           this.currentTurnReplied.delete(agentId);
           this.currentTurnFinalPublished.delete(agentId);
+          // The subprocess is gone -- tear down this agent's delivery-gate
+          // state too, so a held prompt plus an armed backstop timer can never
+          // flush a stale keystroke into a restart that reuses this agent_id.
+          // NOT agentLiveSession: clearing it would let a late session.init
+          // arm a hold on the resumed (already-live) session -- the very
+          // anti-pattern the order-independent gate avoids -- and the new
+          // tailer re-emits replay_done which sets it again anyway.
+          const heldInitTimer = this.agentInitializing.get(agentId);
+          if (heldInitTimer) clearTimeout(heldInitTimer);
+          this.agentInitializing.delete(agentId);
+          this.deliveryQueue.delete(agentId);
         }
       },
       onError: (err, agentId) => this.onError(err, { ctx: "ipc", agentId }),
