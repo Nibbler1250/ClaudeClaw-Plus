@@ -191,9 +191,30 @@ export class BusCoreImpl implements BusCore {
    * missed `replay_done` can never strand a prompt (worst case = the previous
    * deliver-immediately behaviour). `agentInitializing` maps an agent to its
    * backstop timer; `deliveryQueue` holds the wrapped prompts awaiting flush.
+   *
+   * The gate is ORDER-INDEPENDENT. The JSONL tailer emits `replay_done` for
+   * every session generation, but `session.init` only when the model writes
+   * the first line of a previously-empty file. For a fresh / restart /
+   * `/clear`-rotated session the file is empty at `start()`, so the tailer
+   * emits `replay_done` FIRST and `session.init` LATER (once the model
+   * writes). Treating `session.init` as an unconditional "arm" would then hold
+   * an already-live session until the backstop fires — penalising exactly the
+   * (re)init path this gate is meant to protect. So `replay_done`
+   * unconditionally marks the agent READY for its session generation
+   * (`agentLiveSession`) and flushes; a `session.init` for an already-live
+   * generation is a no-op. `session.init` only arms a hold when the agent is
+   * NOT already past `replay_done` for the current generation (the real
+   * init→replay order, i.e. an existing/non-empty file at `start()`).
    */
   private readonly agentInitializing = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly deliveryQueue = new Map<string, string[]>();
+  /**
+   * Per-agent session generation (the `replay_done` `session_id`) that has
+   * already reached `replay_done` and is therefore live. Makes the gate
+   * order-independent: a late `session.init` carrying this same generation
+   * must not re-arm a hold on a session that is already running.
+   */
+  private readonly agentLiveSession = new Map<string, string>();
   private readonly deliveryBackstopMs: number;
 
   constructor(opts: BusCoreOptions = {}) {
@@ -244,6 +265,7 @@ export class BusCoreImpl implements BusCore {
     for (const timer of this.agentInitializing.values()) clearTimeout(timer);
     this.agentInitializing.clear();
     this.deliveryQueue.clear();
+    this.agentLiveSession.clear();
   }
 
   /* ─────────────────────────────── prompts ─────────────────────────────── */
@@ -348,10 +370,18 @@ export class BusCoreImpl implements BusCore {
     );
   }
 
-  /** `session.init` → start holding PTY-stdin prompts for this agent. The
-   *  backstop force-flushes if `replay_done` never arrives, so a held prompt is
-   *  never stranded; it's re-armed on each `session.init`. */
-  private markAgentInitializing(agent_id: string): void {
+  /** `session.init` → start holding PTY-stdin prompts for this agent, UNLESS
+   *  the agent is already past `replay_done` for this session generation (the
+   *  fresh/restart/rotation path emits `replay_done` BEFORE `session.init`, so
+   *  the session is already live and must not be re-held). The backstop
+   *  force-flushes if `replay_done` never arrives, so a held prompt is never
+   *  stranded; the hold is re-armed on each fresh-generation `session.init`. */
+  private markAgentInitializing(agent_id: string, session_id?: string): void {
+    // Order-independence: if `replay_done` for this generation was already
+    // observed, the session is live — a (late) `session.init` for it must not
+    // arm a fresh hold. A missing/unknown session_id falls through to arming,
+    // bounded by the backstop, so worst case = the previous behaviour.
+    if (session_id && this.agentLiveSession.get(agent_id) === session_id) return;
     // Keep the EARLIEST deadline: don't re-arm if already holding. Otherwise a
     // rapid `session.init` churn (< backstop interval, e.g. an IPC-reconnect
     // storm) would keep pushing the deadline out and strand held prompts. The
@@ -369,8 +399,12 @@ export class BusCoreImpl implements BusCore {
     this.agentInitializing.set(agent_id, timer);
   }
 
-  /** `replay_done` (or backstop) → session ready: flush held prompts in order. */
-  private markAgentReady(agent_id: string): void {
+  /** `replay_done` (or backstop) → session ready: record the live generation
+   *  (so a late `session.init` for it can't re-arm a hold), clear any pending
+   *  hold, and flush held prompts in order. Called unconditionally on
+   *  `replay_done`, which the tailer emits for every session generation. */
+  private markAgentReady(agent_id: string, session_id?: string): void {
+    if (session_id) this.agentLiveSession.set(agent_id, session_id);
     const timer = this.agentInitializing.get(agent_id);
     if (timer) clearTimeout(timer);
     this.agentInitializing.delete(agent_id);
@@ -482,8 +516,8 @@ export class BusCoreImpl implements BusCore {
     // (re)initialising so a keystroke isn't swallowed by a not-yet-ready TUI,
     // and release them once it's live.
     if (e.agent_id) {
-      if (e.topic === "session.init") this.markAgentInitializing(e.agent_id);
-      else if (e.topic === "bus.events.replay_done") this.markAgentReady(e.agent_id);
+      if (e.topic === "session.init") this.markAgentInitializing(e.agent_id, e.session_id);
+      else if (e.topic === "bus.events.replay_done") this.markAgentReady(e.agent_id, e.session_id);
     }
     this.publish(e);
   }
