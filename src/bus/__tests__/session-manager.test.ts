@@ -13,9 +13,19 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { encodeCwdForProjectsDir } from "../jsonl-line-types";
+import type { ReceiptRecord } from "../receipt";
 import {
   defaultSupervisionFor,
   resolveAgentCwd,
@@ -125,15 +135,22 @@ describe("pty-stdin supervision", () => {
   }
 
   let mgr: SessionManager;
+  let pmDir: string;
   const spawned: AgentProcess[] = [];
 
   beforeEach(() => {
     // Use a path well under the 96B UDS cap. `/bin/cat` doesn't accept the
     // claude flag set, so we strip args entirely via the test seam.
+    // `persistRotatedSessionId` is a no-op so `restart()`'s fresh-session
+    // mint doesn't write into the repo's real `agents/` dir; `postMortemDir`
+    // is a temp dir so the post-mortem write stays out of `~/.claude`.
+    pmDir = mkdtempSync(join(tmpdir(), "ccaw-pm-"));
     mgr = new SessionManager({
       commandOverride: "/bin/cat",
       argsOverride: [],
       busSocketPath: "/tmp/test-bus.sock",
+      persistRotatedSessionId: async () => {},
+      postMortemDir: pmDir,
     });
   });
 
@@ -146,6 +163,7 @@ describe("pty-stdin supervision", () => {
       }
     }
     spawned.length = 0;
+    rmSync(pmDir, { recursive: true, force: true });
   });
 
   it("spawns under bun-pty with /bin/cat as a stand-in", async () => {
@@ -370,6 +388,275 @@ describe("SessionManager registry + restart", () => {
   it("rejects restart of unknown agent", async () => {
     await expect(mgr.restart("nope")).rejects.toThrow(/unknown agent/);
   });
+});
+
+/* ───────────────────────────────────────────────────────────────────── */
+/* restart() respawn primitive — fresh session, post-mortem, rate-limit   */
+/* (shared mechanism behind rotation + the two wedge triggers)            */
+/* ───────────────────────────────────────────────────────────────────── */
+
+describe("restart() respawn primitive", () => {
+  if (!IS_UNIX) {
+    it.skip("skipped on non-Unix (no bun-pty)", () => {});
+    return;
+  }
+
+  const tmpDirs: string[] = [];
+  const cleanups: Array<() => Promise<void>> = [];
+
+  function mkTmp(prefix: string): string {
+    const d = mkdtempSync(join(tmpdir(), prefix));
+    tmpDirs.push(d);
+    return d;
+  }
+
+  afterEach(async () => {
+    for (const fn of cleanups) {
+      try {
+        await fn();
+      } catch {
+        /* ignore */
+      }
+    }
+    cleanups.length = 0;
+    for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
+    tmpDirs.length = 0;
+  });
+
+  it("respawns the live PTY and mints a fresh session id", async () => {
+    const persisted: Array<[string, string]> = [];
+    const mgr = new SessionManager({
+      commandOverride: "/bin/cat",
+      argsOverride: [],
+      busSocketPath: "/tmp/test-bus.sock",
+      postMortemDir: mkTmp("ccaw-pm-"),
+      persistRotatedSessionId: async (id, sid) => {
+        persisted.push([id, sid]);
+      },
+    });
+    cleanups.push(() => mgr.stop("respawn-1"));
+
+    const agent = mkAgent({ id: "respawn-1" });
+    const oldSession = agent.session_id;
+    const a = await mgr.spawnAgent(agent, "cron");
+    const b = await mgr.restart("respawn-1", { reason: "rotation" });
+
+    expect(b.agent_id).toBe("respawn-1");
+    expect(b.pid).not.toBe(a.pid); // a genuinely new process
+    expect(mgr._list()).toContain("respawn-1");
+    // Fresh session id minted + persisted + reflected on the live record.
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0]?.[0]).toBe("respawn-1");
+    expect(persisted[0]?.[1]).not.toBe(oldSession);
+    expect(agent.session_id).toBe(persisted[0]?.[1]);
+  }, 15000);
+
+  it("freshSession:false recycles the process without rotating the id", async () => {
+    const persisted: Array<[string, string]> = [];
+    const mgr = new SessionManager({
+      commandOverride: "/bin/cat",
+      argsOverride: [],
+      busSocketPath: "/tmp/test-bus.sock",
+      postMortemDir: mkTmp("ccaw-pm-"),
+      persistRotatedSessionId: async (id, sid) => {
+        persisted.push([id, sid]);
+      },
+    });
+    cleanups.push(() => mgr.stop("recycle-1"));
+
+    const agent = mkAgent({ id: "recycle-1" });
+    const oldSession = agent.session_id;
+    const a = await mgr.spawnAgent(agent, "cron");
+    const b = await mgr.restart("recycle-1", { freshSession: false });
+
+    expect(b.pid).not.toBe(a.pid);
+    expect(persisted).toHaveLength(0); // no mint
+    expect(agent.session_id).toBe(oldSession); // same transcript
+  }, 15000);
+
+  it("writes a post-mortem (cwd, jsonl tail, receipt) before the restart", async () => {
+    const pmDir = mkTmp("ccaw-pm-");
+    const projectsDir = mkTmp("ccaw-proj-");
+    const agent = mkAgent({ id: "pm-1" });
+    const origSession = agent.session_id;
+
+    // Seed the dying session's JSONL so the tail is non-empty. The encoding
+    // must match what `resolveAgentCwd` (realpath) feeds the tailer.
+    const enc = encodeCwdForProjectsDir(realpathSync(agent.cwd));
+    mkdirSync(join(projectsDir, enc), { recursive: true });
+    writeFileSync(join(projectsDir, enc, `${origSession}.jsonl`), "L1\nL2\nL3\n");
+
+    const mgr = new SessionManager({
+      commandOverride: "/bin/cat",
+      argsOverride: [],
+      busSocketPath: "/tmp/test-bus.sock",
+      postMortemDir: pmDir,
+      postMortemProjectsDir: projectsDir,
+      persistRotatedSessionId: async () => {},
+    });
+    cleanups.push(() => mgr.stop("pm-1"));
+
+    await mgr.spawnAgent(agent, "cron");
+    const receipt: ReceiptRecord = {
+      message_id: "tg-42",
+      received_at: "2026-06-04T00:00:00.000Z",
+      agent_id: "pm-1",
+      final_state: "wedged_prompt",
+    };
+    await mgr.restart("pm-1", { reason: "wedge-no-turn", receipt });
+
+    const files = readdirSync(pmDir).filter((f) => f.endsWith(".json"));
+    expect(files).toHaveLength(1);
+    const pm = JSON.parse(readFileSync(join(pmDir, files[0] as string), "utf8"));
+    expect(pm.agent_id).toBe("pm-1");
+    expect(pm.reason).toBe("wedge-no-turn");
+    // Captured BEFORE the fresh-session mint → the dying session's id.
+    expect(pm.session_id).toBe(origSession);
+    expect(pm.jsonl_tail).toEqual(["L1", "L2", "L3"]);
+    expect(pm.receipt.final_state).toBe("wedged_prompt");
+  }, 15000);
+
+  it("refuses a 4th restart within the hour and logs CRITICAL, recovers after the window", async () => {
+    let clock = 1_000_000;
+    const errors: string[] = [];
+    const mgr = new SessionManager({
+      commandOverride: "/bin/cat",
+      argsOverride: [],
+      busSocketPath: "/tmp/test-bus.sock",
+      postMortemDir: mkTmp("ccaw-pm-"),
+      persistRotatedSessionId: async () => {},
+      now: () => clock,
+      logger: {
+        warn() {},
+        info() {},
+        error(msg?: unknown) {
+          errors.push(String(msg));
+        },
+      },
+    });
+    cleanups.push(() => mgr.stop("rl-1"));
+
+    const agent = mkAgent({ id: "rl-1" });
+    await mgr.spawnAgent(agent, "cron");
+
+    // 3 restarts inside the window are allowed.
+    for (let i = 0; i < 3; i++) {
+      clock += 1000;
+      await mgr.restart("rl-1");
+    }
+    // The 4th trips the rate-limit: throws + CRITICAL, no respawn.
+    clock += 1000;
+    await expect(mgr.restart("rl-1")).rejects.toThrow(/rate limit/);
+    expect(errors.some((e) => e.includes("CRITICAL"))).toBe(true);
+    // The refused attempt must leave the agent still registered (we never
+    // stopped it — the gate fires before any teardown).
+    expect(mgr._list()).toContain("rl-1");
+
+    // Past the 1h window the history prunes and restart works again.
+    clock += 60 * 60 * 1000 + 1;
+    const recovered = await mgr.restart("rl-1");
+    expect(recovered.agent_id).toBe("rl-1");
+  }, 30000);
+
+  it("reason='rotation' bypasses the crash-loop budget", async () => {
+    const clock = 2_000_000;
+    const mgr = new SessionManager({
+      commandOverride: "/bin/cat",
+      argsOverride: [],
+      busSocketPath: "/tmp/test-bus.sock",
+      postMortemDir: mkTmp("ccaw-pm-"),
+      persistRotatedSessionId: async () => {},
+      now: () => clock, // frozen — every restart shares one window
+    });
+    cleanups.push(() => mgr.stop("rot-budget"));
+
+    const agent = mkAgent({ id: "rot-budget" });
+    await mgr.spawnAgent(agent, "cron");
+
+    // Far more than MAX_RESTARTS_PER_WINDOW rotations in one frozen window:
+    // rotation has its own backpressure, so it never trips the gate.
+    for (let i = 0; i < 6; i++) {
+      const r = await mgr.restart("rot-budget", { reason: "rotation" });
+      expect(r.agent_id).toBe("rot-budget");
+    }
+    expect(mgr._list()).toContain("rot-budget");
+
+    // ...and the bypass didn't consume budget: a failure-driven restart still
+    // gets its full allowance right after the rotation burst.
+    for (let i = 0; i < 3; i++) {
+      await mgr.restart("rot-budget", { reason: "wedge" });
+    }
+    await expect(mgr.restart("rot-budget", { reason: "wedge" })).rejects.toThrow(/rate limit/);
+  }, 30000);
+
+  it("serializes concurrent restart() of the same agent (coalesces, counts once)", async () => {
+    let clock = 3_000_000;
+    let persistCount = 0;
+    const mgr = new SessionManager({
+      commandOverride: "/bin/cat",
+      argsOverride: [],
+      busSocketPath: "/tmp/test-bus.sock",
+      postMortemDir: mkTmp("ccaw-pm-"),
+      persistRotatedSessionId: async () => {
+        persistCount++;
+      },
+      now: () => clock,
+    });
+    cleanups.push(() => mgr.stop("concur-1"));
+
+    const agent = mkAgent({ id: "concur-1" });
+    await mgr.spawnAgent(agent, "cron");
+
+    // Two overlapping restarts fired in the same tick: the second must
+    // coalesce onto the first's in-flight promise — same process back, a
+    // single mint, and a single budget entry (no undercount, no
+    // `already spawned` throw from the loser).
+    const [a, b] = await Promise.all([
+      mgr.restart("concur-1", { reason: "wedge" }),
+      mgr.restart("concur-1", { reason: "wedge" }),
+    ]);
+    expect(a.pid).toBe(b.pid); // coalesced — one respawn, not two
+    expect(persistCount).toBe(1); // single fresh-session mint
+    expect(mgr._list()).toContain("concur-1");
+
+    // Exactly one slot of budget was consumed: two more wedge restarts are
+    // allowed, the third (4th overall) trips the gate.
+    clock += 1000;
+    await mgr.restart("concur-1", { reason: "wedge" });
+    clock += 1000;
+    await mgr.restart("concur-1", { reason: "wedge" });
+    clock += 1000;
+    await expect(mgr.restart("concur-1", { reason: "wedge" })).rejects.toThrow(/rate limit/);
+  }, 30000);
+
+  it("persist failure before stop() leaves the agent live and restartable", async () => {
+    let failNext = true;
+    const mgr = new SessionManager({
+      commandOverride: "/bin/cat",
+      argsOverride: [],
+      busSocketPath: "/tmp/test-bus.sock",
+      postMortemDir: mkTmp("ccaw-pm-"),
+      persistRotatedSessionId: async () => {
+        if (failNext) throw new Error("EROFS: read-only file system");
+      },
+    });
+    cleanups.push(() => mgr.stop("persist-fail"));
+
+    const agent = mkAgent({ id: "persist-fail" });
+    const a = await mgr.spawnAgent(agent, "cron");
+
+    // Persist throws BEFORE stop() — the restart rejects but the live process
+    // is untouched and the agent is still registered (no strand-down).
+    await expect(mgr.restart("persist-fail", { reason: "wedge" })).rejects.toThrow(/EROFS/);
+    // Still registered → not stranded down; recovery through restart() is possible.
+    expect(mgr._list()).toContain("persist-fail");
+
+    // Recovery path through restart() works once persistence is healthy again.
+    failNext = false;
+    const b = await mgr.restart("persist-fail", { reason: "wedge" });
+    expect(b.agent_id).toBe("persist-fail");
+    expect(b.pid).not.toBe(a.pid);
+  }, 15000);
 });
 
 /* ───────────────────────────────────────────────────────────────────── */
