@@ -9,7 +9,7 @@
  * directory to catch framing / chmod regressions.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -59,7 +59,6 @@ function createFakeBus(opts: FakeBusOptions = {}): FakeBus {
   let detachCalls = 0;
   let installed = false;
   let detached = false;
-  let mcpDetached = false;
   const events: string[] = [];
   return {
     async sendPrompt() {
@@ -85,9 +84,7 @@ function createFakeBus(opts: FakeBusOptions = {}): FakeBus {
     setStreamPromptHandler() {},
     // #222 reconciliation contract — runtime-mount installs the reconciler
     // signal handler on start. No-op fake.
-    setMcpSendFailedHandler(h) {
-      if (h === null) mcpDetached = true;
-    },
+    setMcpSendFailedHandler() {},
     isAgentConnected() {
       return false;
     },
@@ -128,9 +125,6 @@ function createFakeBus(opts: FakeBusOptions = {}): FakeBus {
     },
     slashHandlerDetached() {
       return detached;
-    },
-    mcpHandlerDetached() {
-      return mcpDetached;
     },
     startCalls() {
       return starts;
@@ -176,6 +170,17 @@ describe("mountBusRuntime — happy path (injected fakes)", () => {
     expect(handle.socketPath.length).toBeGreaterThan(0);
   });
 
+  it("wires the provided bus into the caller-supplied SessionManager (issue #215 — start.ts builds the SM without a bus, so the JsonlTailer was never created in prod)", async () => {
+    const bus = createFakeBus();
+    // Exactly the start.ts construction: SessionManager built with no bus.
+    const sm = new SessionManager();
+    const spy = spyOn(sm, "attachBus");
+    handle = await mountBusRuntime({ bus, sessionManager: sm, logger: SILENT_LOGGER });
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0][0]).toBe(bus);
+  });
+
   it("stop() detaches the slash handler before tearing down BusCore", async () => {
     const bus = createFakeBus();
     const sm = new SessionManager();
@@ -193,8 +198,6 @@ describe("mountBusRuntime — happy path (injected fakes)", () => {
     expect(detachIdx).toBeGreaterThanOrEqual(0);
     expect(stopIdx).toBeGreaterThanOrEqual(0);
     expect(detachIdx).toBeLessThan(stopIdx);
-    // #237: the reconciler signal handler is detached too (symmetry).
-    expect(bus.mcpHandlerDetached()).toBe(true);
   });
 
   it("stop() swallows errors from bus.stop() and bus.setSlashCommandHandler", async () => {

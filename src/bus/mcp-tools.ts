@@ -13,9 +13,12 @@ export const BUS_MCP_TOOLS = [
   {
     name: "reply",
     description:
-      "Send a reply to the originating surface (Discord/Telegram/Slack/Web UI). " +
-      "Use `intent: 'final'` for the turn-final message, `'progress'` for streaming " +
-      "updates, `'tool_status'` for tool-execution notes.",
+      "THE ONLY WAY TO SEND A MESSAGE TO THE USER. Your plain assistant text is NOT " +
+      "delivered to anyone — it is discarded. To reach the originating surface " +
+      "(Discord/Telegram/Slack/Web UI) you MUST call this tool. ALWAYS end a turn that " +
+      "answers or addresses the user with a `reply` call using `intent: 'final'` — if " +
+      "you end a turn without it, the user receives nothing and your reply is lost. " +
+      "Use `intent: 'progress'` for streaming updates, `'tool_status'` for tool notes.",
     inputSchema: {
       type: "object" as const,
       properties: {

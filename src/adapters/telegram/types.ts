@@ -137,6 +137,8 @@ export interface TelegramApi {
     chat_id: number;
     message_id: number;
     text: string;
+    /** Replace/clear the inline keyboard — pass `{ inline_keyboard: [] }` to drop it. */
+    reply_markup?: { inline_keyboard: TelegramInlineKeyboardButton[][] };
   }): Promise<{ ok: boolean; result?: { message_id: number } | true }>;
   /** Show a chat action (e.g. typing) — expires after ~5s. */
   sendChatAction(params: { chat_id: number; action: "typing" }): Promise<{ ok: boolean }>;

@@ -226,16 +226,11 @@ export class PtyAgentProcess implements AgentProcess {
       // start a turn when the CR lands during a transient REPL render (paste /
       // redraw race) -- the prompt sits un-submitted, no turn, no API socket,
       // and the receipt only times out 5 min later. Confirm a turn started: the
-      // idle REPL footer ("to cycle", the version-stable core of the mode-cycler
-      // hint -- "shift+tab to cycle" in older CLIs, "to cycle permission modes"
-      // in 2.1.168+, so the bare "to cycle" is what survives the rename) is
+      // idle REPL footer ("to cycle", the version-stable mode-cycler hint) is
       // replaced by the streaming view the instant a turn begins; if it is still
       // being rendered after a grace window, re-send the submit keystroke (the
       // text is already in the input box). Bounded; a stray CR at an idle REPL
       // is a no-op, and a genuinely stuck REPL still degrades to the watchdog.
-      // NB: handleBootDialog uses the stricter "tab to cycle" to avoid
-      // disengaging on boot prose (#195); here the REPL is already up, so boot
-      // prose is not a concern and the bare core is the safer live-footer match.
       // A second wedge class (socket=yes): an auto-compaction can seize the
       // REPL the instant the prompt arrives and swallow the submit CR -- the
       // turn never starts and the receipt only times out 5 min later. While
@@ -338,24 +333,18 @@ export class PtyAgentProcess implements AgentProcess {
 
     // REPL is up — disengage FIRST so we never inject a key into a live REPL.
     // Every REPL mode footer carries the mode-cycler hint ("shift+tab to
-    // cycle" / a future "tab to cycle permission modes"); "tab to cycle" is its
-    // version-stable core and — unlike the bare "to cycle" — cannot trip on
-    // arbitrary boot prose, which would disengage early and re-expose #195.
-    if (buf.includes("tab to cycle")) {
+    // cycle" / "to cycle permission modes"); "to cycle" is its version-stable
+    // core and appears in no dialog.
+    if (buf.includes("to cycle")) {
       this.endBootDialogPhase();
       return;
     }
 
     // Bypass-permissions dialog — DEFAULT is "No, exit"; a blind Enter selects
     // exit and kills the agent, so move the selection to the accept row first.
-    if (buf.includes("Yes, I accept")) {
-      if (!this.answeredBypassPrompt) {
-        this.answeredBypassPrompt = true;
-        this.sendBootKeys("\x1b[B", "\r"); // Down, then Enter
-      }
-      // The bypass dialog is still on screen (re-rendered after the Down): do
-      // NOT fall through to the generic confirm branch, which would fire a
-      // second, blind Enter racing the deferred one above (Codex F3 / #195).
+    if (!this.answeredBypassPrompt && buf.includes("Yes, I accept")) {
+      this.answeredBypassPrompt = true;
+      this.sendBootKeys("\x1b[B", "\r"); // Down, then Enter
       return;
     }
 
@@ -382,25 +371,17 @@ export class PtyAgentProcess implements AgentProcess {
       .trim()
       .toLowerCase();
     if (selected === this.lastConfirmSig) return; // same dialog still rendering
-    // Fail-safe ALLOWLIST: only auto-press Enter when the selected ("❯") option
-    // affirmatively reads as a proceed/accept action. This subsumes the old
-    // destructive-blocklist (which both blind-Entered destructive defaults
-    // phrased delete/discard/… and false-wedged on benign labels that merely
-    // mentioned "exit"): an unrecognised default now degrades to "stuck + a
-    // one-time warning" rather than "blindly pressed the wrong button".
-    const label = selected.replace(/^❯\s*\d*[.):]?\s*/, ""); // strip "❯ N." prefix
-    const proceedDefault =
-      /\b(yes|accept|trust|continue|proceed|allow|enable|confirm|ok|i am using this)\b/.test(label);
-    if (proceedDefault) {
+    const destructiveDefault = /\b(exit|cancel|abort|quit|decline|reject)\b/.test(selected);
+    if (!destructiveDefault) {
       this.lastConfirmSig = selected;
-      this.sendBootKeys("\r"); // default is a recognised proceed option
+      this.sendBootKeys("\r"); // default is the proceed option
     } else if (!this.warnedUnhandledDialog) {
-      // Default does not read as a proceed action — don't guess which key is
+      // Unknown dialog with a destructive default — don't guess which key is
       // safe. Surface it so the drift is visible (the watchdog / a follow-up
-      // can react) instead of silently pressing the wrong button.
+      // can react) instead of silently wedging.
       this.warnedUnhandledDialog = true;
       console.error(
-        `[boot-dialog] agent=${this.agent_id}: confirm dialog with non-proceed default ` +
+        `[boot-dialog] agent=${this.agent_id}: confirm dialog with destructive default ` +
           `not auto-answered (selected="${selected.trim().slice(0, 60)}"). REPL may stall.`,
       );
     }

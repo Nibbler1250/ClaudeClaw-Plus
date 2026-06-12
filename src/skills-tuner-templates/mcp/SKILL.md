@@ -88,6 +88,38 @@ For the canonical authentication contract (header names, HMAC signing scope, ISO
 
 This is the source of truth — do not paraphrase the headers (`x-plus-ts` / `x-plus-signature`) or scope (`<ts>\n<body>`) from memory; a single character mismatch returns 401 `invalid_signature`.
 
+### Step 5c — Choose the gateway audit policy — NO silent change
+
+Ask explicitly before changing it; the default is safe. Every tool call through
+the multiplexer is logged to a tamper-evident local chain. The policy decides
+what happens when that log can't be written:
+
+```
+What should the gateway do if it can't write the audit log?
+
+  best-effort  log async, never block a call — if logging fails the call still
+               runs (availability-first)                              [default]
+  enforce      refuse any call whose intent can't be logged first — "no log →
+               no action" (regulated / compliance)
+```
+
+One-line note to show the user verbatim: *"`best-effort` keeps tools available
+even if the audit log hiccups; `enforce` guarantees nothing runs un-audited —
+pick `enforce` only if you need a hard auditability guarantee (regulated
+environments). The intent log is a cheap LOCAL append, so `enforce` adds at most
+a sub-ms write to each call — no network on the call path."*
+
+Write the choice to `mcp.audit` in the ClaudeClaw settings (`settings.json`):
+
+```json
+{ "mcp": { "audit": "enforce" } }
+```
+
+Omit it (or set `"best-effort"`) to keep the backward-compatible default. The
+active policy is itself recorded in the audit chain at boot under `enforce`, so
+`/mcp audit` will show an `mcp.audit_policy` record proving the gateway ran
+fail-closed.
+
 End setup.
 
 ---

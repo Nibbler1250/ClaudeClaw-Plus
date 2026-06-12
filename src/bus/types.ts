@@ -69,6 +69,11 @@ export function defaultSupervisionFor(origin: BusOrigin): SupervisionMode {
 export type BusEventTopic =
   | "prompt"
   | "response.text"
+  // Observability-only mirror of assistant text blocks from the JSONL tailer.
+  // Distinct from `response.text` (the DELIVERY topic owned by the reply tool +
+  // turn_end synthesize) so chat adapters don't double-deliver. Dashboard WS
+  // (subscribes to all topics) still observes it. See jsonl-tailer dispatchAssistant.
+  | "response.assistant_text"
   | "response.tool_use"
   | "response.edit_text"
   | "response.thinking"
@@ -114,32 +119,6 @@ export interface BusEvent<P = unknown> {
   payload: P;
   /** Original JSONL line or MCP message — kept for audit. */
   raw?: unknown;
-}
-
-/**
- * Source marker stamped into the `_meta` of every event the JSONL tailer
- * publishes (issue #217 review). The tailer feeds the live bus purely as
- * an OBSERVABILITY read-path: it re-emits the agent's own session lines
- * (per-block `response.text`, `response.thinking`, `response.tool_use`,
- * usage, …) so the event log / Web UI / silent-drop net can see them.
- *
- * The one event the silent-drop net (#215) actually needs from the tailer
- * is `response.turn_end`, which BusCore consumes internally (it never
- * fans out to delivery adapters). The raw per-block `response.text`
- * echoes, however, ALSO match what the channel adapters subscribe to and
- * deliver — so without a marker every reply would be delivered twice
- * (once by the agent's real `reply` tool → `ingestReply`, once by this
- * observability echo). Adapters use {@link isTailerOriginEvent} to skip
- * tailer-origin `response.text` so only `ingestReply`-produced deliveries
- * reach the user. Synthesized recovery replies go through `ingestReply`
- * (not the tailer) and therefore carry NO marker → still delivered.
- */
-export const TAILER_EVENT_SOURCE = "jsonl-tailer";
-
-/** True when a BusEvent was published by the JSONL tailer (see {@link TAILER_EVENT_SOURCE}). */
-export function isTailerOriginEvent(event: BusEvent): boolean {
-  const meta = (event.payload as { _meta?: { source?: string } } | undefined)?._meta;
-  return meta?.source === TAILER_EVENT_SOURCE;
 }
 
 /* ───────────────────────────────────────────────────────────────────── */

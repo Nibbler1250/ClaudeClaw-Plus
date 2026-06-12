@@ -48,7 +48,6 @@ import type {
   IpcPrompt,
   PermissionResponse,
 } from "./types";
-import { CHANNEL_DRIVEN_ORIGINS } from "./types";
 
 /** Escape XML text content (`&`, `<`, `>`) so a `</channel>` in user text
  *  can't close the wrapper element early and inject sibling markup. */
@@ -133,7 +132,7 @@ export interface BusCoreOptions {
   /** Logger; defaults to console.error. */
   onError?: (err: unknown, ctx?: Record<string, unknown>) => void;
   /**
-   * Reconciliation signal (issue #222). Fired when an IPC `send` to an agent
+   * Reconciliation signal (#222). Fired when an IPC `send` to an agent
    * fails because Bus core has no live MCP connection for it. The daemon
    * wires this to a debounced reconciler that checks process liveness via
    * the Session Manager and respawns the agent if it's alive-but-deaf
@@ -164,9 +163,7 @@ export interface BusCore {
    * bus runtime once the Session Manager is available. Pass `null` to detach
    * (resets to a no-op).
    */
-  setMcpSendFailedHandler(
-    handler: ((agentId: string, ctx: { reason: string }) => void) | null,
-  ): void;
+  setMcpSendFailedHandler(handler: ((agentId: string, ctx: { reason: string }) => void) | null): void;
   /** True if Bus core currently holds a live MCP/IPC connection for the agent (#222). */
   isAgentConnected(agentId: string): boolean;
   ingestReply(req: IngestReplyRequest): void;
@@ -193,7 +190,7 @@ export class BusCoreImpl implements BusCore {
   private readonly onError: (err: unknown, ctx?: Record<string, unknown>) => void;
   // Settable post-hoc (like streamPromptHandler): the bus is constructed
   // before the SessionManager exists, so the reconciler is wired afterwards.
-  private onMcpSendFailed: (agentId: string, ctx: { reason: string }) => void = () => {};
+  private onMcpSendFailed: (agentId: string, ctx: { reason: string }) => void;
   /**
    * Tracks the origin (surface + channel id) of the most recent prompt
    * per agent. Adapters use this on outbound `response.text` events to
@@ -206,40 +203,6 @@ export class BusCoreImpl implements BusCore {
   private readonly lastPromptOrigin = new Map<string, { origin: BusOrigin; origin_id: string }>();
 
   /**
-   * Delivery gate. A prompt typed into a PTY-resident agent while its session
-   * is (re)initialising — `session.init` seen but `bus.events.replay_done` not
-   * yet — is swallowed by the not-yet-ready TUI and never starts a turn
-   * (observed as an intermittent "prompt delivered, no reply"). Such prompts
-   * are held and flushed on `replay_done`, or after a backstop timeout so a
-   * missed `replay_done` can never strand a prompt (worst case = the previous
-   * deliver-immediately behaviour). `agentInitializing` maps an agent to its
-   * backstop timer; `deliveryQueue` holds the wrapped prompts awaiting flush.
-   *
-   * The gate is ORDER-INDEPENDENT. The JSONL tailer emits `replay_done` for
-   * every session generation, but `session.init` only when the model writes
-   * the first line of a previously-empty file. For a fresh / restart /
-   * `/clear`-rotated session the file is empty at `start()`, so the tailer
-   * emits `replay_done` FIRST and `session.init` LATER (once the model
-   * writes). Treating `session.init` as an unconditional "arm" would then hold
-   * an already-live session until the backstop fires — penalising exactly the
-   * (re)init path this gate is meant to protect. So `replay_done`
-   * unconditionally marks the agent READY for its session generation
-   * (`agentLiveSession`) and flushes; a `session.init` for an already-live
-   * generation is a no-op. `session.init` only arms a hold when the agent is
-   * NOT already past `replay_done` for the current generation (the real
-   * init→replay order, i.e. an existing/non-empty file at `start()`).
-   */
-  private readonly agentInitializing = new Map<string, ReturnType<typeof setTimeout>>();
-  private readonly deliveryQueue = new Map<string, string[]>();
-  /**
-   * Per-agent session generation (the `replay_done` `session_id`) that has
-   * already reached `replay_done` and is therefore live. Makes the gate
-   * order-independent: a late `session.init` carrying this same generation
-   * must not re-arm a hold on a session that is already running.
-   */
-  private readonly agentLiveSession = new Map<string, string>();
-  private readonly deliveryBackstopMs: number;
-  /**
    * Silent-drop safety net (issue #215): tracks per-agent whether the
    * current turn has called the `reply` MCP tool with `intent: "final"`.
    * Reset on every new inbound prompt (`sendPrompt`), set to `true` when
@@ -248,34 +211,22 @@ export class BusCoreImpl implements BusCore {
    * this is still `false` and the turn produced non-empty text, the
    * agent ended the turn without delivering — we synthesize an
    * `ingestReply` so the user actually receives the response.
-   *
-   * Single-slot per agent, last-write-wins — the same limitation
-   * `lastPromptOrigin` carries above (and this map depends on
-   * `lastPromptOrigin` for routing the synthesized reply). Interleaving two
-   * in-flight prompts on one agent would let the second `sendPrompt` reset
-   * the flag mid-turn for the first; the webui-bridge mutex serialising
-   * prompt→reply per agent is the workaround for the path that would
-   * otherwise violate the one-turn-at-a-time assumption. The residual
-   * cross-channel stale/misroute race this leaves open (a lagged turn_end
-   * synthesizing the wrong prompt's text to the wrong surface) is tracked
-   * as deferred follow-up #239 — see the note in `handleTurnEnd`.
    */
   private readonly currentTurnReplied = new Map<string, boolean>();
 
   /**
-   * Cross-transport dedup for the silent-drop net (#217, finding 2).
-   * `currentTurnReplied` is reset to `false` on every `sendPrompt` and set
-   * to `true` once a final lands — but a real `reply` (IPC) and the
-   * synthesized recovery (`response.turn_end` via the fs.watch tailer)
-   * travel on two independent, unordered async channels. If the tailer
-   * wins the race, `handleTurnEnd` synthesizes+delivers a final, then the
-   * real `ingestReply(final)` IPC arrives and would deliver the SAME text
-   * a second time. This per-turn flag records that a final `response.text`
-   * was already PUBLISHED for the in-flight turn so the loser of the race
-   * is suppressed. Set in both `ingestReply(final)` and the synthesizer;
-   * cleared alongside `currentTurnReplied` on prompt / disconnect / cancel.
+   * Delivery gate. A prompt typed into a PTY-resident agent while its session
+   * is (re)initialising — `session.init` seen but `bus.events.replay_done` not
+   * yet — is swallowed by the not-yet-ready TUI and never starts a turn
+   * (observed as an intermittent "prompt delivered, no reply"). Such prompts
+   * are held and flushed on `replay_done`, or after a backstop timeout so a
+   * missed `replay_done` can never strand a prompt (worst case = the previous
+   * deliver-immediately behaviour). `agentInitializing` maps an agent to its
+   * backstop timer; `deliveryQueue` holds the wrapped prompts awaiting flush.
    */
-  private readonly currentTurnFinalPublished = new Map<string, boolean>();
+  private readonly agentInitializing = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly deliveryQueue = new Map<string, string[]>();
+  private readonly deliveryBackstopMs: number;
 
   constructor(opts: BusCoreOptions = {}) {
     this.socketPath = opts.socketPath ?? null;
@@ -285,7 +236,7 @@ export class BusCoreImpl implements BusCore {
     this.slashCommandHandler = opts.slashCommandHandler ?? null;
     this.streamPromptHandler = opts.streamPromptHandler ?? null;
     this.onError = opts.onError ?? ((err, ctx) => console.error("[bus]", err, ctx));
-    if (opts.onMcpSendFailed) this.onMcpSendFailed = opts.onMcpSendFailed;
+    this.onMcpSendFailed = opts.onMcpSendFailed ?? (() => {});
   }
 
   /**
@@ -293,7 +244,7 @@ export class BusCoreImpl implements BusCore {
    * stderr → captured in the daemon log, grep-able as `[bus-ipc]`. Until this
    * existed, the bus logged the *symptom* ("No MCP connection") loudly but
    * nothing about *why* there was no connection — no hello/close/restart
-   * trace — so a recurring deaf-agent wedge was undiagnosable from logs.
+   * trace — so the recurring deaf-agent wedge was undiagnosable from logs.
    */
   private logIpc(msg: string, fields: Record<string, unknown>): void {
     console.error(`[bus-ipc] ${msg}`, { ts: new Date().toISOString(), ...fields });
@@ -325,18 +276,6 @@ export class BusCoreImpl implements BusCore {
           // origin and misroute (5-agent review on PR #138, A1 finding).
           this.lastPromptOrigin.delete(agentId);
           this.currentTurnReplied.delete(agentId);
-          this.currentTurnFinalPublished.delete(agentId);
-          // The subprocess is gone -- tear down this agent's delivery-gate
-          // state too, so a held prompt plus an armed backstop timer can never
-          // flush a stale keystroke into a restart that reuses this agent_id.
-          // NOT agentLiveSession: clearing it would let a late session.init
-          // arm a hold on the resumed (already-live) session -- the very
-          // anti-pattern the order-independent gate avoids -- and the new
-          // tailer re-emits replay_done which sets it again anyway.
-          const heldInitTimer = this.agentInitializing.get(agentId);
-          if (heldInitTimer) clearTimeout(heldInitTimer);
-          this.agentInitializing.delete(agentId);
-          this.deliveryQueue.delete(agentId);
           this.logIpc("close", {
             agent: agentId,
             connections: this.ipcServer?.connectionCount() ?? 0,
@@ -363,7 +302,6 @@ export class BusCoreImpl implements BusCore {
     for (const timer of this.agentInitializing.values()) clearTimeout(timer);
     this.agentInitializing.clear();
     this.deliveryQueue.clear();
-    this.agentLiveSession.clear();
   }
 
   /* ─────────────────────────────── prompts ─────────────────────────────── */
@@ -409,9 +347,6 @@ export class BusCoreImpl implements BusCore {
     // turn call reply?" flag. If the agent ends the turn (response.turn_end)
     // without ever setting this to true, we'll synthesize delivery.
     this.currentTurnReplied.set(req.agent_id, false);
-    // #217 finding 2: a new turn starts undelivered — clear the
-    // cross-transport "final already published" dedup flag.
-    this.currentTurnFinalPublished.set(req.agent_id, false);
 
     const ipcMsg: IpcPrompt = {
       type: "prompt",
@@ -429,8 +364,8 @@ export class BusCoreImpl implements BusCore {
           ctx: "sendPrompt",
         });
         // #222 observability: was the agent ever registered, or did it just
-        // drop? `registeredKnown=false` means we never saw a hello (a fresh
-        // mcp-server never reached the bus); `=true` + no connection means the
+        // drop? `registeredKnown=false` means we never saw a hello (fresh
+        // mcp-server never reached the bus); `=true`+no connection means the
         // socket dropped after handshake. Distinguishes "never connected"
         // from "connected then lost" at a glance.
         this.logIpc("send-failed", {
@@ -442,8 +377,8 @@ export class BusCoreImpl implements BusCore {
         // The inbound prompt still falls through to PTY-stdin below, but the
         // agent's outbound `reply` path rides this same dead IPC with no
         // fallback → it goes deaf. Signal the daemon to reconcile (respawn if
-        // the process is alive-but-deaf). Debounce/cooldown live in the wired
-        // reconciler, not here.
+        // the process is alive-but-deaf). Debounce/cooldown live in the
+        // wired reconciler, not here.
         this.onMcpSendFailed(req.agent_id, { reason: "sendPrompt:no-mcp-connection" });
       }
     }
@@ -492,18 +427,10 @@ export class BusCoreImpl implements BusCore {
     );
   }
 
-  /** `session.init` → start holding PTY-stdin prompts for this agent, UNLESS
-   *  the agent is already past `replay_done` for this session generation (the
-   *  fresh/restart/rotation path emits `replay_done` BEFORE `session.init`, so
-   *  the session is already live and must not be re-held). The backstop
-   *  force-flushes if `replay_done` never arrives, so a held prompt is never
-   *  stranded; the hold is re-armed on each fresh-generation `session.init`. */
-  private markAgentInitializing(agent_id: string, session_id?: string): void {
-    // Order-independence: if `replay_done` for this generation was already
-    // observed, the session is live — a (late) `session.init` for it must not
-    // arm a fresh hold. A missing/unknown session_id falls through to arming,
-    // bounded by the backstop, so worst case = the previous behaviour.
-    if (session_id && this.agentLiveSession.get(agent_id) === session_id) return;
+  /** `session.init` → start holding PTY-stdin prompts for this agent. The
+   *  backstop force-flushes if `replay_done` never arrives, so a held prompt is
+   *  never stranded; it's re-armed on each `session.init`. */
+  private markAgentInitializing(agent_id: string): void {
     // Keep the EARLIEST deadline: don't re-arm if already holding. Otherwise a
     // rapid `session.init` churn (< backstop interval, e.g. an IPC-reconnect
     // storm) would keep pushing the deadline out and strand held prompts. The
@@ -511,9 +438,7 @@ export class BusCoreImpl implements BusCore {
     if (this.agentInitializing.has(agent_id)) return;
     const timer = setTimeout(() => {
       this.onError(
-        new Error(
-          `replay_done not seen within backstop; flushing held prompts for agent_id=${agent_id}`,
-        ),
+        new Error(`replay_done not seen within backstop; flushing held prompts for agent_id=${agent_id}`),
         { ctx: "deliveryBackstop", agent_id },
       );
       this.markAgentReady(agent_id);
@@ -521,12 +446,8 @@ export class BusCoreImpl implements BusCore {
     this.agentInitializing.set(agent_id, timer);
   }
 
-  /** `replay_done` (or backstop) → session ready: record the live generation
-   *  (so a late `session.init` for it can't re-arm a hold), clear any pending
-   *  hold, and flush held prompts in order. Called unconditionally on
-   *  `replay_done`, which the tailer emits for every session generation. */
-  private markAgentReady(agent_id: string, session_id?: string): void {
-    if (session_id) this.agentLiveSession.set(agent_id, session_id);
+  /** `replay_done` (or backstop) → session ready: flush held prompts in order. */
+  private markAgentReady(agent_id: string): void {
     const timer = this.agentInitializing.get(agent_id);
     if (timer) clearTimeout(timer);
     this.agentInitializing.delete(agent_id);
@@ -595,22 +516,7 @@ export class BusCoreImpl implements BusCore {
 
   /* ─────────────────────────────── ingest ─────────────────────────────── */
 
-  ingestReply(req: IngestReplyRequest, opts?: { synthetic?: boolean }): void {
-    // Cross-transport dedup (#217 finding 2): a final reply can arrive both
-    // as the agent's real `reply` IPC AND as the synthesized recovery from
-    // `response.turn_end` (the JSONL tailer). They race on two unordered
-    // channels; whichever lands first publishes and sets
-    // `currentTurnFinalPublished`. The loser is suppressed here so the same
-    // turn never delivers two finals. `synthetic` calls (from
-    // `handleTurnEnd`) bypass the check — they only run AFTER confirming no
-    // final has published yet, and must be allowed to publish the first.
-    if (
-      req.intent === "final" &&
-      !opts?.synthetic &&
-      this.currentTurnFinalPublished.get(req.agent_id) === true
-    ) {
-      return;
-    }
+  ingestReply(req: IngestReplyRequest): void {
     const topic: BusEventTopic =
       req.intent === "tool_status" ? "response.tool_use" : "response.text";
     // Attach the originating surface so adapters can route the reply
@@ -655,14 +561,13 @@ export class BusCoreImpl implements BusCore {
     //   - `permission_request` IPC handler (origin on channel.permission_request)
     if (req.intent === "final") {
       this.lastPromptOrigin.delete(req.agent_id);
-      // Silent-drop safety net (#215): the agent called `reply` with a final
-      // intent → mark this turn as delivered, so the `response.turn_end`
-      // handler skips the synthetic-delivery fallback for this turn.
+    }
+    // Silent-drop safety net (#215): the agent called `reply` with a
+    // final intent → mark this turn as delivered. The
+    // `response.turn_end` handler will skip the synthetic-delivery
+    // fallback for this turn.
+    if (req.intent === "final") {
       this.currentTurnReplied.set(req.agent_id, true);
-      // #217 finding 2: record that a final was published for this turn so
-      // the cross-transport race loser (real reply vs synthesized) is
-      // suppressed above.
-      this.currentTurnFinalPublished.set(req.agent_id, true);
     }
   }
 
@@ -678,23 +583,7 @@ export class BusCoreImpl implements BusCore {
    */
   private handleTurnEnd(agentId: string, text: string): void {
     if (this.currentTurnReplied.get(agentId) === true) return;
-    // #217 finding 2: if a final already published for this turn (e.g. the
-    // real reply IPC landed first), don't synthesize a duplicate.
-    if (this.currentTurnFinalPublished.get(agentId) === true) return;
     if (!text || text.trim().length === 0) return;
-    // RESIDUAL RACE (#217 finding 3 → deferred #239): `lastPromptOrigin` and
-    // the per-turn flags are single-slot, keyed by agent_id only, with no
-    // prompt/turn identity. The JSONL tailer's `response.turn_end` is
-    // delivered asynchronously (fs.watch + drain), so on a cross-channel
-    // interleave — P1(telegram) ends → reply → P2(webui) arrives (resets the
-    // flag, rewrites origin=webui) → P1's lagged turn_end lands here — this
-    // can route P1's text to P2's origin (webui). The flag-reset path is
-    // largely covered by the webui-bridge mutex serialising prompt→reply per
-    // agent, but cross-surface interleave is NOT fully closed. A complete fix
-    // threads the originating prompt_id onto the turn_end event and matches
-    // it to the in-flight prompt before synthesizing; that requires the
-    // tailer to carry prompt identity and is tracked as deferred follow-up
-    // #239 to avoid destabilizing this safety-net PR.
     const origin = this.lastPromptOrigin.get(agentId);
     if (!origin) {
       // No origin to route to (cron tick / unprompted ambient turn).
@@ -703,16 +592,6 @@ export class BusCoreImpl implements BusCore {
         `[bus] silent-drop detected for agent=${agentId} (turn ended with text but no reply); ` +
           `no lastPromptOrigin to route to — dropping silently as before.`,
       );
-      return;
-    }
-    // Only channel-driven origins (telegram/webui/discord/slack) have a
-    // user waiting on a reply. Scheduled/ambient origins (cron, heartbeat,
-    // cli, rest) legitimately end turns with text WITHOUT calling `reply`
-    // — that's not a silent drop, and there's no adapter to deliver the
-    // synthesized reply to anyway. Synthesizing for them would spam a
-    // bogus "recovered" warning and emit an undeliverable response.text on
-    // every scheduled tick. Skip them.
-    if (!CHANNEL_DRIVEN_ORIGINS.has(origin.origin)) {
       return;
     }
     console.warn(
@@ -725,27 +604,14 @@ export class BusCoreImpl implements BusCore {
     // because we set the flag here, but the explicit ordering makes the
     // single-fire intent clearer).
     this.currentTurnReplied.set(agentId, true);
-    // `synthetic: true` lets this first delivery through the cross-transport
-    // dedup (#217 finding 2); it sets `currentTurnFinalPublished`, so a
-    // later real `reply` IPC for the same turn is suppressed.
-    this.ingestReply(
-      {
-        agent_id: agentId,
-        text,
-        intent: "final",
-      },
-      { synthetic: true },
-    );
+    this.ingestReply({
+      agent_id: agentId,
+      text,
+      intent: "final",
+    });
   }
 
   ingestSessionEvent(e: BusEvent): void {
-    // Delivery gate: hold PTY-stdin prompts while the agent's session is
-    // (re)initialising so a keystroke isn't swallowed by a not-yet-ready TUI,
-    // and release them once it's live.
-    if (e.agent_id) {
-      if (e.topic === "session.init") this.markAgentInitializing(e.agent_id, e.session_id);
-      else if (e.topic === "bus.events.replay_done") this.markAgentReady(e.agent_id, e.session_id);
-    }
     // Silent-drop safety net (#215): the JSONL tailer publishes a
     // `response.turn_end` event when claude stops with `end_turn`. Hook
     // into it before the generic publish so we can synthesize a
@@ -753,6 +619,13 @@ export class BusCoreImpl implements BusCore {
     if (e.topic === "response.turn_end" && e.agent_id) {
       const payload = e.payload as { text?: string };
       this.handleTurnEnd(e.agent_id, payload?.text ?? "");
+    }
+    // Delivery gate: hold PTY-stdin prompts while the agent's session is
+    // (re)initialising so a keystroke isn't swallowed by a not-yet-ready TUI,
+    // and release them once it's live.
+    if (e.agent_id) {
+      if (e.topic === "session.init") this.markAgentInitializing(e.agent_id);
+      else if (e.topic === "bus.events.replay_done") this.markAgentReady(e.agent_id);
     }
     this.publish(e);
   }
@@ -902,7 +775,6 @@ export class BusCoreImpl implements BusCore {
         // a real reply OR a `response.turn_end` event — drop the
         // tracking flag to keep the map bounded.
         this.currentTurnReplied.delete(agentId);
-        this.currentTurnFinalPublished.delete(agentId);
         break;
       case "request_human": {
         // Forward the correlation id along with the question. Without
@@ -960,7 +832,6 @@ export class BusCoreImpl implements BusCore {
         // Silent-drop safety net (#215): error path won't produce a
         // turn_end either — clear tracking too.
         this.currentTurnReplied.delete(agentId);
-        this.currentTurnFinalPublished.delete(agentId);
         break;
       // hello already handled in the IPC layer; outbound types (prompt,
       // permission_response, ask_answer) shouldn't arrive from MCP.

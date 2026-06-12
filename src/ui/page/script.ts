@@ -1088,10 +1088,12 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
     const tabChatBtn = $("tab-chat");
     const tabKanbanBtn = $("tab-kanban");
     const tabUsageBtn = $("tab-usage");
+    const tabObservabilityBtn = $("tab-observability");
     const dashboardPanel = $("dashboard-panel");
     const chatPanel = $("chat-panel");
     const kanbanPanel = $("kanban-panel");
     const usagePanel = $("usage-panel");
+    const observabilityPanel = $("observability-panel");
     const chatMessages = $("chat-messages");
     const chatForm = $("chat-form");
     const chatInput = $("chat-input");
@@ -1210,12 +1212,17 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
     })();
 
     function setActiveTab(tab) {
-      const allBtns = [tabDashboardBtn, tabChatBtn, tabKanbanBtn, tabUsageBtn];
-      const allPanels = [dashboardPanel, chatPanel, kanbanPanel, usagePanel];
+      const allBtns = [tabDashboardBtn, tabChatBtn, tabKanbanBtn, tabUsageBtn, tabObservabilityBtn];
+      const allPanels = [dashboardPanel, chatPanel, kanbanPanel, usagePanel, observabilityPanel];
       allBtns.forEach(b => { if (b) { b.classList.remove("tab-btn-active"); b.setAttribute("aria-selected", "false"); } });
       allPanels.forEach(p => { if (p) p.hidden = true; });
 
-      if (tab === "dashboard") {
+      if (tab === "observability") {
+        tabObservabilityBtn && tabObservabilityBtn.classList.add("tab-btn-active");
+        tabObservabilityBtn && tabObservabilityBtn.setAttribute("aria-selected", "true");
+        if (observabilityPanel) observabilityPanel.hidden = false;
+        loadObservability();
+      } else if (tab === "dashboard") {
         tabDashboardBtn && tabDashboardBtn.classList.add("tab-btn-active");
         tabDashboardBtn && tabDashboardBtn.setAttribute("aria-selected", "true");
         if (dashboardPanel) dashboardPanel.hidden = false;
@@ -1241,6 +1248,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
     if (tabChatBtn) tabChatBtn.addEventListener("click", function() { setActiveTab("chat"); loadSessions(); });
     if (tabKanbanBtn) tabKanbanBtn.addEventListener("click", () => setActiveTab("kanban"));
     if (tabUsageBtn) tabUsageBtn.addEventListener("click", function() { setActiveTab("usage"); });
+    if (tabObservabilityBtn) tabObservabilityBtn.addEventListener("click", function() { setActiveTab("observability"); });
 
     // --- Session browser ---
 
@@ -2080,4 +2088,220 @@ setInterval(loadKanban, 10000);
 
       // Initial info-line load (so the Settings panel shows the count before the modal is opened).
       loadCurrent();
-    })();`;
+    })();
+    // --- Observability hub ---
+    // Reads the read-only ObservabilityReader via /api/observability. The hub is
+    // plugin-agnostic: it discovers plugins, shows the universal boundary metrics
+    // for any of them, and renders a plugin's specialized page (if it declared a
+    // view-manifest) through the generic panel renderer below — never per-plugin code.
+    var obsRangeSel = $("obs-range");
+    var obsPluginListEl = $("obs-plugin-list");
+    var obsDetailEl = $("obs-detail");
+    var obsState = { hours: 168, plugin: null, plugins: [] };
+
+    function obsRange() {
+      var v = obsRangeSel ? parseInt(obsRangeSel.value, 10) : 168;
+      return isNaN(v) ? 168 : v;
+    }
+
+    function loadObservability() {
+      obsState.hours = obsRange();
+      if (obsPluginListEl && !obsState.plugins.length) {
+        obsPluginListEl.innerHTML = '<div class="obs-loading">Loading plugins…</div>';
+      }
+      fetch("/api/observability?hours=" + obsState.hours)
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          if (!data || data.ok === false) throw new Error((data && data.error) || "load failed");
+          obsState.plugins = Array.isArray(data.plugins) ? data.plugins : [];
+          renderObsPluginList();
+          // Keep the active plugin selected across refreshes; else default to the first.
+          var pick = (obsState.plugin && obsState.plugins.some(function(p){ return p.plugin === obsState.plugin; }))
+            ? obsState.plugin
+            : ((obsState.plugins[0] && obsState.plugins[0].plugin) || null);
+          if (pick) selectObsPlugin(pick);
+          else if (obsDetailEl) obsDetailEl.innerHTML = '<div class="obs-empty">No plugins have reported tool calls yet.</div>';
+        })
+        .catch(function(e) {
+          if (obsPluginListEl) obsPluginListEl.innerHTML = '<div class="obs-empty">Failed to load plugins: ' + esc(String((e && e.message) || e)) + '</div>';
+        });
+    }
+
+    function renderObsPluginList() {
+      if (!obsPluginListEl) return;
+      if (!obsState.plugins.length) {
+        obsPluginListEl.innerHTML = '<div class="obs-empty">No plugins discovered.</div>';
+        return;
+      }
+      obsPluginListEl.innerHTML = obsState.plugins.map(function(p) {
+        var active = p.plugin === obsState.plugin ? " obs-active" : "";
+        var badge = p.hasManifest ? '<span class="obs-badge">page</span>' : '';
+        var meta = p.volume > 0 ? (p.volume + ' · ' + Math.round((p.errorRate || 0) * 100) + '% err') : 'idle';
+        return '<button type="button" class="obs-plugin-btn' + active + '" data-plugin="' + escAttr(p.plugin) + '">' +
+          '<span class="obs-plugin-name">' + esc(p.plugin) + badge + '</span>' +
+          '<span class="obs-plugin-meta">' + meta + '</span>' +
+          '</button>';
+      }).join("");
+      Array.prototype.forEach.call(obsPluginListEl.querySelectorAll(".obs-plugin-btn"), function(btn) {
+        btn.addEventListener("click", function() { selectObsPlugin(btn.getAttribute("data-plugin")); });
+      });
+    }
+
+    function selectObsPlugin(name) {
+      obsState.plugin = name;
+      renderObsPluginList();
+      if (obsDetailEl) obsDetailEl.innerHTML = '<div class="obs-loading">Loading ' + esc(name) + '…</div>';
+      fetch("/api/observability/plugin/" + encodeURIComponent(name) + "?hours=" + obsState.hours)
+        .then(function(r) { return r.json(); })
+        .then(function(page) {
+          if (!page || page.ok === false) throw new Error((page && page.error) || "load failed");
+          renderObsDetail(page);
+        })
+        .catch(function(e) {
+          if (obsDetailEl) obsDetailEl.innerHTML = '<div class="obs-empty">Failed to load plugin: ' + esc(String((e && e.message) || e)) + '</div>';
+        });
+    }
+
+    function obsErrClass(s) {
+      if (!s.volume) return "";
+      if ((s.errorRate || 0) >= 0.1) return "obs-bad";
+      if ((s.errorRate || 0) > 0) return "obs-warn";
+      return "obs-good";
+    }
+    function obsCard(label, value, cls) {
+      return '<div class="obs-card"><div class="obs-card-label">' + esc(label) + '</div>' +
+        '<div class="obs-card-value ' + (cls || "") + '">' + value + '</div></div>';
+    }
+
+    // Universal page (every plugin) + the generic panels of a specialized page.
+    function renderObsDetail(page) {
+      if (!obsDetailEl) return;
+      var s = page.summary || {};
+      var hasManifest = !!page.manifest;
+      var errTxt = s.volume ? ((s.errorRate || 0) * 100).toFixed(1) + "%" : "—";
+      var cards = [
+        obsCard("Volume", String(s.volume != null ? s.volume : 0), ""),
+        obsCard("Error rate", errTxt, obsErrClass(s)),
+        obsCard("p95 latency", s.p95LatencyMs != null ? Math.round(s.p95LatencyMs) + " ms" : "—", ""),
+        obsCard("Cost", s.costUsd != null ? fmtCost(s.costUsd) : "—", ""),
+        obsCard("Last seen", fmtRelative(s.lastSeen), "")
+      ].join("");
+
+      var head = '<div class="obs-detail-head">' +
+        '<div class="obs-detail-title">' + esc(page.plugin) +
+          (hasManifest ? '<span class="obs-badge">specialized</span>' : '') + '</div>' +
+        '<div class="obs-detail-sub">' +
+          (hasManifest
+            ? 'Specialized page · view-manifest ' + esc(String(page.manifest.schemaVersion || ""))
+            : 'Universal boundary metrics (no manifest declared)') +
+        '</div></div>';
+
+      var panelsHtml = "";
+      if (hasManifest) {
+        var specById = {};
+        (page.manifest.panels || []).forEach(function(sp) { specById[sp.id] = sp; });
+        var panels = Array.isArray(page.panels) ? page.panels : [];
+        panelsHtml = panels.length
+          ? panels.map(function(pd) {
+              return renderObsPanel(pd, specById[pd.panelId] || { kind: "table", title: pd.panelId });
+            }).join("")
+          : '<div class="obs-empty">Manifest declared, but no panel data in this window.</div>';
+      }
+
+      obsDetailEl.innerHTML = head + '<div class="obs-cards">' + cards + '</div>' + panelsHtml;
+    }
+
+    // ── Generic panel renderer ──
+    // Renders the four view-manifest panel primitives from a PanelData + its
+    // PanelSpec. The hub interprets nothing plugin-specific: it lays out whatever
+    // columns the manifest (or the row keys) declare. Unknown kind → table.
+    function renderObsPanel(pd, spec) {
+      var kind = (spec && spec.kind) || "table";
+      var rows = (pd && pd.rows) || [];
+      var title = '<div class="obs-panel-title">' + esc((spec && spec.title) || pd.panelId) + '</div>';
+      var body;
+      if (kind === "metric-cards") body = obsRenderCards(rows, spec);
+      else if (kind === "timeline") body = obsRenderTimeline(rows, spec);
+      else if (kind === "log") body = obsRenderLog(rows, spec);
+      else body = obsRenderTable(rows, spec);
+      return '<div class="obs-panel">' + title + body + '</div>';
+    }
+
+    // Columns: explicit manifest order, else the union of row keys.
+    function obsCols(rows, spec) {
+      if (spec && spec.columns && spec.columns.length) return spec.columns;
+      var seen = [];
+      rows.forEach(function(r) { Object.keys(r || {}).forEach(function(k) { if (seen.indexOf(k) < 0) seen.push(k); }); });
+      return seen;
+    }
+
+    // Value formatting + verdict colouring (the one semantic hint the hub honours).
+    function obsVal(v) {
+      if (v === null || v === undefined || v === "") return '<span class="obs-td-dim">—</span>';
+      if (typeof v === "number") {
+        return esc(Number.isInteger(v) ? String(v) : String(parseFloat(v.toFixed(4))));
+      }
+      var str = String(v);
+      var verdicts = {
+        improved: "obs-verdict-improved", regressed: "obs-verdict-regressed",
+        worse: "obs-verdict-worse", neutral: "obs-verdict-neutral", pending: "obs-verdict-pending"
+      };
+      if (verdicts[str]) return '<span class="' + verdicts[str] + '">' + esc(str) + '</span>';
+      return esc(str);
+    }
+
+    function obsRenderTable(rows, spec) {
+      if (!rows.length) return '<div class="obs-empty">No rows.</div>';
+      var cols = obsCols(rows, spec);
+      var head = "<tr>" + cols.map(function(c) { return '<th class="obs-th">' + esc(c) + '</th>'; }).join("") + "</tr>";
+      var body = rows.map(function(r) {
+        return "<tr>" + cols.map(function(c) { return '<td class="obs-td">' + obsVal(r[c]) + '</td>'; }).join("") + "</tr>";
+      }).join("");
+      return '<div class="obs-table-wrap"><table class="obs-table"><thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>';
+    }
+
+    // Timeline: first column is the lead/timestamp; the rest render as labelled fields.
+    function obsRenderTimeline(rows, spec) {
+      if (!rows.length) return '<div class="obs-empty">No events in this window.</div>';
+      var cols = obsCols(rows, spec);
+      var lead = cols[0];
+      var rest = cols.slice(1);
+      return '<div class="obs-timeline">' + rows.map(function(r) {
+        var ts = lead != null ? r[lead] : "";
+        var fields = rest.map(function(c) {
+          return '<span class="obs-tl-field">' + esc(c) + ': <b>' + obsVal(r[c]) + '</b></span>';
+        }).join("");
+        return '<div class="obs-tl-row">' +
+          '<div class="obs-tl-ts">' + esc(String(ts || "")) + '<br><span class="obs-td-dim">' + fmtRelative(ts) + '</span></div>' +
+          '<div class="obs-tl-body"><div class="obs-tl-fields">' + fields + '</div></div>' +
+          '</div>';
+      }).join("") + '</div>';
+    }
+
+    // Metric-cards: one card per row. columns = [label, value, unit?]; else row keys.
+    function obsRenderCards(rows, spec) {
+      if (!rows.length) return '<div class="obs-empty">No metrics.</div>';
+      var cols = obsCols(rows, spec);
+      var labelKey = cols[0], valueKey = cols[1], unitKey = cols[2];
+      return '<div class="obs-cards">' + rows.map(function(r) {
+        var label = labelKey != null ? r[labelKey] : Object.keys(r)[0];
+        var value = valueKey != null ? r[valueKey] : "";
+        var unit = (unitKey != null && r[unitKey]) ? (" " + r[unitKey]) : "";
+        return '<div class="obs-card"><div class="obs-card-label">' + esc(String(label != null ? label : "")) + '</div>' +
+          '<div class="obs-card-value">' + obsVal(value) + esc(unit) + '</div></div>';
+      }).join("") + '</div>';
+    }
+
+    // Log: a monospace block. Prefers a line/message field; else key=value per row.
+    function obsRenderLog(rows, spec) {
+      if (!rows.length) return '<div class="obs-empty">No log lines.</div>';
+      var cols = obsCols(rows, spec);
+      var lines = rows.map(function(r) {
+        if (r.line != null) return String(r.line);
+        if (r.message != null) return String(r.message);
+        return cols.map(function(c) { return c + "=" + (r[c] == null ? "" : r[c]); }).join("  ");
+      }).join("\n");
+      return '<div class="obs-log">' + esc(lines) + '</div>';
+    }
+
+    if (obsRangeSel) obsRangeSel.addEventListener("change", function() { loadObservability(); });`;

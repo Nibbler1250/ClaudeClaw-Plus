@@ -503,12 +503,7 @@ export async function start(args: string[] = []) {
       // Search "Issue #165: deferred bus agent spawn" for step 3.
       const socketPath = resolveDaemonSocketPath();
       const bus = new BusCoreImpl({ socketPath });
-      // Issue #215: pass `bus` so the SessionManager wires a per-agent
-      // JsonlTailer that feeds `response.turn_end` into the silent-drop
-      // safety net. Without this the net is inert in the production daemon
-      // (mountBusRuntime's bus-wired default is bypassed when we supply our
-      // own SessionManager here).
-      const sessionManager = new SessionManager({ busSocketPath: socketPath, bus });
+      const sessionManager = new SessionManager({ busSocketPath: socketPath });
       const handle = await mountBusRuntime({
         bus,
         sessionManager,

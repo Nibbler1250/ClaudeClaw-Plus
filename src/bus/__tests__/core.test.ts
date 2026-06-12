@@ -524,57 +524,6 @@ describe("BusCore IPC", () => {
     client.close();
   });
 
-  it("drops held prompts and cancels the backstop on IPC disconnect (#243 review)", async () => {
-    // A prompt held during (re)init must NOT be flushed into a restart that
-    // reuses the same agent_id: when the subprocess IPC socket drops, onClose
-    // tears down the gate timer + queue so the backstop can never inject a
-    // stale keystroke into the new process.
-    const sockPath = join(tempDir, "bus.sock");
-    bus = createBusCore({
-      eventLogAppend: createMockEventLog().append,
-      socketPath: sockPath,
-      deliveryBackstopMs: 100,
-      onError: () => {},
-    });
-    await bus.start();
-    const delivered: string[] = [];
-    bus.setStreamPromptHandler(async (_a, text) => {
-      delivered.push(text);
-    });
-
-    const client = await connectIpcClient(sockPath);
-    client.send({
-      type: "hello",
-      agent_id: "alpha",
-      capabilities: ["claude/channel", "claude/channel/permission"],
-    });
-    await new Promise((r) => setTimeout(r, 50));
-    expect(bus.state().connectedAgents).toContain("alpha");
-
-    // Arm the gate and queue a held prompt, then drop the socket BEFORE replay_done.
-    bus.ingestSessionEvent({
-      ts: 1,
-      agent_id: "alpha",
-      session_id: "s",
-      topic: "session.init",
-      payload: {},
-    });
-    await bus.sendPrompt({
-      agent_id: "alpha",
-      origin: "webui",
-      origin_id: "i",
-      user_id: "u",
-      text: "held",
-    });
-    expect(delivered).toHaveLength(0);
-    client.close();
-
-    // Past the backstop: without the onClose teardown the held prompt would
-    // flush here; with it, nothing is delivered.
-    await new Promise((r) => setTimeout(r, 160));
-    expect(delivered).toHaveLength(0);
-  });
-
   it("sendPrompt forwards an IpcPrompt to the right MCP connection", async () => {
     const sockPath = join(tempDir, "bus.sock");
     bus = createBusCore({
@@ -1055,33 +1004,6 @@ describe("BusCore IPC", () => {
       expect(replies.length).toBe(0);
     });
 
-    it("does NOT synthesize for a scheduled origin (cron) even though it set lastPromptOrigin", async () => {
-      const b = makeBus();
-      const replies = captureReplies(b, "alpha");
-
-      // A cron/heartbeat tick DOES go through sendPrompt and records an
-      // origin — but those origins aren't channel-driven (no user waiting,
-      // no adapter to deliver to). Ending such a turn with text without
-      // calling `reply` is normal, not a silent drop.
-      await b.sendPrompt({
-        agent_id: "alpha",
-        origin: "cron",
-        origin_id: "cron-1",
-        user_id: "system",
-        text: "scheduled job",
-      });
-
-      b.ingestSessionEvent({
-        ts: Date.now(),
-        agent_id: "alpha",
-        session_id: "",
-        topic: "response.turn_end",
-        payload: { stop_reason: "end_turn", text: "Cost tracker ran — total 30j $2183." },
-      });
-
-      expect(replies.length).toBe(0);
-    });
-
     it("resets the per-turn flag on each new prompt (single-flight per prompt)", async () => {
       const b = makeBus();
       const replies = captureReplies(b, "alpha");
@@ -1169,41 +1091,6 @@ describe("BusCore IPC", () => {
       // Only one synthetic delivery, not two.
       expect(replies.length).toBe(1);
       expect(replies[0].text).toBe("the recovered text");
-    });
-
-    it("delivers exactly once when turn_end LOSES the race (synthesis fires, then real reply lands) (#217 finding 2)", async () => {
-      // Cross-transport race: the real `reply` IPC and the synthesized
-      // recovery (from the tailer's response.turn_end) travel on two
-      // unordered channels. Here the tailer wins — turn_end is processed
-      // BEFORE the real reply IPC lands. handleTurnEnd synthesizes a final,
-      // then the late real reply arrives. Without per-turn dedup the user
-      // would receive the same answer twice.
-      const b = makeBus();
-      const replies = captureReplies(b, "alpha");
-
-      await b.sendPrompt({
-        agent_id: "alpha",
-        origin: "webui",
-        origin_id: "race-1",
-        user_id: "u1",
-        text: "say hi",
-      });
-
-      // Tailer wins: turn_end processed first → synthesizes + delivers.
-      b.ingestSessionEvent({
-        ts: Date.now(),
-        agent_id: "alpha",
-        session_id: "",
-        topic: "response.turn_end",
-        payload: { stop_reason: "end_turn", text: "the answer" },
-      });
-
-      // The real reply IPC lands late for the SAME turn.
-      b.ingestReply({ agent_id: "alpha", text: "the answer", intent: "final" });
-
-      // Exactly one final delivered, not two.
-      expect(replies.length).toBe(1);
-      expect(replies[0].text).toBe("the answer");
     });
   });
 });
@@ -1300,78 +1187,5 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     await prompt("beta", "beta-now");
     expect(delivered).toHaveLength(1);
     expect(delivered[0][0]).toBe("beta");
-  });
-
-  // Real producer order for a fresh/restart/rotation session: the tailer's
-  // start() emits `replay_done` BEFORE the model writes the first line that
-  // triggers `session.init`. The gate must stay order-independent — a prompt
-  // arriving after this real order must deliver IMMEDIATELY (not wait for the
-  // backstop), since the session is already live by `replay_done`.
-  it("delivers immediately on the real producer order (replay_done then session.init)", async () => {
-    bus = createBusCore({
-      eventLogAppend: createMockEventLog().append,
-      deliveryBackstopMs: 1000, // long: a backstop-driven flush would be a bug here
-    });
-    const delivered: string[] = [];
-    bus.setStreamPromptHandler(async (_a, text) => {
-      delivered.push(text);
-    });
-    // Fresh/empty file: tailer emits replay_done first, then a late session.init.
-    bus.ingestSessionEvent(replayEvt("alpha"));
-    bus.ingestSessionEvent(initEvt("alpha"));
-    await prompt("alpha", "fresh");
-    expect(delivered).toHaveLength(1); // not held until the backstop
-    expect(delivered[0]).toContain("fresh");
-  });
-
-  // A late session.init for an already-live generation is a no-op: a prompt
-  // that arrives between replay_done and the late init must still flow.
-  it("a late session.init for the live generation does not re-arm the hold", async () => {
-    bus = createBusCore({
-      eventLogAppend: createMockEventLog().append,
-      deliveryBackstopMs: 1000,
-    });
-    const delivered: string[] = [];
-    bus.setStreamPromptHandler(async (_a, text) => {
-      delivered.push(text);
-    });
-    bus.ingestSessionEvent(replayEvt("alpha")); // session live (generation "s")
-    await prompt("alpha", "p1");
-    expect(delivered).toHaveLength(1);
-    bus.ingestSessionEvent(initEvt("alpha")); // late init for SAME generation "s"
-    await prompt("alpha", "p2");
-    expect(delivered).toHaveLength(2); // p2 not held
-  });
-
-  // A genuinely new generation arriving init-first (existing/non-empty file at
-  // start of the new tailer) must still arm the hold even though a PRIOR
-  // generation was already live.
-  it("a new generation's session.init (init before replay) still arms the hold", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
-    const delivered: string[] = [];
-    bus.setStreamPromptHandler(async (_a, text) => {
-      delivered.push(text);
-    });
-    // Generation "s" goes live, then a new generation "s2" reinitialises with
-    // an existing file → init("s2") arrives BEFORE replay_done("s2").
-    bus.ingestSessionEvent(replayEvt("alpha")); // gen "s" live
-    bus.ingestSessionEvent({
-      ts: 1,
-      agent_id: "alpha",
-      session_id: "s2",
-      topic: "session.init",
-      payload: {},
-    });
-    await prompt("alpha", "held");
-    expect(delivered).toHaveLength(0); // held: new gen is (re)initialising
-    bus.ingestSessionEvent({
-      ts: 1,
-      agent_id: "alpha",
-      session_id: "s2",
-      topic: "bus.events.replay_done",
-      payload: {},
-    });
-    expect(delivered).toHaveLength(1);
-    expect(delivered[0]).toContain("held");
   });
 });

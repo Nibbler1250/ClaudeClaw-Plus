@@ -21,7 +21,7 @@ import type {
   SubscriptionFilter,
   SubscriptionHandler,
 } from "../../../bus/core-subscription";
-import { type BusEvent, TAILER_EVENT_SOURCE } from "../../../bus/types";
+import type { BusEvent } from "../../../bus/types";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -151,7 +151,12 @@ interface AnswerCallbackCall {
  */
 class FakeTelegramApi implements TelegramApi {
   public readonly sendMessages: SendMessageCall[] = [];
-  public readonly editMessages: Array<{ chat_id: number; message_id: number; text: string }> = [];
+  public readonly editMessages: Array<{
+    chat_id: number;
+    message_id: number;
+    text: string;
+    reply_markup?: { inline_keyboard: TelegramInlineKeyboardButton[][] };
+  }> = [];
   public readonly reactions: SetReactionCall[] = [];
   public readonly callbackAcks: AnswerCallbackCall[] = [];
 
@@ -199,6 +204,7 @@ class FakeTelegramApi implements TelegramApi {
     chat_id: number;
     message_id: number;
     text: string;
+    reply_markup?: { inline_keyboard: TelegramInlineKeyboardButton[][] };
   }): Promise<{ ok: boolean; result?: { message_id: number } | true }> {
     this.editMessages.push(params);
     return { ok: true, result: true };
@@ -537,38 +543,6 @@ describe("TelegramAdapter — response.text outbound", () => {
     expect(sent?.chat_id).toBe(100);
   });
 
-  it("IGNORES the JSONL tailer observability echo so replies are not double-posted (#217)", async () => {
-    // The tailer re-emits a raw per-block response.text stamped with
-    // _meta.source = "jsonl-tailer"; the real delivery comes from ingestReply
-    // (no marker). Delivering both double-posts — assert the echo sends nothing.
-    adapter = await startAdapter();
-    await feedInbound();
-    bus.emit({
-      ts: Date.now(),
-      agent_id: "triage",
-      session_id: "s1",
-      topic: "response.text",
-      payload: { text: "echo", _meta: { source: TAILER_EVENT_SOURCE } },
-    });
-    await new Promise((r) => setTimeout(r, 20));
-    expect(api.sendMessages).toHaveLength(0);
-  });
-
-  it("STILL delivers a non-tailer response.text exactly once (#217)", async () => {
-    adapter = await startAdapter();
-    await feedInbound();
-    bus.emit({
-      ts: Date.now(),
-      agent_id: "triage",
-      session_id: "s1",
-      topic: "response.text",
-      payload: { text: "recovered" },
-    });
-    await waitFor(() => api.sendMessages.length > 0);
-    expect(api.sendMessages).toHaveLength(1);
-    expect(api.sendMessages[0]?.text).toBe("recovered");
-  });
-
   it("strips [react:<emoji>] tags and applies them via setMessageReaction", async () => {
     adapter = await startAdapter();
     await feedInbound();
@@ -866,6 +840,139 @@ describe("TelegramAdapter — permission flow", () => {
     await waitFor(() => api.callbackAcks.length > 0);
     expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
     expect(bus.permissionDecisions).toHaveLength(0);
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* pending-action callbacks (pending:<id>:<value>)                          */
+/* ────────────────────────────────────────────────────────────────────── */
+
+describe("TelegramAdapter — pending-action callbacks", () => {
+  function pendingCallback(data: string) {
+    return {
+      callback_query: {
+        id: "pcb1",
+        from: { id: 42 },
+        data,
+        message: {
+          message_id: 555,
+          chat: { id: 100, type: "private" },
+          text: "Proposition: bump cache TTL",
+        },
+      },
+    };
+  }
+
+  it("routes pending:<id>:<value> to the resolver and acks + edits the message", async () => {
+    const calls: Array<{ id: string; decision: string }> = [];
+    const pendingResolver = async (id: string, decision: string) => {
+      calls.push({ id, decision });
+      return "ok" as const;
+    };
+    adapter = await startAdapter({ pendingResolver });
+
+    api.enqueueUpdates([pendingCallback("pending:123:reject")]);
+    await waitFor(() => api.callbackAcks.length > 0);
+
+    // Resolver was invoked with the parsed id + decision.
+    expect(calls).toEqual([{ id: "123", decision: "reject" }]);
+
+    // Acked with the human label for a reject.
+    expect(api.callbackAcks[0]?.callback_query_id).toBe("pcb1");
+    expect(api.callbackAcks[0]?.text).toBe("❌ Rejeté");
+
+    // Original message edited to record the decision, keyboard dropped.
+    await waitFor(() => api.editMessages.length > 0);
+    const edit = api.editMessages[0];
+    expect(edit?.chat_id).toBe(100);
+    expect(edit?.message_id).toBe(555);
+    expect(edit?.text).toContain("❌ Rejeté");
+    expect(edit?.reply_markup).toEqual({ inline_keyboard: [] });
+
+    // Never fell through to the perm: path / silent drop.
+    expect(bus.permissionDecisions).toHaveLength(0);
+  });
+
+  it("maps approve/skip decisions to their labels", async () => {
+    const pendingResolver = async () => "ok" as const;
+    adapter = await startAdapter({ pendingResolver });
+
+    api.enqueueUpdates([pendingCallback("pending:7:approve")]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("✅ Approuvé");
+  });
+
+  it("acks 'introuvable' and skips the edit when the action is not found", async () => {
+    const pendingResolver = async () => "not_found" as const;
+    adapter = await startAdapter({ pendingResolver });
+
+    api.enqueueUpdates([pendingCallback("pending:999:approve")]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("⚠️ Action introuvable ou déjà traitée");
+    // not_found still edits (legacy parity).
+    await waitFor(() => api.editMessages.length > 0);
+    expect(api.editMessages[0]?.text).toContain("introuvable");
+  });
+
+  it("does not call the resolver for non-allow-listed users", async () => {
+    let called = false;
+    const pendingResolver = async () => {
+      called = true;
+      return "ok" as const;
+    };
+    adapter = await startAdapter({ pendingResolver });
+
+    api.enqueueUpdates([
+      {
+        callback_query: {
+          id: "pcb2",
+          from: { id: 999 },
+          data: "pending:1:approve",
+          message: { message_id: 1, chat: { id: 100, type: "private" }, text: "x" },
+        },
+      },
+    ]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
+    expect(called).toBe(false);
+  });
+
+  it("still routes perm: callbacks (non-regression)", async () => {
+    adapter = await startAdapter();
+    api.enqueueUpdates([
+      {
+        message: {
+          message_id: 1,
+          from: { id: 42 },
+          chat: { id: 100, type: "private" },
+          text: "ping",
+        },
+      },
+    ]);
+    await waitFor(() => bus.prompts.length > 0);
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "channel.permission_request",
+      payload: { request_id: "rid1", tool_name: "bash", description: "", input_preview: "" },
+    });
+    await waitFor(() => api.sendMessages.length >= 1);
+
+    api.enqueueUpdates([
+      {
+        callback_query: {
+          id: "cbperm",
+          from: { id: 42 },
+          data: "perm:allow:rid1",
+          message: { message_id: 9999, chat: { id: 100, type: "private" } },
+        },
+      },
+    ]);
+    await waitFor(() => bus.permissionDecisions.length > 0);
+    expect(bus.permissionDecisions[0]?.behavior).toBe("allow");
+    expect(bus.permissionDecisions[0]?.request_id).toBe("rid1");
   });
 });
 
@@ -1228,40 +1335,16 @@ describe("TelegramAdapter — inbound receipts (#211)", () => {
     }
     // Activity kept rearming: still open though elapsed (~150ms) > budget (100ms).
     expect(closedReceipts().some((r) => r.message_id === "tg-1")).toBe(false);
+    // The open receipt recorded the observed activity.
+    const open = receiptStore.find("tg-1");
+    expect(open?.record.notes?.turn_started_at).toBeDefined();
+    expect(open?.record.notes?.last_activity_at).toBeDefined();
     // Once silent, it closes as a genuine inactivity timeout.
     await waitFor(() =>
       closedReceipts().some((r) => r.message_id === "tg-1" && r.final_state === "timeout"),
     );
     expect(closedReceipts().find((r) => r.message_id === "tg-1")?.notes?.reason).toBe(
       "no_final_reply_within_timeout",
-    );
-  });
-
-  it("closes as timeout(max_turn_budget_exceeded) when activity never stops past the absolute ceiling", async () => {
-    // Ceiling = receiptMaxBudgetMultiplier * receiptTimeoutMs. Pin both small
-    // (4 * 30ms = ~120ms from received_at) so the test is deterministic under
-    // the generous production default. Emit progress every 20ms (always under
-    // the inactivity budget) for longer than the ceiling: the inactivity rearm
-    // alone would keep the receipt open forever, but the ceiling forces a close
-    // with a DISTINCT reason so a chatty-but-wedged agent stays visible.
-    adapter = await startAdapter({ receiptTimeoutMs: 30, receiptMaxBudgetMultiplier: 4 });
-    await feed("forever-chatty wedge");
-    const stop = Date.now() + 220;
-    while (Date.now() < stop && !closedReceipts().some((r) => r.message_id === "tg-1")) {
-      bus.emit({
-        ts: Date.now(),
-        agent_id: "triage",
-        session_id: "s1",
-        topic: "response.text",
-        payload: { text: "still working...", intent: "progress" },
-      });
-      await new Promise((r) => setTimeout(r, 20));
-    }
-    await waitFor(() =>
-      closedReceipts().some((r) => r.message_id === "tg-1" && r.final_state === "timeout"),
-    );
-    expect(closedReceipts().find((r) => r.message_id === "tg-1")?.notes?.reason).toBe(
-      "max_turn_budget_exceeded",
     );
   });
 

@@ -131,34 +131,6 @@ describe("createMcpReconciler (#222)", () => {
     expect(h.logs.some((l) => l.msg === "reconcile-giveup")).toBe(true);
   });
 
-  it("rate-limits and gives up even when restart() REJECTS (no storm)", async () => {
-    // restart() that always rejects — e.g. the Session Manager throwing on its
-    // OWN crash-loop rate-limit ("restart rate limit exceeded"). The cooldown
-    // and attempt-cap must still engage: the reconciler counts ATTEMPTS, not
-    // successes. Without that, restartHistory stays empty and the reconciler
-    // storms restart() every confirm window forever, and reconcile-giveup
-    // never fires.
-    const calls: string[] = [];
-    const h = harness({
-      restart: async (id) => {
-        calls.push(id);
-        throw new Error("restart rate limit exceeded");
-      },
-    });
-    const onFail = createMcpReconciler(h.deps, {
-      cooldownMs: 1_000,
-      maxAttempts: 2,
-      windowMs: 60 * 60_000,
-    });
-    for (let i = 0; i < 6; i++) {
-      onFail("default", { reason: `r${i}` });
-      await h.flush();
-      h.advance(2_000); // clear cooldown each round
-    }
-    expect(calls.length).toBe(2); // capped despite every restart rejecting
-    expect(h.logs.some((l) => l.msg === "reconcile-giveup")).toBe(true);
-  });
-
   it("tracks agents independently", async () => {
     const h = harness();
     const onFail = createMcpReconciler(h.deps);

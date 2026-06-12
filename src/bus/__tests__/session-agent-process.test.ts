@@ -284,46 +284,8 @@ describe("PtyAgentProcess boot-dialog watcher (structural / ANSI-resilient)", ()
     } finally {
       console.error = origErr;
     }
-    expect(writes).toEqual([]); // no blind keypress on a non-proceed default
-    expect(warned).toContain("non-proceed default");
-  });
-
-  it("fails safe on a destructive default phrased without an exit/cancel keyword (allowlist invert)", () => {
-    // A selected default phrased "Delete everything" matched no proceed verb,
-    // so the watcher must warn-and-wait rather than blind-Enter it — the case
-    // the old destructive-blocklist (exit|cancel|abort|…) would have missed.
-    const { handle, writes, emit } = bootPty();
-    new PtyAgentProcess("zeta", handle);
-    const origErr = console.error;
-    let warned = "";
-    console.error = (...a: unknown[]) => {
-      warned = a.map(String).join(" ");
-    };
-    try {
-      emit(" ❯ 1. Delete everything\r\n   2. Keep files\r\n Enter to confirm");
-    } finally {
-      console.error = origErr;
-    }
-    expect(writes).toEqual([]); // not a recognised proceed action -> no Enter
-    expect(warned).toContain("non-proceed default");
-  });
-
-  it("does NOT fire a second Enter when the bypass dialog re-renders after Down+Enter (Codex F3)", async () => {
-    // The bypass-permissions dialog is answered by the gated Down+Enter branch.
-    // On the redraw chunk the SAME dialog text is still on screen with "❯" now
-    // on the accept row — it must NOT fall through to the generic confirm
-    // branch and fire a second, blind Enter racing the deferred one.
-    const { handle, writes, emit } = bootPty();
-    new PtyAgentProcess("eta", handle);
-    emit(
-      "WARNING: Bypass Permissions mode\r\n ❯ 1. No, exit\r\n   2. Yes, I accept\r\n Enter to confirm",
-    );
-    // redraw after Down: selection moved to the accept row, dialog still up.
-    emit(
-      "WARNING: Bypass Permissions mode\r\n   1. No, exit\r\n ❯ 2. Yes, I accept\r\n Enter to confirm",
-    );
-    await new Promise((r) => setTimeout(r, 250)); // let the deferred Enter land
-    expect(writes).toEqual(["\x1b[B", "\r"]); // exactly Down then one Enter
+    expect(writes).toEqual([]); // no blind keypress on a destructive default
+    expect(warned).toContain("destructive default");
   });
 
   it("disengages on the REPL footer and ignores later dialog-looking text", async () => {

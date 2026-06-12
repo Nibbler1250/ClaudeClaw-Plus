@@ -21,7 +21,7 @@
  * shortly after spawn in case the account has the channels feature flag
  * on.
  */
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
@@ -29,8 +29,10 @@ import {
   CLAUDECLAW_PLUGIN_NAME,
   PLUS_BUS_CHANNEL,
   buildClaudeArgs,
+  hasResumableSession,
   resolveClaudeclawPluginRoot,
 } from "../session-manager";
+import { encodeCwdForProjectsDir } from "../jsonl-line-types";
 import type { AgentConfig } from "../types";
 
 function makeAgent(over: Partial<AgentConfig> = {}): AgentConfig {
@@ -138,6 +140,27 @@ describe("buildClaudeArgs", () => {
     expect(args[sidIdx + 1]).toBe("deadbeef-1234-1234-1234-000000000000");
   });
 
+  it("uses --session-id (not --resume) by default / for a fresh session", () => {
+    const agent = makeAgent({ id: "fresh", session_id: "11111111-0000-0000-0000-000000000000" });
+    const args = buildClaudeArgs(agent, "pty-stdin");
+    expect(args).toContain("--session-id");
+    expect(args).not.toContain("--resume");
+    expect(args[args.indexOf("--session-id") + 1]).toBe("11111111-0000-0000-0000-000000000000");
+  });
+
+  it("uses --resume (not --session-id) when resume=true, keeping the SAME id", () => {
+    // Continuity fix: resume an existing transcript across restarts instead of
+    // re-pinning --session-id (which collides on an existing JSONL → rotation →
+    // the deaf-agent wedge). Mutually exclusive with --session-id; same id so
+    // the tailer/session.json binding stays put (NOT --fork-session).
+    const agent = makeAgent({ id: "resumed", session_id: "22222222-0000-0000-0000-000000000000" });
+    const args = buildClaudeArgs(agent, "pty-stdin", true);
+    expect(args).toContain("--resume");
+    expect(args).not.toContain("--session-id");
+    expect(args).not.toContain("--fork-session");
+    expect(args[args.indexOf("--resume") + 1]).toBe("22222222-0000-0000-0000-000000000000");
+  });
+
   it("defaults permission_mode to bypassPermissions when unset (headless contract)", () => {
     // commands/start.md §Security Levels: "All levels run without
     // permission prompts (headless)". Legacy `claude -p` delivered
@@ -149,5 +172,33 @@ describe("buildClaudeArgs", () => {
     const args = buildClaudeArgs(agent, "pty-stdin");
     const pmIdx = args.indexOf("--permission-mode");
     expect(args[pmIdx + 1]).toBe("bypassPermissions");
+  });
+});
+
+describe("hasResumableSession", () => {
+  function writeTranscript(cwd: string, sessionId: string, bytes: string): void {
+    const dir = join(tmp, encodeCwdForProjectsDir(cwd));
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${sessionId}.jsonl`), bytes);
+  }
+
+  it("is true when a non-empty transcript exists for the session", () => {
+    const cwd = "/home/agent/work";
+    const sid = "aaaaaaaa-0000-0000-0000-000000000000";
+    writeTranscript(cwd, sid, '{"type":"user"}\n');
+    expect(hasResumableSession(cwd, sid, tmp)).toBe(true);
+  });
+
+  it("is false when no transcript file exists (fresh session)", () => {
+    expect(
+      hasResumableSession("/home/agent/work", "bbbbbbbb-0000-0000-0000-000000000000", tmp),
+    ).toBe(false);
+  });
+
+  it("is false when the transcript exists but is empty (never written a turn)", () => {
+    const cwd = "/home/agent/work";
+    const sid = "cccccccc-0000-0000-0000-000000000000";
+    writeTranscript(cwd, sid, "");
+    expect(hasResumableSession(cwd, sid, tmp)).toBe(false);
   });
 });

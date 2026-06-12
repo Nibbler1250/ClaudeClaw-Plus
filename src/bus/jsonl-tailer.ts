@@ -39,7 +39,7 @@ import {
   type ToolResultBlock,
   type UserLine,
 } from "./jsonl-line-types";
-import { type BusEvent, type BusEventTopic, TAILER_EVENT_SOURCE } from "./types";
+import type { BusEvent, BusEventTopic } from "./types";
 
 /**
  * Parser schema version. Bump whenever line-type handling changes in a
@@ -130,15 +130,6 @@ export class JsonlTailer {
   private readonly startAt: "begin" | "end";
 
   private offset = 0;
-  /**
-   * Set when the startup seek-to-EOF (`startAt: "end"`) could not `statSync`
-   * the file (transient perm flip / NFS hiccup / rotation). While true, the
-   * next `drainFromOffset` re-seeks to current EOF instead of reading from
-   * offset 0 — otherwise it would replay the entire history and synthesize a
-   * stale reply, the exact failure `startAt: "end"` exists to prevent
-   * (#217 review).
-   */
-  private seekToEndPending = false;
   private buffer = "";
   /** Set true once the first non-empty line emits `session.init`. */
   private initEmitted = false;
@@ -195,27 +186,19 @@ export class JsonlTailer {
           this.offset = statSync(this.filePath).size;
         } catch (err) {
           this.onError(err, { ctx: "start-eof-stat" });
-          // Couldn't establish EOF. Do NOT let the follow-up drain read from
-          // offset 0 — that replays the whole history and synthesizes a stale
-          // reply. Defer the seek: the next drainFromOffset re-seeks to the
-          // then-current EOF and tails forward (#217 review).
-          this.seekToEndPending = true;
         }
       } else {
         await this.drainFromOffset();
       }
+      // Forensic (issue #215 tailer-binding): record which file/offset this
+      // tailer bound to, so a wedge dossier can compare bound-vs-real and
+      // tell seek-past (#2) from wrong-file/resume (#1/#3). console.error →
+      // daemon stderr → telegram*.log, where the wedge probe greps it.
+      console.error(
+        `[jsonl-tailer] attach agent=${this.agent_id} session=${this.session_id} file=${this.filePath} startOffset=${this.offset} startAt=${this.startAt} existed=true`,
+      );
       this.emitReplayDone();
       this.attachFileWatcher();
-      // Close the startup TOCTOU on the existing-file path (review #217).
-      // `fs.watch` only fires on changes AFTER it attaches, so bytes written
-      // in the window between the `statSync` seek-to-EOF above and
-      // `attachFileWatcher()` are not delivered by the watcher and stay unread
-      // until the NEXT write triggers `scheduleDrain`. If those missed bytes
-      // contain an `end_turn` line and the agent then goes idle — the exact
-      // pattern this safety net exists to recover — synthesis is delayed
-      // indefinitely. Schedule a follow-up drain to sweep the gap immediately,
-      // mirroring what `awaitFileCreation` already does after its attach.
-      this.scheduleDrain();
       return;
     }
 
@@ -226,6 +209,9 @@ export class JsonlTailer {
     // tailer is inert for every fresh session (issue #215 runtime wiring:
     // the common case — the original code only logged the ENOENT from
     // `watch()` and gave up, so no events ever flowed in production).
+    console.error(
+      `[jsonl-tailer] attach agent=${this.agent_id} session=${this.session_id} file=${this.filePath} startOffset=0 startAt=${this.startAt} existed=false awaiting-file`,
+    );
     this.emitReplayDone();
     this.awaitFileCreation();
   }
@@ -252,10 +238,6 @@ export class JsonlTailer {
     const poll = (): void => {
       if (this.stopped) return;
       if (existsSync(this.filePath)) {
-        // File appeared — the await-creation poll is done; clear its handle so
-        // the tailer's state isn't misleading and stop() doesn't clear a stale
-        // timer (Copilot review #217).
-        this.createPollTimer = null;
         this.attachFileWatcher();
         this.scheduleDrain();
         return;
@@ -307,14 +289,6 @@ export class JsonlTailer {
       // re-fire when bytes appear (or won't, if the file truly never
       // gets created — that's a higher-layer concern).
       this.onError(err, { ctx: "drain-stat" });
-      return;
-    }
-    if (this.seekToEndPending) {
-      // Startup seek-to-EOF was deferred because the initial statSync failed.
-      // Establish EOF now and tail forward — a startAt:"end" tailer must never
-      // replay history (#217 review).
-      this.offset = size;
-      this.seekToEndPending = false;
       return;
     }
     if (size <= this.offset) return;
@@ -463,7 +437,21 @@ export class JsonlTailer {
     for (const block of blocks) {
       switch (block.type) {
         case "text":
-          this.publish("response.text", { text: (block as { text?: string }).text ?? "" }, line);
+          // Regression fix 2026-06-06: assistant text blocks are mirrored on the
+          // OBSERVABILITY topic `response.assistant_text`, NOT `response.text`. The
+          // chat adapters (telegram/slack/discord) and the webui /api/chat stream
+          // subscribe to `response.text` as a DELIVERY topic; once the tailer was
+          // wired into prod (attachBus / 801c9d6), mirroring text blocks onto
+          // `response.text` double-delivered alongside the `reply` tool (and leaked
+          // the trailing reasoning text as a bogus "message sent" confirmation).
+          // The dashboard WS subscribes to ALL topics, so it still sees this raw
+          // stream. Delivery stays owned by the `reply` tool (core.ingestReply) and,
+          // for silent-drop turns, by the `response.turn_end` synthesize net below.
+          this.publish(
+            "response.assistant_text",
+            { text: (block as { text?: string }).text ?? "" },
+            line,
+          );
           break;
         case "tool_use":
           this.publish(
@@ -585,13 +573,7 @@ export class JsonlTailer {
       agent_id: this.agent_id,
       session_id: sessionFromLine ?? this.session_id,
       topic,
-      // Stamp the tailer source marker (#217) into `_meta` so delivery
-      // adapters can tell this observability echo apart from a real
-      // `ingestReply` delivery (otherwise every reply double-posts).
-      // Merge with any caller-supplied metadata. Only object (non-array)
-      // payloads carry `_meta`; primitive/array payloads are never
-      // adapter-deliverable, so leave them untouched.
-      payload: this.withTailerMeta(payload, metadata),
+      payload: metadata ? { ...(payload as object), _meta: metadata } : payload,
       raw: rawLine,
     };
     try {
@@ -599,22 +581,6 @@ export class JsonlTailer {
     } catch (err) {
       this.onError(err, { ctx: "publish", topic });
     }
-  }
-
-  /**
-   * Merge the tailer source marker (#217) — and any caller metadata —
-   * into an object payload's `_meta`. Primitive/array payloads are
-   * returned unchanged (they are never adapter-deliverable, so they
-   * don't need the marker, and spreading them would be lossy).
-   */
-  private withTailerMeta(payload: unknown, metadata?: Record<string, unknown>): unknown {
-    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
-      return payload;
-    }
-    return {
-      ...(payload as object),
-      _meta: { ...metadata, source: TAILER_EVENT_SOURCE },
-    };
   }
 
   private emitReplayDone(): void {
