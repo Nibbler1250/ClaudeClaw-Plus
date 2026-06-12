@@ -94,6 +94,12 @@ export class PtyAgentProcess implements AgentProcess {
   /** Serializes the write/settle/CR sequence so concurrent prompts can't
    *  interleave in the PTY input buffer (review #141 P1). */
   private writeChain: Promise<void> = Promise.resolve();
+  /** ANSI-stripped tail of PTY output, reset after each submit so the
+   *  delivery-confirm check only inspects post-submit frames (#wedge). */
+  private recentOut = "";
+  private readonly submitConfirmMs: number;
+  private readonly maxSubmitNudges: number;
+  private readonly maxCompactionWaitMs: number;
   /** Boot-dialog watcher state (issue #193). Claude shows interactive
    *  confirmation dialogs at startup (the dev-channels prompt, and the newer
    *  "Bypass Permissions mode" prompt). We answer them by inspecting early PTY
@@ -110,6 +116,9 @@ export class PtyAgentProcess implements AgentProcess {
    *  Enter per distinct dialog instead of on every render chunk. */
   private lastConfirmSig: string | null = null;
   private warnedUnhandledDialog = false;
+  /** One-shot guard so an unconfirmed delivery is surfaced once per process
+   *  (see the delivery-confirm loop) instead of spamming the log. */
+  private warnedUnconfirmedDelivery = false;
   /** Hard cap on the boot-dialog watch window (issue #193 / Codex P2). If no
    *  REPL-ready marker is observed within this window (e.g. a future CLI
    *  changes the footer text), the watcher disengages anyway so it never
@@ -117,16 +126,35 @@ export class PtyAgentProcess implements AgentProcess {
   private static readonly BOOT_DIALOG_MAX_MS = 15_000;
   private bootDialogTimer: ReturnType<typeof setTimeout> | undefined;
 
-  constructor(agent_id: string, pty: PtyHandle) {
+  constructor(
+    agent_id: string,
+    pty: PtyHandle,
+    opts: {
+      /** Grace window to confirm a submit started a turn before re-nudging. */
+      submitConfirmMs?: number;
+      /** Max times to re-send the submit keystroke when no turn is observed. */
+      maxSubmitNudges?: number;
+      /** Upper bound to wait out an in-progress auto-compaction before the
+       *  submit is abandoned to the watchdog (compaction can run ~100s). */
+      maxCompactionWaitMs?: number;
+    } = {},
+  ) {
     this.agent_id = agent_id;
     this.pty = pty;
     this.pid = pty.pid;
+    this.submitConfirmMs = opts.submitConfirmMs ?? 1500;
+    this.maxSubmitNudges = opts.maxSubmitNudges ?? 2;
+    this.maxCompactionWaitMs = opts.maxCompactionWaitMs ?? 240_000;
     this.bootDialogTimer = setTimeout(
       () => this.endBootDialogPhase(),
       PtyAgentProcess.BOOT_DIALOG_MAX_MS,
     );
     pty.onData((chunk) => {
       if (this.bootDialogActive) this.handleBootDialog(chunk);
+      // Keep a small ANSI-stripped tail so send_prompt_stream can tell whether a
+      // submit actually started a turn (the idle REPL footer disappears on turn
+      // start) -- see the delivery-confirm loop. Observation only.
+      this.recentOut = (this.recentOut + stripAnsiEscapes(chunk)).slice(-2000);
       // Crash-signal observation ONLY (spec §5.3). Never parsed as model output.
       for (const h of this.dataHandlers) {
         try {
@@ -192,7 +220,81 @@ export class PtyAgentProcess implements AgentProcess {
       if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
       this.pty.write(text);
       await new Promise((r) => setTimeout(r, 200));
+      if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
       this.pty.write("\r");
+      // #wedge fix (prompt-delivery-confirm): the typed text + CR can fail to
+      // start a turn when the CR lands during a transient REPL render (paste /
+      // redraw race) -- the prompt sits un-submitted, no turn, no API socket,
+      // and the receipt only times out 5 min later. Confirm a turn started: the
+      // idle REPL footer ("to cycle", the version-stable core of the mode-cycler
+      // hint -- "shift+tab to cycle" in older CLIs, "to cycle permission modes"
+      // in 2.1.168+, so the bare "to cycle" is what survives the rename) is
+      // replaced by the streaming view the instant a turn begins; if it is still
+      // being rendered after a grace window, re-send the submit keystroke (the
+      // text is already in the input box). Bounded; a stray CR at an idle REPL
+      // is a no-op, and a genuinely stuck REPL still degrades to the watchdog.
+      // NB: handleBootDialog uses the stricter "tab to cycle" to avoid
+      // disengaging on boot prose (#195); here the REPL is already up, so boot
+      // prose is not a concern and the bare core is the safer live-footer match.
+      // A second wedge class (socket=yes): an auto-compaction can seize the
+      // REPL the instant the prompt arrives and swallow the submit CR -- the
+      // turn never starts and the receipt only times out 5 min later. While
+      // "Compacting" is on screen, wait it out; this does NOT spend a submit
+      // nudge (compaction runs ~100s, far longer than the nudge cadence). When
+      // it finishes the footer returns to "to cycle" and the idle-footer branch
+      // re-submits the still-typed prompt. Bounded by maxCompactionWaitMs so a
+      // stuck compaction degrades to the watchdog instead of looping forever.
+      // Outcomes: "turn-started" (delivered) | "stuck-compaction" |
+      // "unconfirmed-idle" (gave up). A give-up degrades to the watchdog, but
+      // NEVER silently -- the stranded input line is cleared and a diagnostic is
+      // surfaced, since a silently-dropped prompt is the failure this loop fixes.
+      const compactionDeadline = Date.now() + this.maxCompactionWaitMs;
+      let outcome: "turn-started" | "stuck-compaction" | "unconfirmed-idle" = "unconfirmed-idle";
+      for (let nudge = 0; nudge < this.maxSubmitNudges; ) {
+        this.recentOut = "";
+        await new Promise((r) => setTimeout(r, this.submitConfirmMs));
+        // Exit mid-confirm must REJECT, in parity with the two pre-CR checks
+        // above: the CR is not proof of delivery (the whole point of this loop),
+        // so resolving here would report a phantom success for a prompt whose
+        // target just died -- suppressing re-queue and masking the wedge.
+        if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
+        // Anchor the compaction probe to the CLI status line ("Compacting
+        // conversation" / "Compacting at auto window") rather than the bare word
+        // "Compacting", which also occurs in ordinary model output: a live turn
+        // streaming that word would otherwise be mistaken for a compaction and
+        // stall this loop -- and the serialised writeChain behind it -- up to the
+        // deadline.
+        if (
+          this.recentOut.includes("Compacting conversation") ||
+          this.recentOut.includes("Compacting at auto")
+        ) {
+          if (Date.now() > compactionDeadline) {
+            outcome = "stuck-compaction";
+            break;
+          }
+          continue; // compaction in progress -> wait, do not spend a nudge
+        }
+        if (!this.recentOut.includes("to cycle")) {
+          outcome = "turn-started";
+          break;
+        }
+        this.pty.write("\r"); // footer still idle -> CR did not submit -> nudge
+        nudge++;
+      }
+      if (outcome === "unconfirmed-idle") {
+        // The prompt is still sitting un-submitted in the REPL input box; left
+        // there it would concatenate onto the next prompt. The REPL is idle here
+        // (footer present every window), so clearing the line is safe.
+        this.pty.write("\x15"); // Ctrl-U: kill the input line
+      }
+      if (outcome !== "turn-started" && !this.warnedUnconfirmedDelivery) {
+        this.warnedUnconfirmedDelivery = true;
+        console.warn(
+          `[delivery-confirm] agent=${this.agent_id}: submit not confirmed ` +
+            `(${outcome}); degraded to the watchdog. Recurring occurrences may mean ` +
+            `the REPL footer marker changed in the CLI.`,
+        );
+      }
     });
     // Keep the chain alive past a rejected write so later prompts still run.
     this.writeChain = run.catch(() => {});
