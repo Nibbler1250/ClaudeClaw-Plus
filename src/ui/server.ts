@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { htmlPage } from "./page/html";
 import { clampInt, json } from "./http";
 import { checkToken } from "./auth";
+import { handleVoiceCallback } from "./voice-callback";
+import { handleSpawnHarness } from "./voice-spawn-harness";
 import type { StartWebUiOptions, WebServerHandle } from "./types";
 import { buildState, buildTechnicalInfo, sanitizeSettings } from "./services/state";
 import { readHeartbeatSettings, updateHeartbeatSettings } from "./services/settings";
@@ -299,8 +301,11 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
       if (url.pathname.startsWith("/api/")) {
         const validWebToken = checkToken(req, opts.token);
         const apiToken = opts.getSnapshot().settings.apiToken;
-        const validApiToken =
-          url.pathname === "/api/inject" && !!apiToken && checkToken(req, apiToken);
+        const apiTokenRoutes =
+          url.pathname === "/api/inject" ||
+          url.pathname === "/api/voice-callback" ||
+          url.pathname === "/api/voice-spawn-harness";
+        const validApiToken = apiTokenRoutes && !!apiToken && checkToken(req, apiToken);
         if (!validWebToken && !validApiToken) {
           return json({ ok: false, error: "unauthorized" }, 401);
         }
@@ -692,6 +697,14 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
         } catch (err) {
           return json({ ok: false, error: String(err) }, 500);
         }
+      }
+
+      if (url.pathname === "/api/voice-callback" && req.method === "POST") {
+        return handleVoiceCallback(req, opts.getSnapshot().settings);
+      }
+
+      if (url.pathname === "/api/voice-spawn-harness" && req.method === "POST") {
+        return handleSpawnHarness(req, opts.getSnapshot().settings);
       }
 
       if (url.pathname === "/api/chat" && req.method === "POST") {
