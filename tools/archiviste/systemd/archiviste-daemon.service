@@ -1,0 +1,15 @@
+[Unit]
+Description=Archiviste RAG daemon — Plus plugin via HTTP gateway
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/simon/agent/archiviste/daemon.py
+Restart=on-failure
+RestartSec=5s
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=append:/home/simon/agent/logs/archiviste-daemon.log
+StandardError=append:/home/simon/agent/logs/archiviste-daemon.log
+
+[Install]
+WantedBy=default.target
