@@ -114,6 +114,22 @@ export type SlashCommandHandler = (agent_id: string, cmd: string) => Promise<voi
  */
 export type StreamPromptHandler = (agent_id: string, text: string) => Promise<void>;
 
+/**
+ * Tailer topics that prove an agent's turn actually started — used to cancel a
+ * pending backstop-flush re-delivery (`armFlushVerify`). `prompt` is the
+ * earliest and most reliable: the JSONL tailer emits it when claude writes the
+ * ingested user line, which happens on ingest before any thinking, so a slow
+ * (no-tool) turn never trips a false re-delivery. The in-turn signals are
+ * belt-and-suspenders. `session.init`/`replay_done` are deliberately excluded —
+ * they mark (re)init, not a turn.
+ */
+const TURN_ACTIVITY_TOPICS: ReadonlySet<string> = new Set([
+  "prompt",
+  "tool_result",
+  "usage",
+  "response.turn_end",
+]);
+
 export interface BusCoreOptions {
   /** Path to bind the UDS server. If omitted, no IPC server is started. */
   socketPath?: string;
@@ -125,6 +141,13 @@ export interface BusCoreOptions {
    *  agent's session (re)initialises before it's flushed even without a
    *  `replay_done`. Defaults to 4000. Lowered in tests. */
   deliveryBackstopMs?: number;
+  /** After a BACKSTOP flush (timer-driven, not a real `replay_done`), the
+   *  session may still be mid-(re)init and swallow the keystroke, so the prompt
+   *  never starts a turn (the socket=no wedge, dossier 20260613T033017). Verify
+   *  a turn actually starts within this window; if not, re-deliver ONCE. Only
+   *  the backstop path is verified — the real `replay_done` path is known-ready.
+   *  Defaults to 8000. Lowered in tests. */
+  flushVerifyMs?: number;
   /** Slash-command delegate (Agent C wires this). */
   slashCommandHandler?: SlashCommandHandler;
   /** REPL prompt delegate for PTY-stdin agents. Wired by the Session Manager. */
@@ -163,7 +186,9 @@ export interface BusCore {
    * bus runtime once the Session Manager is available. Pass `null` to detach
    * (resets to a no-op).
    */
-  setMcpSendFailedHandler(handler: ((agentId: string, ctx: { reason: string }) => void) | null): void;
+  setMcpSendFailedHandler(
+    handler: ((agentId: string, ctx: { reason: string }) => void) | null,
+  ): void;
   /** True if Bus core currently holds a live MCP/IPC connection for the agent (#222). */
   isAgentConnected(agentId: string): boolean;
   ingestReply(req: IngestReplyRequest): void;
@@ -227,11 +252,27 @@ export class BusCoreImpl implements BusCore {
   private readonly agentInitializing = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly deliveryQueue = new Map<string, string[]>();
   private readonly deliveryBackstopMs: number;
+  /**
+   * Pending turn-start verification for a BACKSTOP-flushed prompt. The backstop
+   * fires on a TIMER because `replay_done` never arrived — but during an
+   * IPC-reconnect storm the session is still re-initialising, so the flushed
+   * keystroke can be swallowed and never start a turn (dossier 20260613T033017).
+   * After such a flush we watch for proof a turn started (a tailer event for the
+   * agent) and, if none lands within `flushVerifyMs`, re-deliver ONCE — by then
+   * the session is past re-init. One re-delivery max; the watchdog stays the
+   * ultimate net. Maps agent → {held prompts, verify timer}.
+   */
+  private readonly flushVerify = new Map<
+    string,
+    { prompts: string[]; timer: ReturnType<typeof setTimeout> }
+  >();
+  private readonly flushVerifyMs: number;
 
   constructor(opts: BusCoreOptions = {}) {
     this.socketPath = opts.socketPath ?? null;
     this.ringbufferCapacity = opts.ringbufferCapacity ?? DEFAULT_RINGBUFFER_CAPACITY;
     this.deliveryBackstopMs = opts.deliveryBackstopMs ?? 4000;
+    this.flushVerifyMs = opts.flushVerifyMs ?? 8000;
     this.eventLogAppend = opts.eventLogAppend ?? eventLogAppend;
     this.slashCommandHandler = opts.slashCommandHandler ?? null;
     this.streamPromptHandler = opts.streamPromptHandler ?? null;
@@ -302,6 +343,8 @@ export class BusCoreImpl implements BusCore {
     for (const timer of this.agentInitializing.values()) clearTimeout(timer);
     this.agentInitializing.clear();
     this.deliveryQueue.clear();
+    for (const v of this.flushVerify.values()) clearTimeout(v.timer);
+    this.flushVerify.clear();
   }
 
   /* ─────────────────────────────── prompts ─────────────────────────────── */
@@ -438,16 +481,22 @@ export class BusCoreImpl implements BusCore {
     if (this.agentInitializing.has(agent_id)) return;
     const timer = setTimeout(() => {
       this.onError(
-        new Error(`replay_done not seen within backstop; flushing held prompts for agent_id=${agent_id}`),
+        new Error(
+          `replay_done not seen within backstop; flushing held prompts for agent_id=${agent_id}`,
+        ),
         { ctx: "deliveryBackstop", agent_id },
       );
-      this.markAgentReady(agent_id);
+      this.markAgentReady(agent_id, true);
     }, this.deliveryBackstopMs);
     this.agentInitializing.set(agent_id, timer);
   }
 
-  /** `replay_done` (or backstop) → session ready: flush held prompts in order. */
-  private markAgentReady(agent_id: string): void {
+  /** `replay_done` (or backstop) → session ready: flush held prompts in order.
+   *  `viaBackstop` = the flush is timer-driven (no `replay_done`), so the session
+   *  may still be mid-(re)init and swallow the keystroke; verify a turn actually
+   *  starts and re-deliver once if not. The real `replay_done` path is
+   *  known-ready and needs no verification. */
+  private markAgentReady(agent_id: string, viaBackstop = false): void {
     const timer = this.agentInitializing.get(agent_id);
     if (timer) clearTimeout(timer);
     this.agentInitializing.delete(agent_id);
@@ -455,6 +504,40 @@ export class BusCoreImpl implements BusCore {
     if (!q || q.length === 0) return;
     this.deliveryQueue.delete(agent_id);
     for (const wrapped of q) this.streamDeliver(agent_id, wrapped);
+    if (viaBackstop) this.armFlushVerify(agent_id, q);
+  }
+
+  /** Arm turn-start verification after a backstop flush. If no tailer event for
+   *  the agent lands within `flushVerifyMs` (i.e. the flushed keystroke was
+   *  swallowed by a still-initialising TUI), re-deliver the prompts ONCE — the
+   *  session is past re-init by now. Cleared by `noteAgentTurnActivity` on the
+   *  first sign of a turn. One re-delivery max: a second backstop flush replaces
+   *  the pending verify rather than stacking, and the watchdog remains the
+   *  ultimate net if even the re-delivery fails to land. */
+  private armFlushVerify(agent_id: string, prompts: string[]): void {
+    const existing = this.flushVerify.get(agent_id);
+    if (existing) clearTimeout(existing.timer);
+    const timer = setTimeout(() => {
+      this.flushVerify.delete(agent_id);
+      this.onError(
+        new Error(
+          `backstop-flushed prompt produced no turn within ${this.flushVerifyMs}ms; re-delivering once for agent_id=${agent_id}`,
+        ),
+        { ctx: "flushVerify", agent_id },
+      );
+      for (const wrapped of prompts) this.streamDeliver(agent_id, wrapped);
+    }, this.flushVerifyMs);
+    this.flushVerify.set(agent_id, { prompts, timer });
+  }
+
+  /** Any tailer event for the agent (claude ingested a prompt, emitted a tool
+   *  result/usage, or ended a turn) proves the backstop-flushed prompt DID start
+   *  a turn → cancel the pending re-delivery. */
+  private noteAgentTurnActivity(agent_id: string): void {
+    const v = this.flushVerify.get(agent_id);
+    if (!v) return;
+    clearTimeout(v.timer);
+    this.flushVerify.delete(agent_id);
   }
 
   async invokeSlashCommand(agent_id: string, cmd: string): Promise<void> {
@@ -626,6 +709,12 @@ export class BusCoreImpl implements BusCore {
     if (e.agent_id) {
       if (e.topic === "session.init") this.markAgentInitializing(e.agent_id);
       else if (e.topic === "bus.events.replay_done") this.markAgentReady(e.agent_id);
+      // Turn-start proof for a pending backstop-flush verification: a tailer
+      // `prompt` (claude wrote the ingested user line — fires within ms of
+      // ingest, before any thinking, so a slow-but-healthy turn never triggers a
+      // spurious re-delivery), or any in-turn output. NOT `session.init`/
+      // `replay_done` (those are init, not a turn).
+      else if (TURN_ACTIVITY_TOPICS.has(e.topic)) this.noteAgentTurnActivity(e.agent_id);
     }
     this.publish(e);
   }
