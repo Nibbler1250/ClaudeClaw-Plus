@@ -1374,4 +1374,58 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     expect(delivered).toHaveLength(1);
     expect(delivered[0]).toContain("held");
   });
+
+  // A backstop flush fires on a TIMER because replay_done never arrived. During
+  // an IPC-reconnect storm the session is still re-initialising, so the flushed
+  // keystroke is swallowed and never starts a turn (dossier 20260613T033017).
+  const turnEvt = (agent: string): BusEvent => ({
+    ts: 1,
+    agent_id: agent,
+    session_id: "s",
+    topic: "prompt", // tailer: claude wrote the ingested user line = turn started
+    payload: { text: "x" },
+  });
+
+  it("re-delivers ONCE when a backstop-flushed prompt never starts a turn (idle-REPL wedge)", async () => {
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 20,
+      flushVerifyMs: 30,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "held");
+    expect(delivered).toHaveLength(0);
+    await new Promise((r) => setTimeout(r, 45)); // > backstop → first (swallowed) flush
+    expect(delivered).toHaveLength(1);
+    await new Promise((r) => setTimeout(r, 45)); // > flushVerify, no turn activity → re-deliver
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]).toContain("held");
+    await new Promise((r) => setTimeout(r, 45)); // never more than once
+    expect(delivered).toHaveLength(2);
+  });
+
+  it("does NOT re-deliver a backstop-flushed prompt that starts a turn", async () => {
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 20,
+      flushVerifyMs: 30,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "held");
+    await new Promise((r) => setTimeout(r, 45)); // > backstop → flush
+    expect(delivered).toHaveLength(1);
+    bus.ingestSessionEvent(turnEvt("alpha")); // turn started → cancel pending re-delivery
+    await new Promise((r) => setTimeout(r, 45)); // > flushVerify
+    expect(delivered).toHaveLength(1); // not re-delivered
+  });
 });
