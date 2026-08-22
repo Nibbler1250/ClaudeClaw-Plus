@@ -9,10 +9,18 @@
  *
  * Per-PTY isolation:
  *   - Each (server, ptyId) pair gets its own ephemeral SDK `Server` +
- *     transport pair, lazily created on first request.
- *   - For servers in `settings.mcp.stateless`, the (ptyId) dimension is
- *     collapsed — a single `Server` + transport pair is shared across
- *     all PTYs. Per-PTY HMAC verification still gates access.
+ *     transport pair, lazily created on first request. This holds for
+ *     EVERY server, `settings.mcp.stateless` included: a bucket is the
+ *     client-facing MCP session, and an MCP session cannot be shared by
+ *     two clients. The SDK transport rejects a second `initialize` with
+ *     `400 -32600 "Server already initialized"`, which a client reads as
+ *     an unreachable server and drops — so collapsing the (ptyId)
+ *     dimension made a stateless server single-client in practice.
+ *   - `settings.mcp.stateless` therefore scopes DOWNSTREAM state only:
+ *     no session binding is persisted and none is replayed at restart
+ *     (`installResumedBucket` refuses). The upstream child is a single
+ *     shared process for every bucket regardless of the marker, so
+ *     per-PTY buckets add no upstream cost — only the facing transport.
  *   - Identity teardown (`McpMultiplexerPlugin.releaseIdentity(ptyId)`)
  *     calls `releasePty(ptyId)` here to tear down the per-PTY transport.
  *
@@ -30,14 +38,9 @@ import type { McpServerProcess } from "../mcp-proxy/server-process.js";
 import { AUTH_HEADER, PTY_ID_HEADER, PTY_TS_HEADER, verifyBearer } from "./pty-identity.js";
 import type { SessionPersistenceStore } from "./session-persistence.js";
 
-/** Sentinel used when a server is declared stateless: all PTYs collapse
- *  to a single (server, *) bucket so they share one upstream session.
- *  Per-PTY auth verification still happens before any routing. */
-const STATELESS_BUCKET = "__stateless__";
-
 /** Pair of objects making up a live MCP session against this server. */
 interface ServerBucket {
-  /** Owner ptyId or `STATELESS_BUCKET`. */
+  /** Owner ptyId. One bucket per client, stateless servers included. */
   bucketKey: string;
   sdkServer: Server;
   transport: WebStandardStreamableHTTPServerTransport;
@@ -50,14 +53,18 @@ export interface McpHttpHandlerOpts {
   serverName: string;
   /** Upstream child to which `tools/call` is proxied. */
   proc: McpServerProcess;
-  /** When `true`, all PTYs share a single upstream MCP session for this
-   *  server. Defaults to `false` (per-PTY isolation). */
+  /** When `true`, this server keeps no session binding on disk and none is
+   *  replayed at restart. It does NOT change client demultiplexing: buckets
+   *  are keyed per-PTY either way, because a bucket is the client-facing MCP
+   *  session and two clients cannot share one. Defaults to `false`. */
   stateless?: boolean;
   /** Optional persistence layer. When provided, `_createBucket` records a
    *  (serverName, ptyId, sessionId) tuple on the SDK transport's
    *  `onsessioninitialized` callback; `releasePty` drops it; bucket
-   *  reuse touches `lastUsedAt`. Stateless buckets are never persisted
-   *  (no per-PTY identity to bind to). When undefined, no on-disk
+   *  reuse touches `lastUsedAt`. Stateless servers are never persisted —
+   *  the operator has declared the upstream carries nothing worth rebinding
+   *  a session id to, so there is nothing to survive a restart. When
+   *  undefined, no on-disk
    *  session-binding state is written — the dispatch path otherwise
    *  honours the issue #68 metrics hook and issue #69 cache hook
    *  (both default-off, opt-in via `settings.mcp.metricsEnabled` /
@@ -216,9 +223,10 @@ export class McpHttpHandler {
     this.serverName = opts.serverName;
     this.proc = opts.proc;
     this.stateless = opts.stateless === true;
-    // Persistence is only meaningful for per-PTY (stateful) buckets — the
-    // stateless bucket has no per-PTY identity to bind to. Even if the
-    // operator wires a store, we skip it for stateless servers.
+    // `stateless` declares the upstream holds nothing worth rebinding a
+    // session id to, so we persist nothing for it even when the operator
+    // wires a store. This is the marker's whole remaining job — it does not
+    // affect how clients are demultiplexed (see the header note).
     this.persistence = this.stateless ? undefined : opts.persistence;
     this._rlMax = opts.rateLimit?.maxRequestsPerWindow ?? 0;
     this._rlWindowMs = opts.rateLimit?.windowMs ?? 60_000;
@@ -383,8 +391,51 @@ export class McpHttpHandler {
     }
 
     // ── Dispatch to per-(server, pty) bucket ──────────────────────────
-    const bucketKey = this.stateless ? STATELESS_BUCKET : ptyId;
+    // Keyed on ptyId for every server. A `stateless` server used to
+    // collapse to one shared bucket here; that made its SECOND client
+    // fail its `initialize` and drop the server (see the header note).
+    const bucketKey = ptyId;
     let bucket = this.buckets.get(bucketKey);
+
+    // A bucket can outlive the client that opened it: the supervisor
+    // deliberately keeps the identity across a crash-respawn (`this is a
+    // respawn, not a permanent dispose` — pty-supervisor.ts), so no
+    // `releasePty` runs and the fresh `claude` arrives at a transport the
+    // SDK already marked initialized. Its `initialize` would draw the same
+    // `400 -32600 "Server already initialized"` this file exists to prevent,
+    // just one ptyId at a time instead of one server at a time.
+    //
+    // A pre-session `initialize` — no session id header — can only come from
+    // a client that has no session here, so an already-initialized bucket
+    // under that key belongs to a predecessor. Retire it and build fresh.
+    if (bucket && _peekRpcMethod(probePeek) === "initialize") {
+      if (
+        safeReq.headers.get(SESSION_ID_HEADER) === null &&
+        bucket.transport.sessionId !== undefined
+      ) {
+        this.buckets.delete(bucketKey);
+        const retired = bucket;
+        bucket = undefined;
+        getMcpBridge().audit("multiplexer_bucket_recycled", {
+          server: this.serverName,
+          pty_id: ptyId,
+          reason: "reinitialize_without_session",
+        });
+        // Teardown is best-effort and must not delay the handshake the new
+        // client is waiting on; the map no longer references it either way.
+        void Promise.resolve()
+          .then(async () => {
+            try {
+              await retired.transport.close();
+            } catch {}
+            try {
+              await retired.sdkServer.close();
+            } catch {}
+          })
+          .catch(() => {});
+      }
+    }
+
     const isNewBucket = !bucket;
     if (!bucket) {
       try {
@@ -465,16 +516,17 @@ export class McpHttpHandler {
     // (the normal `releaseIdentity` → `issueIdentity` rotation in
     // index.ts), the fresh bearer would otherwise inherit the prior
     // session's timestamps and immediately hit 429s based on traffic
-    // it didn't originate. Cleared unconditionally — stateless handlers
-    // still keyed the window by ptyId (we use `STATELESS_BUCKET` for
-    // the SDK session, but `_checkRateLimit` keys on the actual ptyId).
+    // it didn't originate.
     this._rlWindows.delete(ptyId);
     // Same hygiene for the cost-tracking metrics (issue #68): drop any
     // tuples scoped to this PTY so stale percentiles from the reaped
     // session don't bleed into the next bucket. 5-agent review on
     // PR #cost-metrics flagged this class from PR #91 P2.
     getMetricsRegistry().releasePty(this.serverName, ptyId);
-    if (this.stateless) return; // no per-PTY bucket exists
+    // Stateless servers own a per-PTY bucket like every other server and
+    // must be torn down here too; only their persistence is skipped
+    // (`this.persistence` is undefined for them, so the drop below is a
+    // no-op rather than a special case).
     // Drop the persisted record FIRST so that even if the bucket's
     // already gone (race with transport_error path) the disk state is
     // still cleaned up.
@@ -685,6 +737,7 @@ export class McpHttpHandler {
     const serverName = this.serverName;
     const persistence = this.persistence;
     const stateless = this.stateless;
+    const this_buckets = this.buckets;
 
     const transport = new WebStandardStreamableHTTPServerTransport({
       // SPEC §4.5: replay overrides the UUID generator with the
@@ -712,6 +765,16 @@ export class McpHttpHandler {
       // this catches a PTY-side claude that DELETEs without supervisor
       // teardown (e.g. claude restarted in-place).
       onsessionclosed: (_sessionId: string) => {
+        // The client ended its session (transport DELETE). A bucket IS that
+        // session, so it must not outlive it: the SDK's close() leaves
+        // `_initialized` and `sessionId` set, so a retained bucket would
+        // answer the next client's `initialize` on this ptyId with
+        // `400 -32600 "Server already initialized"`. Guard on transport
+        // identity so a bucket already replaced by the reinitialize path
+        // above is not evicted out from under its successor.
+        if (this_buckets.get(bucketKey)?.transport === transport) {
+          this_buckets.delete(bucketKey);
+        }
         if (!persistence || stateless) return;
         persistence.drop(serverName, bucketKey).catch(() => {});
       },

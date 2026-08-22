@@ -99,7 +99,14 @@ async function connectClient(opts: {
   ptyId: string;
   bearer: string;
   clientName?: string;
-}): Promise<{ client: Client; close: () => Promise<void> }> {
+}): Promise<{
+  client: Client;
+  /** Exposed so a test can assert two clients got DISTINCT MCP session ids —
+   *  `bucket_keys` only proves the map was keyed apart, not that the SDK
+   *  minted separate sessions. */
+  transport: StreamableHTTPClientTransport;
+  close: () => Promise<void>;
+}> {
   const transport = new StreamableHTTPClientTransport(
     new URL(`${opts.origin}/mcp/${opts.server}`),
     {
@@ -118,6 +125,7 @@ async function connectClient(opts: {
   await client.connect(transport);
   return {
     client,
+    transport,
     close: async () => {
       try {
         await client.close();
@@ -379,7 +387,7 @@ describe("mcp-multiplexer integration — auth rejection", () => {
 // ── 4) Stateful vs stateless session demux ──────────────────────────────────
 
 describe("mcp-multiplexer integration — stateful vs stateless demux", () => {
-  it("stateful server creates per-PTY buckets; stateless server collapses to a single __stateless__ bucket", {
+  it("both stateful and stateless servers key their buckets per PTY", {
     timeout: 10000,
   }, async () => {
     const cfg = writeProxyConfig(tmpDir, ["alpha", "beta"]);
@@ -397,8 +405,8 @@ describe("mcp-multiplexer integration — stateful vs stateless demux", () => {
     const a = plugin.issueIdentity("pty-1");
     const b = plugin.issueIdentity("pty-2");
 
-    // STATEFUL server (`alpha`): use full SDK clients — each PTY's
-    // initialize() goes to its own SDK Server in its own bucket.
+    // STATEFUL server (`alpha`): each PTY's initialize() goes to its own
+    // SDK Server in its own bucket.
     const a1 = await connectClient({
       origin: gateway.origin,
       server: "alpha",
@@ -414,47 +422,24 @@ describe("mcp-multiplexer integration — stateful vs stateless demux", () => {
     await a1.client.listTools();
     await a2.client.listTools();
 
-    // STATELESS server (`beta`): both PTYs share a single SDK Server.
-    // The first PTY drives initialize() via the SDK Client; the second
-    // PTY hits the same bucket via a raw tools/list — re-initialising
-    // a shared SDK Server would (correctly) be rejected, which is the
-    // whole point of the stateless mode. We assert the bucket-collapse
-    // property on the handler health snapshot.
+    // STATELESS server (`beta`): same keying. The marker changes what is
+    // persisted, not how clients are demultiplexed — an MCP session is
+    // per-client either way. See the concurrent-clients test below for
+    // the behaviour this protects.
     const b1 = await connectClient({
       origin: gateway.origin,
       server: "beta",
       ptyId: "pty-1",
       bearer: a.headers.Authorization,
     });
-    await b1.client.listTools();
-
-    // PTY-2 reuses the existing __stateless__ bucket — send a raw
-    // tools/list bypassing client-side initialization. Auth still
-    // gates the request, so PTY-2 must use its own bearer. The SDK
-    // transport will reject this with 400 (no session ID) — that's
-    // fine; what matters is the request flowed past auth into the
-    // shared bucket without creating a new one, which is the
-    // collapse property we assert below on handler.health().
-    const resp = await fetch(`${gateway.origin}/mcp/beta`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json, text/event-stream",
-        Authorization: b.headers.Authorization,
-        "X-Claudeclaw-Pty-Id": "pty-2",
-      },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 99,
-        method: "tools/list",
-        params: {},
-      }),
+    const b2 = await connectClient({
+      origin: gateway.origin,
+      server: "beta",
+      ptyId: "pty-2",
+      bearer: b.headers.Authorization,
     });
-    // Past auth (status !== 401, !== 404). The SDK transport may
-    // accept (200/202) or reject as malformed session (400) — either
-    // proves the request reached the bucket, not the auth wall.
-    expect(resp.status).not.toBe(401);
-    expect(resp.status).not.toBe(404);
+    await b1.client.listTools();
+    await b2.client.listTools();
 
     try {
       const alphaH = plugin._getHandler("alpha")?.health() as {
@@ -470,13 +455,261 @@ describe("mcp-multiplexer integration — stateful vs stateless demux", () => {
       expect(alphaH.bucket_keys.sort()).toEqual(["pty-1", "pty-2"]);
 
       expect(betaH.stateless).toBe(true);
-      // STATELESS_BUCKET sentinel — one bucket regardless of PTY count.
-      expect(betaH.bucket_keys).toEqual(["__stateless__"]);
+      expect(betaH.bucket_keys.sort()).toEqual(["pty-1", "pty-2"]);
     } finally {
       await a1.close();
       await a2.close();
       await b1.close();
+      await b2.close();
     }
+  });
+});
+
+describe("mcp-multiplexer integration — stateless server serves concurrent clients", () => {
+  // No explicit timeout override anywhere in this describe: these are
+  // sub-second, and the `it(name, {timeout}, fn)` overload is what the
+  // typecheck ratchet already counts as an error 7 times over in this file.
+  it("four PTYs each complete their own initialize against a stateless server", async () => {
+    const cfg = writeProxyConfig(tmpDir, ["beta"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({
+        webEnabled: true,
+        shared: ["beta"],
+        stateless: ["beta"],
+      }),
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+
+    // FOUR, not two. Two proves the keys are not ALL collapsed; it does not
+    // prove the keying is unbounded — a mutation that keys the first two
+    // apart and collapses the third onward survives a 2-client test.
+    const ids = ["pty-a", "pty-b", "pty-c", "pty-d"];
+    const conns = [];
+    for (const ptyId of ids) {
+      const ident = plugin.issueIdentity(ptyId);
+      conns.push(
+        await connectClient({
+          origin: gateway.origin,
+          server: "beta",
+          ptyId,
+          bearer: ident.headers.Authorization,
+        }),
+      );
+    }
+
+    try {
+      for (const c of conns) {
+        expect((await c.client.listTools()).tools.map((t) => t.name)).toEqual(["echo"]);
+      }
+
+      // Concurrent IN-FLIGHT dispatch. Awaiting each call in turn never puts
+      // two requests on the wire at once, so it cannot catch a regression
+      // where two clients share one session and collide on JSON-RPC ids —
+      // the very hazard this test is named for.
+      const results = await Promise.all(
+        conns.map((c, i) =>
+          c.client.callTool({ name: "echo", arguments: { message: `from-${ids[i]}` } }),
+        ),
+      );
+      results.forEach((r, i) => {
+        expect(JSON.stringify(r)).toContain(`from-${ids[i]}`);
+      });
+
+      // Distinct MCP session ids — the property that actually prevents the
+      // id collision. `bucket_keys` only shows the map was keyed apart.
+      const sids = conns.map((c) => c.transport.sessionId);
+      for (const sid of sids) expect(sid).toBeDefined();
+      expect(new Set(sids).size).toBe(ids.length);
+
+      const betaH = plugin._getHandler("beta")?.health() as {
+        stateless: boolean;
+        bucket_keys: string[];
+        active_buckets: number;
+      };
+      expect(betaH.stateless).toBe(true);
+      expect(betaH.bucket_keys.sort()).toEqual([...ids].sort());
+      expect(betaH.active_buckets).toBe(ids.length);
+    } finally {
+      for (const c of conns) await c.close();
+    }
+  });
+
+  it("a fresh client on the SAME ptyId is not bricked by its predecessor", async () => {
+    const cfg = writeProxyConfig(tmpDir, ["beta"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({
+        webEnabled: true,
+        shared: ["beta"],
+        stateless: ["beta"],
+      }),
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+
+    const ident = plugin.issueIdentity("pty-r");
+
+    // First client opens and goes away WITHOUT the supervisor revoking the
+    // identity — that is exactly what a crash-respawn looks like
+    // ("a respawn, not a permanent dispose"), so no `releasePty` runs.
+    const first = await connectClient({
+      origin: gateway.origin,
+      server: "beta",
+      ptyId: "pty-r",
+      bearer: ident.headers.Authorization,
+    });
+    await first.client.listTools();
+    const firstSid = first.transport.sessionId;
+    await first.close();
+
+    // The replacement must be able to handshake. Without bucket recycling it
+    // lands on the predecessor's initialized transport and the SDK answers
+    // `400 -32600 "Server already initialized"`, which the client reads as an
+    // unreachable server — the same failure mode as the collapsed bucket,
+    // one ptyId at a time.
+    const second = await connectClient({
+      origin: gateway.origin,
+      server: "beta",
+      ptyId: "pty-r",
+      bearer: ident.headers.Authorization,
+    });
+    try {
+      expect((await second.client.listTools()).tools.map((t) => t.name)).toEqual(["echo"]);
+      expect(second.transport.sessionId).toBeDefined();
+      expect(second.transport.sessionId).not.toBe(firstSid);
+
+      // One live bucket for the ptyId, not two: the predecessor was retired,
+      // not merely shadowed.
+      const betaH = plugin._getHandler("beta")?.health() as {
+        bucket_keys: string[];
+        active_buckets: number;
+      };
+      expect(betaH.bucket_keys).toEqual(["pty-r"]);
+      expect(betaH.active_buckets).toBe(1);
+    } finally {
+      await second.close();
+    }
+  });
+
+  it("routes an authenticated raw POST with no session id into that PTY's own bucket", async () => {
+    const cfg = writeProxyConfig(tmpDir, ["beta"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({
+        webEnabled: true,
+        shared: ["beta"],
+        stateless: ["beta"],
+      }),
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+
+    const a = plugin.issueIdentity("pty-1");
+    const b = plugin.issueIdentity("pty-2");
+
+    const b1 = await connectClient({
+      origin: gateway.origin,
+      server: "beta",
+      ptyId: "pty-1",
+      bearer: a.headers.Authorization,
+    });
+    await b1.client.listTools();
+
+    try {
+      // A bare POST: valid bearer, no `mcp-session-id`, not an initialize.
+      // This is the shape the `server/discover` guard re-reads the body for,
+      // and the only stateless path not driven through an SDK Client.
+      const resp = await fetch(`${gateway.origin}/mcp/beta`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          Authorization: b.headers.Authorization,
+          "X-Claudeclaw-Pty-Id": "pty-2",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 99, method: "tools/list", params: {} }),
+      });
+      // Past auth. The SDK rejects it as a session-less non-initialize (400)
+      // — what matters is where it landed.
+      expect(resp.status).not.toBe(401);
+      expect(resp.status).not.toBe(404);
+
+      // It got its OWN bucket rather than being routed onto pty-1's session.
+      const betaH = plugin._getHandler("beta")?.health() as { bucket_keys: string[] };
+      expect(betaH.bucket_keys.sort()).toEqual(["pty-1", "pty-2"]);
+    } finally {
+      await b1.close();
+    }
+  });
+
+  it("a client that ends its session releases the bucket immediately", async () => {
+    const cfg = writeProxyConfig(tmpDir, ["beta"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({
+        webEnabled: true,
+        shared: ["beta"],
+        stateless: ["beta"],
+      }),
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+
+    const ident = plugin.issueIdentity("pty-d");
+    const conn = await connectClient({
+      origin: gateway.origin,
+      server: "beta",
+      ptyId: "pty-d",
+      bearer: ident.headers.Authorization,
+    });
+    await conn.client.listTools();
+    const handler = plugin._getHandler("beta");
+    expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual(["pty-d"]);
+
+    // The SDK client's terminateSession() sends the transport DELETE. A
+    // bucket IS the session it belongs to, so it must go with it rather than
+    // sit on a transport the SDK still considers initialized until the
+    // supervisor happens to revoke the identity.
+    await conn.transport.terminateSession();
+    await new Promise((r) => setTimeout(r, 50));
+    expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual([]);
+
+    await conn.close();
+  });
+
+  it("releaseIdentity tears down a stateless bucket", async () => {
+    const cfg = writeProxyConfig(tmpDir, ["beta"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({
+        webEnabled: true,
+        shared: ["beta"],
+        stateless: ["beta"],
+      }),
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+
+    const ident = plugin.issueIdentity("pty-x");
+    const conn = await connectClient({
+      origin: gateway.origin,
+      server: "beta",
+      ptyId: "pty-x",
+      bearer: ident.headers.Authorization,
+    });
+    await conn.client.listTools();
+
+    const handler = plugin._getHandler("beta");
+    expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual(["pty-x"]);
+
+    // Restoring `releasePty`'s old `if (this.stateless) return` early exit
+    // passes every other test in this repo; this is the one that catches it.
+    await plugin.releaseIdentity("pty-x");
+    expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual([]);
+
+    await conn.close();
   });
 });
 
