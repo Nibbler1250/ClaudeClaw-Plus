@@ -820,6 +820,25 @@ export async function runClaudeOnce(
 }
 
 /**
+ * Build the argv for one headless agent job.
+ *
+ * Extracted so the `--mcp-config` wiring is directly assertable: without the
+ * flag a dispatched job cannot reach any of the operator's `mcp.shared`
+ * servers, while the agent that dispatched it reaches all of them.
+ */
+export function buildAgentJobArgs(input: {
+  prompt: string;
+  securityArgs: string[];
+  persona: string;
+  mcpConfigPath?: string;
+}): string[] {
+  const args = [CLAUDE_EXECUTABLE, "-p", input.prompt, ...input.securityArgs];
+  if (input.persona) args.push("--append-system-prompt", input.persona);
+  if (input.mcpConfigPath) args.push("--mcp-config", input.mcpConfigPath);
+  return args;
+}
+
+/**
  * Run a named agent as a one-shot headless job (for the bus AgentJobRunner). Loads
  * the agent's persona (IDENTITY/SOUL/CLAUDE.md), runs `claude -p <prompt>` in the
  * agent's dir with plain-text output, and returns the final text. Honours the
@@ -832,6 +851,13 @@ export async function runAgentJobHeadless(input: {
   model?: string;
   timeoutMs: number;
   signal: AbortSignal;
+  /**
+   * Absolute path to a synthesized `--mcp-config` for this job, or omitted
+   * when the MCP multiplexer is dormant. Minted and released by the caller
+   * (the bus wires the job runner and owns the multiplexer identity); this
+   * function only forwards the flag to the spawned `claude`.
+   */
+  mcpConfigPath?: string;
 }): Promise<{ exitCode: number; resultText?: string; error?: string; timedOut?: boolean }> {
   const settings = getSettings();
   // Security review (#296 PR 3): validate the caller-supplied model against the
@@ -840,8 +866,12 @@ export async function runAgentJobHeadless(input: {
   validateModelString(input.model, "agent job");
   const ctx = await loadAgent(input.agent);
   const persona = await loadAgentPrompts(input.agent);
-  const args = [CLAUDE_EXECUTABLE, "-p", input.prompt, ...buildSecurityArgs(settings.security)];
-  if (persona) args.push("--append-system-prompt", persona);
+  const args = buildAgentJobArgs({
+    prompt: input.prompt,
+    securityArgs: buildSecurityArgs(settings.security),
+    persona,
+    mcpConfigPath: input.mcpConfigPath,
+  });
   const model = input.model?.trim() || settings.model;
   const { rawStdout, stderr, exitCode } = await runClaudeOnce(
     args,
