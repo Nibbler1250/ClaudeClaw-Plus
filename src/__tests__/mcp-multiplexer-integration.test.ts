@@ -31,7 +31,8 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { McpMultiplexerPlugin, _resetMcpMultiplexer } from "../plugins/mcp-multiplexer/index.js";
 import { _resetHttpGateway, getHttpGateway } from "../plugins/http-gateway.js";
 import { _resetMcpBridge, getMcpBridge } from "../plugins/mcp-bridge.js";
-import { _resetIdentityStore } from "../plugins/mcp-multiplexer/pty-identity.js";
+import { _resetIdentityStore, revokeIdentity } from "../plugins/mcp-multiplexer/pty-identity.js";
+import type { SessionPersistenceStore } from "../plugins/mcp-multiplexer/session-persistence.js";
 import { makeMuxSettingsView } from "./fixtures/mux-settings-view.js";
 
 const MOCK_SERVER = fileURLToPath(new URL("./fixtures/mock-mcp-server.ts", import.meta.url));
@@ -710,6 +711,235 @@ describe("mcp-multiplexer integration — stateless server serves concurrent cli
     expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual([]);
 
     await conn.close();
+  });
+});
+
+describe("mcp-multiplexer integration — GC tick reclaims orphaned buckets", () => {
+  it("sweeps a bucket whose identity is gone, on a handler with no persistence", async () => {
+    const cfg = writeProxyConfig(tmpDir, ["beta"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({
+        webEnabled: true,
+        shared: ["beta"],
+        // `stateless` here only makes the handler's own store undefined —
+        // it is NOT what used to disable the tick. The old early return was
+        // gated on the PLUGIN's store, which this fixture leaves off by
+        // default (`sessionPersistenceEnabled: false`). Two different stores;
+        // keeping them straight matters, because the tick this test asserts
+        // is armed for the whole plugin, not per handler.
+        stateless: ["beta"],
+      }),
+      gcTickMs: 0, // drive it by hand
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+
+    const ident = plugin.issueIdentity("job-9");
+    const conn = await connectClient({
+      origin: gateway.origin,
+      server: "beta",
+      ptyId: "job-9",
+      bearer: ident.headers.Authorization,
+    });
+    await conn.client.listTools();
+
+    const handler = plugin._getHandler("beta");
+    expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual(["job-9"]);
+
+    // The orphan state: identity revoked, bucket still in the map. This is
+    // what the mid-request release race leaves behind, and a dispatched
+    // job's ptyId never recurs, so nothing would ever pick it up again.
+    revokeIdentity("job-9");
+    expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual(["job-9"]);
+
+    await plugin._runGCTickForTests();
+    expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual([]);
+
+    await conn.close();
+  });
+});
+
+describe("mcp-multiplexer integration — the sweep and the replay path coexist", () => {
+  it("leaves a replay-installed bucket alone while its binding is still live", async () => {
+    const cfg = writeProxyConfig(tmpDir, ["alpha"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({ webEnabled: true, shared: ["alpha"] }),
+      gcTickMs: 0,
+    });
+    await plugin.start();
+
+    // Restart replay installs a bucket for a ptyId that has NO identity — the
+    // identity store is in-memory and the restart is what wiped it. That is
+    // indistinguishable from "this PTY was released" unless the bucket says
+    // so, and reaping it would destroy the binding replay exists to preserve.
+    const handler = plugin._getHandler("alpha");
+    await handler?.installResumedBucket("pty-resumed", "11111111-2222-3333-4444-555555555555");
+    expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual(["pty-resumed"]);
+
+    expect(await handler?.sweepOrphanedBuckets()).toBe(0);
+    expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual(["pty-resumed"]);
+  });
+
+  it("survives the race when driven through the REAL releaseIdentity", async () => {
+    const cfg = writeProxyConfig(tmpDir, ["alpha"]);
+    // Persistence wired ON PURPOSE. `releasePty` yields on
+    // `await this.persistence.drop(...)`, and that await is what turns a
+    // revoke-ordering mistake into a real window: with no store the whole
+    // teardown runs in one microtask turn and the ordering cannot be
+    // observed, so a test without persistence passes either way and pins
+    // nothing. In-memory stand-in — this test has no business touching disk.
+    const store = {
+      record: async () => {},
+      touch: async () => {},
+      loadAll: async () => [],
+      garbageCollect: async () => ({ scanned: 0, kept: 0, dropped: 0 }),
+      drop: async () => {},
+    };
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({
+        webEnabled: true,
+        shared: ["alpha"],
+        sessionPersistenceEnabled: true,
+        sessionPersistencePath: join(tmpDir, "sessions"),
+      }),
+      persistenceFactory: () => store as unknown as SessionPersistenceStore,
+      gcTickMs: 0,
+    });
+    await plugin.start();
+
+    const handler = plugin._getHandler("alpha");
+    const ident = plugin.issueIdentity("agent-job-race");
+
+    // The unit test for this guard hand-simulates teardown as
+    // `revokeIdentity()` then `releasePty()`. That bakes the production
+    // ordering into the FIXTURE, so swapping those two lines in
+    // `releaseIdentity` — which is what actually has to stay true — breaks
+    // nothing. Drive the real method instead: the guard only works because
+    // the identity is revoked BEFORE the teardown it announces, and this is
+    // the test that says so.
+    const inFlight = handler?.handle(
+      new Request("http://127.0.0.1:4632/mcp/alpha", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          "X-Claudeclaw-Pty-Id": "agent-job-race",
+          Authorization: ident.headers.Authorization,
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            clientInfo: { name: "test", version: "1.0" },
+          },
+        }),
+      }),
+    );
+
+    // Mid-window — past the pre-auth turns, before the transport serves.
+    for (let i = 0; i < 4; i++) await Promise.resolve();
+    await plugin.releaseIdentity("agent-job-race");
+
+    const resp = await inFlight;
+    expect(resp).toBeDefined();
+    expect(resp!.status).toBe(401);
+    expect((await resp!.json()).error.code).toBe("pty_released");
+    expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual([]);
+  });
+
+  it("reaps a replay-installed bucket once its grace has run out", async () => {
+    const cfg = writeProxyConfig(tmpDir, ["alpha"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({ webEnabled: true, shared: ["alpha"] }),
+      gcTickMs: 0,
+    });
+    await plugin.start();
+
+    const handler = plugin._getHandler("alpha");
+    await handler?.installResumedBucket(
+      "pty-never-returns",
+      "66666666-7777-8888-9999-aaaaaaaaaaaa",
+    );
+    expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual([
+      "pty-never-returns",
+    ]);
+
+    // The counterpart to the test above, and the one that matters more.
+    // `resumed` is cleared on the authenticated-request path and nowhere
+    // else, so a PTY that never reconnects never clears it. Exempting such a
+    // bucket unconditionally would outlive even the on-disk record it exists
+    // to protect — a permanent orphan produced by the guard against orphans.
+    //
+    // Age the bucket past the grace rather than waiting an hour: `lastUsed`
+    // is the install time until a request claims the bucket, and the grace is
+    // measured from it.
+    const aged = (handler as unknown as { buckets: Map<string, { lastUsed: number }> }).buckets.get(
+      "pty-never-returns",
+    );
+    expect(aged).toBeDefined();
+    aged!.lastUsed = Date.now() - (60 * 60 * 1000 + 1000);
+
+    expect(await handler?.sweepOrphanedBuckets()).toBe(1);
+    expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual([]);
+    // Idempotent: nothing left to reclaim on a second pass.
+    expect(await handler?.sweepOrphanedBuckets()).toBe(0);
+  });
+
+  it("reclaims that same bucket once its PTY has come and gone", async () => {
+    const cfg = writeProxyConfig(tmpDir, ["alpha"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({ webEnabled: true, shared: ["alpha"] }),
+      gcTickMs: 0,
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+
+    const handler = plugin._getHandler("alpha");
+    await handler?.installResumedBucket("pty-back", "11111111-2222-3333-4444-666666666666");
+
+    // The PTY reconnects: the supervisor issues an identity and a request
+    // authenticates. The bucket is claimed — no longer replayed state waiting
+    // for an owner — so ordinary orphan rules apply to it again.
+    const ident = plugin.issueIdentity("pty-back");
+    const conn = await connectClient({
+      origin: gateway.origin,
+      server: "alpha",
+      ptyId: "pty-back",
+      bearer: ident.headers.Authorization,
+    });
+    await conn.client.listTools();
+    await conn.close();
+
+    revokeIdentity("pty-back");
+    expect(await handler?.sweepOrphanedBuckets()).toBe(1);
+    expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual([]);
+  });
+
+  it("arms the GC tick even with session persistence turned off", async () => {
+    const cfg = writeProxyConfig(tmpDir, ["alpha"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      // Persistence off — the documented kill switch. The bucket sweep has
+      // nothing to do with on-disk session records, so it must still run.
+      settingsView: makeMuxSettingsView({ webEnabled: true, shared: ["alpha"] }),
+      gcTickMs: 60_000,
+    });
+    await plugin.start();
+
+    // Reaching the private timer is the only way to assert the tick was ARMED
+    // rather than merely runnable by hand: every other test drives
+    // `_runGCTickForTests`, which bypasses `_startGCTick` entirely — which is
+    // how a gate that skipped arming it went unnoticed.
+    const timer = (plugin as unknown as { gcTimer: unknown }).gcTimer;
+    expect(timer).not.toBeNull();
   });
 });
 
