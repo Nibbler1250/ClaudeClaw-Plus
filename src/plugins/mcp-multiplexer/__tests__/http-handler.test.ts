@@ -711,3 +711,121 @@ describe("McpHttpHandler — body-peek threshold for audit (#72 item 11)", () =>
     revokeIdentity("suzy");
   });
 });
+
+describe("McpHttpHandler — session-less discovery probe", () => {
+  let proc: McpServerProcess | null = null;
+  let handler: McpHttpHandler | null = null;
+
+  beforeEach(async () => {
+    _resetIdentityStore();
+    proc = new McpServerProcess("test", makeServerConfig());
+    await proc.start();
+    handler = new McpHttpHandler({ serverName: "test", proc });
+  });
+
+  afterEach(async () => {
+    if (handler) await handler.stop();
+    if (proc) await proc.stop();
+    proc = null;
+    handler = null;
+    _resetIdentityStore();
+  });
+
+  function authed(body: unknown): Request {
+    const id = issueIdentity("suzy");
+    return rpcRequest(body, {
+      [PTY_ID_HEADER]: "suzy",
+      [PTY_TS_HEADER]: String(Date.now()),
+      ...id.headers,
+    });
+  }
+
+  // A client on MCP revision 2026-07-28 probes with `server/discover` before
+  // it holds a session id. The session-ful SDK transport answers that with a
+  // transport-level 400, which the client reads as "server unreachable" and
+  // drops the server. A JSON-RPC "method not found" keeps the connection
+  // usable and lets the client fall back to `initialize`.
+  it("answers server/discover with a JSON-RPC error, not a transport 400", async () => {
+    const resp = await handler!.handle(
+      authed({ jsonrpc: "2.0", id: "server-discover-probe-1", method: "server/discover" }),
+    );
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as {
+      jsonrpc: string;
+      id: unknown;
+      error: { code: number; message: string };
+    };
+    expect(body.jsonrpc).toBe("2.0");
+    expect(body.error.code).toBe(-32601);
+    expect(body.id).toBe("server-discover-probe-1");
+  });
+
+  it("echoes a null id back when the probe carries none", async () => {
+    const resp = await handler!.handle(authed({ jsonrpc: "2.0", method: "server/discover" }));
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as { id: unknown; error?: { code: number } };
+    // Assert the error too: without it this passes on the unpatched
+    // transport as well, which would make the test prove nothing.
+    expect(body.error?.code).toBe(-32601);
+    expect(body.id).toBeNull();
+  });
+
+  /** Same as `authed`, but with an explicit `content-length` header and a
+   *  body padded past PEEK_MAX_BYTES. `new Request(url, { body })` sets no
+   *  content-length of its own, so without this the peek's declared-size
+   *  branch — the one production actually takes over a socket — is never
+   *  exercised. Mirrors `bigRpcRequest` in the #72 item 11 block. */
+  function authedBig(method: string, targetBodyBytes: number): Request {
+    const id = issueIdentity("suzy");
+    const padding = "x".repeat(Math.max(0, targetBodyBytes - 80));
+    const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { padding } });
+    return new Request("http://127.0.0.1:4632/mcp/test", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "content-length": String(body.length),
+        [PTY_ID_HEADER]: "suzy",
+        [PTY_TS_HEADER]: String(Date.now()),
+        ...id.headers,
+      },
+      body,
+    });
+  }
+
+  // Regression: the audit peek skips bodies over PEEK_MAX_BYTES, so gating
+  // the probe answer on that peek alone let a >4 KiB probe fall through to
+  // the transport and 400 — the exact failure this guard exists to prevent.
+  // Reproduced over a real socket before the fix; in-process it needs the
+  // declared content-length that `authedBig` supplies.
+  it("answers a probe larger than the audit peek threshold", async () => {
+    const req = authedBig("server/discover", 8192);
+    expect(req.headers.get("content-length")).not.toBeNull();
+    expect(Number(req.headers.get("content-length"))).toBeGreaterThan(4096);
+
+    const resp = await handler!.handle(req);
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as { error: { code: number } };
+    expect(body.error.code).toBe(-32601);
+  });
+
+  it("does not divert other large methods onto the probe path", async () => {
+    const resp = await handler!.handle(authedBig("tools/list", 8192));
+    expect(resp.status).not.toBe(401);
+    expect(await resp.text()).not.toContain("-32601");
+  });
+
+  it("still authenticates the probe — no bearer, no answer", async () => {
+    const resp = await handler!.handle(
+      rpcRequest({ jsonrpc: "2.0", id: 1, method: "server/discover" }),
+    );
+    expect(resp.status).toBe(401);
+  });
+
+  it("leaves every other method on the transport path", async () => {
+    const resp = await handler!.handle(authed({ jsonrpc: "2.0", id: 1, method: "initialize" }));
+    expect(resp.status).not.toBe(401);
+    const body = (await resp.text()) as string;
+    expect(body).not.toContain("-32601");
+  });
+});
