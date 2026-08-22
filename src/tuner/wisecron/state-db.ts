@@ -3,8 +3,8 @@ import { existsSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
 import type { RevisionRecord, ScheduleState, AppliedBy } from "./types.js";
-import type { Patch, Proposal } from "../../skills-tuner/core/types.js";
-import { ProposalSchema } from "../../skills-tuner/core/types.js";
+import type { Patch, PersistedProposal, Proposal } from "../../skills-tuner/core/types.js";
+import { PersistedProposalSchema, ProposalSchema } from "../../skills-tuner/core/types.js";
 
 interface SubjectStateRow {
   subject: string;
@@ -40,8 +40,38 @@ export interface OutcomeRow {
   verdict: string | null;
 }
 
-/** Persisted proposal lifecycle status. */
+/**
+ * A proposal the emit gate refused. Distinct from every other failure
+ * `persistProposal` can raise — a full disk, a locked database, a corrupt
+ * file — because only this one is the SUBJECT's bug. A caller that isolates
+ * refusals so one bad proposal cannot end a run must not swallow a disk
+ * failure through the same catch and report the run as healthy.
+ */
+export class ProposalRejectedError extends Error {
+  constructor(
+    readonly proposalId: number,
+    readonly subject: string,
+    readonly reason: string,
+  ) {
+    super(`proposal #${proposalId} from subject '${subject}' is not persistable — ${reason}`);
+    this.name = "ProposalRejectedError";
+  }
+}
+
+/** Persisted proposal lifecycle status — what this binary WRITES. */
 export type ProposalStatus = "pending" | "applied" | "refused";
+
+/**
+ * Whether a stored status column value is one this binary understands.
+ *
+ * A store outlives the binary that wrote it: a production store holds rows in
+ * `rejected`, a status nothing here writes any more. `StoredProposal.status`
+ * is therefore typed as the string it actually is, and code that needs the
+ * union narrows through this guard instead of asserting.
+ */
+export function isKnownProposalStatus(status: string): status is ProposalStatus {
+  return status === "pending" || status === "applied" || status === "refused";
+}
 
 interface ProposalRow {
   id: string;
@@ -56,21 +86,46 @@ interface ProposalRow {
 export interface StoredProposal {
   id: string;
   subject: string;
-  status: ProposalStatus;
-  proposal: Proposal;
+  /** The status column verbatim. Not narrowed to `ProposalStatus`: a row an
+   *  older binary wrote can hold a value outside the union. Narrow with
+   *  `isKnownProposalStatus` where the union is required. */
+  status: string;
+  proposal: PersistedProposal;
   created_at: Date;
   updated_at: Date;
+}
+
+/** A stored row that could not be rehydrated, reported instead of dropped. */
+export interface UnreadableProposalRow {
+  id: string;
+  subject: string;
+  status: string;
+  error: string;
+}
+
+/** A proposal listing: the rows that parsed, plus the ones that did not. */
+export interface ProposalListing {
+  proposals: StoredProposal[];
+  unreadable: UnreadableProposalRow[];
 }
 
 function rowToStoredProposal(row: ProposalRow): StoredProposal {
   return {
     id: row.id,
     subject: row.subject,
-    status: row.status as ProposalStatus,
-    // ProposalSchema coerces created_at (string in JSON) back to a Date so the
-    // canonical signature re-derivation (which calls created_at.toISOString())
-    // matches what was signed at persist time.
-    proposal: ProposalSchema.parse(JSON.parse(row.proposal_json)),
+    // NOT cast to `ProposalStatus`. The column is a plain string and real
+    // stores hold values this binary no longer writes — a production store
+    // has rows in `rejected`, which the union does not contain. Asserting the
+    // narrow type here would lie to every consumer, and that lie is exactly
+    // what produced a `counts[row.status]++` yielding NaN in the summary.
+    // Callers that need the union narrow it with `isKnownProposalStatus`.
+    status: row.status,
+    // Read path: PersistedProposalSchema, NOT the emit schema — a row on disk is
+    // validated against the shape it was written under, not against the bounds a
+    // subject must respect today. It coerces created_at (string in JSON) back to
+    // a Date so the canonical signature re-derivation (which calls
+    // created_at.toISOString()) matches what was signed at persist time.
+    proposal: PersistedProposalSchema.parse(JSON.parse(row.proposal_json)),
     created_at: new Date(row.created_at),
     updated_at: new Date(row.updated_at),
   };
@@ -362,19 +417,54 @@ export class WisecronStateDB {
    * Persist a signed proposal as `pending`. Idempotent on re-run: an existing
    * row (any status) is left untouched, so re-running a cron cycle never
    * resurrects an applied/refused proposal or clobbers its status.
+   *
+   * Returns whether a row was actually INSERTED. That distinction is the
+   * whole point of the idempotence: a caller counting "proposals produced"
+   * without it counts presentations, and a cron re-running an overlapping
+   * window then reports a steady stream while writing nothing.
    */
-  persistProposal(proposal: Proposal): void {
+  persistProposal(proposal: Proposal): boolean {
+    // Emit gate. The read path deliberately no longer carries the alternatives
+    // upper bound, so this is where a subject that emits past it is rejected:
+    // at the write, loudly, while it is still a live bug someone can fix — not
+    // on the way back out, years later, against a row nobody can change.
+    //
+    // The error names the proposal and its subject. A bare ZodError dump gives
+    // an operator nothing to act on: a propose cycle walks every subject, and
+    // "expected array to have <=20 items" does not say which one produced it.
+    const parsed = ProposalSchema.safeParse(proposal);
+    if (!parsed.success) {
+      const why = parsed.error.issues
+        .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+        .join("; ");
+      throw new ProposalRejectedError(proposal.id, proposal.subject, why);
+    }
     const now = new Date().toISOString();
-    this.db
+    const result = this.db
       .prepare(`
       INSERT INTO proposals(id, subject, status, proposal_json, created_at, updated_at)
       VALUES (?, ?, 'pending', ?, ?, ?)
       ON CONFLICT(id) DO NOTHING
     `)
-      .run(String(proposal.id), proposal.subject, JSON.stringify(proposal), now, now);
+      // `parsed.data`, not the caller's object. The emit schema coerces
+      // (`created_at: z.coerce.date()`), so a non-TypeScript caller can pass a
+      // date as text, satisfy the gate, and have the un-normalised form
+      // written — after which the canonical signature, derived from
+      // `created_at.toISOString()`, no longer matches on read. Validating and
+      // then storing something else makes the gate decorative.
+      .run(String(parsed.data.id), parsed.data.subject, JSON.stringify(parsed.data), now, now);
+    return result.changes === 1;
   }
 
-  listProposals(status?: ProposalStatus): StoredProposal[] {
+  /**
+   * Listing with per-row error isolation: one row whose stored JSON no longer
+   * parses is reported in `unreadable` instead of aborting the whole query. A
+   * listing walks rows the caller did not name — including terminal ones it will
+   * never act on — so a single bad row must not be able to hide every good one.
+   * Skipped rows are always returned, never dropped silently: the caller decides
+   * whether to surface them.
+   */
+  listProposalsDetailed(status?: ProposalStatus): ProposalListing {
     const rows = (
       status
         ? this.db
@@ -382,14 +472,107 @@ export class WisecronStateDB {
             .all(status)
         : this.db.prepare("SELECT * FROM proposals ORDER BY created_at DESC").all()
     ) as ProposalRow[];
-    return rows.map(rowToStoredProposal);
+    const proposals: StoredProposal[] = [];
+    const unreadable: UnreadableProposalRow[] = [];
+    for (const row of rows) {
+      try {
+        proposals.push(rowToStoredProposal(row));
+      } catch (err) {
+        unreadable.push({
+          id: row.id,
+          subject: row.subject,
+          status: row.status,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    return { proposals, unreadable };
   }
 
+  /**
+   * Existence only — never rehydrates the row, so a row the read schema cannot
+   * parse still answers an existence question (dedup) instead of throwing.
+   */
+  hasProposal(id: string): boolean {
+    return this.db.prepare("SELECT 1 FROM proposals WHERE id = ?").get(id) != null;
+  }
+
+  /**
+   * Whether a stored row can still be rehydrated. Separate from
+   * `hasProposal` on purpose: existence answers dedup, readability answers
+   * "is this row still usable", and conflating the two lets a caller be told
+   * its proposal is queued when the bytes on disk cannot be listed or applied.
+   * Returns false for a row that does not exist at all.
+   */
+  isProposalReadable(id: string): boolean {
+    const row = this.db.prepare("SELECT * FROM proposals WHERE id = ?").get(id) as
+      | ProposalRow
+      | undefined;
+    if (!row) return false;
+    try {
+      rowToStoredProposal(row);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Back-compat shim for the pre-isolation signature. `WisecronStateDB` is
+   * public surface of a published plugin, so the rename to
+   * `listProposalsDetailed` should not silently remove the method an
+   * out-of-tree caller depends on.
+   *
+   * It is NOT a transparent restoration: this shape has nowhere to report a
+   * skipped row, so on a degraded store it throws rather than returning a
+   * short list the caller has no reason to distrust. That is a deliberate
+   * breaking choice — a caller surviving on a degraded store must move to
+   * `listProposalsDetailed`, and the error says so.
+   */
+  listProposals(status?: ProposalStatus): StoredProposal[] {
+    const { proposals, unreadable } = this.listProposalsDetailed(status);
+    if (unreadable.length > 0) {
+      // Refusing beats truncating. This shape has no way to say "and N rows
+      // were skipped", so returning the good rows alone would hand a caller a
+      // short listing it has no reason to distrust — the exact silent loss
+      // this store was changed to stop. A caller that wants to survive a
+      // degraded store asks for it explicitly.
+      const named = unreadable.slice(0, 20).map((r) => r.id);
+      const more = unreadable.length - named.length;
+      throw new Error(
+        `${unreadable.length} stored proposal(s) could not be rehydrated ` +
+          `(${named.join(", ")}${more > 0 ? `, and ${more} more` : ""}); ` +
+          `use listProposalsDetailed() to receive them alongside the readable rows`,
+      );
+    }
+    return proposals;
+  }
+
+  /**
+   * Single-row fetch. Unlike the listing path this still throws on a row that
+   * fails to parse: the caller asked for THIS proposal by id, and reporting an
+   * unreadable row as `null` would read as "no such proposal" — the lifecycle
+   * handlers would then answer "not found" for a row that is on disk.
+   */
   getStoredProposal(id: string): StoredProposal | null {
     const row = this.db.prepare("SELECT * FROM proposals WHERE id = ?").get(id) as
       | ProposalRow
       | undefined;
-    return row ? rowToStoredProposal(row) : null;
+    if (!row) return null;
+    try {
+      return rowToStoredProposal(row);
+    } catch (err) {
+      // Still throws — returning `null` would read as "no such proposal" and
+      // send a lifecycle handler down the not-found path for a row that is
+      // very much on disk. But it says WHICH row and why, instead of handing
+      // an operator a raw schema dump. This is the error they actually hit:
+      // apply and refuse both come through here.
+      const why = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `proposal #${id} (subject '${row.subject}', status '${row.status}') is on disk ` +
+          `but its stored JSON no longer rehydrates — ${why}`,
+      );
+    }
   }
 
   setProposalStatus(id: string, status: ProposalStatus): void {
