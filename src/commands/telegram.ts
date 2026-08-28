@@ -1834,6 +1834,52 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
  * `resolved_at` is the ISO timestamp the resolver reports; it is rendered
  * `DD/MM HH:MM` when parseable, omitted otherwise.
  */
+/**
+ * What a decision value actually did, as far as this layer can honestly tell.
+ *
+ * The decision vocabulary is not owned here: the value comes from whoever built
+ * the proposal's buttons, and one live database holds 39 distinct values. A
+ * deny-list of the four we happen to know therefore answers `✅ Approuvé` for
+ * everything else — including `refuse`, whose own button reads "je le refuse
+ * pour 30 jours". Telling someone their refusal was approved is a worse failure
+ * than saying nothing.
+ *
+ * So: an allow-list for approval, explicit answers for the outcomes we do know,
+ * and for anything unknown an ack that reports the decision without claiming a
+ * meaning it cannot verify.
+ *
+ * Shared by both ack paths on purpose. They answer the same question and had
+ * drifted — `discuss` was handled in one and left lying in the other — which is
+ * what a rule duplicated in two places does.
+ */
+type AckKind = "approved" | "rejected" | "postponed" | "discussed" | "informational" | "unknown";
+
+/**
+ * The one normalised form of a decision, used both to classify it and to echo it
+ * back. `ackForAlready` lower-cases while parsing and `ackForResolution` does
+ * not, so echoing each function's own local variable made the same decision
+ * print two different ways — `Done` from a fresh tap, `done` from a repeated
+ * one. Classification was right either way; only the display diverged, which is
+ * precisely the drift this change exists to remove.
+ */
+export function normalizeDecision(decision: string): string {
+  return decision.trim().toLowerCase();
+}
+
+export function classifyDecision(decision: string): AckKind {
+  const d = normalizeDecision(decision);
+  if (d === "skip" || d === "skipped" || d === "later" || d === "snooze") return "postponed";
+  if (d === "reject" || d === "cancel" || d === "rejected" || d === "refuse" || d === "drop")
+    return "rejected";
+  if (d === "discuss") return "discussed";
+  // `details` shows something and deliberately leaves the action pending; it is
+  // not a decision at all, so it must not be acked as one.
+  if (d === "details" || d === "note" || d === "keep") return "informational";
+  if (d === "approve" || d === "approved" || d === "ok" || d === "yes" || d.startsWith("apply"))
+    return "approved";
+  return "unknown";
+}
+
 export function ackForAlready(resolution: string): string {
   const rest = resolution.slice("already:".length);
   const sep = rest.indexOf(":");
@@ -1842,10 +1888,20 @@ export function ackForAlready(resolution: string): string {
   // "2026-07-16T11:51…" → " (16/07 11:51)"
   const m = at.match(/^\d{4}-(\d{2})-(\d{2})T(\d{2}:\d{2})/);
   const when = m ? ` (${m[2]}/${m[1]} ${m[3]})` : "";
-  if (decision === "reject" || decision === "cancel" || decision === "rejected")
-    return `❌ Déjà rejeté${when}`;
-  if (decision === "skip" || decision === "skipped") return `⏸ Déjà reporté${when}`;
-  return `✅ Déjà approuvé${when}`;
+  switch (classifyDecision(decision)) {
+    case "rejected":
+      return `❌ Déjà rejeté${when}`;
+    case "postponed":
+      return `⏸ Déjà reporté${when}`;
+    case "discussed":
+      return `💬 Déjà envoyé en discussion${when}`;
+    case "informational":
+      return `👀 Déjà consulté${when}`;
+    case "approved":
+      return `✅ Déjà approuvé${when}`;
+    default:
+      return `↩︎ Déjà traité — ${normalizeDecision(decision)}${when}`;
+  }
 }
 
 /** The four outcomes a pending resolver can report. `no_answer` is not a
@@ -1886,10 +1942,23 @@ export function parseResolverVerdict(stdout: string): { verdict: ResolverVerdict
 export function ackForResolution(stdout: string, decision: string): string {
   const { verdict, line } = parseResolverVerdict(stdout);
   if (verdict === "ok") {
-    const decLower = decision.toLowerCase();
-    if (decLower === "skip") return "⏸ Plus tard";
-    if (decLower === "reject" || decLower === "cancel") return "❌ Rejeté";
-    return "✅ Approuvé";
+    switch (classifyDecision(decision)) {
+      case "postponed":
+        return "⏸ Plus tard";
+      case "rejected":
+        return "❌ Rejeté";
+      case "discussed":
+        // Routes to the discussion handler, which opens a thread on the proposal
+        // instead of applying it. The ack names no agent: which assistant it went
+        // to comes from the operator's own config, not from this string.
+        return "💬 Envoyé en discussion — réponds pour continuer";
+      case "informational":
+        return "👀 Consulté";
+      case "approved":
+        return "✅ Approuvé";
+      default:
+        return `↩︎ Décision enregistrée — ${normalizeDecision(decision)}`;
+    }
   }
   if (verdict === "already") return ackForAlready(line);
   if (verdict === "not_found") return "⚠️ Action introuvable";
