@@ -298,7 +298,7 @@ export class PtyAgentProcess implements AgentProcess {
   private pendingArmedAtMs = 0;
   private promptIngested = false;
   /**
-   * `promptId`s already accepted. The bus re-delivers a prompt verbatim on
+   * Records already accepted, keyed by `promptId` + normalised text. The bus re-delivers a prompt verbatim on
    * flush-verify, so the same text can be armed twice; without this a late
    * event for the FIRST delivery would confirm the second — a phantom success
    * of exactly the kind this whole mechanism exists to remove. Bounded: only
@@ -332,9 +332,9 @@ export class PtyAgentProcess implements AgentProcess {
        *  submit is abandoned to the watchdog (compaction can run ~100s). */
       maxCompactionWaitMs?: number;
       /** How long to keep waiting for the transcript once the screen alone
-       *  would have declared a turn. Measured at ~0.5s in practice; the
-       *  default is generous, and it bounds the wait so a silent transcript
-       *  degrades in seconds rather than at the compaction budget. */
+       *  would have declared a turn. The union of the two transcript records
+       *  has a measured p95 of 0.25s and a 0.27s maximum across 56 deliveries,
+       *  so this default is roughly 10x the observed worst case. */
       transcriptGraceMs?: number;
     } = {},
   ) {
@@ -342,7 +342,7 @@ export class PtyAgentProcess implements AgentProcess {
     this.pty = pty;
     this.pid = pty.pid;
     this.submitConfirmMs = opts.submitConfirmMs ?? 1500;
-    this.transcriptGraceMs = opts.transcriptGraceMs ?? 8000;
+    this.transcriptGraceMs = opts.transcriptGraceMs ?? 3000;
     this.maxSubmitNudges = opts.maxSubmitNudges ?? 2;
     this.maxCompactionWaitMs = opts.maxCompactionWaitMs ?? 240_000;
     this.bootDialogTimer = setTimeout(
@@ -574,6 +574,7 @@ export class PtyAgentProcess implements AgentProcess {
           visible.includes("Compacting at auto")
         ) {
           sawCompaction = true;
+          screenClaimedTurnAtMs = 0; // the screen is not claiming a turn here
           // Evidence of a running turn only means anything AFTER the compaction:
           // before it, the echoed input line (the prompt sitting un-submitted in
           // the box) is itself non-footer output and would gate the retype off.
@@ -585,6 +586,9 @@ export class PtyAgentProcess implements AgentProcess {
           continue; // compaction in progress -> wait, do not spend a nudge
         }
         const footerVisible = /to\s*cycle/.test(visible);
+        // The idle footer is positive evidence that no turn is running, so any
+        // earlier screen claim is withdrawn and its clock restarts.
+        if (footerVisible) screenClaimedTurnAtMs = 0;
         // Everything in this window that is not a footer repaint and not a
         // spinner glyph. Printable ASCII only, so box-drawing and braille
         // spinner frames do not register as output.
@@ -652,6 +656,10 @@ export class PtyAgentProcess implements AgentProcess {
           // not "yes" (the wedge) and not "no" (which would strand a turn that
           // really is running).
           if (this.transcriptAvailable) {
+            // Reset whenever the screen stops claiming (see the idle/compaction
+            // branches): otherwise one repaint window before a compaction burns
+            // the whole grace, and the post-compaction turn — the case this
+            // machinery exists for — gets none of it.
             if (screenClaimedTurnAtMs === 0) screenClaimedTurnAtMs = Date.now();
             if (Date.now() - screenClaimedTurnAtMs < this.transcriptGraceMs) continue;
             outcome = "unconfirmed-live";
@@ -874,25 +882,51 @@ export class PtyAgentProcess implements AgentProcess {
   }
 
   notePromptIngested(ingestion: PromptIngestion): void {
+    // Key on promptId AND the text, never on promptId alone.
+    //
+    // A `promptId` identifies a submission, not a record: an auto-compaction
+    // emits a cluster of `user` lines under one id — the continuation summary,
+    // the `/compact` command echo, its stdout — and the summary is written
+    // BEFORE the real prompt. Keying on the id alone let the summary consume
+    // it, so the actual prompt's record was dismissed as already seen and could
+    // never confirm. That failed in precisely the auto-compaction case this
+    // mechanism exists for, and `enqueue` does not cover it: a prompt that
+    // TRIGGERS a compaction is not queued behind a running turn.
+    const key = ingestion.promptId
+      ? `${ingestion.promptId}\u0000${normalizePromptForMatch(ingestion.text)}`
+      : null;
+    const alreadySeen = key ? this.consumedPromptIds.has(key) : false;
+    // Record the id FIRST, before any early return.
+    //
+    // A delivery routinely ends with the transcript still silent, so its record
+    // arrives while nothing is armed. Returning early without recording it left
+    // that record eligible to confirm the NEXT arming of the same text — and
+    // the bus re-delivers verbatim on flush-verify, so "the same text again" is
+    // a coded path, not a coincidence. That phantom confirmation is the exact
+    // failure this mechanism exists to remove.
+    if (key && !alreadySeen) {
+      if (this.consumedPromptIds.size >= PtyAgentProcess.CONSUMED_PROMPT_IDS_MAX) {
+        // Set iteration is insertion-ordered, so this is genuinely the oldest.
+        const oldest = this.consumedPromptIds.values().next().value;
+        if (oldest !== undefined) this.consumedPromptIds.delete(oldest);
+      }
+      this.consumedPromptIds.add(key);
+    }
+
     if (this.pendingPromptMatch === null) return;
-    // Already used to confirm a delivery — cannot confirm another.
-    if (ingestion.promptId && this.consumedPromptIds.has(ingestion.promptId)) return;
-    // Recorded before this prompt was even written: it belongs to an earlier
-    // delivery whose event the tail is only handing over now.
+    if (alreadySeen) return;
+    // Staleness by timestamp applies to `enqueue` ONLY. Its timestamp tracks
+    // acceptance within ~0.2s, whereas the CLI backdates `user` lines — observed
+    // by up to 148s (a line written at 14:04:43 stamped 14:02:15). Judging a
+    // `user` record stale on its own timestamp would discard live confirmations.
     if (
+      ingestion.source === "enqueue" &&
       ingestion.ingestedAtMs > 0 &&
       ingestion.ingestedAtMs < this.pendingArmedAtMs - INGESTION_CLOCK_SKEW_MS
     ) {
       return;
     }
     if (normalizePromptForMatch(ingestion.text) !== this.pendingPromptMatch) return;
-    if (ingestion.promptId) {
-      if (this.consumedPromptIds.size >= PtyAgentProcess.CONSUMED_PROMPT_IDS_MAX) {
-        const oldest = this.consumedPromptIds.values().next().value;
-        if (oldest !== undefined) this.consumedPromptIds.delete(oldest);
-      }
-      this.consumedPromptIds.add(ingestion.promptId);
-    }
     this.promptIngested = true;
   }
 

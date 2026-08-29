@@ -404,6 +404,32 @@ export class JsonlTailer {
    * "simple" types (single field extraction) are handled via the
    * `SIMPLE_DISPATCH` table to keep this method small.
    */
+  /**
+   * Issue #363 — a queued prompt's acceptance, reported the moment the CLI
+   * takes the keystrokes rather than when it gets round to running them. The
+   * line is already dispatched to `session.queue` via SIMPLE_DISPATCH; this is
+   * an additional consumer of the same record, not new parsing.
+   *
+   * `operation` takes other values too (`"dequeue"` / `"remove"` depending on
+   * CLI version), so the test is positive rather than a blocklist.
+   */
+  private notifyEnqueue(line: Record<string, unknown>): void {
+    if (!this.onPromptIngested) return;
+    if (line.operation !== "enqueue") return;
+    const content = line.content;
+    if (typeof content !== "string") return;
+    const ts = typeof line.timestamp === "string" ? Date.parse(line.timestamp) : Number.NaN;
+    try {
+      this.onPromptIngested({
+        text: content,
+        source: "enqueue",
+        ingestedAtMs: Number.isFinite(ts) ? ts : 0,
+      });
+    } catch (err) {
+      this.onError(err, { where: "onPromptIngested(enqueue)", agent_id: this.agent_id });
+    }
+  }
+
   private dispatch(line: JsonlLine, raw: string): void {
     if (!this.sawAnyLine) {
       this.sawAnyLine = true;
@@ -427,6 +453,9 @@ export class JsonlTailer {
         this.dispatchSystem(line as SystemLine);
         return;
       default: {
+        if (line.type === "queue-operation") {
+          this.notifyEnqueue(line as unknown as Record<string, unknown>);
+        }
         const simple = SIMPLE_DISPATCH[line.type];
         if (simple) {
           this.publish(simple.topic, simple.extract(line as Record<string, unknown>), line);
@@ -471,6 +500,7 @@ export class JsonlTailer {
         try {
           this.onPromptIngested({
             text: content,
+            source: "user",
             promptId: line.promptId,
             ingestedAtMs: Number.isFinite(ts) ? ts : 0,
           });

@@ -249,7 +249,22 @@ export function encodeCwdForProjectsDir(
  */
 export interface PromptIngestion {
   text: string;
-  /** CLI-assigned id for this prompt. Absent on older CLIs. */
+  /**
+   * Which record carried the fact. The two are complementary, not redundant:
+   *
+   * - `"enqueue"` is written the moment the CLI ACCEPTS the keystrokes, and
+   *   only exists when the prompt is genuinely queued behind a running turn.
+   * - `"user"` is written when the CLI EXECUTES the turn — immediate when
+   *   nothing was queued, and arbitrarily late when something was.
+   *
+   * Measured over 56 deliveries on a long-running session: `user` alone has a
+   * p95 of 236 s (12 deliveries past 8 s, max 443 s); every one of those slow
+   * deliveries has an `enqueue`. Taking whichever lands first gives p95 0.25 s
+   * and a 0.27 s maximum. Neither record alone is sufficient.
+   */
+  source: "user" | "enqueue";
+  /** CLI-assigned id. Present on `user` lines only, and it identifies a
+   *  submission rather than a record — a compaction cluster shares one. */
   promptId?: string;
   /** Transcript `timestamp`, epoch ms. `0` when unparseable. */
   ingestedAtMs: number;
