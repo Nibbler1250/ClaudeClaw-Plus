@@ -240,6 +240,21 @@ export function encodeCwdForProjectsDir(
   return platform === "win32" ? cwd.replace(/[/\\:]/g, "-") : cwd.replace(/\//g, "-");
 }
 
+/**
+ * A transcript-confirmed prompt ingestion (issue #362).
+ *
+ * `promptId` and `ingestedAtMs` are what make this safe to act on: text alone
+ * cannot tell a fresh ingestion from a late event for an earlier delivery of
+ * the identical string, and the bus re-delivers verbatim on flush-verify.
+ */
+export interface PromptIngestion {
+  text: string;
+  /** CLI-assigned id for this prompt. Absent on older CLIs. */
+  promptId?: string;
+  /** Transcript `timestamp`, epoch ms. `0` when unparseable. */
+  ingestedAtMs: number;
+}
+
 /* ───────────────────────────────────────────────────────────────────── */
 /* Extraction helpers                                                    */
 /* ───────────────────────────────────────────────────────────────────── */

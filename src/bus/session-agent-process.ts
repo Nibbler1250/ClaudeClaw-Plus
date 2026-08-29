@@ -41,6 +41,33 @@ import type { SupervisionMode } from "./types";
  *  confirm")` / `includes("Yes, I accept")` dialog gates — leaving a spawned
  *  agent stuck at the boot dialog. This is the bus-path analogue of the #345
  *  pty-supervisor footer hang. */
+/**
+ * Normalise a prompt for cross-surface comparison (issue #362). The PTY is fed
+ * `sanitizePtyPromptText` output while the transcript stores what the CLI
+ * parsed, so the two can differ in trailing whitespace and in how a run of
+ * spaces survives the input box. Compare on the shape both surfaces agree on.
+ */
+function normalizePromptForMatch(text: string): string {
+  // Whitespace is dropped entirely rather than collapsed. The two surfaces
+  // disagree on more than runs of spaces: `sanitizePtyPromptText` preserves a
+  // TAB, but a raw 0x09 typed into the TUI is a completion KEY, so it never
+  // reaches the transcript at all. Collapsing would leave `"a\tb"` arming
+  // `"a b"` against a recorded `"ab"` — a permanent non-match.
+  //
+  // This is only safe because identity no longer rests on the text: `promptId`
+  // and the transcript timestamp are what decide which delivery an ingestion
+  // belongs to. The text is a sanity check, not the key.
+  return text.replace(/\s+/g, "");
+}
+
+/** Tolerance for CLI-vs-daemon clock skew when ordering an ingestion against
+ *  the moment its prompt was armed. Same host, so this is generous. */
+const INGESTION_CLOCK_SKEW_MS = 2000;
+
+import type { PromptIngestion } from "./jsonl-line-types";
+
+export type { PromptIngestion };
+
 function stripAnsiEscapes(text: string): string {
   return (
     expandCursorForwardToSpaces(text)
@@ -71,6 +98,18 @@ export interface AgentProcess {
   send_slash(cmd: string): Promise<void>;
   /** Send a stream-json line. Only valid in `process-stream-json` mode. */
   send_prompt_stream(line: string): Promise<void>;
+  /**
+   * Optional: report that the session transcript recorded the CLI ingesting
+   * `text` as a top-level user prompt (issue #362). Implementations that have
+   * no transcript simply omit this and keep the screen heuristics.
+   */
+  notePromptIngested?(ingestion: PromptIngestion): void;
+  /**
+   * Optional: declare that a session transcript is being tailed for this
+   * process, so the confirm loop can require its word instead of trusting the
+   * rendered terminal in the one window where the terminal is known to lie.
+   */
+  enableTranscriptConfirmation?(): void;
   onExit(handler: ExitHandler): void;
   /**
    * Crash-signal observer ONLY. The Bus must NEVER parse model output from
@@ -241,6 +280,39 @@ export class PtyAgentProcess implements AgentProcess {
   /** One-shot guard so an unconfirmed delivery is surfaced once per process
    *  (see the delivery-confirm loop) instead of spamming the log. */
   private warnedUnconfirmedDelivery = false;
+  /**
+   * Issue #362 — authoritative delivery signal.
+   *
+   * `pendingPromptMatch` is the normalised text of the prompt currently being
+   * delivered; `promptIngested` flips when the session transcript records the
+   * CLI ingesting exactly that text. Only `send_prompt_stream` arms and
+   * disarms them, and the write chain serialises prompts, so at most one is
+   * ever in flight.
+   *
+   * This exists because every other probe in the confirm loop reads the
+   * rendered terminal, where a post-compaction repaint is byte-identical to a
+   * streaming turn. The transcript is written by the CLI when it actually
+   * ingests the prompt — a fact, not an inference from pixels.
+   */
+  private pendingPromptMatch: string | null = null;
+  private pendingArmedAtMs = 0;
+  private promptIngested = false;
+  /**
+   * `promptId`s already accepted. The bus re-delivers a prompt verbatim on
+   * flush-verify, so the same text can be armed twice; without this a late
+   * event for the FIRST delivery would confirm the second — a phantom success
+   * of exactly the kind this whole mechanism exists to remove. Bounded: only
+   * the recent past can plausibly arrive late.
+   */
+  private readonly consumedPromptIds = new Set<string>();
+  private static readonly CONSUMED_PROMPT_IDS_MAX = 64;
+  /**
+   * True once a JSONL tailer is feeding `notePromptIngested`. Gates the
+   * stricter post-compaction rule below: without a transcript there is nothing
+   * better than the screen, so the original heuristics must stay in force.
+   */
+  private transcriptAvailable = false;
+  private readonly transcriptGraceMs: number;
   /** Hard cap on the boot-dialog watch window (issue #193 / Codex P2). If no
    *  REPL-ready marker is observed within this window (e.g. a future CLI
    *  changes the footer text), the watcher disengages anyway so it never
@@ -259,12 +331,18 @@ export class PtyAgentProcess implements AgentProcess {
       /** Upper bound to wait out an in-progress auto-compaction before the
        *  submit is abandoned to the watchdog (compaction can run ~100s). */
       maxCompactionWaitMs?: number;
+      /** How long to keep waiting for the transcript once the screen alone
+       *  would have declared a turn. Measured at ~0.5s in practice; the
+       *  default is generous, and it bounds the wait so a silent transcript
+       *  degrades in seconds rather than at the compaction budget. */
+      transcriptGraceMs?: number;
     } = {},
   ) {
     this.agent_id = agent_id;
     this.pty = pty;
     this.pid = pty.pid;
     this.submitConfirmMs = opts.submitConfirmMs ?? 1500;
+    this.transcriptGraceMs = opts.transcriptGraceMs ?? 8000;
     this.maxSubmitNudges = opts.maxSubmitNudges ?? 2;
     this.maxCompactionWaitMs = opts.maxCompactionWaitMs ?? 240_000;
     this.bootDialogTimer = setTimeout(
@@ -381,6 +459,12 @@ export class PtyAgentProcess implements AgentProcess {
       // cost O(prompt x lines) for the life of the process. The input box only
       // ever echoes a screenful, so the head is the part that can come back.
       this.lastWritten = text.slice(0, PtyAgentProcess.ECHO_MATCH_MAX);
+      // Issue #362: arm the transcript watcher BEFORE the write. The CLI can
+      // ingest the prompt during the 200ms settle below — arming afterwards
+      // would miss exactly the fast case and fall back to reading pixels.
+      this.pendingPromptMatch = normalizePromptForMatch(text);
+      this.pendingArmedAtMs = Date.now();
+      this.promptIngested = false;
       const compactingAtWrite = this.compacting;
       const compactionEpochAtWrite = this.compactionEpoch;
       this.pty.write(text);
@@ -414,7 +498,11 @@ export class PtyAgentProcess implements AgentProcess {
       // NEVER silently -- the stranded input line is cleared and a diagnostic is
       // surfaced, since a silently-dropped prompt is the failure this loop fixes.
       const compactionDeadline = Date.now() + this.maxCompactionWaitMs;
-      let outcome: "turn-started" | "stuck-compaction" | "unconfirmed-idle" = "unconfirmed-idle";
+      let outcome: "turn-started" | "stuck-compaction" | "unconfirmed-idle" | "unconfirmed-live" =
+        "unconfirmed-idle";
+      // When the screen first claimed a turn while a live transcript had not
+      // yet spoken. Bounds how long that claim is held unresolved.
+      let screenClaimedTurnAtMs = 0;
       let sawCompaction = compactingAtWrite || this.compactionEpoch !== compactionEpochAtWrite;
       let retypedAfterCompaction = false;
       // Latched as soon as any window shows real output that is neither the idle
@@ -433,6 +521,21 @@ export class PtyAgentProcess implements AgentProcess {
         // so resolving here would report a phantom success for a prompt whose
         // target just died -- suppressing re-queue and masking the wedge.
         if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
+        // Issue #362 — the transcript settles this window before any screen
+        // heuristic gets a say. The CLI wrote a `user` entry for this exact
+        // prompt, which it only does once it has actually ingested it. That
+        // outranks every probe below, all of which infer delivery from the
+        // rendered terminal and therefore cannot tell a submitted prompt from
+        // a post-compaction repaint (the 2026-08-27 false positive).
+        //
+        // Checking here also removes the retype's remaining double-submit
+        // risk: a confirmed ingestion exits the loop before the retype branch
+        // can fire on a stale idle footer.
+        if (this.promptIngested) {
+          outcome = "turn-started";
+          this.warnedUnconfirmedDelivery = false;
+          break;
+        }
         // Anchor the compaction probe to the CLI status line ("Compacting
         // conversation" / "Compacting at auto window") rather than the bare word
         // "Compacting", which also occurs in ordinary model output: a live turn
@@ -527,6 +630,33 @@ export class PtyAgentProcess implements AgentProcess {
         // footer's absence; an empty/whitespace window stays inconclusive and
         // spends a nudge instead of claiming a phantom success.
         if (visible.trim().length > 0 && !footerVisible) {
+          // Issue #362 — the 2026-08-27 false positive lands exactly here.
+          // After a compaction the CLI repaints the restored transcript for
+          // seconds; those repaints are non-empty, carry no idle footer, and
+          // `Compacted (` has already scrolled out of this rolling window.
+          // Byte for byte, that is a streaming turn.
+          //
+          // This deliberately does NOT test whether a compaction was seen.
+          // `sawCompaction` is itself derived from the screen, and it is blind
+          // to the production ordering: a compaction that STARTED BEFORE this
+          // prompt was written and ENDED BEFORE it too bumps the epoch ahead of
+          // the snapshot, clears the latch, and shows no start banner — which
+          // is precisely the 2026-08-27 timeline (compaction ends 14:04:43,
+          // prompt written 14:04:47). Gating on it would leave the reported
+          // failure untouched.
+          //
+          // So: whenever a transcript is proven live, it is the only thing that
+          // may CONFIRM a turn. The screen's claim is held, unresolved and
+          // without spending a nudge, for a bounded grace period. If the
+          // transcript still has not spoken, the honest answer is "unknown" —
+          // not "yes" (the wedge) and not "no" (which would strand a turn that
+          // really is running).
+          if (this.transcriptAvailable) {
+            if (screenClaimedTurnAtMs === 0) screenClaimedTurnAtMs = Date.now();
+            if (Date.now() - screenClaimedTurnAtMs < this.transcriptGraceMs) continue;
+            outcome = "unconfirmed-live";
+            break;
+          }
           outcome = "turn-started";
           // A turn confirmed → re-arm the one-shot wedge warning, so a LATER
           // genuine wedge on this long-lived process still surfaces a diagnostic
@@ -570,7 +700,23 @@ export class PtyAgentProcess implements AgentProcess {
       // filter has nothing left to match. Clearing it keeps the filter from
       // running against unrelated output for the whole idle period after a turn.
       this.lastWritten = "";
-      if (outcome !== "turn-started" && !this.warnedUnconfirmedDelivery) {
+      // Disarm alongside the echo filter: a late transcript event for a prompt
+      // this loop already resolved must not confirm the NEXT one. The arm
+      // above resets both fields anyway, so an early throw cannot strand them.
+      this.pendingPromptMatch = null;
+      this.promptIngested = false;
+      if (outcome === "unconfirmed-live") {
+        // Distinct from the wedge warnings, and deliberately NOT one-shot-
+        // silenced: this says the screen looked like a turn while the
+        // transcript stayed quiet past the grace period. It is a real
+        // ambiguity worth seeing every time, and burning the one-shot flag
+        // here would mute a genuine wedge later in this process's life.
+        console.warn(
+          `[delivery-confirm] agent=${this.agent_id}: screen showed turn output but ` +
+            `the session transcript did not record the prompt within ` +
+            `${this.transcriptGraceMs}ms; reporting unconfirmed rather than guessing.`,
+        );
+      } else if (outcome !== "turn-started" && !this.warnedUnconfirmedDelivery) {
         this.warnedUnconfirmedDelivery = true;
         console.warn(
           `[delivery-confirm] agent=${this.agent_id}: submit not confirmed ` +
@@ -711,6 +857,43 @@ export class PtyAgentProcess implements AgentProcess {
 
   onExit(handler: ExitHandler): void {
     this.exitHandlers.push(handler);
+  }
+
+  /**
+   * Issue #362 — called by the session JSONL tailer when the transcript shows
+   * the CLI ingested a top-level user prompt. Ignored unless it matches the
+   * prompt currently in flight: the transcript also carries prompts this
+   * process never typed (a resumed session's harness nudge, for one), and
+   * treating those as confirmation would report delivery for a prompt still
+   * sitting un-submitted in the input box.
+   */
+  /** Issue #362 — see `transcriptAvailable`. Called by the session manager
+   *  when it binds a JSONL tailer to this process. */
+  enableTranscriptConfirmation(): void {
+    this.transcriptAvailable = true;
+  }
+
+  notePromptIngested(ingestion: PromptIngestion): void {
+    if (this.pendingPromptMatch === null) return;
+    // Already used to confirm a delivery — cannot confirm another.
+    if (ingestion.promptId && this.consumedPromptIds.has(ingestion.promptId)) return;
+    // Recorded before this prompt was even written: it belongs to an earlier
+    // delivery whose event the tail is only handing over now.
+    if (
+      ingestion.ingestedAtMs > 0 &&
+      ingestion.ingestedAtMs < this.pendingArmedAtMs - INGESTION_CLOCK_SKEW_MS
+    ) {
+      return;
+    }
+    if (normalizePromptForMatch(ingestion.text) !== this.pendingPromptMatch) return;
+    if (ingestion.promptId) {
+      if (this.consumedPromptIds.size >= PtyAgentProcess.CONSUMED_PROMPT_IDS_MAX) {
+        const oldest = this.consumedPromptIds.values().next().value;
+        if (oldest !== undefined) this.consumedPromptIds.delete(oldest);
+      }
+      this.consumedPromptIds.add(ingestion.promptId);
+    }
+    this.promptIngested = true;
   }
 
   onData(handler: DataHandler): void {

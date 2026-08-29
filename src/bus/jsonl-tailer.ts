@@ -31,6 +31,7 @@ import type { BusCore } from "./core";
 import {
   BUS_CRITICAL_ATTACHMENT_SUBTYPES,
   encodeCwdForProjectsDir,
+  type PromptIngestion,
   extractToolResults,
   type AssistantLine,
   type AttachmentLine,
@@ -92,6 +93,8 @@ const SIMPLE_DISPATCH: Record<
   },
 };
 
+export type { PromptIngestion };
+
 export interface JsonlTailerOptions {
   bus: BusCore;
   agent_id: string;
@@ -116,6 +119,26 @@ export interface JsonlTailerOptions {
   startAt?: "begin" | "end";
   /** Error sink. Defaults to console.error. */
   onError?: (err: unknown, ctx?: Record<string, unknown>) => void;
+  /**
+   * Called when the transcript records that the CLI actually ingested a
+   * top-level user prompt (issue #362). This is the only delivery signal that
+   * originates outside the terminal rendering: on the PTY surface "the CLI
+   * submitted my text" and "the CLI repainted something" are the same bytes,
+   * so every screen heuristic can be fooled by a post-compaction repaint.
+   * The session manager wires this to the agent's `notePromptIngested`.
+   */
+  onPromptIngested?: (ingestion: PromptIngestion) => void;
+  /**
+   * Called once, on the first line this tailer actually reads (issue #362).
+   *
+   * Being constructed is NOT evidence that a transcript is readable: the path
+   * is derived from the cwd encoding, and a mismatch there leaves the tailer
+   * pointed at a file that never appears — silently, since a missing session
+   * file is a normal startup state. Anything that hardens behaviour on the
+   * assumption that the transcript will speak must key off this, not off the
+   * wiring, or it degrades every agent whose transcript is unreachable.
+   */
+  onTranscriptAlive?: () => void;
 }
 
 export class JsonlTailer {
@@ -126,6 +149,9 @@ export class JsonlTailer {
   private readonly projectsDir: string;
   private readonly schemaVersion: string;
   private readonly onError: (err: unknown, ctx?: Record<string, unknown>) => void;
+  private readonly onPromptIngested?: (ingestion: PromptIngestion) => void;
+  private readonly onTranscriptAlive?: () => void;
+  private sawAnyLine = false;
   private readonly filePath: string;
   private readonly startAt: "begin" | "end";
 
@@ -162,6 +188,8 @@ export class JsonlTailer {
     this.schemaVersion = opts.schemaVersion ?? SCHEMA_VERSION;
     this.onError = opts.onError ?? ((err, ctx) => console.error("[jsonl-tailer]", err, ctx));
     this.startAt = opts.startAt ?? "begin";
+    this.onPromptIngested = opts.onPromptIngested;
+    this.onTranscriptAlive = opts.onTranscriptAlive;
     this.filePath = join(
       this.projectsDir,
       encodeCwdForProjectsDir(this.cwd),
@@ -377,6 +405,14 @@ export class JsonlTailer {
    * `SIMPLE_DISPATCH` table to keep this method small.
    */
   private dispatch(line: JsonlLine, raw: string): void {
+    if (!this.sawAnyLine) {
+      this.sawAnyLine = true;
+      try {
+        this.onTranscriptAlive?.();
+      } catch (err) {
+        this.onError(err, { where: "onTranscriptAlive", agent_id: this.agent_id });
+      }
+    }
     switch (line.type) {
       case "user":
         this.dispatchUser(line as UserLine, raw);
@@ -418,6 +454,30 @@ export class JsonlTailer {
         },
         line,
       );
+      // Issue #362: the transcript writing this line IS the CLI acknowledging
+      // it ingested the prompt, which is what the PTY delivery-confirm loop
+      // has no way to observe. Notify out-of-band so a failure in a consumer
+      // cannot take down the tail — the publish above is the contract, this is
+      // a side-channel.
+      // Sub-agent prompts and harness meta lines are recorded the same way but
+      // are not this process's delivery. Excluded at the source so no consumer
+      // has to know the distinction.
+      if (
+        this.onPromptIngested &&
+        line.isSidechain !== true &&
+        !(line as { isMeta?: boolean }).isMeta
+      ) {
+        const ts = line.timestamp ? Date.parse(line.timestamp) : Number.NaN;
+        try {
+          this.onPromptIngested({
+            text: content,
+            promptId: line.promptId,
+            ingestedAtMs: Number.isFinite(ts) ? ts : 0,
+          });
+        } catch (err) {
+          this.onError(err, { where: "onPromptIngested", agent_id: this.agent_id });
+        }
+      }
       return;
     }
     if (Array.isArray(content)) {
