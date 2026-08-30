@@ -7,7 +7,7 @@
  *     REPL-ready marker, not on first prompt (issue #193 / Codex P2 on #195).
  */
 import { describe, expect, it } from "bun:test";
-import { PtyAgentProcess, type PtyHandle } from "../session-agent-process";
+import { PtyAgentProcess, type PromptIngestion, type PtyHandle } from "../session-agent-process";
 
 describe("PtyAgentProcess.send_prompt_stream", () => {
   it("serialises concurrent prompts so their bytes don't interleave", async () => {
@@ -712,5 +712,427 @@ describe("PtyAgentProcess compaction latch", () => {
     // Footer preserved ⇒ the REPL is correctly seen as idle ⇒ the loop nudges
     // instead of declaring a turn. 1 initial submit + 2 nudges.
     expect(writes.filter((w) => w === "\r").length).toBe(3);
+  });
+});
+
+describe("PtyAgentProcess transcript-confirmed delivery (issue #362)", () => {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const ingestion = (text: string, over: Partial<PromptIngestion> = {}): PromptIngestion => ({
+    text,
+    source: "user",
+    promptId: `pid-${Math.random().toString(36).slice(2)}`,
+    ingestedAtMs: Date.now(),
+    ...over,
+  });
+
+  /**
+   * A compaction that STARTS AND ENDS BEFORE the prompt is written, then keeps
+   * repainting the restored transcript. This is the production ordering of the
+   * 2026-08-27 wedge (compaction ends 14:04:43, prompt written 14:04:47) and
+   * the one no screen-derived signal can see: the epoch was bumped before the
+   * snapshot, the latch is already cleared, `markerTail` is wiped at write, and
+   * `Compacted (` never appears in a confirm window.
+   */
+  async function compactionEndsThenWrite(
+    proc: PtyAgentProcess,
+    emit: (d: string) => void,
+    prompt: string,
+  ) {
+    emit("Compacting conversation…");
+    await sleep(20);
+    emit("Compacted (ctrl+o to see full summary)");
+    await sleep(30);
+    const iv = setInterval(() => emit("earlier turn text being repainted\n"), 5);
+    const done = proc.send_prompt_stream(prompt);
+    return { done, stop: () => clearInterval(iv) };
+  }
+
+  it("does not confirm a turn from a repaint when the compaction ended BEFORE the write", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("f1", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+
+    const { done, stop } = await compactionEndsThenWrite(proc, emit, "please summarise");
+    await done;
+    stop();
+
+    // The prompt was never ingested: reporting a started turn here is the wedge.
+    expect(writes).toContain("\x15");
+  });
+
+  it("keeps the old screen behaviour for that same ordering when no transcript is live", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("f1b", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    // No enableTranscriptConfirmation: also the blind-tailer case, where a
+    // path mismatch means no line is ever read. Such an agent must degrade to
+    // the previous behaviour, never stall waiting on a transcript that cannot
+    // speak. Identical config to the test above — only the transcript differs.
+
+    const { done, stop } = await compactionEndsThenWrite(proc, emit, "please summarise");
+    await done;
+    stop();
+
+    expect(writes).not.toContain("\x15");
+  });
+
+  it("confirms as soon as the transcript records the prompt, whatever the screen shows", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("ok", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 3,
+      transcriptGraceMs: 5000,
+    });
+    proc.enableTranscriptConfirmation();
+
+    const { done, stop } = await compactionEndsThenWrite(proc, emit, "hello there");
+    setTimeout(() => proc.notePromptIngested(ingestion("hello there")), 30);
+    await done;
+    stop();
+
+    expect(writes).not.toContain("\x15");
+    expect(writes.filter((w) => w === "\r").length).toBe(1);
+  });
+
+  it("reports unconfirmed rather than a turn when a live transcript stays silent", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("f2", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+
+    // Genuine streaming output the whole way, but the transcript never speaks.
+    const p = proc.send_prompt_stream("hi");
+    const iv = setInterval(() => emit("assistant is streaming a response\n"), 5);
+    await p;
+    clearInterval(iv);
+
+    // Held for the grace period without spending a nudge, then answered
+    // "unknown" — exactly one submit CR, never re-nudged or re-typed.
+    expect(writes.filter((w) => w === "\r").length).toBe(1);
+  });
+
+  /**
+   * Staleness-by-timestamp applies to `enqueue` only. Its stamp tracks
+   * acceptance within ~0.2s, whereas the CLI backdates `user` lines — observed
+   * by up to 148s — so a `user` record cannot be judged stale that way. What
+   * protects the `user` path is the consumed-id set, covered separately.
+   */
+  it("ignores an enqueue recorded before this prompt was armed (late event, earlier delivery)", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("f4a", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+
+    const { done, stop } = await compactionEndsThenWrite(
+      proc,
+      emit,
+      "heartbeat: any new messages?",
+    );
+    // The bus re-delivers verbatim; this is the FIRST delivery's transcript
+    // line arriving late. Same text, but stamped well before this arming.
+    setTimeout(
+      () =>
+        proc.notePromptIngested({
+          text: "heartbeat: any new messages?",
+          source: "enqueue",
+          ingestedAtMs: Date.now() - 60_000,
+        }),
+      30,
+    );
+    await done;
+    stop();
+
+    expect(writes).toContain("\x15");
+  });
+
+  it("refuses to reuse a promptId that already confirmed a delivery", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("f4b", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+    const shared = "identical prompt text";
+    const pid = "pid-reused";
+
+    // First delivery, confirmed by the transcript.
+    const first = proc.send_prompt_stream(shared);
+    setTimeout(
+      () =>
+        proc.notePromptIngested({
+          text: shared,
+          source: "user",
+          promptId: pid,
+          ingestedAtMs: Date.now(),
+        }),
+      25,
+    );
+    await first;
+    const afterFirst = writes.length;
+
+    // Second, verbatim re-delivery. The same promptId must not confirm it.
+    const { done, stop } = await compactionEndsThenWrite(proc, emit, shared);
+    setTimeout(
+      () =>
+        proc.notePromptIngested({
+          text: shared,
+          source: "user",
+          promptId: pid,
+          ingestedAtMs: Date.now(),
+        }),
+      25,
+    );
+    await done;
+    stop();
+
+    expect(writes.slice(afterFirst)).toContain("\x15");
+  });
+
+  it("ignores a transcript prompt that is not the one in flight", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("other", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+
+    const { done, stop } = await compactionEndsThenWrite(proc, emit, "the real prompt");
+    setTimeout(() => proc.notePromptIngested(ingestion("Continue from where you left off")), 30);
+    await done;
+    stop();
+
+    expect(writes).toContain("\x15");
+  });
+
+  it("matches a prompt containing a tab, which the transcript cannot carry", async () => {
+    const { handle, writes } = bootPty();
+    const proc = new PtyAgentProcess("tab", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 3,
+      transcriptGraceMs: 5000,
+    });
+    proc.enableTranscriptConfirmation();
+
+    // sanitizePtyPromptText preserves TAB, but a raw 0x09 typed into the TUI is
+    // a completion key and never reaches the transcript.
+    const p = proc.send_prompt_stream("col a\tcol b");
+    setTimeout(() => proc.notePromptIngested(ingestion("col acol b")), 40);
+    await p;
+
+    expect(writes).not.toContain("\x15");
+  });
+});
+
+describe("PtyAgentProcess enqueue-confirmed delivery (issue #363)", () => {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const enqueued = (text: string, over: Partial<PromptIngestion> = {}): PromptIngestion => ({
+    text,
+    source: "enqueue",
+    ingestedAtMs: Date.now(),
+    ...over,
+  });
+
+  /**
+   * The case that refuted the `user`-only design. The bus delivers into an
+   * active turn: the CLI queues the keystrokes and does not write the `user`
+   * line until the neighbouring turn ends — measured past 8s for 12 of 56
+   * deliveries, with a 443s maximum. Meanwhile the screen is non-empty,
+   * footer-free streaming output, so requiring `user` turned a rare false
+   * "delivered" into a frequent false "lost".
+   *
+   * `enqueue` is written ~0.2s after the keystrokes land, precisely BECAUSE
+   * the prompt was queued. Every one of those 12 slow deliveries has one.
+   */
+  it("confirms a prompt queued behind a live turn from its enqueue record", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("q1", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 200,
+    });
+    proc.enableTranscriptConfirmation();
+
+    const p = proc.send_prompt_stream("new inbound message");
+    // A neighbour turn streams the whole time; the `user` line never arrives.
+    const iv = setInterval(() => emit("neighbour turn is streaming its answer\n"), 5);
+    setTimeout(() => proc.notePromptIngested(enqueued("new inbound message")), 40);
+    await p;
+    clearInterval(iv);
+
+    // Confirmed, so no stranded-line clear and exactly one submit CR.
+    expect(writes).not.toContain("\x15");
+    expect(writes.filter((w) => w === "\r").length).toBe(1);
+  });
+
+  /**
+   * An auto-compaction emits a cluster of `user` lines sharing ONE promptId —
+   * the continuation summary first, the real prompt after. Keying the consumed
+   * set on the id alone let the summary burn it, so the prompt that followed
+   * could never confirm: the failure landed in exactly the case this mechanism
+   * exists for, and `enqueue` does not cover it (a prompt that TRIGGERS a
+   * compaction is not queued behind a running turn).
+   */
+  it("still confirms when a compaction cluster shares one promptId with earlier lines", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("cluster", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 3,
+      transcriptGraceMs: 400,
+    });
+    proc.enableTranscriptConfirmation();
+    const sharedId = "pid-compaction-cluster";
+
+    const p = proc.send_prompt_stream("summarise the thread");
+    const iv = setInterval(() => emit("restored transcript repaint\n"), 5);
+    // The cluster's earlier lines arrive first, under the same promptId.
+    setTimeout(() => {
+      proc.notePromptIngested({
+        text: "This session is being continued from a previous conversation…",
+        source: "user",
+        promptId: sharedId,
+        ingestedAtMs: Date.now(),
+      });
+      proc.notePromptIngested({
+        text: "<command-name>/compact</command-name>",
+        source: "user",
+        promptId: sharedId,
+        ingestedAtMs: Date.now(),
+      });
+      // Then the real prompt, same id.
+      proc.notePromptIngested({
+        text: "summarise the thread",
+        source: "user",
+        promptId: sharedId,
+        ingestedAtMs: Date.now(),
+      });
+    }, 40);
+    await p;
+    clearInterval(iv);
+
+    expect(writes).not.toContain("\x15");
+  });
+
+  it("ignores a de-queue: only operation=enqueue is an ingestion", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("q2", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+
+    const p = proc.send_prompt_stream("dropped prompt");
+    const iv = setInterval(() => emit("repaint noise\n"), 5);
+    // A `remove` record is filtered at the tailer, so nothing reaches the
+    // process. Assert the process still refuses to confirm from the screen.
+    await p;
+    clearInterval(iv);
+
+    expect(writes).toContain("\x15");
+  });
+
+  /**
+   * The screen claimed a turn, the transcript spoke only afterwards. This is
+   * the path the grace period exists for, and the previous attempt never
+   * exercised it: its ingestions all fired inside the 200ms paste settle, so
+   * deleting the grace entirely left every test passing.
+   */
+  it("holds the screen's claim and confirms when the transcript speaks during the grace", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("grace", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 400,
+    });
+    proc.enableTranscriptConfirmation();
+
+    const p = proc.send_prompt_stream("held then confirmed");
+    const iv = setInterval(() => emit("output with no footer\n"), 5);
+    // Well after the settle, so the loop must reach the claim branch and hold.
+    setTimeout(() => proc.notePromptIngested(enqueued("held then confirmed")), 260);
+    await p;
+    clearInterval(iv);
+
+    expect(writes).not.toContain("\x15");
+    expect(writes.filter((w) => w === "\r").length).toBe(1);
+  });
+
+  /**
+   * An ingestion arriving while nothing is armed must still be recorded as
+   * consumed. Deliveries routinely end with the transcript silent, so this is
+   * the common case — and leaving the id unrecorded let it confirm the next
+   * verbatim re-delivery, which the bus produces on flush-verify.
+   */
+  it("consumes an id seen while unarmed, so it cannot confirm a later delivery", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("unarmed", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+    const text = "heartbeat: any new messages?";
+    const pid = "pid-late";
+
+    // Nothing armed: the tail hands over a record between deliveries.
+    proc.notePromptIngested({ text, source: "user", promptId: pid, ingestedAtMs: Date.now() });
+
+    const p = proc.send_prompt_stream(text);
+    const iv = setInterval(() => emit("repaint noise\n"), 5);
+    // The same record arrives again mid-delivery. Already consumed.
+    setTimeout(
+      () =>
+        proc.notePromptIngested({ text, source: "user", promptId: pid, ingestedAtMs: Date.now() }),
+      30,
+    );
+    await p;
+    clearInterval(iv);
+
+    expect(writes).toContain("\x15");
+  });
+
+  /**
+   * The claim clock must restart when the screen stops claiming. Otherwise a
+   * repaint window before a compaction spends the whole grace, and the
+   * post-compaction turn gets none of it.
+   */
+  it("restarts the grace after the screen withdraws its claim", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("reset", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 4,
+      transcriptGraceMs: 150,
+    });
+    proc.enableTranscriptConfirmation();
+
+    const p = proc.send_prompt_stream("do the thing");
+    // Claim, then withdraw it (idle footer), then a real turn whose transcript
+    // record lands shortly after it starts.
+    emit("a repaint with no footer\n");
+    await sleep(60);
+    const idle = setInterval(() => emit("\n> accept edits on (shift+tab to cycle)"), 5);
+    await sleep(60);
+    clearInterval(idle);
+    const turn = setInterval(() => emit("the real turn is streaming\n"), 5);
+    setTimeout(() => proc.notePromptIngested(enqueued("do the thing")), 60);
+    await p;
+    clearInterval(turn);
+
+    expect(writes).not.toContain("\x15");
   });
 });

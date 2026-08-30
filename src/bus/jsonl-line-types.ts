@@ -240,6 +240,42 @@ export function encodeCwdForProjectsDir(
   return platform === "win32" ? cwd.replace(/[/\\:]/g, "-") : cwd.replace(/\//g, "-");
 }
 
+/**
+ * A transcript-confirmed prompt ingestion (issue #362).
+ *
+ * `promptId` and `ingestedAtMs` are what make this safe to act on: text alone
+ * cannot tell a fresh ingestion from a late event for an earlier delivery of
+ * the identical string, and the bus re-delivers verbatim on flush-verify.
+ */
+export interface PromptIngestion {
+  text: string;
+  /**
+   * Which record carried the fact. The two are complementary, not redundant:
+   *
+   * - `"enqueue"` is written the moment the CLI ACCEPTS the keystrokes. It is
+   *   not emitted for every prompt (14 of 56 in the sample), but the repo's own
+   *   fixtures show it for unqueued prompts too, so "it exists iff the prompt
+   *   was queued" is too strong a claim — treat it as an early record that is
+   *   often but not always present.
+   * - `"user"` is written when the CLI EXECUTES the turn — immediate when
+   *   nothing was queued, and arbitrarily late when something was.
+   *
+   * Measured over 56 deliveries on a long-running session: `user` alone has a
+   * p95 of 236 s (12 deliveries past 8 s, max 443 s); every one of those slow
+   * deliveries has an `enqueue`. That is the property the loop relies on — the
+   * slow cases are covered — and it holds regardless of whether `enqueue` is
+   * also emitted in fast ones. Taking whichever lands first gives p95 0.25 s
+   * and a 0.27 s maximum. Neither record alone is sufficient: `enqueue` covers
+   * only a quarter of prompts, and `user` has the 443 s tail.
+   */
+  source: "user" | "enqueue";
+  /** CLI-assigned id. Present on `user` lines only, and it identifies a
+   *  submission rather than a record — a compaction cluster shares one. */
+  promptId?: string;
+  /** Transcript `timestamp`, epoch ms. `0` when unparseable. */
+  ingestedAtMs: number;
+}
+
 /* ───────────────────────────────────────────────────────────────────── */
 /* Extraction helpers                                                    */
 /* ───────────────────────────────────────────────────────────────────── */
