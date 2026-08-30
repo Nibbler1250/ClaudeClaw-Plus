@@ -366,6 +366,7 @@ function matchesScope(
   record: {
     source?: string;
     channelId?: string;
+    userId?: string;
     sessionId?: string;
     provider?: string;
     model?: string;
@@ -384,6 +385,14 @@ function matchesScope(
   if (scope.channelId) {
     const channels = Array.isArray(scope.channelId) ? scope.channelId : [scope.channelId];
     if (!record.channelId || !channels.includes(record.channelId)) {
+      return false;
+    }
+  }
+
+  // Check userId (#258 item 1: per-user budget scoping)
+  if (scope.userId) {
+    const users = Array.isArray(scope.userId) ? scope.userId : [scope.userId];
+    if (!record.userId || !users.includes(record.userId)) {
       return false;
     }
   }
@@ -473,15 +482,25 @@ export async function evaluateBudget(context: {
     // Get period bounds
     const { startDate, endDate } = getPeriodBounds(policy.period);
 
-    // Get usage for the period
+    // Get usage for the period, SCOPED TO THE POLICY (not the request context).
+    // Filtering by context.channelId unconditionally (as before) made a global /
+    // source-scoped / monthly budget count ONLY the current channel's spend ->
+    // under-count -> the cap trips late or never (#277 Terry HIGH: threading
+    // channelId had activated this fail-open). Mirror getBudgetState: only
+    // constrain a dimension the policy actually scopes on; multi-value (string[])
+    // and unscoped dimensions aggregate broadly (over-count = fail-SAFE). channelId
+    // and userId are now persisted per record (#258 item 1), so per-channel /
+    // per-user budgets meter their own spend.
+    const asFilter = (v?: string | string[]) => (typeof v === "string" ? v : undefined);
     const filters: UsageFilters = {
       startDate,
       endDate,
-      sessionId: policy.period === "session" ? context.sessionId : undefined,
-      channelId: context.channelId,
-      source: context.source,
-      provider: context.provider,
-      model: context.model,
+      sessionId: policy.period === "session" ? context.sessionId : asFilter(policy.scope.sessionId),
+      channelId: asFilter(policy.scope.channelId),
+      userId: asFilter(policy.scope.userId),
+      source: asFilter(policy.scope.source),
+      provider: asFilter(policy.scope.provider),
+      model: asFilter(policy.scope.model),
     };
 
     const aggregates = await getAggregates(filters);
@@ -547,6 +566,20 @@ export async function getBudgetState(scope: BudgetScope): Promise<BudgetStateSum
 
   const summaries: BudgetStateSummary[] = [];
 
+  // An empty query scope means "every policy" — the budget-health / dashboard
+  // view passes {}. matchesScope() answers "does this query select this policy?",
+  // and with no fields set it rejects every SCOPED policy (the scoped field has
+  // nothing in the empty query to match against), so getBudgetHealth() silently
+  // dropped all channel/user/model-scoped budgets. Treat an empty query as
+  // "select all"; a non-empty query still filters as before.
+  const selectsAllPolicies =
+    !scope.source &&
+    !scope.channelId &&
+    !scope.userId &&
+    !scope.sessionId &&
+    !scope.provider &&
+    !scope.model;
+
   for (const policy of budgetPolicies!) {
     if (!policy.enabled) {
       continue;
@@ -554,6 +587,7 @@ export async function getBudgetState(scope: BudgetScope): Promise<BudgetStateSum
 
     // Check if policy matches the requested scope
     if (
+      !selectsAllPolicies &&
       !matchesScope(
         scope as {
           source?: string;
@@ -571,10 +605,27 @@ export async function getBudgetState(scope: BudgetScope): Promise<BudgetStateSum
     // Get period bounds
     const { startDate, endDate } = getPeriodBounds(policy.period);
 
-    // Get usage for the period
+    // Get usage for the period, SCOPED to the policy — previously this summed
+    // GLOBAL spend against a scoped threshold, so a per-channel/per-model budget
+    // was compared against everyone's total (governance audit). Map the single-
+    // value scope fields onto the usage filter (UsageFilters can't express the
+    // string[] multi-value form; those still aggregate broadly — noted).
+    //
+    // channelId/userId are now persisted on each usage record (the runner threads
+    // them from the inbound event — #258 item 1), so we filter on them too: a
+    // per-channel / per-user budget meters only its own spend instead of the
+    // global total. Multi-value (string[]) scopes still aggregate broadly
+    // (over-count = fail-SAFE).
+    const asFilter = (v?: string | string[]) => (typeof v === "string" ? v : undefined);
     const filters: UsageFilters = {
       startDate,
       endDate,
+      source: asFilter(policy.scope.source),
+      channelId: asFilter(policy.scope.channelId),
+      userId: asFilter(policy.scope.userId),
+      sessionId: asFilter(policy.scope.sessionId),
+      provider: asFilter(policy.scope.provider),
+      model: asFilter(policy.scope.model),
     };
 
     const aggregates = await getAggregates(filters);

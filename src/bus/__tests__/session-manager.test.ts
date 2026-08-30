@@ -28,6 +28,7 @@ import { join } from "node:path";
 import { encodeCwdForProjectsDir } from "../jsonl-line-types";
 import type { ReceiptRecord } from "../receipt";
 import {
+  buildClaudeArgs,
   defaultSupervisionFor,
   resolveAgentCwd,
   SessionManager,
@@ -55,6 +56,29 @@ describe("defaultSupervisionFor", () => {
     const nonChannel: BusOrigin[] = ["cron", "heartbeat", "cli", "rest"];
     for (const origin of nonChannel) {
       expect(defaultSupervisionFor(origin)).toBe("process-stream-json");
+    }
+  });
+});
+
+/* ───────────────────────────────────────────────────────────────────── */
+/* buildClaudeArgs — native scheduling-tool block (#342)                 */
+/* ───────────────────────────────────────────────────────────────────── */
+
+describe("buildClaudeArgs — native scheduling-tool block", () => {
+  it("blocks CronCreate/CronDelete/CronList/ScheduleWakeup on every spawned bus agent", () => {
+    const agent: AgentConfig = {
+      id: "default",
+      cwd: "/tmp",
+      session_id: "11111111-2222-3333-4444-555555555555",
+    };
+    const args = buildClaudeArgs(agent, "pty-stdin");
+    const idx = args.indexOf("--disallowedTools");
+    expect(idx).toBeGreaterThanOrEqual(0);
+    const value = args[idx + 1];
+    // Comma-joined, matching the neighbouring --allowedTools convention.
+    const blocked = value.split(",");
+    for (const tool of ["CronCreate", "CronDelete", "CronList", "ScheduleWakeup"]) {
+      expect(blocked).toContain(tool);
     }
   });
 });
@@ -745,7 +769,20 @@ describe("session-id collision rotation", () => {
         `echo "Error: Session ID 99999999-9999-9999-9999-999999999bad is already in use."; exit 1`,
       ],
       busSocketPath: "/tmp/test-bus-rotate.sock",
-      sessionCollisionDetectMs: 300,
+      // 2000ms, not 300ms. An UPPER BOUND, not a fixed wait, FOR A STAND-IN
+      // THAT EXITS WITHIN IT — the sibling at the top of this describe keeps
+      // 500ms deliberately, because its retry stand-in `sleep 60`s and so
+      // burns the whole window; do not "fix the inconsistency" by raising it.
+      // `detectSessionIdCollision` resolves as soon as `proc.onExit` fires,
+      // so a fast stand-in still finishes in ~ms and the suite pays nothing.
+      // Observed: at 300ms these tests flaked under the CPU contention of
+      // concurrently running test files; at 2000ms they passed 10/10 in
+      // isolation and across repeated full-suite runs.
+      // NOT claimed: that the window is the only race here. The detector
+      // also depends on the marker chunk arriving before `onExit`
+      // (session-manager.ts:421-435), which no window size fixes. If these
+      // flake again, suspect that ordering rather than raising the bound.
+      sessionCollisionDetectMs: 2000,
       persistRotatedSessionId: async () => {},
       logger: { warn: () => {}, info: () => {}, error: () => {} },
     });
@@ -764,7 +801,20 @@ describe("session-id collision rotation", () => {
       commandOverride: "/bin/sh",
       argsOverride: ["-c", "echo unrelated boot error; exit 1"],
       busSocketPath: "/tmp/test-bus-rotate.sock",
-      sessionCollisionDetectMs: 300,
+      // 2000ms, not 300ms. An UPPER BOUND, not a fixed wait, FOR A STAND-IN
+      // THAT EXITS WITHIN IT — the sibling at the top of this describe keeps
+      // 500ms deliberately, because its retry stand-in `sleep 60`s and so
+      // burns the whole window; do not "fix the inconsistency" by raising it.
+      // `detectSessionIdCollision` resolves as soon as `proc.onExit` fires,
+      // so a fast stand-in still finishes in ~ms and the suite pays nothing.
+      // Observed: at 300ms these tests flaked under the CPU contention of
+      // concurrently running test files; at 2000ms they passed 10/10 in
+      // isolation and across repeated full-suite runs.
+      // NOT claimed: that the window is the only race here. The detector
+      // also depends on the marker chunk arriving before `onExit`
+      // (session-manager.ts:421-435), which no window size fixes. If these
+      // flake again, suspect that ordering rather than raising the bound.
+      sessionCollisionDetectMs: 2000,
       persistRotatedSessionId: async (agentId, sessionId) => {
         persisted.push({ agentId, sessionId });
       },
@@ -790,7 +840,20 @@ describe("session-id collision rotation", () => {
       // inside the detection window.
       argsOverride: ["-c", "echo non-collision crash; exit 1"],
       busSocketPath: "/tmp/test-bus-rotate.sock",
-      sessionCollisionDetectMs: 300,
+      // 2000ms, not 300ms. An UPPER BOUND, not a fixed wait, FOR A STAND-IN
+      // THAT EXITS WITHIN IT — the sibling at the top of this describe keeps
+      // 500ms deliberately, because its retry stand-in `sleep 60`s and so
+      // burns the whole window; do not "fix the inconsistency" by raising it.
+      // `detectSessionIdCollision` resolves as soon as `proc.onExit` fires,
+      // so a fast stand-in still finishes in ~ms and the suite pays nothing.
+      // Observed: at 300ms these tests flaked under the CPU contention of
+      // concurrently running test files; at 2000ms they passed 10/10 in
+      // isolation and across repeated full-suite runs.
+      // NOT claimed: that the window is the only race here. The detector
+      // also depends on the marker chunk arriving before `onExit`
+      // (session-manager.ts:421-435), which no window size fixes. If these
+      // flake again, suspect that ordering rather than raising the bound.
+      sessionCollisionDetectMs: 2000,
       logger: { warn: () => {}, info: () => {}, error: () => {} },
     });
     const agent = mkAgent({ id: "rot-race", session_id: STALE });
@@ -839,7 +902,14 @@ describe("JSONL tailer wiring (issue #215)", () => {
     const enc = encodeCwdForProjectsDir(realpathSync(agentCwd));
     mkdirSync(join(projectsDir, enc), { recursive: true });
     sessionPath = join(projectsDir, enc, `${SID}.jsonl`);
-    bus = createBusCore({ eventLogAppend: (async () => ({})) as never });
+    // replyNudge:false: this suite proves the synthesis runtime wiring; the
+    // nudge-first path (#215/#240) is exercised in core.test.ts. With the nudge
+    // on, a turn_end would inject a reminder to /bin/cat (which never replies)
+    // instead of synthesizing, so the wiring assertion must target the fallback.
+    bus = createBusCore({
+      eventLogAppend: (async () => ({})) as never,
+      replyNudge: false,
+    });
     mgr = new SessionManager({
       commandOverride: "/bin/cat",
       argsOverride: [],

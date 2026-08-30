@@ -1,4 +1,5 @@
 import { timingSafeEqual, randomUUID } from "crypto";
+import { readMemoryPressure } from "../observability/memory-pressure.js";
 import { tmpdir } from "node:os";
 import { htmlPage } from "./page/html";
 import { clampInt, json } from "./http";
@@ -285,7 +286,47 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
       // Health check is intentionally pre-auth so monitors / load balancers
       // work unauthenticated.
       if (url.pathname === "/api/health") {
-        return json({ ok: true, now: Date.now() });
+        // #178: expose the daemon cgroup memory state so external monitors
+        // can tell a memory-freeze (cgroup over MemoryHigh — kill the hog,
+        // do NOT restart-loop the daemon) apart from a dead daemon. See
+        // docs/deploy-systemd-hardening.md. `ok` stays true: the freeze
+        // discriminator must not trip naive ok-based restart loops.
+        // Health is deliberately pre-auth (monitors / load balancers), so
+        // the unauthenticated payload carries ONLY the boolean signal —
+        // byte counts and configured limits require the web token.
+        const mem = readMemoryPressure();
+        const authed = checkToken(req, opts.token);
+        // #315: pre-auth busy signal so an external restart guard can
+        // drain-then-restart instead of killing an in-flight turn. Follows the
+        // #178 rule: the unauthenticated payload carries ONLY the boolean; the
+        // agent count requires the web token. `ok` stays true — a busy agent is
+        // not unhealthy (busy is orthogonal to health, per IETF health+json /
+        // k8s readiness guidance). Absent bus (legacy mode) → field omitted.
+        const activeTurns = opts.bus?.activeTurnAgents();
+        return json({
+          ok: true,
+          now: Date.now(),
+          ...(activeTurns
+            ? {
+                busy: activeTurns.length > 0,
+                ...(authed ? { activeTurns: activeTurns.length } : {}),
+              }
+            : {}),
+          ...(mem.supported
+            ? {
+                memory: {
+                  overHigh: mem.overHigh,
+                  ...(authed
+                    ? {
+                        currentBytes: mem.currentBytes,
+                        highBytes: mem.highBytes,
+                        highEvents: mem.highEvents,
+                      }
+                    : {}),
+                },
+              }
+            : {}),
+        });
       }
 
       // Issue #164 PR B: require the web token for every /api/* route.
@@ -317,7 +358,10 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
       }
 
       if (url.pathname === "/api/state") {
-        return json(await buildState(opts.getSnapshot()));
+        // #325: fold the bus-derived operator alerts into the polled state.
+        // Absent bus (legacy mode) → empty list, no panel.
+        const state = await buildState(opts.getSnapshot());
+        return json({ ...state, operatorAlerts: opts.bus?.recentOperatorAlerts?.() ?? [] });
       }
 
       if (url.pathname === "/api/settings") {

@@ -7,7 +7,9 @@
  * IMPORTANT: Skill overlays must not become a privilege-escalation path.
  * - "preferredTools" influences recommendation, not security overrides
  * - "requiredTools" surfaces actionable policy errors when unavailable
- * - "deniedTools" are enforced as restrictions even when globally allowed
+ * - "deniedTools" become deny rules at priority 150 (basePriority + 50): they
+ *   restrict tools a broader rule allows, but the deny is NOT absolute — a
+ *   higher-priority (or equal-priority, more-specific) allow still outranks it.
  */
 
 import type { PolicyRule, ToolRequestContext } from "./engine";
@@ -166,7 +168,9 @@ export function overlayToRules(overlay: SkillOverlay, basePriority: number = 100
     for (const tool of overlay.deniedTools) {
       rules.push({
         id: `skill-${overlay.skillName}-deny-${tool}`,
-        priority: basePriority + 50, // Higher than typical rules
+        // Above typical rules so an overlay deny outranks a broad allow — but
+        // NOT absolute: an equal/higher-priority allow still wins (see sortRules).
+        priority: basePriority + 50,
         scope: {
           skillName: overlay.skillName,
         },
@@ -178,6 +182,97 @@ export function overlayToRules(overlay: SkillOverlay, basePriority: number = 100
   }
 
   return rules;
+}
+
+// ============================================================================
+// Sync Overlay Rules Cache (#258 item 2)
+// ============================================================================
+
+/**
+ * Skill overlays live in SKILL.md files (async to read). The policy engine's
+ * getApplicableRules is synchronous, so overlay-derived deny rules are cached
+ * here keyed by skillName. The cache is populated when a surface resolves a
+ * slash command to a skill (the SKILL.md content is already in hand at that
+ * point), then read synchronously during evaluation.
+ *
+ * Lifecycle (#284 LOW): a long-running daemon must not hold overlay rules
+ * forever. Each entry carries `cachedAt`; entries older than OVERLAY_CACHE_TTL_MS
+ * expire (forcing re-population on the next slash-command resolve, which is
+ * where fresh SKILL.md content is available, so an edited SKILL.md is not served
+ * stale indefinitely), and the cache is bounded to OVERLAY_CACHE_MAX entries
+ * (oldest evicted first) so it can't grow unbounded.
+ */
+interface CachedOverlay {
+  rules: PolicyRule[];
+  cachedAt: number;
+}
+const overlayRulesCache = new Map<string, CachedOverlay>();
+const OVERLAY_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const OVERLAY_CACHE_MAX = 256;
+
+/** Drop expired entries and bound the cache to OVERLAY_CACHE_MAX (oldest first). */
+function pruneOverlayCache(now: number): void {
+  for (const [name, entry] of overlayRulesCache) {
+    if (now - entry.cachedAt > OVERLAY_CACHE_TTL_MS) overlayRulesCache.delete(name);
+  }
+  // Map preserves insertion order, so the first key is the oldest.
+  while (overlayRulesCache.size > OVERLAY_CACHE_MAX) {
+    const oldest = overlayRulesCache.keys().next().value;
+    if (oldest === undefined) break;
+    overlayRulesCache.delete(oldest);
+  }
+}
+
+/**
+ * Parse a skill's overlay from its (already-loaded) SKILL.md content and cache
+ * the derived deny rules under skillName. Overlay-less skills cache an empty
+ * array so repeat lookups stay sync and allocation-free.
+ */
+export function cacheSkillOverlayFromContent(skillName: string, content: string): void {
+  const overlay = parseSkillMetadata(content, skillName);
+  const now = Date.now();
+  // Delete-then-set so a refreshed entry moves to the most-recent insertion
+  // slot, keeping the size-based eviction order meaningful.
+  overlayRulesCache.delete(skillName);
+  overlayRulesCache.set(skillName, {
+    rules: overlay ? overlayToRules(overlay) : [],
+    cachedAt: now,
+  });
+  pruneOverlayCache(now);
+}
+
+/** Synchronously get cached overlay deny rules for a skill (empty if none/expired). */
+export function getCachedSkillOverlayRules(skillName?: string): PolicyRule[] {
+  if (!skillName) return [];
+  const entry = overlayRulesCache.get(skillName);
+  if (!entry) return [];
+  if (Date.now() - entry.cachedAt > OVERLAY_CACHE_TTL_MS) {
+    overlayRulesCache.delete(skillName);
+    return [];
+  }
+  return entry.rules;
+}
+
+/**
+ * Whether a non-expired overlay entry is cached for this skill. Lets callers
+ * distinguish "skill declared no deny overlay" (cached empty) from "overlay was
+ * never resolved in this process / has expired" — the process-local-cache gap
+ * the engine surfaces for observability (#284 LOW).
+ */
+export function hasCachedSkillOverlay(skillName?: string): boolean {
+  if (!skillName) return false;
+  const entry = overlayRulesCache.get(skillName);
+  if (!entry) return false;
+  if (Date.now() - entry.cachedAt > OVERLAY_CACHE_TTL_MS) {
+    overlayRulesCache.delete(skillName);
+    return false;
+  }
+  return true;
+}
+
+/** Clear the overlay rules cache (tests / skill reload). */
+export function clearSkillOverlayRulesCache(): void {
+  overlayRulesCache.clear();
 }
 
 // ============================================================================

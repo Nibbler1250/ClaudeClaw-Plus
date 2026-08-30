@@ -376,6 +376,37 @@ export async function start(args: string[] = []) {
   const settings = await loadSettings();
   await ensureProjectClaudeMd();
 
+  // Wire operator-facing governance config into the in-memory watchdog state
+  // (#268). Without this, `settings.governance.watchdog.{enabled,limits}` is
+  // parsed but never reaches the runtime, leaving the hardcoded defaults
+  // (currently `enabled: false` after #270's band-aid) in effect.
+  try {
+    const { configureWatchdog } = await import("../governance/watchdog");
+    const w = settings.governance.watchdog;
+    // Build the limits object only with defined fields — `configureWatchdog`
+    // spreads `config.limits` onto the existing defaults, so any `undefined`
+    // would clobber a sane default with nothing.
+    const limits: Partial<{
+      maxToolCalls: number;
+      maxTurns: number;
+      maxRuntimeSeconds: number;
+      maxRepeatedTools: number;
+      repeatedToolThreshold: number;
+    }> = {};
+    if (w.maxToolCalls !== undefined) limits.maxToolCalls = w.maxToolCalls;
+    if (w.maxTurns !== undefined) limits.maxTurns = w.maxTurns;
+    if (w.maxRuntimeSeconds !== undefined) limits.maxRuntimeSeconds = w.maxRuntimeSeconds;
+    if (w.maxRepeatedTools !== undefined) limits.maxRepeatedTools = w.maxRepeatedTools;
+    if (w.repeatedToolThreshold !== undefined)
+      limits.repeatedToolThreshold = w.repeatedToolThreshold;
+    configureWatchdog({
+      ...(w.enabled !== undefined ? { enabled: w.enabled } : {}),
+      ...(Object.keys(limits).length > 0 ? { limits } : {}),
+    });
+  } catch (err) {
+    console.warn("[start] governance watchdog config wiring failed:", err);
+  }
+
   // Wire deployed claudeclaw's skills/commands into Claude Code's user-level
   // discovery paths (~/.claude/skills/, ~/.claude/commands/). No-op in local
   // dev. Idempotent and non-destructive.
@@ -443,6 +474,15 @@ export async function start(args: string[] = []) {
   // trigger routes (jobs/fire, inject, chat) instead of spawning a
   // sidecar PTY claude that would race the bus's own session.
   let busCoreForWebUi: import("../bus/core").BusCore | null = null;
+  // #294: live Kanban board of subagent activity — a global bus subscriber that
+  // turns Task/Agent tool_use → tool_result into board cards. Instantiated in the
+  // deferred-spawn block once the bus + agents are up; stopped on teardown.
+  let kanbanTracker: import("../bus/kanban-tracker").KanbanTracker | null = null;
+  // #325: recent operator alerts (stall watchdog, …) for the polled /api/state
+  // dashboard panel — a global bus subscriber over `system.operator_alert`.
+  // Mounted with the bus, detached on teardown; the web bridge reads it via
+  // `recentOperatorAlerts`.
+  let operatorAlertBuffer: import("../bus/operator-alert-buffer").OperatorAlertBuffer | null = null;
 
   // Plugin system — initialize before gateway start
   const pluginManager = new PluginManager(process.cwd());
@@ -590,6 +630,24 @@ export async function start(args: string[] = []) {
     if (discordStopGateway) discordStopGateway();
     if (slackStopFn) slackStopFn();
     if (web) web.stop();
+    // #294: unsubscribe the kanban tracker before the bus stops.
+    if (kanbanTracker) {
+      try {
+        kanbanTracker.stop();
+      } catch (err) {
+        console.error("[kanban-tracker] shutdown failed", err);
+      }
+      kanbanTracker = null;
+    }
+    // #325: detach the operator-alert buffer before the bus stops.
+    if (operatorAlertBuffer) {
+      try {
+        operatorAlertBuffer.detach();
+      } catch (err) {
+        console.error("[operator-alert-buffer] shutdown failed", err);
+      }
+      operatorAlertBuffer = null;
+    }
     if (busRuntimeHandle) {
       try {
         await busRuntimeHandle.stop();
@@ -923,6 +981,59 @@ export async function start(args: string[] = []) {
       });
       busRuntimeHandle.attachScheduler(schedulerHandle);
 
+      // #325: mount the operator-alert buffer now that the bus is up — a global
+      // subscriber over `system.operator_alert` feeding the web dashboard's
+      // polled alerts panel. Detached in shutdown() below.
+      try {
+        const { OperatorAlertBuffer } = await import("../bus/operator-alert-buffer");
+        operatorAlertBuffer = new OperatorAlertBuffer();
+        operatorAlertBuffer.attach(busRuntimeHandle.bus);
+      } catch (err) {
+        console.error("[operator-alert-buffer] mount failed", err);
+      }
+
+      // #294: mount the live Kanban tracker now that the bus + agents are up.
+      // A pure global bus subscriber — maps subagent (Task/Agent) tool_use →
+      // tool_result onto the Web UI board via the (previously unwired) kanban
+      // mutators. Gated ON by default (`settings.kanban.enabled`). Stopped in
+      // shutdown() and in the deferred-spawn rollback below.
+      if (currentSettings.kanban?.enabled !== false) {
+        try {
+          const { KanbanTracker } = await import("../bus/kanban-tracker");
+          const kanbanSvc = await import("../ui/services/kanban");
+          const bus = busRuntimeHandle.bus;
+          kanbanTracker = new KanbanTracker(
+            { enabled: true, maxDoneCards: kanbanSvc.DEFAULT_MAX_DONE_CARDS },
+            {
+              subscribe: (handler) => {
+                const sub = bus.subscribe(
+                  {
+                    topics: [
+                      "response.tool_use",
+                      "tool_result",
+                      "session.end",
+                      "session.init",
+                      "session.agent_name",
+                    ],
+                  },
+                  handler,
+                );
+                return () => sub.close();
+              },
+              addCard: kanbanSvc.addCardToColumn,
+              moveCard: kanbanSvc.moveCard,
+              capDone: kanbanSvc.capDoneCards,
+              now: () => Date.now(),
+              log: (msg, err) => console.warn(`[${ts()}] kanban-tracker: ${msg}`, err),
+            },
+          );
+          kanbanTracker.start();
+        } catch (kbErr) {
+          console.warn(`[${ts()}] kanban tracker mount failed (non-fatal):`, kbErr);
+          kanbanTracker = null;
+        }
+      }
+
       // Issue #166: write the architecture doc only after the bus booted
       // end-to-end (spawn + scheduler), so a doc on disk always reflects a
       // genuinely-running bus. Best-effort — a missing doc degrades agent
@@ -948,6 +1059,17 @@ export async function start(args: string[] = []) {
         `[${ts()}] Bus runtime: deferred agent spawn failed — tearing down and falling back to legacy command surfaces`,
         spawnErr,
       );
+      // #294: tear down the kanban subscriber alongside the bus on rollback.
+      // Inside this catch, `kanbanTracker` narrows to `never` purely as a tsc
+      // error-recovery artifact cascading from the pre-existing type errors
+      // upstream in this fn (~L832); the value is correct at runtime, so cast
+      // through the real shape to keep the teardown typechecking.
+      try {
+        (kanbanTracker as { stop(): void } | null)?.stop();
+      } catch {
+        /* best-effort */
+      }
+      kanbanTracker = null;
       try {
         await busRuntimeHandle.stop();
       } catch (stopErr) {
@@ -1100,6 +1222,11 @@ export async function start(args: string[] = []) {
                 origin: "webui",
                 originId: "chat",
                 onChunk,
+                // #227: actually rotate the live PTY when the threshold trips.
+                // Bare reference is safe — rotateAgent is a closure over the
+                // SessionManager (no `this`); evaluated per-call so the handle
+                // is set by the time a chat request runs.
+                rotateAgent: busRuntimeHandle?.rotateAgent,
               });
               // Codex P2 on #136: surface timeout / dispatch failure to
               // the SSE stream so a failed turn doesn't render as a
@@ -1118,6 +1245,10 @@ export async function start(args: string[] = []) {
             busCoreForWebUi && busRuntimeSpawnedAgents[0]
               ? {
                   defaultAgentId: busRuntimeSpawnedAgents[0],
+                  activeTurnAgents: () =>
+                    (busCoreForWebUi as NonNullable<typeof busCoreForWebUi>).activeTurnAgents(),
+                  // #325: feed the dashboard's polled operator-alerts panel.
+                  recentOperatorAlerts: () => operatorAlertBuffer?.recent() ?? [],
                   sendPromptAndAwait: (agentId, text, sendOpts) =>
                     streamBusPrompt(
                       busCoreForWebUi as NonNullable<typeof busCoreForWebUi>,
@@ -1132,6 +1263,8 @@ export async function start(args: string[] = []) {
                         origin: sendOpts?.origin as import("../bus/types").BusOrigin | undefined,
                         originId: sendOpts?.originId,
                         timeoutMs: sendOpts?.timeoutMs,
+                        // #227: rotate the live PTY when the threshold trips.
+                        rotateAgent: busRuntimeHandle?.rotateAgent,
                       },
                     ),
                 }

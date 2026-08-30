@@ -1,8 +1,18 @@
-import { join, isAbsolute } from "path";
-import { mkdir } from "fs/promises";
-import { existsSync } from "fs";
+import { join, isAbsolute } from "node:path";
+import { mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { normalizeTimezoneName, resolveTimezoneOffsetMinutes } from "./timezone";
 import { parseWatchdogConfig, type WatchdogConfig } from "./watchdog";
+import {
+  DEFAULT_STALL_CONFIG,
+  parseStallWatchdogConfig,
+  type StallWatchdogConfig,
+} from "./bus/stall-watchdog";
+import {
+  DEFAULT_AGENT_JOB_CONFIG,
+  parseAgentJobConfig,
+  type AgentJobConfig,
+} from "./bus/agent-jobs";
 import { parsePlugins, type PluginEntry } from "./plugins";
 import { parseMemorySearchSettings, type MemorySearchSettings } from "./memory";
 
@@ -35,6 +45,29 @@ const LOGS_DIR = join(HEARTBEAT_DIR, "logs");
 export const DEFAULT_SESSION_TIMEOUT_MS = 120 * 60 * 1000;
 
 export const DEFAULT_IMAGE_OUTPUT_ROOT = join(HEARTBEAT_DIR, "outbox", "discord");
+
+/**
+ * Claude Code's native scheduling tools, blocked on every claude process the
+ * daemon spawns — both the interactive bus PTY session (`buildClaudeArgs`) and
+ * every headless `claude -p` path (`buildSecurityArgs`, e.g. the `dispatch_job`
+ * subagent runner).
+ *
+ * Their wakeups are tied to the specific session that registered them. Under
+ * the bus runtime a session rotates/churns independently of the daemon, and a
+ * headless dispatch is a one-shot process that exits immediately — so a
+ * wakeup scheduled through these tools silently never fires (issue #342, the
+ * lost "call the GP for Ginna at 8am" reminder). ClaudeClaw+'s own file-backed
+ * scheduler (`schedule_task`) is durable across those boundaries and is the
+ * only correct path, so the native tools are removed rather than left as a
+ * tempting wrong door. Hardcoded, not operator-configurable: they're broken by
+ * architecture here, not a security preference.
+ */
+export const NATIVE_SCHEDULING_TOOLS_BLOCKLIST = [
+  "CronCreate",
+  "CronDelete",
+  "CronList",
+  "ScheduleWakeup",
+] as const;
 
 export function getJobsDir(): string {
   if (cached?.jobsDir) {
@@ -168,6 +201,16 @@ const DEFAULT_SETTINGS: Settings = {
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   stt: { baseUrl: "", model: "" },
+  attachments: {
+    enabled: true,
+    maxBytes: 25 * 1024 * 1024,
+    maxInlineTextBytes: 64 * 1024,
+    maxAttachmentsPerMessage: 10,
+    maxTranscribeBytes: 8 * 1024 * 1024,
+    rootDir: "",
+    transcribeVoice: true,
+    retentionHours: 24,
+  },
   sessionTimeoutMs: DEFAULT_SESSION_TIMEOUT_MS,
   timeouts: { telegram: 5, discord: 5, heartbeat: 15, job: 30, default: 5 },
   pty: {
@@ -216,6 +259,11 @@ const DEFAULT_SETTINGS: Settings = {
     },
   },
   watchdog: { maxConsecutiveTimeouts: null, maxRuntimeSeconds: null },
+  // Clone so a future in-place edit of settings.stallWatchdog can't mutate the
+  // shared exported default.
+  stallWatchdog: structuredClone(DEFAULT_STALL_CONFIG),
+  agentJobs: structuredClone(DEFAULT_AGENT_JOB_CONFIG),
+  governance: { watchdog: {} },
   session: { autoRotate: false, maxMessages: 50, maxAgeHours: 24, summaryPath: "" },
   // Default runtime: `bus` (Sprint 5.4 flip after Hetzner staging soak ended
   // 2026-05-25). `runtime: "pty"` remains as a permanent first-class option
@@ -242,6 +290,9 @@ const DEFAULT_SETTINGS: Settings = {
     tiers: { fast: [], balanced: [], reasoning: [] },
     openRouterBaseUrl: "https://openrouter.ai/api/v1",
   },
+  // eval-framework (#80) lives under `governance.evalFramework` (see
+  // GovernanceConfig) — its field defaults come from the plugin's own zod
+  // schema (src/plugins/eval-framework/types.ts), so nothing to seed here.
 };
 
 export interface HeartbeatExcludeWindow {
@@ -642,6 +693,7 @@ export interface Settings {
   security: SecurityConfig;
   web: WebConfig;
   stt: SttConfig;
+  attachments: AttachmentsConfig;
   apiToken?: string;
   sessionTimeoutMs: number;
   timeouts: TimeoutsConfig;
@@ -668,11 +720,25 @@ export interface Settings {
   pty: PtyConfig;
   mcp: McpConfig;
   watchdog: WatchdogSettings;
+  stallWatchdog: StallWatchdogConfig;
+  /** Agent-job primitive config (#296 PR 3): concurrency cap + per-job timeouts. */
+  agentJobs: AgentJobConfig;
+  governance: GovernanceConfig;
   plugins: Record<string, PluginEntry>;
   session: SessionConfig;
   memorySearch: MemorySearchSettings;
   llmRouter: LlmRouterConfig;
   jobsDir?: string;
+  /**
+   * Live Kanban board of subagent activity (#294). Optional; when absent the
+   * tracker defaults ON. Set `{ enabled: false }` to disable the bus-driven
+   * board feed (the manual `/api/kanban` "+ Add task" path is unaffected).
+   */
+  kanban?: KanbanSettings;
+}
+
+export interface KanbanSettings {
+  enabled: boolean;
 }
 
 /**
@@ -688,6 +754,39 @@ export interface LlmRouterConfig {
   openRouterBaseUrl: string;
   /** Optional local Ollama OpenAI-compatible base (e.g. http://127.0.0.1:11434/v1). */
   ollamaBaseUrl?: string;
+}
+
+/**
+ * Operator-facing config for the governance watchdog (`src/governance/watchdog.ts`).
+ *
+ * The fields here mirror the runtime `WatchdogConfig` but are kept narrow so
+ * settings.json doesn't have to deal with the internal in-memory shape. Unset
+ * fields fall back to the hardcoded runtime defaults.
+ */
+export interface GovernanceWatchdogConfig {
+  enabled?: boolean;
+  maxToolCalls?: number;
+  maxTurns?: number;
+  maxRuntimeSeconds?: number;
+  maxRepeatedTools?: number;
+  repeatedToolThreshold?: number;
+}
+
+export interface GovernanceConfig {
+  watchdog: GovernanceWatchdogConfig;
+  // eval-framework (#80). All fields optional: the plugin's zod schema
+  // (EvalFrameworkSettingsSchema) fills defaults at construction, so an
+  // operator only writes the keys they change (plus enabled=true to opt in).
+  evalFramework?: {
+    enabled?: boolean;
+    evals_root?: string;
+    database_path?: string;
+    reports_dir?: string;
+    default_max_cost_usd?: number;
+    default_judge_model?: string;
+    provider_credentials_env?: Record<string, string>;
+    budget_guard_scope?: string;
+  };
 }
 
 export interface AgenticMode {
@@ -729,6 +828,27 @@ export interface SttConfig {
   delegateTool?: string;
 }
 
+export interface AttachmentsConfig {
+  /** Master switch for the inbound attachment pipeline. Default: true. */
+  enabled: boolean;
+  /** Skip attachments larger than this many bytes. Default: 25 MiB. */
+  maxBytes: number;
+  /** Inlined text content is truncated to this many bytes. Default: 64 KiB. */
+  maxInlineTextBytes: number;
+  /** Base directory downloaded attachments are written under; per agent/message
+   *  subdirs are created beneath it. Empty → `<cwd>/.claudeclaw/inbound-attachments`. */
+  rootDir: string;
+  /** Transcribe voice/audio attachments via the STT pipeline. Default: true. */
+  transcribeVoice: boolean;
+  /** Max attachments processed per message; the rest are noted. Default: 10. */
+  maxAttachmentsPerMessage: number;
+  /** Don't transcribe audio larger than this many bytes. Default: 8 MiB. */
+  maxTranscribeBytes: number;
+  /** Delete saved attachment dirs older than this many hours (TTL cleanup).
+   *  Default: 24. Set 0 to disable cleanup. */
+  retentionHours: number;
+}
+
 export interface SessionConfig {
   /** Automatically rotate the global session when a threshold is exceeded. Default: false. */
   autoRotate: boolean;
@@ -748,7 +868,7 @@ export async function initConfig(): Promise<void> {
   await mkdir(LOGS_DIR, { recursive: true });
 
   if (!existsSync(SETTINGS_FILE)) {
-    await Bun.write(SETTINGS_FILE, JSON.stringify(DEFAULT_SETTINGS, null, 2) + "\n");
+    await Bun.write(SETTINGS_FILE, `${JSON.stringify(DEFAULT_SETTINGS, null, 2)}\n`);
   }
 }
 
@@ -932,6 +1052,35 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
         ? { delegateTool: raw.stt.delegateTool.trim() }
         : {}),
     },
+    attachments: {
+      enabled: raw.attachments?.enabled !== false,
+      maxBytes:
+        Number.isFinite(raw.attachments?.maxBytes) && Number(raw.attachments.maxBytes) > 0
+          ? Number(raw.attachments.maxBytes)
+          : 25 * 1024 * 1024,
+      maxInlineTextBytes:
+        Number.isFinite(raw.attachments?.maxInlineTextBytes) &&
+        Number(raw.attachments.maxInlineTextBytes) > 0
+          ? Number(raw.attachments.maxInlineTextBytes)
+          : 64 * 1024,
+      maxAttachmentsPerMessage:
+        Number.isFinite(raw.attachments?.maxAttachmentsPerMessage) &&
+        Number(raw.attachments.maxAttachmentsPerMessage) > 0
+          ? Number(raw.attachments.maxAttachmentsPerMessage)
+          : 10,
+      maxTranscribeBytes:
+        Number.isFinite(raw.attachments?.maxTranscribeBytes) &&
+        Number(raw.attachments.maxTranscribeBytes) > 0
+          ? Number(raw.attachments.maxTranscribeBytes)
+          : 8 * 1024 * 1024,
+      rootDir: typeof raw.attachments?.rootDir === "string" ? raw.attachments.rootDir.trim() : "",
+      transcribeVoice: raw.attachments?.transcribeVoice !== false,
+      retentionHours:
+        Number.isFinite(raw.attachments?.retentionHours) &&
+        Number(raw.attachments.retentionHours) >= 0
+          ? Number(raw.attachments.retentionHours)
+          : 24,
+    },
     sessionTimeoutMs:
       Number.isFinite(raw.sessionTimeoutMs) && (raw.sessionTimeoutMs as number) > 0
         ? (raw.sessionTimeoutMs as number)
@@ -1008,6 +1157,9 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
     agents: parseBusAgents(raw.agents),
     mcp: parseMcpConfig(raw.mcp, raw.web?.enabled),
     watchdog: parseWatchdogConfig(raw.watchdog),
+    stallWatchdog: parseStallWatchdogConfig(raw.stallWatchdog),
+    agentJobs: parseAgentJobConfig(raw.agentJobs),
+    governance: parseGovernanceConfig(raw.governance),
     plugins: parsePlugins(raw.plugins),
     memorySearch: parseMemorySearchSettings(raw.memorySearch),
     llmRouter: parseLlmRouterConfig(raw.llmRouter),
@@ -1022,6 +1174,11 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
       typeof raw.apiToken === "string" && raw.apiToken.trim() ? raw.apiToken.trim() : undefined,
     ...(typeof raw.jobsDir === "string" && raw.jobsDir.trim()
       ? { jobsDir: raw.jobsDir.trim() }
+      : {}),
+    // #294: live Kanban board of subagent activity. Present-but-not-false ⇒
+    // enabled; absent block leaves `kanban` undefined (tracker treats as ON).
+    ...(raw.kanban && typeof raw.kanban === "object"
+      ? { kanban: { enabled: (raw.kanban as { enabled?: unknown }).enabled !== false } }
       : {}),
   };
 }
@@ -1159,6 +1316,41 @@ function parseBusAgents(raw: unknown): BusAgentSettings[] {
     }
     out.push(parsed);
   }
+  return out;
+}
+
+/**
+ * Parse the `settings.governance` block: `watchdog` (narrow, optional fields
+ * falling back to runtime defaults in `src/governance/watchdog.ts`) and
+ * `evalFramework` (#80 — carried through as-is when present; the plugin's
+ * zod schema validates and fills defaults at construction).
+ */
+export function parseGovernanceConfig(raw: unknown): GovernanceConfig {
+  const out: GovernanceConfig = { watchdog: {} };
+  if (!raw || typeof raw !== "object") return out;
+  const r = raw as Record<string, unknown>;
+
+  const numIfFinitePositive = (v: unknown): number | undefined =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
+
+  const w = r.watchdog;
+  if (w && typeof w === "object") {
+    const wr = w as Record<string, unknown>;
+    out.watchdog = {
+      enabled: typeof wr.enabled === "boolean" ? wr.enabled : undefined,
+      maxToolCalls: numIfFinitePositive(wr.maxToolCalls),
+      maxTurns: numIfFinitePositive(wr.maxTurns),
+      maxRuntimeSeconds: numIfFinitePositive(wr.maxRuntimeSeconds),
+      maxRepeatedTools: numIfFinitePositive(wr.maxRepeatedTools),
+      repeatedToolThreshold: numIfFinitePositive(wr.repeatedToolThreshold),
+    };
+  }
+
+  const ef = r.evalFramework;
+  if (ef && typeof ef === "object") {
+    out.evalFramework = ef as GovernanceConfig["evalFramework"];
+  }
+
   return out;
 }
 
@@ -1374,7 +1566,7 @@ function parseMcpConfig(raw: any, webEnabled: unknown): McpConfig {
   // (SPEC-DELTA-2026-05-16 always-resume). Anything other than an
   // explicit `false` keeps the default — protects against typos like
   // `"false"` (string) silently disabling persistence.
-  const sessionPersistenceEnabled = raw?.sessionPersistenceEnabled === false ? false : true;
+  const sessionPersistenceEnabled = raw?.sessionPersistenceEnabled !== false;
 
   // Rule 6: sessionMaxAgeSeconds — positive integer, clamp to 60. Anything
   // sub-minute is operator error (TTL eviction would fire faster than a

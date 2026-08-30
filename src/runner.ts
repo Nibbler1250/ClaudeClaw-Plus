@@ -27,6 +27,7 @@ import {
 import {
   getSettings,
   DEFAULT_SESSION_TIMEOUT_MS,
+  NATIVE_SCHEDULING_TOOLS_BLOCKLIST,
   type ModelConfig,
   type SecurityConfig,
   type AgenticMode,
@@ -40,10 +41,15 @@ import {
   recordInvocationStart,
   recordInvocationCompletion,
   recordInvocationFailure,
+  extractTranscriptUsage,
+  type EstimatedCost,
+  type UsageMetrics,
 } from "./governance/usage-tracker";
+import { calculateEstimatedCost } from "./governance/budget-engine";
 import {
   recordExecutionMetric,
   checkLimits,
+  clearInvocation as watchdogClearInvocation,
   handleTrigger as watchdogHandleTrigger,
 } from "./governance/watchdog";
 import {
@@ -61,6 +67,7 @@ import {
   indexSessionsBackground,
 } from "./memory";
 import { loadAgent } from "./agents";
+import { validateModelString } from "./jobs";
 import { selectModel } from "./model-router";
 import { recordResult, abortReason, clearSession, startSession } from "./watchdog";
 import { getPluginManager, type EventContext } from "./plugins";
@@ -739,6 +746,7 @@ export async function runClaudeOnce(
   baseEnv: Record<string, string>,
   timeoutMs: number = DEFAULT_SESSION_TIMEOUT_MS,
   cwd?: string,
+  signal?: AbortSignal,
 ): Promise<{ rawStdout: string; stderr: string; exitCode: number }> {
   const args = [...baseArgs];
   const normalizedModel = model.trim().toLowerCase();
@@ -760,6 +768,13 @@ export async function runClaudeOnce(
       timeoutMs,
     );
   });
+  // Cancellation (e.g. a job cancelled via the AgentJobRunner): abort like a
+  // timeout so the catch below kills the process and returns.
+  const abortPromise = new Promise<never>((_, reject) => {
+    if (!signal) return;
+    if (signal.aborted) reject(new Error("aborted"));
+    else signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+  });
 
   try {
     const [rawStdout, stderr] = (await Promise.race([
@@ -768,6 +783,7 @@ export async function runClaudeOnce(
         collectStream(proc.stderr as ReadableStream<Uint8Array>, MAX_OUTPUT_BYTES),
       ]),
       timeoutPromise,
+      abortPromise,
     ])) as [string, string];
 
     if (timeoutId) clearTimeout(timeoutId);
@@ -801,6 +817,74 @@ export async function runClaudeOnce(
       exitCode: 124,
     };
   }
+}
+
+/**
+ * Build the argv for one headless agent job.
+ *
+ * Extracted so the `--mcp-config` wiring is directly assertable: without the
+ * flag a dispatched job cannot reach any of the operator's `mcp.shared`
+ * servers, while the agent that dispatched it reaches all of them.
+ */
+export function buildAgentJobArgs(input: {
+  prompt: string;
+  securityArgs: string[];
+  persona: string;
+  mcpConfigPath?: string;
+}): string[] {
+  const args = [CLAUDE_EXECUTABLE, "-p", input.prompt, ...input.securityArgs];
+  if (input.persona) args.push("--append-system-prompt", input.persona);
+  if (input.mcpConfigPath) args.push("--mcp-config", input.mcpConfigPath);
+  return args;
+}
+
+/**
+ * Run a named agent as a one-shot headless job (for the bus AgentJobRunner). Loads
+ * the agent's persona (IDENTITY/SOUL/CLAUDE.md), runs `claude -p <prompt>` in the
+ * agent's dir with plain-text output, and returns the final text. Honours the
+ * AbortSignal (cancel → kill) and the timeout via `runClaudeOnce`. This is the
+ * supported replacement for the hand-rolled `/tmp` fire-scripts that caused #295.
+ */
+export async function runAgentJobHeadless(input: {
+  agent: string;
+  prompt: string;
+  model?: string;
+  timeoutMs: number;
+  signal: AbortSignal;
+  /**
+   * Absolute path to a synthesized `--mcp-config` for this job, or omitted
+   * when the MCP multiplexer is dormant. Minted and released by the caller
+   * (the bus wires the job runner and owns the multiplexer identity); this
+   * function only forwards the flag to the spawned `claude`.
+   */
+  mcpConfigPath?: string;
+}): Promise<{ exitCode: number; resultText?: string; error?: string; timedOut?: boolean }> {
+  const settings = getSettings();
+  // Security review (#296 PR 3): validate the caller-supplied model against the
+  // allow-list before spawning — reject an attacker-picked tier rather than
+  // silently falling back. Throws → the job is marked failed (never spawns).
+  validateModelString(input.model, "agent job");
+  const ctx = await loadAgent(input.agent);
+  const persona = await loadAgentPrompts(input.agent);
+  const args = buildAgentJobArgs({
+    prompt: input.prompt,
+    securityArgs: buildSecurityArgs(settings.security),
+    persona,
+    mcpConfigPath: input.mcpConfigPath,
+  });
+  const model = input.model?.trim() || settings.model;
+  const { rawStdout, stderr, exitCode } = await runClaudeOnce(
+    args,
+    model,
+    settings.api,
+    cleanSpawnEnv(),
+    input.timeoutMs,
+    ctx.dir,
+    input.signal,
+  );
+  if (exitCode === 124) return { exitCode, timedOut: true, error: stderr || "timed out" };
+  if (exitCode !== 0) return { exitCode, error: stderr || `claude exited ${exitCode}` };
+  return { exitCode, resultText: rawStdout.trim() };
 }
 
 // Runs claude with --output-format stream-json --verbose, reading NDJSON events as they
@@ -1298,28 +1382,36 @@ export function buildSecurityArgs(security: SecurityConfig): string[] {
       ? ["--dangerously-skip-permissions"]
       : ["--permission-mode", permissionMode];
 
-  switch (security.level) {
-    case "locked":
-      // Include Write tool so memory persistence works even in locked mode
-      args.push("--tools", "Read,Grep,Glob,Write");
-      break;
-    case "strict":
-      args.push("--disallowedTools", "Bash,WebSearch,WebFetch");
-      break;
-    case "moderate":
-      // all tools available, scoped to project dir via system prompt
-      break;
-    case "unrestricted":
-      // all tools, no directory restriction
-      break;
+  // Native scheduling tools (CronCreate/…) are broken in every daemon-spawned
+  // claude process — a headless `claude -p` is a one-shot that exits before any
+  // wakeup could fire (#342). Block them everywhere buildSecurityArgs is used,
+  // merged into a single `--disallowedTools` alongside the level's own denials
+  // and any operator config, so multiple `--disallowedTools` flags can't fight.
+  const disallowed = new Set<string>(NATIVE_SCHEDULING_TOOLS_BLOCKLIST);
+
+  if (security.level === "locked") {
+    // Include Write tool so memory persistence works even in locked mode. This
+    // is an allow-LIST (`--tools`): everything else, native cron included, is
+    // already unavailable, so no `--disallowedTools` is needed here.
+    args.push("--tools", "Read,Grep,Glob,Write");
+    if (security.allowedTools.length > 0) {
+      args.push("--allowedTools", security.allowedTools.join(" "));
+    }
+    return args;
   }
+
+  if (security.level === "strict") {
+    disallowed.add("Bash");
+    disallowed.add("WebSearch");
+    disallowed.add("WebFetch");
+  }
+  // "moderate" / "unrestricted": all tools available except the merged denials.
+  for (const tool of security.disallowedTools) disallowed.add(tool);
 
   if (security.allowedTools.length > 0) {
     args.push("--allowedTools", security.allowedTools.join(" "));
   }
-  if (security.disallowedTools.length > 0) {
-    args.push("--disallowedTools", security.disallowedTools.join(" "));
-  }
+  args.push("--disallowedTools", [...disallowed].join(","));
 
   return args;
 }
@@ -1484,7 +1576,12 @@ async function evaluateToolForExecution(
 /**
  * Get context for policy evaluation from current session and settings.
  */
-async function getPolicyContext(source: string): Promise<{
+async function getPolicyContext(
+  source: string,
+  channelId?: string,
+  userId?: string,
+  skillName?: string,
+): Promise<{
   eventId: string;
   source: string;
   channelId?: string;
@@ -1498,9 +1595,9 @@ async function getPolicyContext(source: string): Promise<{
   return {
     eventId: crypto.randomUUID(),
     source,
-    channelId: undefined, // Will be populated from event context
-    userId: undefined,
-    skillName: undefined,
+    channelId, // #258 item 1: threaded from inbound event (undefined for non-channel sources)
+    userId,
+    skillName,
     sessionId: existing?.sessionId,
     claudeSessionId: existing?.sessionId ?? null,
   };
@@ -1558,6 +1655,14 @@ export async function compactCurrentThreadSession(
     : { success: false, message: `❌ Compact failed (${existing.sessionId.slice(0, 8)})` };
 }
 
+/**
+ * Identity fields threaded from the inbound surface for policy/budget scoping (#258 item 1).
+ */
+interface PolicyIdentity {
+  userId?: string;
+  skillName?: string;
+}
+
 async function execClaude(
   name: string,
   prompt: string,
@@ -1568,9 +1673,14 @@ async function execClaude(
   timeoutCategory?: string,
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void,
+  identity?: PolicyIdentity,
 ): Promise<RunResult> {
   mainRunCount++;
   persistRunCount();
+  // Invocation ID for watchdog tracking. Declared OUTSIDE the try so the
+  // `finally` can always clear the activeInvocations record on EVERY exit
+  // path — early returns, throws, and normal completion alike (#268).
+  const invocationId = crypto.randomUUID();
   try {
     await mkdir(LOGS_DIR, { recursive: true });
 
@@ -1596,8 +1706,6 @@ async function execClaude(
     const settings = getSettings();
     const { security, model, api, fallback, agentic, watchdog } = settings;
 
-    // Generate invocation ID for tracking
-    const invocationId = crypto.randomUUID();
     const invocationSessionId = existing?.sessionId;
 
     // Initialize watchdog metrics
@@ -1621,7 +1729,8 @@ async function execClaude(
         prompt,
         taskType: agentic.defaultMode,
         sessionId: existing?.sessionId,
-        channelId: undefined,
+        channelId: threadId, // #258 item 1: per-channel budget/policy scoping
+        userId: identity?.userId,
         source: name,
       });
       primaryConfig = {
@@ -1773,7 +1882,9 @@ async function execClaude(
       sessionId: existing?.sessionId,
       claudeSessionId: existing?.sessionId ?? null,
       source: name,
-      channelId: undefined,
+      channelId: threadId, // #258 item 1: persist channel scope into usage record
+      userId: identity?.userId,
+      skillName: identity?.skillName,
       provider:
         primaryConfig.model.startsWith("gpt") ||
         primaryConfig.model.startsWith("o1") ||
@@ -1783,6 +1894,7 @@ async function execClaude(
       model: primaryConfig.model,
       metadata: { taskType, routingReasoning },
     };
+    const invocationStartedAt = new Date().toISOString();
     await recordInvocationStart(invocationContext, invocationId);
 
     // Capture memory file mtime before invocation (for fallback write detection)
@@ -2098,10 +2210,43 @@ async function execClaude(
       exitCode,
     };
 
-    // Record successful completion
-    await recordInvocationCompletion(invocationId, undefined, undefined);
+    // Record successful completion WITH the real token usage + cost so the
+    // budget layer can actually enforce. Previously this passed undefined →
+    // every record had estimatedCost undefined → totalEstimatedCost stayed 0 →
+    // budgetState never left "healthy" → the block branch was unreachable
+    // (governance audit CRITICAL). Usage is read from claude's own session
+    // transcript (works for BOTH the legacy stream-json and the PTY paths);
+    // cost is computed from the configured pricing tier. Best-effort: a failure
+    // here never breaks the invocation.
+    let invocationUsage: UsageMetrics | undefined;
+    let invocationCost: EstimatedCost | undefined;
+    try {
+      const u = await extractTranscriptUsage(
+        spawnCwd ?? PROJECT_DIR,
+        sessionId,
+        invocationStartedAt,
+      );
+      if (u) {
+        invocationUsage = u;
+        const c = calculateEstimatedCost(u, invocationContext.provider, invocationContext.model);
+        if (c) {
+          invocationCost = {
+            currency: "USD",
+            inputCost: c.breakdown.inputCost,
+            outputCost: c.breakdown.outputCost,
+            cacheCost: c.breakdown.cacheCost,
+            totalCost: c.totalCost,
+          };
+        }
+      }
+    } catch {
+      // best-effort — usage accounting must never break the invocation
+    }
+    await recordInvocationCompletion(invocationId, invocationUsage, invocationCost);
 
-    // Check watchdog limits
+    // Check watchdog limits. Both suspend AND kill route through
+    // handleTrigger, which dispatches by state (kill → audited terminate path).
+    // `kill` is now reachable (#280): checkLimits escalates past the hard ceiling.
     const watchdogDecision = await checkLimits({ invocationId, sessionId: invocationSessionId });
     if (watchdogDecision.state === "suspend" || watchdogDecision.state === "kill") {
       console.warn(
@@ -2110,6 +2255,7 @@ async function execClaude(
       await watchdogHandleTrigger(
         { invocationId, sessionId: invocationSessionId },
         watchdogDecision,
+        { terminate: killActive },
       );
       // Send escalation notification for watchdog triggers
       try {
@@ -2295,6 +2441,7 @@ async function execClaude(
             await watchdogHandleTrigger(
               { invocationId, sessionId: invocationSessionId },
               retryWatchdogDecision,
+              { terminate: killActive },
             );
           }
         }
@@ -2337,6 +2484,18 @@ async function execClaude(
 
     return result;
   } finally {
+    // Lifecycle hook (#268): drop the invocation record on EVERY exit path —
+    // normal completion, early returns (budget block, consecutive-timeout
+    // abort, auto-compact retry) and throws. Without this, `activeInvocations`
+    // accumulates a record per cron firing; once any record ages past
+    // maxRuntimeSeconds (default 2h) `checkLimits` returns suspend forever and
+    // a CRITICAL watchdog handoff fires on every tick. Best-effort: a clear
+    // failure must never mask the original result or throw.
+    try {
+      await watchdogClearInvocation(invocationId);
+    } catch (clearErr) {
+      console.warn(`[watchdog] clearInvocation(${invocationId}) failed:`, clearErr);
+    }
     mainRunCount--;
     persistRunCount();
   }
@@ -2352,6 +2511,7 @@ export async function run(
   timeoutCategory?: string,
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void,
+  identity?: PolicyIdentity,
 ): Promise<RunResult> {
   return enqueue(
     () =>
@@ -2365,6 +2525,7 @@ export async function run(
         timeoutCategory,
         onChunk,
         onToolEvent,
+        identity,
       ),
     threadId,
   );
@@ -2638,6 +2799,7 @@ export async function runUserMessage(
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void,
   modelOverride?: string,
+  identity?: PolicyIdentity,
 ): Promise<RunResult> {
   return run(
     name,
@@ -2649,6 +2811,7 @@ export async function runUserMessage(
     undefined,
     onChunk,
     onToolEvent,
+    identity,
   );
 }
 

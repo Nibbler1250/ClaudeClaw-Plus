@@ -10,7 +10,7 @@ import {
   PTY_ID_HEADER,
   PTY_TS_HEADER,
 } from "../pty-identity.js";
-import { _resetMcpBridge, _setMcpBridge } from "../../mcp-bridge.js";
+import { _resetMcpBridge, _setMcpBridge, getMcpBridge } from "../../mcp-bridge.js";
 
 const MOCK_SERVER = fileURLToPath(
   new URL("../../../__tests__/fixtures/mock-mcp-server.ts", import.meta.url),
@@ -194,13 +194,40 @@ describe("McpHttpHandler — successful auth + RPC dispatch", () => {
     expect(remaining).not.toContain("suzy");
   });
 
-  it("stateless handler does not have per-PTY buckets", async () => {
+  it("stateless handler keys buckets per PTY and releasePty tears them down", async () => {
     await handler!.stop();
     handler = new McpHttpHandler({ serverName: "test", proc: proc!, stateless: true });
-    // releasePty is a no-op for stateless
+    const a = issueIdentity("suzy");
+
+    await handler.handle(
+      rpcRequest(
+        {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            clientInfo: { name: "test", version: "1.0" },
+          },
+        },
+        { [PTY_ID_HEADER]: "suzy", [AUTH_HEADER]: a.headers[AUTH_HEADER] },
+      ),
+    );
+
+    const before = handler.health();
+    expect(before.stateless).toBe(true);
+    // The marker does not collapse the key space: a stateless server owns a
+    // bucket per PTY like any other.
+    expect(before.bucket_keys as string[]).toEqual(["suzy"]);
+
+    // And that bucket is genuinely reclaimed on identity teardown. This is
+    // the half of the per-PTY fix that an earlier `if (this.stateless)
+    // return` in `releasePty` would silently skip — leaking the transport
+    // and leaving the next identity for this ptyId to collide with a stale
+    // initialized session.
     await handler.releasePty("suzy");
-    const h = handler.health();
-    expect(h.stateless).toBe(true);
+    expect(handler.health().bucket_keys as string[]).toEqual([]);
   });
 });
 
@@ -709,5 +736,294 @@ describe("McpHttpHandler — body-peek threshold for audit (#72 item 11)", () =>
     expect(invoke!.payload.pty_id).toBe("suzy");
     expect(invoke!.payload.rpc_method).toBeUndefined();
     revokeIdentity("suzy");
+  });
+});
+
+describe("McpHttpHandler — session-less discovery probe", () => {
+  let proc: McpServerProcess | null = null;
+  let handler: McpHttpHandler | null = null;
+
+  beforeEach(async () => {
+    _resetIdentityStore();
+    proc = new McpServerProcess("test", makeServerConfig());
+    await proc.start();
+    handler = new McpHttpHandler({ serverName: "test", proc });
+  });
+
+  afterEach(async () => {
+    if (handler) await handler.stop();
+    if (proc) await proc.stop();
+    proc = null;
+    handler = null;
+    _resetIdentityStore();
+  });
+
+  function authed(body: unknown): Request {
+    const id = issueIdentity("suzy");
+    return rpcRequest(body, {
+      [PTY_ID_HEADER]: "suzy",
+      [PTY_TS_HEADER]: String(Date.now()),
+      ...id.headers,
+    });
+  }
+
+  // A client on MCP revision 2026-07-28 probes with `server/discover` before
+  // it holds a session id. The session-ful SDK transport answers that with a
+  // transport-level 400, which the client reads as "server unreachable" and
+  // drops the server. A JSON-RPC "method not found" keeps the connection
+  // usable and lets the client fall back to `initialize`.
+  it("answers server/discover with a JSON-RPC error, not a transport 400", async () => {
+    const resp = await handler!.handle(
+      authed({ jsonrpc: "2.0", id: "server-discover-probe-1", method: "server/discover" }),
+    );
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as {
+      jsonrpc: string;
+      id: unknown;
+      error: { code: number; message: string };
+    };
+    expect(body.jsonrpc).toBe("2.0");
+    expect(body.error.code).toBe(-32601);
+    expect(body.id).toBe("server-discover-probe-1");
+  });
+
+  it("echoes a null id back when the probe carries none", async () => {
+    const resp = await handler!.handle(authed({ jsonrpc: "2.0", method: "server/discover" }));
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as { id: unknown; error?: { code: number } };
+    // Assert the error too: without it this passes on the unpatched
+    // transport as well, which would make the test prove nothing.
+    expect(body.error?.code).toBe(-32601);
+    expect(body.id).toBeNull();
+  });
+
+  /** Same as `authed`, but with an explicit `content-length` header and a
+   *  body padded past PEEK_MAX_BYTES. `new Request(url, { body })` sets no
+   *  content-length of its own, so without this the peek's declared-size
+   *  branch — the one production actually takes over a socket — is never
+   *  exercised. Mirrors `bigRpcRequest` in the #72 item 11 block. */
+  function authedBig(method: string, targetBodyBytes: number): Request {
+    const id = issueIdentity("suzy");
+    const padding = "x".repeat(Math.max(0, targetBodyBytes - 80));
+    const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { padding } });
+    return new Request("http://127.0.0.1:4632/mcp/test", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "content-length": String(body.length),
+        [PTY_ID_HEADER]: "suzy",
+        [PTY_TS_HEADER]: String(Date.now()),
+        ...id.headers,
+      },
+      body,
+    });
+  }
+
+  // Regression: the audit peek skips bodies over PEEK_MAX_BYTES, so gating
+  // the probe answer on that peek alone let a >4 KiB probe fall through to
+  // the transport and 400 — the exact failure this guard exists to prevent.
+  // Reproduced over a real socket before the fix; in-process it needs the
+  // declared content-length that `authedBig` supplies.
+  it("answers a probe larger than the audit peek threshold", async () => {
+    const req = authedBig("server/discover", 8192);
+    expect(req.headers.get("content-length")).not.toBeNull();
+    expect(Number(req.headers.get("content-length"))).toBeGreaterThan(4096);
+
+    const resp = await handler!.handle(req);
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as { error: { code: number } };
+    expect(body.error.code).toBe(-32601);
+  });
+
+  it("does not divert other large methods onto the probe path", async () => {
+    const resp = await handler!.handle(authedBig("tools/list", 8192));
+    expect(resp.status).not.toBe(401);
+    expect(await resp.text()).not.toContain("-32601");
+  });
+
+  it("still authenticates the probe — no bearer, no answer", async () => {
+    const resp = await handler!.handle(
+      rpcRequest({ jsonrpc: "2.0", id: 1, method: "server/discover" }),
+    );
+    expect(resp.status).toBe(401);
+  });
+
+  it("leaves every other method on the transport path", async () => {
+    const resp = await handler!.handle(authed({ jsonrpc: "2.0", id: 1, method: "initialize" }));
+    expect(resp.status).not.toBe(401);
+    const body = (await resp.text()) as string;
+    expect(body).not.toContain("-32601");
+  });
+});
+
+// ── Orphaned buckets (issue #355) ───────────────────────────────────────────
+
+describe("McpHttpHandler — a bucket orphaned by a mid-request release", () => {
+  let proc: McpServerProcess | null = null;
+  let handler: McpHttpHandler | null = null;
+
+  beforeEach(async () => {
+    _resetIdentityStore();
+    _resetMcpBridge();
+    proc = new McpServerProcess("test", makeServerConfig());
+    await proc.start();
+    handler = new McpHttpHandler({ serverName: "test", proc, stateless: true });
+  });
+
+  afterEach(async () => {
+    await handler?.stop();
+    await proc?.stop();
+    _resetIdentityStore();
+    _resetMcpBridge();
+  });
+
+  function initialize(ptyId: string, bearer: string): Request {
+    return rpcRequest(
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "test", version: "1.0" },
+        },
+      },
+      { [PTY_ID_HEADER]: ptyId, [AUTH_HEADER]: bearer },
+    );
+  }
+
+  it("is not inserted after its own teardown", async () => {
+    const ident = issueIdentity("job-1");
+
+    // Start the request but do NOT await it. `handle()` yields on the body
+    // cap read, then authenticates, then yields again on the audit peek and
+    // on the bucket build before `buckets.set` runs.
+    const inFlight = handler!.handle(initialize("job-1", ident.headers[AUTH_HEADER]!));
+
+    // Land the teardown INSIDE that window. Measured against this handler
+    // with the guard removed, the window is microtask turns 2-6: turns 0-1
+    // are still pre-auth (the request just 401s, nothing is built), and
+    // from turn 7 the transport is already serving the request. Four sits
+    // in the middle.
+    for (let i = 0; i < 4; i++) await Promise.resolve();
+
+    // Production order: `releaseIdentity` revokes the identity first, then
+    // tears down the handlers.
+    revokeIdentity("job-1");
+    await handler!.releasePty("job-1");
+
+    const resp = await inFlight;
+
+    // The request loses — correctly. Its PTY is gone.
+    expect(resp.status).toBe(401);
+    // Assert the REASON, not just the status. 401 is reachable three ways on
+    // this path, and the pre-auth one (`invalid_bearer`, turns 0-1) satisfies
+    // both of the other assertions here while proving nothing: no bucket was
+    // ever built, so of course none was stranded. Pin `pty_released` and the
+    // test can no longer drift into that window silently — add an `await`
+    // upstream of the auth check and this fails loudly with the wrong code,
+    // which is the signal to retune the turn count above.
+    expect((await resp.json()).error.code).toBe("pty_released");
+    // And crucially it did not resurrect the bucket. Before the guard, the
+    // `delete` above found nothing (the key was not in the map yet) and
+    // this insert landed afterwards, stranding a bucket under a ptyId that
+    // — being a one-shot job key — no request would ever look up again.
+    expect(handler!.health().bucket_keys as string[]).toEqual([]);
+  });
+
+  it("is not inserted when the key was revoked and RE-ISSUED mid-request", async () => {
+    const dead = issueIdentity("job-3");
+
+    const inFlight = handler!.handle(initialize("job-3", dead.headers[AUTH_HEADER]!));
+    for (let i = 0; i < 4; i++) await Promise.resolve();
+
+    // Teardown, then a NEW identity minted under the same key before the
+    // in-flight request resumes. This is not hypothetical: the bus session
+    // manager revokes fire-and-forget and re-issues under the same agent id
+    // on its collision-retry and respawn paths, so both halves land inside
+    // one request's window.
+    revokeIdentity("job-3");
+    await handler!.releasePty("job-3");
+    issueIdentity("job-3");
+
+    const resp = await inFlight;
+
+    // Asking "does SOME identity exist for this key" answers yes here and
+    // lets the dead PTY's request install a bucket under the live key —
+    // initialized with a session id only the dead client holds. Asking
+    // "does the identity honour THIS bearer" is the question that matters.
+    expect(resp.status).toBe(401);
+    expect((await resp.json()).error.code).toBe("pty_released");
+    expect(handler!.health().bucket_keys as string[]).toEqual([]);
+  });
+
+  it("bounds the swept-bucket audit's ptyId list and counts what it omits", async () => {
+    // 25 orphans, cap is 20. An audit line that names every reclaimed key
+    // grows with the number of PTYs the daemon has ever seen; an unbounded
+    // audit payload was a blocking finding on the sibling PR.
+    const audits: Array<{ event: string; payload: Record<string, unknown> }> = [];
+    const bridge = getMcpBridge();
+    const origAudit = bridge.audit.bind(bridge);
+    bridge.audit = (event, payload) => {
+      audits.push({ event, payload });
+    };
+    try {
+      for (let i = 0; i < 25; i++) {
+        const id = issueIdentity(`job-mass-${i}`);
+        await handler!.handle(initialize(`job-mass-${i}`, id.headers[AUTH_HEADER]!));
+        revokeIdentity(`job-mass-${i}`);
+      }
+
+      expect(await handler!.sweepOrphanedBuckets()).toBe(25);
+
+      const swept = audits.find((a) => a.event === "multiplexer_buckets_swept");
+      expect(swept).toBeDefined();
+      // The COUNT stays exact — that is the number an operator acts on.
+      expect(swept!.payload.reclaimed).toBe(25);
+      // The NAMES are a capped sample, and the shortfall is stated rather
+      // than left for the reader to infer from a short array.
+      expect((swept!.payload.pty_ids as string[]).length).toBe(20);
+      expect(swept!.payload.pty_ids_omitted).toBe(5);
+    } finally {
+      bridge.audit = origAudit;
+    }
+  });
+
+  it("is reclaimed by the sweep when it slips through anyway", async () => {
+    const live = issueIdentity("pty-live");
+    const doomed = issueIdentity("job-2");
+
+    await handler!.handle(initialize("pty-live", live.headers[AUTH_HEADER]!));
+    await handler!.handle(initialize("job-2", doomed.headers[AUTH_HEADER]!));
+    expect((handler!.health().bucket_keys as string[]).sort()).toEqual(["job-2", "pty-live"]);
+
+    // Simulate the orphan directly: identity gone, bucket still in the map.
+    // This is the state the race produces, and also what any caller that
+    // reaches `releasePty` without going through `releaseIdentity` leaves.
+    revokeIdentity("job-2");
+
+    // Seed the rate-limit windows directly. The test handler runs with the
+    // limiter disabled (`_rlMax <= 0`), so `handle()` never creates an entry
+    // and asserting on an empty map would pass no matter what the sweep did.
+    const windows = (handler as unknown as { _rlWindows: Map<string, number[]> })._rlWindows;
+    windows.set("job-2", [Date.now()]);
+    windows.set("pty-live", [Date.now()]);
+
+    expect(await handler!.sweepOrphanedBuckets()).toBe(1);
+    // The live PTY is untouched — the sweep keys on identity, not on idle
+    // time, so a healthy session that simply went quiet is never reaped.
+    expect(handler!.health().bucket_keys as string[]).toEqual(["pty-live"]);
+
+    // The bucket is not the only thing keyed by ptyId. `releasePty` clears
+    // the rate-limit window too, and the sweep has to be symmetric with it:
+    // reclaiming 21 KB of bucket while leaving a window entry per one-shot
+    // `agent-job-<uuid>` moves the unbounded growth instead of stopping it.
+    expect(windows.has("job-2")).toBe(false);
+    expect(windows.has("pty-live")).toBe(true);
+
+    // Idempotent: a second pass finds nothing left to do.
+    expect(await handler!.sweepOrphanedBuckets()).toBe(0);
   });
 });

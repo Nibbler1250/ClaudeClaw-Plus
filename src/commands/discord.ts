@@ -16,6 +16,7 @@ import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
+import { cacheSkillOverlayFromContent } from "../policy/skill-overlays";
 import { fireJob, parseFireArgs } from "./fire";
 import { mkdir } from "node:fs/promises";
 import { extname, join, basename, sep } from "node:path";
@@ -29,6 +30,11 @@ import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wi
 
 const DISCORD_API = "https://discord.com/api/v10";
 const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
+
+/** #323: deny ALL mention parsing on outbound (model-generated) content — a
+ *  single source every content-bearing send references, so the guarantee is
+ *  greppable/one-place-to-change instead of a literal copy-pasted per site. */
+const DENY_ALL_MENTIONS = { parse: [] as string[] } as const;
 
 const GatewayOp = {
   DISPATCH: 0,
@@ -283,7 +289,8 @@ async function sendMessage(
   const chunks = discordMessageChunks(text);
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
-    const body: Record<string, unknown> = { content: chunk };
+    // #323: deny mention parsing — chunk is model output.
+    const body: Record<string, unknown> = { content: chunk, allowed_mentions: DENY_ALL_MENTIONS };
     // Attach components only to the last chunk
     if (components && i === chunks.length - 1) {
       body.components = components;
@@ -401,7 +408,10 @@ async function sendMessageWithImages(
   const chunks = discordMessageChunks(text || "​");
   const uploadText = chunks.pop() ?? "​";
   for (const chunk of chunks) {
-    await discordApi(token, "POST", `/channels/${channelId}/messages`, { content: chunk });
+    await discordApi(token, "POST", `/channels/${channelId}/messages`, {
+      content: chunk,
+      allowed_mentions: DENY_ALL_MENTIONS,
+    });
   }
 
   await uploadImageMessage(token, channelId, uploadText, imagePaths);
@@ -415,7 +425,10 @@ async function uploadImageMessage(
   attempt = 0,
 ): Promise<void> {
   const form = new FormData();
-  form.append("payload_json", JSON.stringify({ content: text }));
+  form.append(
+    "payload_json",
+    JSON.stringify({ content: text, allowed_mentions: DENY_ALL_MENTIONS }),
+  );
   for (let i = 0; i < imagePaths.length; i++) {
     const file = Bun.file(imagePaths[i]);
     form.append(`files[${i}]`, file, basename(imagePaths[i]));
@@ -683,7 +696,8 @@ async function respondToInteraction(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       type: 4, // CHANNEL_MESSAGE_WITH_SOURCE
-      data,
+      // #323: deny mention parsing on every interaction response.
+      data: { ...data, allowed_mentions: DENY_ALL_MENTIONS },
     }),
   });
 }
@@ -753,6 +767,7 @@ function makeDiscordStreamCallback(token: string, channelId: string): DiscordStr
       try {
         await discordApi(token, "PATCH", `/channels/${channelId}/messages/${streamMsgId}`, {
           content,
+          allowed_mentions: DENY_ALL_MENTIONS,
         });
       } catch (err) {
         debugLog(`Stream edit failed: ${err instanceof Error ? err.message : err}`);
@@ -1158,6 +1173,9 @@ async function handleMessageCreate(
         skillContext = await resolveSkillPrompt(command);
         if (skillContext) {
           debugLog(`Skill resolved for ${command}: ${skillContext.length} chars`);
+          // #258 item 2: cache this skill's deny-tool overlay so the policy
+          // engine can consult it synchronously during evaluation.
+          cacheSkillOverlayFromContent(command.replace(/^\//, ""), skillContext);
         }
       } catch (err) {
         debugLog(
@@ -1294,6 +1312,11 @@ async function handleMessageCreate(
           threadInfo?.agentName,
           streamCb?.onChunk,
           streamCb?.onToolEvent,
+          undefined, // modelOverride
+          // #284 LOW: thread the inbound identity so the policy gate can scope by
+          // user and (for a slash command) by skill, matching the bus adapter.
+          // `command` is "/x" → skillName "x"; undefined for plain chat.
+          { userId, skillName: command ? command.replace(/^\//, "") : undefined },
         );
       } finally {
         if (streamCb) {
@@ -1400,7 +1423,7 @@ async function handleInteractionCreate(
         {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content: result.message }),
+          body: JSON.stringify({ content: result.message, allowed_mentions: DENY_ALL_MENTIONS }),
         },
       );
       return;

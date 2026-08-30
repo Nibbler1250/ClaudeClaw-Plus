@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mountBusRuntime, type BusRuntimeHandle } from "../runtime-mount";
 import type { BusCore } from "../core";
-import { SessionManager } from "../session-manager";
+import { SessionManager, type RestartOptions } from "../session-manager";
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* FakeBus — records start/stop + slash-handler installation.             */
@@ -83,6 +83,9 @@ function createFakeBus(opts: FakeBusOptions = {}): FakeBus {
     // care about ordering observe via the `events` buffer in
     // setSlashCommandHandler.
     setStreamPromptHandler() {},
+    // #296 PR 3 contract — runtime-mount installs the agent-job handler on
+    // start and detaches it on stop. No-op fake.
+    setJobHandler() {},
     // #222 reconciliation contract — runtime-mount installs the reconciler
     // signal handler on start. No-op fake.
     setMcpSendFailedHandler(h) {
@@ -315,8 +318,9 @@ describe("mountBusRuntime — real UDS path", () => {
     try {
       expect(handle.bus).toBeDefined();
       expect(handle.sessionManager).toBeInstanceOf(SessionManager);
-      // BusCore.state() works post-mount.
-      expect(handle.bus.state().subscriberCount).toBe(0);
+      // BusCore.state() works post-mount. The one subscriber is the stall
+      // watchdog's session-event subscription, started by mountBusRuntime (#296).
+      expect(handle.bus.state().subscriberCount).toBe(1);
     } finally {
       await handle.stop();
     }
@@ -382,6 +386,37 @@ function cfg(id: string, overrides: Partial<AgentConfig> = {}): AgentConfig {
     ...overrides,
   };
 }
+
+/** Captures the (id, opts) every restart() call receives. */
+class RestartSpySessionManager extends FakeSessionManager {
+  public readonly restartLog: Array<{ id: string; opts: RestartOptions }> = [];
+  async restart(id: string, opts: RestartOptions = {}): Promise<AgentProcess> {
+    this.restartLog.push({ id, opts });
+    return {
+      onData: () => () => {},
+      onExit: () => () => {},
+      send_prompt: async () => {},
+      send_slash: async () => {},
+      kill: async () => {},
+    } as unknown as AgentProcess;
+  }
+}
+
+describe("mountBusRuntime — rotateAgent wiring (#227)", () => {
+  it("forwards reason:'rotation' to sessionManager.restart (crash-loop budget exemption)", async () => {
+    const bus = createFakeBus();
+    const sm = new RestartSpySessionManager();
+    const handle = await mountBusRuntime({ bus, sessionManager: sm, logger: SILENT_LOGGER });
+    try {
+      await handle.rotateAgent("agent-x");
+      // The load-bearing literal: rotation must be budget-exempt, which depends
+      // entirely on restart() receiving { reason: "rotation" }.
+      expect(sm.restartLog).toEqual([{ id: "agent-x", opts: { reason: "rotation" } }]);
+    } finally {
+      await handle.stop();
+    }
+  });
+});
 
 describe("mountBusRuntime — auto-spawn happy path", () => {
   let handle: BusRuntimeHandle | null = null;

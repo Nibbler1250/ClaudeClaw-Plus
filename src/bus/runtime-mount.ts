@@ -31,15 +31,35 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { AgentConfig, BusOrigin } from "./types";
 import { BusCoreImpl, type BusCore } from "./core";
-import { SessionManager } from "./session-manager";
+import {
+  AgentJobRunner,
+  DEFAULT_AGENT_JOB_CONFIG,
+  type AgentJobConfig,
+  type JobView,
+} from "./agent-jobs";
+import { runAgentJobHeadless } from "../runner";
+import { agentExists, loadAgent } from "../agents";
+import {
+  type BusMcpConfigSynthesizer,
+  releaseAgentJobMcpConfig,
+  SessionManager,
+  synthesizeAgentJobMcpConfig,
+} from "./session-manager";
 import { wireSlashCommands } from "./wiring";
 import { createMcpReconciler } from "./mcp-reconciler";
 import type { MountedAdapter } from "./adapter-wiring";
 import { stopBusAdapters } from "./adapter-wiring";
 import { detectOrphanAgents, formatOrphanWarnings } from "./orphan-agent-detect";
 import { createPromptStreamHandler } from "./receipt-wiring";
+import { peekSession } from "../sessions";
+import { generateSummary } from "../rotation";
+import { getSettings, type BusAgentSettings } from "../config";
+import { StallWatchdog, DEFAULT_STALL_CONFIG, type StallWatchdogConfig } from "./stall-watchdog";
+import { createStallAlertNotifier } from "./stall-alert-delivery";
+import { probeProcessTreeCpu, classifyKill, appendStallKillAudit } from "./stall-forensics";
 
 export interface BusRuntimeHandle {
   /** The mounted BusCore. Adapters / tests subscribe via this. */
@@ -76,6 +96,14 @@ export interface BusRuntimeHandle {
    * to legacy surfaces). Throws if the handle has already been stopped.
    */
   spawnAgents(batch?: readonly AgentConfig[], spawnOriginOverride?: BusOrigin): Promise<void>;
+  /**
+   * Restart-based session rotation for one agent (#227). Drops the live PTY,
+   * mints a fresh session id, respawns, and best-effort summarizes the old
+   * session in the background. Wired into the bridge's post-turn rotation gate
+   * (`streamBusPrompt`'s `rotateAgent` option) so a threshold trip actually
+   * rotates the live conversation instead of only logging a warning.
+   */
+  rotateAgent(agentId: string): Promise<void>;
   /**
    * Register adapters with the handle's stop lifecycle. Sprint 5.2b
    * (PR #123) Codex P1/P2 fold-in: callers wire adapters AFTER the
@@ -216,6 +244,133 @@ export function resolveDaemonSocketPath(override?: string): string {
 }
 
 /**
+ * Injectable dependencies for {@link createRotateAgent}. Kept narrow so the
+ * rotation orchestration is unit-testable without spawning a real PTY, reading
+ * settings, or shelling out to the summarizer.
+ */
+export interface RotateAgentDeps {
+  /** Drop the live PTY + mint a fresh session id + respawn (the #226 primitive, with reason "rotation"). */
+  restart: (agentId: string) => Promise<unknown>;
+  /** The agent's CURRENT (about-to-be-rotated) session id, read BEFORE restart. */
+  peekSessionId: (agentId: string) => Promise<string | undefined>;
+  /** Summarize a (no-longer-live) session id into the summary dir. */
+  summarize: (sessionId: string, summaryPath: string) => Promise<unknown>;
+  /** Resolve the configured summary dir, or "" to skip summarization. Must not throw. */
+  getSummaryPath: () => string;
+  logger: Pick<Console, "warn" | "error">;
+}
+
+/**
+ * Build the restart-based session-rotation orchestrator (#227).
+ *
+ * Order matters: capture the OLD session id, then `restart()` (which drops the
+ * live PTY, mints+persists a fresh session id, respawns — re-arming the message
+ * counter via the new session.json), THEN summarize the OLD id. Summarizing
+ * after the restart is what sidesteps claude's locked-`--resume` refusal (the
+ * old id is no longer live — #227 critical 3), and it runs in the background so
+ * the turn that tripped the threshold isn't blocked on the ~60s summarizer.
+ */
+export function createRotateAgent(deps: RotateAgentDeps): (agentId: string) => Promise<void> {
+  return async (agentId: string): Promise<void> => {
+    let oldSessionId: string | undefined;
+    try {
+      oldSessionId = await deps.peekSessionId(agentId);
+    } catch (err) {
+      deps.logger.warn(`[bus-runtime] rotation: peek session for ${agentId} failed`, err);
+    }
+
+    // A rotation restart drops the live PTY BEFORE respawning. If the respawn
+    // throws (spawn-time fault), the agent is left with no live process — worse
+    // than the pre-#227 "warn and keep serving". restart() is budget-exempt for
+    // rotation so it won't rate-limit-throw, but a genuine spawn fault still can.
+    // Surface it as CRITICAL (watchdog-keyable) and rethrow so the caller does
+    // NOT mistake a failed rotation for a successful one.
+    try {
+      await deps.restart(agentId);
+    } catch (err) {
+      deps.logger.error(
+        `[bus-runtime] CRITICAL agent=${agentId} rotation restart failed — ` +
+          `the agent may have no live PTY until it is respawned (operator/watchdog action needed)`,
+        err,
+      );
+      throw err;
+    }
+
+    const summaryPath = deps.getSummaryPath();
+    if (oldSessionId && summaryPath) {
+      void deps
+        .summarize(oldSessionId, summaryPath)
+        .catch((err) =>
+          deps.logger.warn(`[bus-runtime] rotation summary for ${agentId} failed`, err),
+        );
+    }
+  };
+}
+
+/**
+ * Deliver a finished agent job back to its DISPATCHER (decision 1a) as a
+ * system-origin prompt, so it can act on / report the result — the loop the
+ * `/tmp` fire-scripts faked by tailing a log.
+ *
+ * Codex review (#296 PR 3): `bus.sendPrompt` overwrites the agent's single-slot
+ * prompt-origin bookkeeping. If we delivered while the dispatcher was mid-turn
+ * on a channel prompt (Discord/Web/…), its later `reply(final)` would be
+ * attributed to this `origin:"cron"` and misrouted/dropped. So we deliver
+ * immediately only when the dispatcher is idle; if it's mid-turn we defer to its
+ * next `response.turn_end`. Best-effort either way — the result is always
+ * queryable via `job_status`, so if the dispatcher never turns again we simply
+ * don't push (no clobber, no loss).
+ */
+export function deliverAgentJobResult(
+  bus: Pick<BusCore, "sendPrompt" | "isAgentTurnActive" | "subscribe">,
+  job: JobView,
+  logger: Pick<Console, "warn">,
+): void {
+  const detail = job.error ? `Error: ${job.error}` : (job.resultText ?? "(job produced no output)");
+  const send = (): void => {
+    void bus
+      .sendPrompt({
+        agent_id: job.dispatcher,
+        origin: "cron",
+        origin_id: `agent-job:${job.jobId}`,
+        user_id: "system",
+        text:
+          `Agent job ${job.jobId} (agent "${job.agent}") finished with status ` +
+          `"${job.status}".\n\n${detail}`,
+        metadata: {
+          kind: "agent_job_result",
+          job_id: job.jobId,
+          job_agent: job.agent,
+          job_status: job.status,
+        },
+      })
+      .catch((err) =>
+        logger.warn(`[bus-runtime] agent-job result delivery for ${job.jobId} failed`, err),
+      );
+  };
+
+  if (!bus.isAgentTurnActive(job.dispatcher)) {
+    send();
+    return;
+  }
+  // Mid-turn: defer to the dispatcher's next turn end so we never clobber the
+  // live prompt-origin. One-shot subscription.
+  let delivered = false;
+  const sub = bus.subscribe({ agent_id: job.dispatcher, topics: ["response.turn_end"] }, () => {
+    if (delivered) return;
+    delivered = true;
+    sub.close();
+    send();
+  });
+  // Race guard: the turn may have ended between the check and the subscribe.
+  if (!delivered && !bus.isAgentTurnActive(job.dispatcher)) {
+    delivered = true;
+    sub.close();
+    send();
+  }
+}
+
+/**
  * Mount the Bus runtime stack and return a teardown handle.
  *
  * Idempotency: each call returns a fresh handle. Callers must invoke
@@ -269,10 +424,88 @@ export async function mountBusRuntime(
       createMcpReconciler({
         isConnected: (agentId) => bus.isAgentConnected(agentId),
         isProcessAlive: (agentId) => sessionManager.health()[agentId]?.alive ?? false,
+        isTurnActive: (agentId) => bus.isAgentTurnActive(agentId),
         restart: (agentId) => sessionManager.restart(agentId),
         log: (msg, fields) => logger.error("[mcp-reconcile]", msg, fields),
       }),
     );
+
+    // #296 PR 3 — agent-job primitive. Gives agents a supported `dispatch_job`
+    // instead of hand-rolling `/tmp` fire-scripts + `claude -p` + `nohup … &`
+    // (the shape that wedged the daemon for ~11h in #295). The runner lives
+    // HERE in the daemon (only it can spawn/track processes); `dispatch_job`
+    // etc. route over IPC to `handleJobRequest`. Fire-and-return, capped
+    // concurrency, hard timeout cap, dispatcher-validated agent — a job can
+    // never block the caller's turn or spawn an unknown agent. Wired BEFORE
+    // agent spawn so a just-spawned agent's first dispatch is never dropped.
+    let agentJobConfig: AgentJobConfig;
+    try {
+      agentJobConfig = getSettings().agentJobs;
+    } catch {
+      agentJobConfig = DEFAULT_AGENT_JOB_CONFIG; // settings not loaded (early boot / tests)
+    }
+    const jobRunner = new AgentJobRunner(agentJobConfig, {
+      // Issue #165 wired `mcp.shared` into the supervisor and then into the
+      // bus agent spawn; the agent-job spawn is the third path and was never
+      // wired, so a dispatched job ran with no MCP servers while its
+      // dispatcher had them all. Mint a job-scoped identity here (the bus
+      // owns the synthesizer), hand the path to the runner, and release it
+      // when the run ends — a job's identity is per-run, unlike an agent's.
+      runAgentJob: async (input) => {
+        // Precedence, mirroring `synthesizeBusMcpConfig`: an operator-supplied
+        // static `agent.mcp_config` ALWAYS wins. Forward it unchanged and skip
+        // synthesis entirely, so the job's MCP surface matches the long-lived
+        // agent it runs as and exactly one `--mcp-config` is ever emitted.
+        const staticPath = staticAgentMcpConfig(input.agent, readSettingsAgents());
+        if (staticPath) {
+          return runAgentJobHeadless({ ...input, mcpConfigPath: staticPath });
+        }
+        const cwd = (await loadAgent(input.agent)).dir;
+        return withAgentJobMcpConfig(
+          cwd,
+          sessionManager.getMcpConfigSynthesizer(),
+          (mcpConfigPath) => runAgentJobHeadless({ ...input, mcpConfigPath }),
+          logger,
+        );
+      },
+      isKnownAgent: agentExists,
+      deliverResult: (job) => deliverAgentJobResult(bus, job, logger),
+      now: Date.now,
+      genId: () => randomUUID(),
+    });
+    bus.setJobHandler(jobRunner);
+
+    // #227 restart-based session rotation. The bus PTY is spawned once at boot
+    // and kept alive, so the session JSONL grows unbounded and per-prompt
+    // latency creeps up (#213). When the per-agent message/age threshold trips,
+    // the bridge calls this to actually rotate: restart() drops the live PTY,
+    // mints+persists a FRESH session id, and respawns (criticals 1 & 2 — the
+    // counter re-arms because a new session.json exists). The summary is the
+    // rotation caller's concern per restart()'s contract: generated against the
+    // now-freed OLD id (never the live one — critical 3) and in the background
+    // so the turn that tripped the threshold isn't blocked on the summarizer.
+    // (Injecting that summary into the fresh PTY's bootstrap has no bus consumer
+    // yet — the legacy runner consumes loadLatestSummary, the bus spawn path
+    // does not — so it stays a follow-up.)
+    // Declared before the rotation wiring so `getSummaryPath` can short-circuit
+    // once teardown has begun — never start a new ~60s summary subprocess while
+    // the handle is stopping (it would outlive stop()). Set true in stop().
+    let stopped = false;
+
+    const rotateAgent = createRotateAgent({
+      restart: (id) => sessionManager.restart(id, { reason: "rotation" }),
+      peekSessionId: async (id) => (await peekSession(id))?.sessionId,
+      summarize: generateSummary,
+      getSummaryPath: () => {
+        if (stopped) return ""; // tearing down — don't spawn a new summarizer
+        try {
+          return getSettings().session.summaryPath ?? "";
+        } catch {
+          return ""; // settings not loaded (early boot / tests) — skip summary
+        }
+      },
+      logger,
+    });
 
     const declaredAgents = opts.agents ?? [];
 
@@ -346,11 +579,78 @@ export async function mountBusRuntime(
         : `adapters=[${adapters.map((a) => a.name).join(", ")}]`;
     logger.info(`[bus-runtime] mounted; socket=${socketPath}; ${spawnedLabel}; ${adaptersLabel}`);
 
-    let stopped = false;
+    // #296 PR#1 — Stall watchdog. Detect a bus PTY session wedged mid-tool-call
+    // (a `tool_use` with no `tool_result` past its per-tool ceiling) and
+    // kill+respawn it so a single hung tool can never take the daemon offline
+    // (the #295 outage). Recovery reuses `restart()` (inherits the restart
+    // rate-limiter); every kill is audited by the auto-discovery forensic
+    // (`stall-forensics`). Started here — after a successful mount — so a failed
+    // mount never leaves a dangling sweep timer; torn down in `stop()`.
+    let stallConfig: StallWatchdogConfig;
+    try {
+      stallConfig = getSettings().stallWatchdog;
+    } catch {
+      stallConfig = DEFAULT_STALL_CONFIG; // settings not loaded (early boot / tests)
+    }
+    const stallWatchdog = new StallWatchdog(stallConfig, {
+      subscribe: (handler) => {
+        const sub = bus.subscribe(
+          {
+            topics: [
+              "response.tool_use",
+              "tool_result",
+              "response.turn_end",
+              "session.init",
+              "session.end",
+            ],
+          },
+          handler,
+        );
+        return () => sub.close();
+      },
+      restart: async (agentId, o) => {
+        await sessionManager.restart(agentId, { reason: o.reason });
+      },
+      captureForensic: async (agentId) => {
+        const proc = sessionManager.getAgent(agentId);
+        if (!proc) return { cpuAdvancing: null, outputRecencyMs: null };
+        const cpuAdvancing = await probeProcessTreeCpu(
+          proc.pid,
+          stallConfig.autoDiscovery.cpuProbeMs,
+        );
+        const outputRecencyMs = proc.lastDataAt === null ? null : Date.now() - proc.lastDataAt;
+        return { cpuAdvancing, outputRecencyMs };
+      },
+      recordKill: async (input) => {
+        const outcome = classifyKill(input.snapshot, input.outstandingMs, input.ceiling);
+        await appendStallKillAudit({
+          ts: new Date().toISOString(),
+          agentId: input.agentId,
+          sessionId: input.sessionId,
+          tool: input.tool,
+          outstandingMs: input.outstandingMs,
+          killSeconds: input.ceiling.killSeconds,
+          classification: outcome.classification,
+          cpuAdvancing: input.snapshot.cpuAdvancing,
+          outputRecencyMs: input.snapshot.outputRecencyMs,
+          suggestedKillSeconds: outcome.suggestedKillSeconds,
+        });
+        return outcome;
+      },
+      // #301: log AND deliver to the operator's chat surface. A wrong kill
+      // (suspected_false_positive) is the case the operator most needs to see
+      // — it means a ceiling is too tight — and it previously reached only
+      // journalctl + stall-kills.jsonl.
+      notify: createStallAlertNotifier({ bus, logger }),
+      now: () => Date.now(),
+    });
+    stallWatchdog.start();
+
     return {
       bus,
       sessionManager,
       socketPath,
+      rotateAgent,
       get spawnedAgentIds() {
         // Snapshot via getter so the handle reflects the current state
         // even after stop() empties the list.
@@ -404,6 +704,18 @@ export async function mountBusRuntime(
       async stop() {
         if (stopped) return;
         stopped = true;
+        // Agent-job runner: cancel in-flight jobs + clear the queue so no
+        // headless `claude -p` outlives the daemon, and detach the handler so
+        // a late `job_request` gets a clean "not enabled" error (#296 PR 3).
+        try {
+          jobRunner.stop();
+          bus.setJobHandler(null);
+        } catch (err) {
+          logger.error("[bus-runtime] jobRunner.stop() failed", err);
+        }
+        // Stall watchdog next: cancel its sweep timer + bus subscription and
+        // await any in-flight kill so it can't respawn a session mid-teardown.
+        await stallWatchdog.stop();
         // Adapters first: stop inbound traffic so nothing new hits the
         // bus while we're tearing down agents. Sprint 5.2b.
         await stopBusAdapters(adapters, logger);
@@ -471,5 +783,77 @@ export async function mountBusRuntime(
       }
     }
     throw err;
+  }
+}
+
+/**
+ * The operator's static `agent.mcp_config` for the agent a job was dispatched
+ * to, or `undefined` when that agent has none.
+ *
+ * `settings.agents[].id` and the `agents/<name>` directory `dispatch_job`
+ * validates against are the SAME namespace (`id` "becomes … the
+ * `agents/<id>/session.json` directory" — see `BusAgentSettings.id`), so an
+ * entry carrying `mcp_config` is reachable by name from a dispatch and must
+ * be honoured on the job path exactly as `buildClaudeArgs` honours it on the
+ * agent path.
+ *
+ * Pure + exported so the precedence rule is directly assertable without
+ * standing up a daemon.
+ */
+export function staticAgentMcpConfig(
+  agentId: string,
+  agents: readonly BusAgentSettings[],
+): string | undefined {
+  return agents.find((a) => a.id === agentId)?.mcp_config;
+}
+
+/** `settings.agents`, or `[]` when settings aren't loaded (early boot / tests). */
+function readSettingsAgents(): readonly BusAgentSettings[] {
+  try {
+    return getSettings().agents;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Mint a job-scoped MCP identity, run one agent job with the synthesized
+ * `--mcp-config`, and release the identity when the run ends.
+ *
+ * Scope: `mcp.shared` (multiplexer) servers only. An agent carrying a static
+ * `agent.mcp_config` never reaches this function — the caller forwards that
+ * path directly (see the `runAgentJob` dep above), matching
+ * `synthesizeBusMcpConfig`'s "static ALWAYS wins" rule.
+ *
+ * Issue #165 wired `mcp.shared` into the legacy PTY supervisor and then into
+ * the bus agent spawn. The agent-job spawn (`dispatch_job`) is the third
+ * spawn path and was never wired: it builds its argv by hand, so a dispatched
+ * job started with no MCP servers at all while the agent that dispatched it —
+ * spawned by the same daemon, from the same settings — had every shared
+ * server. This closes that gap.
+ *
+ * A job's identity is per-run, unlike an agent's (one agent = one long-lived
+ * PTY = one identity), so it is released in a `finally`: without that, every
+ * dispatched job would leak an identity in the multiplexer's registry and a
+ * 0600 config file in the agent's directory.
+ *
+ * Exported for tests — the production caller is the `runAgentJob` dep below.
+ */
+export async function withAgentJobMcpConfig<T>(
+  cwd: string,
+  synth: BusMcpConfigSynthesizer | null,
+  run: (mcpConfigPath: string | undefined) => Promise<T>,
+  logger: Pick<Console, "warn"> = console,
+): Promise<T> {
+  // Generated, never caller- or model-supplied: the key lands in the
+  // synthesized file's name.
+  const jobKey = `agent-job-${randomUUID()}`;
+  const mcpConfigPath = synthesizeAgentJobMcpConfig(jobKey, synth, cwd);
+  try {
+    return await run(mcpConfigPath);
+  } finally {
+    // Not awaited by design — see `releaseAgentJobMcpConfig`. The job's
+    // concurrency slot must not be held open by multiplexer teardown.
+    releaseAgentJobMcpConfig(jobKey, synth, cwd, logger);
   }
 }

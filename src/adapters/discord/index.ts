@@ -42,15 +42,24 @@ import {
   type BusOrigin,
   type PermissionRequest,
   isTailerOriginEvent,
+  withSynthesizedNotice,
 } from "../../bus/types";
 import { createDiscordGateway } from "./gateway";
+import { join } from "node:path";
+import { getSettings, type AttachmentsConfig } from "../../config";
+import { transcribeAudioToText } from "../../whisper";
 import {
-  attachmentMeta,
+  buildAttachmentManifest,
+  cleanupAttachments,
+  type InboundAttachment,
+  processAttachments,
+} from "../attachment-pipeline";
+import {
   buildPermissionButtons,
+  classifyAttachmentKind,
   formatPermissionPrompt,
   makeDefaultRateLimit,
   parsePermissionCustomId,
-  summariseAttachments,
 } from "./helpers";
 import { createDiscordRestApi } from "./rest-api";
 import { resolveAgentId, uniqueAgentIds, type RoutingConfig } from "./router";
@@ -67,6 +76,11 @@ import type {
 /* Adapter                                                                */
 /* ────────────────────────────────────────────────────────────────────── */
 
+/** Discord attachment URLs always live on these hosts. Restricting fetches to
+ *  them blocks SSRF via a forged gateway payload (the pipeline also enforces
+ *  https-only + private-IP blocking as defence-in-depth). */
+const DISCORD_CDN_HOSTS = ["cdn.discordapp.com", "media.discordapp.net"];
+
 export class DiscordAdapter {
   private readonly bus: BusCore;
   private readonly token: string;
@@ -76,6 +90,9 @@ export class DiscordAdapter {
   private readonly rateLimitCheck: (userId: string) => boolean;
   private readonly gateway: DiscordGatewayLike;
   private readonly restApi: DiscordRestApiLike;
+  private readonly attachmentsCfg?: AttachmentsConfig;
+  private readonly transcribeFn: (inputPath: string) => Promise<string>;
+  private readonly fetchFn: typeof fetch;
 
   /** Active bus subscriptions, one per unique routed agent. */
   private subscriptions: Subscription[] = [];
@@ -123,6 +140,9 @@ export class DiscordAdapter {
     // `FakeDiscordGateway` / `FakeDiscordRestApi` to bypass the network.
     this.gateway = opts.gateway ?? createDiscordGateway({ token: this.token, logger: this.logger });
     this.restApi = opts.restApi ?? createDiscordRestApi({ token: this.token, logger: this.logger });
+    this.attachmentsCfg = opts.attachments;
+    this.transcribeFn = opts.transcribe ?? transcribeAudioToText;
+    this.fetchFn = opts.fetchFn ?? fetch;
   }
 
   /* ──────────────────────────── lifecycle ─────────────────────────── */
@@ -138,7 +158,14 @@ export class DiscordAdapter {
       const sub = this.bus.subscribe(
         {
           agent_id: agentId,
-          topics: ["response.text", "channel.permission_request", "system.request_human"],
+          topics: [
+            "response.text",
+            "channel.permission_request",
+            "system.request_human",
+            // #301: out-of-band operator alerts (stall watchdog). A dedicated
+            // topic, not `response.text`, so it carries no turn semantics.
+            "system.operator_alert",
+          ],
         },
         (event) => this.handleBusEvent(agentId, event),
       );
@@ -246,15 +273,31 @@ export class DiscordAdapter {
       return;
     }
 
-    // 5. Detect attachments and pin metadata to the BusEvent so future
-    //    surfaces can render them. Sprint 3 does NOT download or
-    //    transcribe — that's `discord.ts:980+` legacy behaviour and
-    //    belongs in a Sprint 4 attachment-pipeline component. Forward
-    //    URLs + flags only.
-    const { images, voices, texts, hasAny } = summariseAttachments(message.attachments);
+    // 5. Any attachment of any kind (image, voice, text, generic file) counts —
+    //    a .json/.pdf upload used to be dropped here. The downloaded content is
+    //    injected into the prompt text below (step 6b), NOT the bus metadata:
+    //    the PTY delivery path stringifies object metadata to "[object Object]".
+    const hasAny = message.attachments.length > 0;
 
     // 6. Drop empty messages with no attachments.
     if (!message.content.trim() && !hasAny) return;
+
+    // 6b. Download + process attachments into a manifest appended to the
+    //     prompt text. Fail-soft: a broken pipeline never blocks the message.
+    let promptText = message.content;
+    if (hasAny) {
+      try {
+        const manifest = await this.processInboundAttachments(agentId, message);
+        if (manifest) {
+          promptText = message.content.trim() ? `${message.content}\n\n${manifest}` : manifest;
+        }
+      } catch (err) {
+        this.logger.error("[discord-adapter] attachment pipeline failed", err);
+        // Don't silently drop the uploads — tell the agent they were lost.
+        const notice = `[Attachments: ${message.attachments.length} could not be processed — pipeline error]`;
+        promptText = message.content.trim() ? `${message.content}\n\n${notice}` : notice;
+      }
+    }
 
     // 7. Special-case: pending `request_human` for this (agent, channel).
     //    If one exists, route this message text as the answer rather
@@ -268,7 +311,7 @@ export class DiscordAdapter {
         this.bus.ingestAskAnswer({
           agent_id: pendingAsk.agent_id,
           ask_id: pendingAsk.ask_id,
-          answer: message.content,
+          answer: promptText,
         });
       } catch (err) {
         this.logger.error("[discord-adapter] ingestAskAnswer failed", err);
@@ -283,19 +326,11 @@ export class DiscordAdapter {
         origin: "discord",
         origin_id: channelId,
         user_id: userId,
-        text: message.content,
+        text: promptText,
         metadata: {
           message_id: message.id,
           username: message.author.username,
-          ...(hasAny
-            ? {
-                attachments: {
-                  images: images.map(attachmentMeta),
-                  voices: voices.map(attachmentMeta),
-                  texts: texts.map(attachmentMeta),
-                },
-              }
-            : {}),
+          ...(hasAny ? { attachment_count: message.attachments.length } : {}),
         },
       });
     } catch (err) {
@@ -310,6 +345,63 @@ export class DiscordAdapter {
     void this.restApi.sendTyping(channelId).catch((err) => {
       this.logger.warn("[discord-adapter] sendTyping failed", err);
     });
+  }
+
+  /**
+   * Download + process a message's attachments and return a manifest block to
+   * append to the prompt. Returns "" when disabled or nothing usable. Writes
+   * downloaded files under `<rootDir>/<agentId>/<messageId>/` so the PTY agent
+   * (same host) can `Read` them by absolute path.
+   */
+  private async processInboundAttachments(
+    agentId: string,
+    message: DiscordInboundMessage,
+  ): Promise<string> {
+    const cfg = this.attachmentsCfg ?? getSettings().attachments;
+    if (!cfg.enabled || message.attachments.length === 0) return "";
+
+    const baseRoot =
+      cfg.rootDir.trim() || join(process.cwd(), ".claudeclaw", "inbound-attachments");
+    // Sanitise path segments — agentId/message.id ride a (trusted) gateway
+    // payload, but never interpolate them into a filesystem path unguarded.
+    const safeSeg = (s: string) => s.replace(/[^0-9A-Za-z._-]/g, "_").slice(0, 64) || "x";
+    const rootDir = join(baseRoot, safeSeg(agentId), safeSeg(message.id));
+
+    // Fire-and-forget TTL cleanup of old attachment dirs (never blocks the turn).
+    if (cfg.retentionHours > 0) {
+      void cleanupAttachments(baseRoot, cfg.retentionHours * 60 * 60 * 1000, {
+        log: (m) => this.logger.warn(`[discord-adapter] ${m}`),
+      }).catch(() => {});
+    }
+
+    const inbound: InboundAttachment[] = message.attachments.map((a) => ({
+      id: a.id,
+      filename: a.filename,
+      url: a.url,
+      contentType: a.content_type,
+      size: a.size,
+      kind: classifyAttachmentKind(a),
+    }));
+
+    const processed = await processAttachments(
+      inbound,
+      {
+        enabled: cfg.enabled,
+        maxBytes: cfg.maxBytes,
+        maxInlineTextBytes: cfg.maxInlineTextBytes,
+        maxAttachmentsPerMessage: cfg.maxAttachmentsPerMessage,
+        maxTranscribeBytes: cfg.maxTranscribeBytes,
+        rootDir,
+        transcribeVoice: cfg.transcribeVoice,
+        allowedHosts: DISCORD_CDN_HOSTS,
+      },
+      {
+        fetchFn: this.fetchFn,
+        transcribe: this.transcribeFn,
+        log: (m) => this.logger.warn(`[discord-adapter] ${m}`),
+      },
+    );
+    return buildAttachmentManifest(processed);
   }
 
   /**
@@ -437,8 +529,11 @@ export class DiscordAdapter {
       const payload = event.payload as { text?: string };
       const text = typeof payload.text === "string" ? payload.text : "";
       if (!text) return;
+      // #240: label a silent-drop safety-net delivery so it is not mistaken for
+      // a curated reply (no-op for normal replies). Full text preserved.
+      const outText = withSynthesizedNotice(text, event.payload);
       for (const channelId of targetChannels) {
-        void this.safeSendMessage(channelId, text);
+        void this.safeSendMessage(channelId, outText);
       }
       return;
     }
@@ -451,6 +546,30 @@ export class DiscordAdapter {
       for (const channelId of targetChannels) {
         void this.safeSendMessage(channelId, prompt, components);
       }
+      return;
+    }
+
+    // #301: an out-of-band operator alert (e.g. the stall watchdog flagging a
+    // kill that looked like a false positive). Rendered as a standalone
+    // message — it is NOT a reply, so it must not touch turn state, edit a
+    // live message, or register a pending ask.
+    if (event.topic === "system.operator_alert") {
+      const payload = event.payload as { text?: string };
+      const text = typeof payload.text === "string" ? payload.text : "";
+      if (!text) return;
+      // Deliberately ONE channel, unlike the reply fan-out below.
+      // `targetChannels` is already `[primaryChannel]` when the operator set
+      // one; without an entry it degrades to `channelsForAgent`, i.e. every
+      // channel AND thread mapped to the agent (#151's opt-in containment —
+      // see the comment above). For a periodic heartbeat that is merely
+      // noisy; for a stall alert it is an alert storm into places like
+      // `daily-digest-*`, and the watchdog's guards bound alerts per SESSION,
+      // not per channel. Taking the first also matches Telegram's
+      // single-target semantics, so one logical alert has the same blast
+      // radius on both surfaces.
+      const alertChannel = targetChannels[0];
+      if (!alertChannel) return;
+      void this.safeSendMessage(alertChannel, text);
       return;
     }
 

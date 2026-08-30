@@ -21,14 +21,16 @@ import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { peekThreadSession, removeThreadSession } from "../sessionManager";
 import { readFile, mkdir } from "node:fs/promises";
 import { existsSync, realpathSync, statSync, mkdirSync } from "node:fs";
-import { execFile } from "node:child_process";
+import { execFile, type ExecFileException } from "node:child_process";
 import { homedir } from "node:os";
 import { resolve, sep } from "node:path";
 import { resolveSkillPrompt, listSkills } from "../skills";
+import { cacheSkillOverlayFromContent } from "../policy/skill-overlays";
 import { fireJob, parseFireArgs } from "./fire";
 import { extname, join } from "node:path";
 import { submitTelegramToGateway } from "../gateway";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
+import { markdownToTelegramHtml } from "../adapters/telegram/format";
 import type { EventRecord } from "../event-log";
 import type { GatewayRunResult } from "../event-processor";
 
@@ -81,71 +83,6 @@ function validateOutboxPath(raw: string, allowedExts: Set<string>, maxBytes: num
     throw new Error(`file exceeds size limit (${size} bytes)`);
   }
   return candidate;
-}
-
-// --- Markdown → Telegram HTML conversion (ported from nanobot) ---
-
-function markdownToTelegramHtml(text: string): string {
-  if (!text) return "";
-
-  // 1. Extract and protect code blocks
-  const codeBlocks: string[] = [];
-  text = text.replace(/```[\w]*\n?([\s\S]*?)```/g, (_m, code) => {
-    codeBlocks.push(code);
-    return `\x00CB${codeBlocks.length - 1}\x00`;
-  });
-
-  // 2. Extract and protect inline code
-  const inlineCodes: string[] = [];
-  text = text.replace(/`([^`]+)`/g, (_m, code) => {
-    inlineCodes.push(code);
-    return `\x00IC${inlineCodes.length - 1}\x00`;
-  });
-
-  // 3. Strip markdown headers
-  text = text.replace(/^#{1,6}\s+(.+)$/gm, "$1");
-
-  // 4. Strip blockquotes
-  text = text.replace(/^>\s*(.*)$/gm, "$1");
-
-  // 5. Escape HTML special characters
-  text = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-
-  // 6. Links [text](url) — before bold/italic to handle nested cases
-  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
-
-  // 7. Bold **text** or __text__
-  text = text.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
-  text = text.replace(/__(.+?)__/g, "<b>$1</b>");
-
-  // 8. Italic _text_ (avoid matching inside words like some_var_name)
-  text = text.replace(/(?<![a-zA-Z0-9])_([^_]+)_(?![a-zA-Z0-9])/g, "<i>$1</i>");
-
-  // 9. Strikethrough ~~text~~
-  text = text.replace(/~~(.+?)~~/g, "<s>$1</s>");
-
-  // 10. Bullet lists
-  text = text.replace(/^[-*]\s+/gm, "• ");
-
-  // 11. Restore inline code with HTML tags
-  for (let i = 0; i < inlineCodes.length; i++) {
-    const escaped = inlineCodes[i]
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
-    text = text.replace(`\x00IC${i}\x00`, `<code>${escaped}</code>`);
-  }
-
-  // 12. Restore code blocks with HTML tags
-  for (let i = 0; i < codeBlocks.length; i++) {
-    const escaped = codeBlocks[i]
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
-    text = text.replace(`\x00CB${i}\x00`, `<pre><code>${escaped}</code></pre>`);
-  }
-
-  return text;
 }
 
 // --- Telegram Bot API (raw fetch, zero deps) ---
@@ -1641,6 +1578,9 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         skillContext = await resolveSkillPrompt(command);
         if (skillContext) {
           debugLog(`Skill resolved for ${command}: ${skillContext.length} chars`);
+          // #258 item 2: cache this skill's deny-tool overlay so the policy
+          // engine can consult it synchronously during evaluation.
+          cacheSkillOverlayFromContent(command.replace(/^\//, ""), skillContext);
         }
       } catch (err) {
         debugLog(
@@ -1745,6 +1685,10 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         stream.onChunk,
         stream.onToolEvent,
         modelOverride,
+        {
+          userId: userId !== undefined ? String(userId) : undefined,
+          skillName: skillContext ? command!.replace(/^\//, "") : undefined,
+        },
       );
       const streamResult = await stream.waitForStreamMsg();
       streamMsgId = streamResult.msgId;
@@ -1880,6 +1824,109 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
   }
 }
 
+/**
+ * Ack for an `already:<decision>:<resolved_at>` resolution (#314) — the user
+ * tapped a pending-action button whose action was resolved earlier (a
+ * double-tap, a Telegram callback retry after a slow ack, or a duplicate
+ * notification). Names the PRIOR decision and when it happened, so the ack is
+ * informative instead of the alarming "not found" the boolean resolver forced.
+ *
+ * `resolved_at` is the ISO timestamp the resolver reports; it is rendered
+ * `DD/MM HH:MM` when parseable, omitted otherwise.
+ */
+export function ackForAlready(resolution: string): string {
+  const rest = resolution.slice("already:".length);
+  const sep = rest.indexOf(":");
+  const decision = (sep === -1 ? rest : rest.slice(0, sep)).toLowerCase();
+  const at = sep === -1 ? "" : rest.slice(sep + 1);
+  // "2026-07-16T11:51…" → " (16/07 11:51)"
+  const m = at.match(/^\d{4}-(\d{2})-(\d{2})T(\d{2}:\d{2})/);
+  const when = m ? ` (${m[2]}/${m[1]} ${m[3]})` : "";
+  if (decision === "reject" || decision === "cancel" || decision === "rejected")
+    return `❌ Déjà rejeté${when}`;
+  if (decision === "skip" || decision === "skipped") return `⏸ Déjà reporté${when}`;
+  return `✅ Déjà approuvé${when}`;
+}
+
+/** The four outcomes a pending resolver can report. `no_answer` is not a
+ *  statement about the action — it means we never got a verdict. */
+export type ResolverVerdict = "ok" | "already" | "not_found" | "no_answer";
+
+/**
+ * Read the resolver's verdict off its stdout.
+ *
+ * The verdict is the LAST non-empty line, not the whole buffer: the resolver is
+ * operator-supplied, and a resolver that logs its own diagnostics (a failed
+ * notification edit, a deprecation notice) prints them before the verdict it
+ * was asked for. Comparing the whole buffer classifies "diagnostic\nok" as
+ * garbage and misreports a decision that was in fact applied.
+ */
+export function parseResolverVerdict(stdout: string): { verdict: ResolverVerdict; line: string } {
+  const line =
+    stdout
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .pop() ?? "";
+  if (line === "ok") return { verdict: "ok", line };
+  if (line.startsWith("already:")) return { verdict: "already", line };
+  if (line === "not_found") return { verdict: "not_found", line };
+  return { verdict: "no_answer", line };
+}
+
+/**
+ * Ack for a pending-action resolution.
+ *
+ * `not_found` is a statement about the action: the id is unknown, the button is
+ * stale. `no_answer` is a statement about the resolver: it never printed a
+ * verdict, so the action's fate is unknown — the resolver commits its decision
+ * before we read its exit status, so the tap may well have applied. Acking both
+ * as "not found" claims the tap was rejected when it may have landed.
+ */
+export function ackForResolution(stdout: string, decision: string): string {
+  const { verdict, line } = parseResolverVerdict(stdout);
+  if (verdict === "ok") {
+    const decLower = decision.toLowerCase();
+    if (decLower === "skip") return "⏸ Plus tard";
+    if (decLower === "reject" || decLower === "cancel") return "❌ Rejeté";
+    return "✅ Approuvé";
+  }
+  if (verdict === "already") return ackForAlready(line);
+  if (verdict === "not_found") return "⚠️ Action introuvable";
+  return "⚠️ Erreur — réessaie";
+}
+
+/**
+ * Strip credentials from resolver diagnostics before they reach the log. A
+ * resolver that fails while calling the Bot API can put the bot token — which
+ * lives in the request URL — into its stderr. Mirrors the redaction the PTY
+ * tail applies for the same reason.
+ */
+/**
+ * Describe how the pending resolver failed, in the shape an operator can act on.
+ *
+ * `code` is not always an exit status: a spawn failure (ENOENT, EACCES…) reports
+ * a string there, so labelling it `exit ENOENT` would misreport the very failure
+ * this diagnostic exists to explain. A signal kill reports `code: null`, which is
+ * why the signal and timeout cases are tested first.
+ */
+export function describeResolverFailure(result: {
+  timedOut: boolean;
+  signal: string | null;
+  code: number | string | null;
+}): string {
+  if (result.timedOut) return "timed out";
+  if (result.signal) return `killed by ${result.signal}`;
+  if (typeof result.code === "string") return `spawn error ${result.code}`;
+  return `exit ${result.code}`;
+}
+
+export function redactResolverDiagnostics(text: string): string {
+  return text
+    .replace(/\bbot\d+:[A-Za-z0-9_-]{20,}/g, "bot<redacted>")
+    .replace(/\bBearer\s+[A-Za-z0-9_.-]{16,}/g, "Bearer <redacted>");
+}
+
 // --- Callback query handler ---
 
 async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> {
@@ -1946,34 +1993,57 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
       ackText = "⚠️ Pending action handler not configured";
     } else {
       try {
-        const result = await new Promise<{ code: number; stdout: string; stderr: string }>(
-          (resolve) => {
-            execFile(
-              "python3",
-              [
-                "-c",
-                "import sys; sys.path.insert(0, sys.argv[1]); from pending import resolve_pending; ok = resolve_pending(int(sys.argv[2]), sys.argv[3]); print('ok' if ok else 'not_found')",
-                pendingLibPath,
-                actionId,
-                decision,
-              ],
-              { timeout: 5000 },
-              (err: Error | null, stdout: string, stderr: string) => {
-                resolve({ code: err ? 1 : 0, stdout: stdout.trim(), stderr });
-              },
-            );
-          },
-        );
-        if (result.stdout === "ok") {
-          const decLower = decision.toLowerCase();
-          if (decLower === "skip") ackText = "⏸ Plus tard";
-          else if (decLower === "reject" || decLower === "cancel") ackText = "❌ Rejeté";
-          else ackText = "✅ Approuvé";
-        } else {
-          ackText = "⚠️ Action introuvable ou déjà traitée";
+        const result = await new Promise<{
+          code: number | string | null;
+          signal: string | null;
+          timedOut: boolean;
+          stdout: string;
+          stderr: string;
+        }>((resolve) => {
+          execFile(
+            "python3",
+            [
+              "-c",
+              // #314: prefer the richer `resolve_pending_ex`
+              // (ok|not_found|already:<decision>:<at>) when the operator's lib
+              // provides it, so an already-resolved tap is distinguishable from
+              // a genuinely unknown/expired one; fall back to the boolean
+              // `resolve_pending` otherwise (zero regression for older libs).
+              "import sys; sys.path.insert(0, sys.argv[1]); import pending; f = getattr(pending, 'resolve_pending_ex', None); print(f(int(sys.argv[2]), sys.argv[3]) if f else ('ok' if pending.resolve_pending(int(sys.argv[2]), sys.argv[3]) else 'not_found'))",
+              pendingLibPath,
+              actionId,
+              decision,
+            ],
+            { timeout: 5000 },
+            (err: ExecFileException | null, stdout: string, stderr: string) => {
+              // `err` carries the real exit code, or a signal when the 5s
+              // timeout killed the process — the three failure shapes this
+              // branch has to tell apart.
+              resolve({
+                code: err?.code ?? (err ? 1 : 0),
+                signal: err?.signal ?? null,
+                timedOut: err?.killed === true,
+                stdout: stdout.trim(),
+                stderr,
+              });
+            },
+          );
+        });
+        const { verdict } = parseResolverVerdict(result.stdout);
+        ackText = ackForResolution(result.stdout, decision);
+        if (verdict === "no_answer") {
+          // No verdict: the ack cannot say whether the decision was applied, so
+          // the operator needs the reason it failed.
+          const how = describeResolverFailure(result);
+          const why = redactResolverDiagnostics(result.stderr).trim().slice(0, 200) || "no stderr";
+          console.warn(
+            `[Telegram] pending resolver reported no verdict for action ${actionId} (${how}): ${why}`,
+          );
         }
-        // Edit original message to show decision
-        if (query.message) {
+        // Edit the original message to record the decision — but only once we
+        // know one was taken. Editing strips the keyboard, and an ack that asks
+        // the user to retry must not delete the buttons it is pointing them at.
+        if (query.message && verdict !== "no_answer") {
           const originalText = query.message.text ?? "";
           await callApi(config.token, "editMessageText", {
             chat_id: query.message.chat.id,

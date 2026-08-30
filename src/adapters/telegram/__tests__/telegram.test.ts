@@ -130,6 +130,7 @@ interface SendMessageCall {
   text: string;
   message_thread_id?: number;
   reply_markup?: { inline_keyboard: TelegramInlineKeyboardButton[][] };
+  parse_mode?: "HTML";
 }
 
 interface SetReactionCall {
@@ -151,9 +152,16 @@ interface AnswerCallbackCall {
  */
 class FakeTelegramApi implements TelegramApi {
   public readonly sendMessages: SendMessageCall[] = [];
-  public readonly editMessages: Array<{ chat_id: number; message_id: number; text: string }> = [];
+  public readonly editMessages: Array<{
+    chat_id: number;
+    message_id: number;
+    text: string;
+    parse_mode?: "HTML";
+  }> = [];
   public readonly reactions: SetReactionCall[] = [];
   public readonly callbackAcks: AnswerCallbackCall[] = [];
+  /** #201: count inbound polls so send-only configs can assert zero. */
+  public getUpdatesCalls = 0;
 
   private nextUpdateId = 1;
   private readonly pending: TelegramUpdate[][] = [];
@@ -165,6 +173,7 @@ class FakeTelegramApi implements TelegramApi {
     _timeoutSeconds: number,
     signal: AbortSignal,
   ): Promise<TelegramGetUpdatesResult> {
+    this.getUpdatesCalls += 1;
     const batch = this.pending.shift();
     if (batch !== undefined) {
       return { ok: true, result: batch };
@@ -199,6 +208,7 @@ class FakeTelegramApi implements TelegramApi {
     chat_id: number;
     message_id: number;
     text: string;
+    parse_mode?: "HTML";
   }): Promise<{ ok: boolean; result?: { message_id: number } | true }> {
     this.editMessages.push(params);
     return { ok: true, result: true };
@@ -504,6 +514,80 @@ describe("TelegramAdapter — bus.sendPrompt shape", () => {
 /* response.text → sendMessage                                              */
 /* ────────────────────────────────────────────────────────────────────── */
 
+describe("TelegramAdapter — receiveEnabled:false (send-only, #201)", () => {
+  it("never polls getUpdates and drops enqueued inbound when receiveEnabled is false", async () => {
+    adapter = await startAdapter({ receiveEnabled: false });
+    // Structural guarantee: an inbound update that IS waiting is never consumed
+    // (the long-poll loop was never started), so it never reaches the bus. This
+    // asserts the real "inbound ignored" contract rather than a wall-clock proxy.
+    api.enqueueUpdates([
+      {
+        message: {
+          message_id: 50,
+          from: { id: 42 },
+          chat: { id: 100, type: "private" },
+          text: "should be ignored",
+        },
+      },
+    ]);
+    // A started poll loop calls getUpdates synchronously on its first iteration;
+    // a short tick gives any erroneously-started loop room to consume + route.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(api.getUpdatesCalls).toBe(0);
+    expect(bus.prompts).toHaveLength(0);
+  });
+
+  it("polls getUpdates by default (receiveEnabled omitted)", async () => {
+    adapter = await startAdapter();
+    await waitFor(() => api.getUpdatesCalls > 0);
+    expect(api.getUpdatesCalls).toBeGreaterThan(0);
+  });
+
+  it("still delivers outbound response.text via origin_id while send-only", async () => {
+    // No inbound is ever consumed, but a reply routed by origin_id (e.g. a
+    // cron/heartbeat-driven notification) must still reach the chat.
+    adapter = await startAdapter({
+      receiveEnabled: false,
+      routing: { chats: { "100": "triage" } },
+    });
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "send-only ping", origin: "telegram", origin_id: "100" },
+    });
+    await waitFor(() => api.sendMessages.length > 0);
+    expect(api.getUpdatesCalls).toBe(0);
+    expect(api.sendMessages[0]?.chat_id).toBe(100);
+    expect(api.sendMessages[0]?.text).toBe("send-only ping");
+  });
+
+  it("stop() cleanly tears down a send-only start (subscriptions closed)", async () => {
+    adapter = await startAdapter({
+      receiveEnabled: false,
+      routing: { chats: { "100": "triage" } },
+    });
+    const reply = (text: string) =>
+      bus.emit({
+        ts: Date.now(),
+        agent_id: "triage",
+        session_id: "s1",
+        topic: "response.text",
+        payload: { text, origin: "telegram", origin_id: "100" },
+      });
+    reply("first");
+    await waitFor(() => api.sendMessages.length === 1);
+    // The send-only branch never set loopPromise/inflightAbort; stop() must
+    // still resolve and close the outbound subscriptions symmetrically.
+    await adapter.stop();
+    adapter = null; // afterEach already stopped — avoid a double stop()
+    reply("second");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(api.sendMessages).toHaveLength(1);
+  });
+});
+
 describe("TelegramAdapter — response.text outbound", () => {
   async function feedInbound(): Promise<void> {
     api.enqueueUpdates([
@@ -535,6 +619,136 @@ describe("TelegramAdapter — response.text outbound", () => {
     expect(sent).toBeDefined();
     expect(sent?.text).toBe("hi there");
     expect(sent?.chat_id).toBe(100);
+  });
+
+  it("renders markdown as Telegram HTML with parse_mode (raw-markdown bug)", async () => {
+    // Regression: the bus adapter sent agent replies as plain text with no
+    // parse_mode, so Claude's markdown arrived as literal `**bold**` etc.
+    // Replies now convert to Telegram HTML and set parse_mode: "HTML".
+    adapter = await startAdapter();
+    await feedInbound();
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: {
+        text: "**bold** and *italic* and `code` and [link](https://example.com)",
+      },
+    });
+    await waitFor(() => api.sendMessages.length > 0);
+    const sent = api.sendMessages[0];
+    expect(sent?.parse_mode).toBe("HTML");
+    expect(sent?.text).toBe(
+      '<b>bold</b> and <i>italic</i> and <code>code</code> and <a href="https://example.com">link</a>',
+    );
+  });
+
+  it("converts markdown on an in-place edit too (progress → final)", async () => {
+    adapter = await startAdapter();
+    await feedInbound();
+
+    // Progress opens a live turn (fresh send); final edits it in place.
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "working", intent: "progress" },
+    });
+    await waitFor(() => api.sendMessages.length === 1);
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "**done**", intent: "final" },
+    });
+    await waitFor(() => api.editMessages.some((e) => e.text === "<b>done</b>"));
+    const edit = api.editMessages.find((e) => e.text === "<b>done</b>");
+    expect(edit?.parse_mode).toBe("HTML");
+  });
+
+  it("prefixes a synthesized (safety-net) final with the uncurated-output notice (#240)", async () => {
+    adapter = await startAdapter();
+    await feedInbound();
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "raw turn output", intent: "final", synthesized: true },
+    });
+    await waitFor(() => api.sendMessages.length > 0);
+    const sent = api.sendMessages[0];
+    expect(sent?.text.startsWith("⚠️")).toBe(true);
+    expect(sent?.text).toContain("without sending a reply");
+    // The full uncurated text is preserved (the safety net's whole point).
+    expect(sent?.text).toContain("raw turn output");
+  });
+
+  it("does NOT prefix a normal curated final (#240)", async () => {
+    adapter = await startAdapter();
+    await feedInbound();
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "curated answer", intent: "final" },
+    });
+    await waitFor(() => api.sendMessages.length > 0);
+    expect(api.sendMessages[0]?.text).toBe("curated answer");
+  });
+
+  it("prefixes the notice on the edit-in-place path when a turn is live (#240)", async () => {
+    adapter = await startAdapter();
+    await feedInbound();
+
+    // Progress reply opens a live turn (fresh message + spinner) so the
+    // following final edits in place instead of sending fresh — the dominant
+    // path for a normal prompted turn, distinct from the send-fresh tests above.
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "working", intent: "progress" },
+    });
+    await waitFor(() => api.sendMessages.length === 1);
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "raw turn output", intent: "final", synthesized: true },
+    });
+    await waitFor(() => api.editMessages.some((e) => e.text.startsWith("⚠️")));
+    const edit = api.editMessages.find((e) => e.text.startsWith("⚠️"));
+    expect(edit?.text).toContain("without sending a reply");
+    expect(edit?.text).toContain("raw turn output");
+  });
+
+  it("does not emit a lone notice for a reaction-only synthesized final (#240)", async () => {
+    adapter = await startAdapter();
+    await feedInbound();
+
+    // Text is non-empty but becomes empty after reaction directives are
+    // stripped — the cleanedText.length>0 gate must suppress a bare notice.
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "[react:🪶]", intent: "final", synthesized: true },
+    });
+    await waitFor(() => api.reactions.length > 0);
+    expect(api.sendMessages).toHaveLength(0);
+    expect(api.editMessages).toHaveLength(0);
   });
 
   it("IGNORES the JSONL tailer observability echo so replies are not double-posted (#217)", async () => {
@@ -1046,6 +1260,228 @@ describe("TelegramAdapter — request_human flow", () => {
 });
 
 /* ────────────────────────────────────────────────────────────────────── */
+/* #301 — out-of-band operator alerts                                       */
+/* ────────────────────────────────────────────────────────────────────── */
+
+describe("TelegramAdapter — system.operator_alert (#301)", () => {
+  /** Drive one inbound prompt so the agent has a live chat + turn. */
+  async function feedInbound(): Promise<void> {
+    api.enqueueUpdates([
+      {
+        message: {
+          message_id: 50,
+          from: { id: 42 },
+          chat: { id: 100, type: "private" },
+          text: "hello",
+        },
+      },
+    ]);
+    await waitFor(() => bus.prompts.length > 0);
+  }
+
+  it("delivers the alert as a NEW message", async () => {
+    adapter = await startAdapter();
+    await feedInbound();
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: {
+        level: "critical",
+        text: "stall-watchdog: looked ALIVE",
+        source: "stall-watchdog",
+      },
+    });
+
+    await waitFor(() => api.sendMessages.length === 1);
+    expect(api.sendMessages[0]?.chat_id).toBe(100);
+    expect(api.sendMessages[0]?.text).toContain("looked ALIVE");
+  });
+
+  it("does NOT overwrite the agent's live reply message", async () => {
+    // The bug this guards: routing the alert through `handleResponseText`
+    // would take the edit-in-place branch and replace the in-flight reply of
+    // the very agent the watchdog is reporting on.
+    adapter = await startAdapter();
+    await feedInbound();
+
+    // Open a live turn.
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "working", intent: "progress" },
+    });
+    await waitFor(() => api.sendMessages.length === 1);
+    const editsBefore = api.editMessages.length;
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "critical", text: "watchdog alert", source: "stall-watchdog" },
+    });
+
+    // Fresh send, and the live turn message is untouched.
+    await waitFor(() => api.sendMessages.length === 2);
+    expect(api.editMessages.length).toBe(editsBefore);
+    expect(api.sendMessages[1]?.text).toContain("watchdog alert");
+  });
+
+  it("drops an alert with no text rather than posting an empty message", async () => {
+    adapter = await startAdapter();
+    await feedInbound();
+    const before = api.sendMessages.length;
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "warn", source: "stall-watchdog" },
+    });
+
+    await new Promise((r) => setTimeout(r, 30));
+    expect(api.sendMessages.length).toBe(before);
+  });
+
+  it("converts the markdown prefix to HTML rather than sending literal asterisks", async () => {
+    adapter = await startAdapter();
+    await feedInbound();
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: {
+        level: "critical",
+        text: "**stall-watchdog** looked ALIVE",
+        source: "stall-watchdog",
+      },
+    });
+
+    await waitFor(() => api.sendMessages.length === 1);
+    const sent = api.sendMessages[0];
+    expect(sent?.parse_mode).toBe("HTML");
+    expect(sent?.text).toContain("<b>stall-watchdog</b>");
+    expect(sent?.text).not.toContain("**");
+  });
+
+  it("WARNS instead of dropping silently when the agent has no known chat", async () => {
+    // Send-only deployments (telegram.receiveEnabled:false, #260) never
+    // populate lastChatPerAgent, so an agent with no static routing.chats
+    // entry lands here. An alert that reaches neither chat nor a greppable
+    // log line would defeat the point of #301.
+    const warnings: string[] = [];
+    // `global` is subscribed (defaultAgentId) but has NO routing.chats entry,
+    // so targetForAgent falls through to null once lastChatPerAgent is empty.
+    adapter = await startAdapter({
+      routing: { chats: { "100": "triage" }, defaultAgentId: "global" },
+      receiveEnabled: false,
+      logger: { ...SILENT_LOGGER, warn: (m: string) => warnings.push(m) },
+    });
+    // NOTE: deliberately no feedInbound() — lastChatPerAgent stays empty.
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "global",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "critical", text: "alert for an unrouted agent", source: "stall-watchdog" },
+    });
+
+    await waitFor(() => warnings.length > 0);
+    expect(warnings.some((w) => w.includes("operator_alert"))).toBe(true);
+    expect(warnings.some((w) => w.includes("global"))).toBe(true);
+    expect(api.sendMessages).toHaveLength(0);
+  });
+
+  it("forwards message_thread_id so a forum alert lands in the watched topic", async () => {
+    adapter = await startAdapter();
+    // Inbound from a forum topic → lastChatPerAgent carries the thread id.
+    api.enqueueUpdates([
+      {
+        message: {
+          message_id: 51,
+          from: { id: 42 },
+          chat: { id: 100, type: "supergroup" },
+          message_thread_id: 5,
+          text: "hello",
+        },
+      },
+    ]);
+    await waitFor(() => bus.prompts.length > 0);
+    const before = api.sendMessages.length;
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "critical", text: "forum alert", source: "stall-watchdog" },
+    });
+
+    await waitFor(() => api.sendMessages.length === before + 1);
+    // Without this the alert posts to General, not the topic being watched.
+    expect(api.sendMessages[before]?.message_thread_id).toBe(5);
+  });
+
+  it("falls back to plain text when the HTML send 400s on malformed markup", async () => {
+    // sendHtml's documented caller contract. The alert interpolates an
+    // arbitrary err.message, so a parse 400 must degrade to unformatted
+    // text rather than vanish — dropping it would defeat #301.
+    adapter = await startAdapter();
+    await feedInbound();
+    const before = api.sendMessages.length;
+
+    let firstCall = true;
+    const realSend = api.sendMessage.bind(api);
+    api.sendMessage = async (params) => {
+      if (firstCall && params.parse_mode === "HTML") {
+        firstCall = false;
+        throw new Error("Telegram API 400: can't parse entities: unmatched tag");
+      }
+      return realSend(params);
+    };
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "critical", text: "**alert** with bad markup", source: "stall-watchdog" },
+    });
+
+    await waitFor(() => api.sendMessages.length === before + 1);
+    const sent = api.sendMessages[before];
+    // Delivered, and as plain text (no parse_mode) rather than dropped.
+    expect(sent?.parse_mode).toBeUndefined();
+    expect(sent?.text).toContain("alert");
+  });
+
+  it("still delivers via the static routing.chats fallback with no inbound message", async () => {
+    adapter = await startAdapter({ routing: { chats: { "100": "triage" } } });
+    // No feedInbound() — must resolve the target from routing.chats alone.
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "warn", text: "static-route alert", source: "stall-watchdog" },
+    });
+
+    await waitFor(() => api.sendMessages.length === 1);
+    expect(api.sendMessages[0]?.chat_id).toBe(100);
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────── */
 /* stop() cleanup                                                           */
 /* ────────────────────────────────────────────────────────────────────── */
 
@@ -1054,8 +1490,9 @@ describe("TelegramAdapter — stop()", () => {
     adapter = await startAdapter({
       routing: { chats: { "100": "triage", "200": "research" } },
     });
-    // Two agents × four topics (text, edit_text, permission, request_human) = eight.
-    expect(bus.state().subscriberCount).toBe(8);
+    // Two agents × five topics (text, edit_text, permission, request_human,
+    // operator_alert — the last added by #301) = ten.
+    expect(bus.state().subscriberCount).toBe(10);
     await adapter.stop();
     adapter = null;
     expect(bus.state().subscriberCount).toBe(0);

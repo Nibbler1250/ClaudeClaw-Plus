@@ -80,6 +80,30 @@ export interface BusWebUiBridge {
    * daemon boot.
    */
   defaultAgentId: string;
+  /**
+   * #315: ids of agents with an in-flight turn, for the pre-auth `/api/health`
+   * busy signal. Lets an external restart guard drain-then-restart instead of
+   * killing a turn mid-flight. Bus-derived, so absent in legacy (non-bus) mode
+   * → the health field is simply omitted.
+   */
+  activeTurnAgents: () => string[];
+  /**
+   * #325: recent out-of-band operator alerts (stall watchdog, restart-failed,
+   * …), newest last, for the polled `/api/state` dashboard panel — the web UI
+   * has no server→client push, so it reads them on its normal poll. Optional /
+   * bus-derived: absent in legacy (non-bus) mode → the dashboard shows no
+   * alerts panel.
+   */
+  recentOperatorAlerts?: () => OperatorAlertView[];
+}
+
+/** One entry of the `/api/state` operator-alerts panel (#325). */
+export interface OperatorAlertView {
+  ts: number;
+  agentId: string;
+  level: "warn" | "critical";
+  text: string;
+  source: string;
 }
 
 export interface BusWebUiPromptResult {

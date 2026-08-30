@@ -19,6 +19,10 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "crypto";
+// Scoped per-channel/per-user policies. Imported for use at evaluate-time only
+// (not at module init), so the channel-policies↔engine cycle never hits a TDZ.
+import { getScopedRules, mergeScopedPolicies } from "./channel-policies";
+import { getCachedSkillOverlayRules, hasCachedSkillOverlay } from "./skill-overlays";
 
 const POLICY_DIR = join(process.cwd(), ".claude", "claudeclaw");
 const POLICY_FILE = join(POLICY_DIR, "policies.json");
@@ -402,8 +406,47 @@ export function clearCache(): void {
 // Internal Helpers
 // ============================================================================
 
+// #284 LOW: dedupe the "overlay not cached in this process" warning so a hot
+// path doesn't spam the log — one line per skill name is enough to flag the gap.
+const warnedUncachedOverlays = new Set<string>();
+function warnUncachedSkillOverlay(skillName: string): void {
+  if (warnedUncachedOverlays.has(skillName)) return;
+  warnedUncachedOverlays.add(skillName);
+  console.warn(
+    `[policy] skill "${skillName}" has no overlay cached in this process — its ` +
+      `deny overlay (if any) is not enforced on this evaluation path; the ` +
+      `request still falls through to the normal approval gate.`,
+  );
+}
+
 function getApplicableRules(request: ToolRequestContext): PolicyRule[] {
-  return loadedRules.filter((rule) => {
+  // Evaluate against the GLOBAL rules merged with the scoped per-channel /
+  // per-user rules for THIS request — previously only `loadedRules` (global)
+  // was consulted, so any deny/require_approval an operator wrote in
+  // scoped-policies.json was silently inert (governance audit HIGH).
+  // getScopedRules() already folds in the globals; mergeScopedPolicies dedups by
+  // id (scoped overrides a same-id global). Falls back to globals on any error.
+  let candidates: PolicyRule[];
+  try {
+    candidates = mergeScopedPolicies(loadedRules, getScopedRules(request));
+  } catch {
+    candidates = loadedRules;
+  }
+  // Fold in skill-overlay deny rules for this request's skill (#258 item 2).
+  // Overlays are deny-only and scoped by skillName, so they can only ADD a
+  // restriction for the matching skill — never widen access. Empty when the
+  // request carries no skillName or the skill declared no deniedTools.
+  const overlayRules = getCachedSkillOverlayRules(request.skillName);
+  if (overlayRules.length > 0) candidates = candidates.concat(overlayRules);
+  else if (request.skillName && !hasCachedSkillOverlay(request.skillName)) {
+    // #284 LOW: overlay enforcement is process-local — if this skill's SKILL.md
+    // was never resolved (or has expired) in THIS process, its deny overlay is
+    // silently absent on this evaluation path. Surface the gap once per skill so
+    // an operator can see a deny overlay may not be enforced here. No behaviour
+    // change: the request still falls through to the normal approval gate.
+    warnUncachedSkillOverlay(request.skillName);
+  }
+  return candidates.filter((rule) => {
     // Skip disabled rules
     if (rule.enabled === false) return false;
 

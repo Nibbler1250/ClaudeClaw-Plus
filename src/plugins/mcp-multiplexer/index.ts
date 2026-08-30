@@ -258,7 +258,12 @@ export class McpMultiplexerPlugin {
    *   - no `persistenceFactory` was supplied (W1 not yet merged), OR
    *   - the factory returned null (degraded — disk/permission errors). */
   private persistence: SessionPersistenceStore | null = null;
-  /** Periodic GC sweep. Null when persistence is dormant. */
+  /** Periodic GC tick: the persisted-record GC AND the orphaned-bucket
+   *  sweep. Armed whenever the plugin is running — NOT gated on persistence.
+   *  The sweep bounds in-memory buckets, which a handler accumulates whether
+   *  or not anything is written to disk, so gating the tick on a store would
+   *  leave exactly the handlers with no persistence unswept. Null only while
+   *  the plugin is stopped or dormant. */
   private gcTimer: ReturnType<typeof setInterval> | null = null;
   /** #72 item 7: file to check for shared-name collisions at startup.
    *  Defaults to `~/.claude/mcp.json`; tests can override. */
@@ -496,11 +501,16 @@ export class McpMultiplexerPlugin {
     // method returns, so this ordering is safe.
     if (this.persistence) {
       await this._replayPersistedSessions();
-      // Start the GC sweep. Default cadence 1h; tests pin to 0 to drive
-      // synchronously via `_runGCTickForTests`.
-      const gcTickMs = this.gcTickMsOverride ?? 3_600_000;
-      this._startGCTick(gcTickMs);
     }
+    // The tick runs whether or not a persistence store exists — it also
+    // reclaims orphaned in-memory buckets, which is a hazard the store has no
+    // bearing on. Gating the whole thing on `this.persistence` meant an
+    // operator who turned session persistence off got no bucket sweep either,
+    // and those two knobs have nothing to do with each other.
+    // Default cadence 1h; tests pin to 0 to drive synchronously via
+    // `_runGCTickForTests`.
+    const gcTickMs = this.gcTickMsOverride ?? 3_600_000;
+    this._startGCTick(gcTickMs);
   }
 
   async stop(): Promise<void> {
@@ -695,7 +705,6 @@ export class McpMultiplexerPlugin {
 
   private _startGCTick(intervalMs: number): void {
     if (intervalMs <= 0) return;
-    if (!this.persistence) return;
     this.gcTimer = setInterval(() => {
       void this._runGCTick();
     }, intervalMs);
@@ -711,18 +720,34 @@ export class McpMultiplexerPlugin {
     }
   }
 
-  /** One GC pass. Delegates the TTL sweep to the persistence layer;
-   *  the store emits `mcp_session_gc` per dropped entry internally. */
+  /** One GC pass. Two independent sweeps, each isolated so a failure in
+   *  one still runs the other:
+   *    - on-disk session records, TTL-based, delegated to the persistence
+   *      layer (it emits `mcp_session_gc` per dropped entry internally);
+   *    - in-memory buckets whose PTY identity is gone, which is how a
+   *      bucket orphaned by a mid-request `releasePty` gets reclaimed. */
   private async _runGCTick(): Promise<void> {
-    if (!this.persistence) return;
-    try {
-      await this.persistence.garbageCollect();
-    } catch (err) {
-      console.warn(
-        `[mcp-multiplexer] persistence GC failed (continuing): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
+    if (this.persistence) {
+      try {
+        await this.persistence.garbageCollect();
+      } catch (err) {
+        console.warn(
+          `[mcp-multiplexer] persistence GC failed (continuing): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+    for (const handler of this.handlers.values()) {
+      try {
+        await handler.sweepOrphanedBuckets();
+      } catch (err) {
+        console.warn(
+          `[mcp-multiplexer] bucket sweep failed (continuing): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
     }
   }
 

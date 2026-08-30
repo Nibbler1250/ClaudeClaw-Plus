@@ -939,26 +939,184 @@ describe("BusCore IPC", () => {
     client.close();
   });
 
+  it("re-delivers an immediately-delivered prompt when the IPC send failed (MCP-blip wedge, #252)", async () => {
+    // dossier 20260614T034258: the MCP/IPC socket blipped right at the prompt
+    // boundary (`send-failed: no-mcp-connection`), the prompt fell through to an
+    // IMMEDIATE PTY delivery (session not initialising, so no backstop), the
+    // keystroke coincided with the reconnect and never started a turn — and the
+    // #222 reconciler disarmed on "reconnected during confirm window" without
+    // verifying a turn. Verify turn-start on this path too and re-deliver once.
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      flushVerifyMs: 30,
+      streamPromptHandler: async (_a, text) => {
+        delivered.push(text);
+      },
+      onError: () => {},
+    });
+    await bus.start();
+    // No agent ever connected → ipcServer.send returns false (ipcSendFailed),
+    // and the agent is NOT initialising → the prompt is delivered immediately.
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "ping",
+    });
+    expect(delivered).toHaveLength(1); // delivered immediately to PTY
+    await new Promise((r) => setTimeout(r, 45)); // > flushVerify, no turn → re-deliver once
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]).toContain("ping");
+  });
+
+  it("clears a pending flush-verify when the agent's socket closes (no stale re-delivery, #252)", async () => {
+    // A reconciler restart (#222) kills the claude process → its IPC socket
+    // closes → onClose must tear down any armed verify, so a verify timer can
+    // never re-deliver a keystroke into a restarted session that reused the
+    // agent_id (and the reconciler/verify don't both act on the same prompt).
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      deliveryBackstopMs: 20,
+      flushVerifyMs: 80,
+      streamPromptHandler: async (_a, text) => {
+        delivered.push(text);
+      },
+      onError: () => {},
+    });
+    await bus.start();
+    const client = await connectIpcClient(sockPath);
+    const hello: IpcHello = {
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    };
+    client.send(hello);
+    await new Promise((r) => setTimeout(r, 20)); // let the hello register the connection
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "session.init",
+      payload: {},
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "held",
+    });
+    await new Promise((r) => setTimeout(r, 50)); // > backstop → flush + arm verify
+    expect(delivered).toHaveLength(1);
+    client.close(); // socket close → onClose(alpha) → clearFlushVerify(alpha)
+    await new Promise((r) => setTimeout(r, 120)); // > flushVerify + grace
+    expect(delivered).toHaveLength(1); // verify torn down → NOT re-delivered
+  });
+
+  it("re-delivers a prompt held at socket close once the fresh session is ready (#252 stack ultra B1)", async () => {
+    // A reconciler restart of an alive-but-deaf agent closes the socket while a
+    // prompt is still held (or awaiting verify). onClose snapshots it; the fresh
+    // generation's replay_done re-delivers it through the gate instead of the
+    // prompt being silently dropped (no recovery layer owned it before).
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      deliveryBackstopMs: 5000, // large: the prompt stays HELD (not backstop-flushed) until close
+      onError: () => {},
+      streamPromptHandler: async (_a, text) => {
+        delivered.push(text);
+      },
+    });
+    await bus.start();
+    const client = await connectIpcClient(sockPath);
+    const hello: IpcHello = {
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    };
+    client.send(hello);
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "session.init",
+      payload: {},
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "carryme",
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(delivered).toHaveLength(0); // held while (re)initialising
+    client.close(); // onClose → snapshot the held prompt into pendingRedelivery
+    await new Promise((r) => setTimeout(r, 40));
+    expect(delivered).toHaveLength(0); // still nothing — no ready session yet
+    // The fresh generation reaches replay_done → carried prompt re-delivered.
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s2",
+      topic: "bus.events.replay_done",
+      payload: {},
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toContain("carryme");
+  });
+
   describe("silent-drop safety net (issue #215)", () => {
-    function makeBus(): BusCore {
+    function makeBus(opts?: { replyNudge?: boolean; nudges?: string[] }): BusCore {
       return createBusCore({
         eventLogAppend: createMockEventLog().append,
+        replyNudge: opts?.replyNudge,
+        // Capture PTY-stdin deliveries so nudge tests can assert the reminder
+        // was injected (no real REPL in tests).
+        streamPromptHandler: opts?.nudges
+          ? async (_agentId: string, wrapped: string) => {
+              // sendPrompt also delivers <channel> prompts over this seam;
+              // capture only the bus-injected reply nudges.
+              if (wrapped.includes("<system-reminder>")) opts.nudges?.push(wrapped);
+            }
+          : undefined,
       });
     }
 
     function captureReplies(b: BusCore, agentId: string) {
-      const replies: { text: string; origin?: string }[] = [];
+      const replies: { text: string; origin?: string; synthesized?: boolean }[] = [];
       b.subscribe({ agent_id: agentId, topics: ["response.text"] }, (event) => {
-        const payload = event.payload as { text?: string; intent?: string; origin?: string };
+        const payload = event.payload as {
+          text?: string;
+          intent?: string;
+          origin?: string;
+          synthesized?: boolean;
+        };
         if (payload?.intent === "final") {
-          replies.push({ text: payload.text ?? "", origin: payload.origin });
+          replies.push({
+            text: payload.text ?? "",
+            origin: payload.origin,
+            synthesized: payload.synthesized,
+          });
         }
       });
       return replies;
     }
 
     it("synthesizes a final reply when turn_end fires without prior reply call", async () => {
-      const b = makeBus();
+      // replyNudge:false isolates the fallback synthesis path from the nudge.
+      const b = makeBus({ replyNudge: false });
       const replies = captureReplies(b, "alpha");
 
       await b.sendPrompt({
@@ -981,6 +1139,123 @@ describe("BusCore IPC", () => {
       expect(replies.length).toBe(1);
       expect(replies[0].text).toBe("hi there, this is the silent-dropped text");
       expect(replies[0].origin).toBe("webui");
+    });
+
+    it("tags the synthesized delivery with synthesized:true so surfaces can label it (#240)", async () => {
+      // replyNudge:false to reach the synthesis path directly (not via a nudge).
+      const b = makeBus({ replyNudge: false });
+      const replies = captureReplies(b, "alpha");
+
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "webui",
+        origin_id: "test-240",
+        user_id: "u1",
+        text: "say hi",
+      });
+
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "",
+        topic: "response.turn_end",
+        payload: { stop_reason: "end_turn", text: "uncurated working prose" },
+      });
+
+      expect(replies.length).toBe(1);
+      expect(replies[0].synthesized).toBe(true);
+    });
+
+    /* ───────── reply-tool enforcement: nudge-first (#215/#240) ───────── */
+
+    const turnEnd = (b: BusCore, agentId: string, text: string) =>
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: agentId,
+        session_id: "",
+        topic: "response.turn_end",
+        payload: { stop_reason: "end_turn", text },
+      });
+    const promptTg = (b: BusCore, agentId: string) =>
+      b.sendPrompt({
+        agent_id: agentId,
+        origin: "telegram",
+        origin_id: "tg-1",
+        user_id: "u1",
+        text: "hi",
+      });
+    const tick = () => new Promise((r) => setTimeout(r, 5));
+
+    it("nudges the agent to call reply instead of synthesizing on the first miss", async () => {
+      const nudges: string[] = [];
+      const b = makeBus({ nudges });
+      const replies = captureReplies(b, "alpha");
+
+      await promptTg(b, "alpha");
+      turnEnd(b, "alpha", "uncurated scratch");
+      await tick();
+
+      // No synthesized delivery — the agent got a reminder to call reply.
+      expect(replies.length).toBe(0);
+      expect(nudges.length).toBe(1);
+      expect(nudges[0]).toContain("<system-reminder>");
+      expect(nudges[0]).toContain("reply");
+    });
+
+    it("delivers the agent's real reply (not a synthesized dump) when the nudge works", async () => {
+      const nudges: string[] = [];
+      const b = makeBus({ nudges });
+      const replies = captureReplies(b, "alpha");
+
+      await promptTg(b, "alpha");
+      turnEnd(b, "alpha", "scratch"); // → nudge
+      await tick();
+      expect(replies.length).toBe(0);
+
+      // The agent obeys the nudge and calls reply with a curated answer.
+      b.ingestReply({ agent_id: "alpha", text: "Curated answer", intent: "final" });
+      expect(replies.length).toBe(1);
+      expect(replies[0].text).toBe("Curated answer");
+      expect(replies[0].synthesized).toBeUndefined(); // a REAL reply, not synthesized
+
+      // A trailing turn_end for the nudged turn must NOT double-deliver.
+      turnEnd(b, "alpha", "scratch");
+      await tick();
+      expect(replies.length).toBe(1);
+    });
+
+    it("falls back to a labeled synthesized delivery when the nudged turn ALSO skips reply", async () => {
+      const nudges: string[] = [];
+      const b = makeBus({ nudges });
+      const replies = captureReplies(b, "alpha");
+
+      await promptTg(b, "alpha");
+      turnEnd(b, "alpha", "original output"); // first miss → nudge
+      await tick();
+      expect(replies.length).toBe(0);
+      expect(nudges.length).toBe(1);
+
+      turnEnd(b, "alpha", "second output"); // nudged turn ALSO skips reply
+      await tick();
+      expect(replies.length).toBe(1);
+      expect(replies[0].synthesized).toBe(true);
+      expect(nudges.length).toBe(1); // bounded: exactly one nudge per turn
+    });
+
+    it("the fallback preserves the original turn text if the nudged turn produces none", async () => {
+      const nudges: string[] = [];
+      const b = makeBus({ nudges });
+      const replies = captureReplies(b, "alpha");
+
+      await promptTg(b, "alpha");
+      turnEnd(b, "alpha", "the original answer"); // → nudge (text stashed)
+      await tick();
+      turnEnd(b, "alpha", ""); // nudged turn ends empty, still no reply
+      await tick();
+
+      expect(replies.length).toBe(1);
+      expect(replies[0].text).toBe("the original answer");
+      expect(replies[0].synthesized).toBe(true);
     });
 
     it("does NOT synthesize when the agent already called reply with intent: final", async () => {
@@ -1014,6 +1289,8 @@ describe("BusCore IPC", () => {
       // Only the real reply, no duplicate from the safety net.
       expect(replies.length).toBe(1);
       expect(replies[0].text).toBe("hello — delivered properly via reply tool");
+      // A curated reply is NOT tagged synthesized (#240).
+      expect(replies[0].synthesized).toBeUndefined();
     });
 
     it("does NOT synthesize when turn_end text is empty", async () => {
@@ -1083,7 +1360,8 @@ describe("BusCore IPC", () => {
     });
 
     it("resets the per-turn flag on each new prompt (single-flight per prompt)", async () => {
-      const b = makeBus();
+      // replyNudge:false: asserts the synthesis path directly across prompts.
+      const b = makeBus({ replyNudge: false });
       const replies = captureReplies(b, "alpha");
 
       // Prompt 1: agent calls reply → no synthesis.
@@ -1204,6 +1482,33 @@ describe("BusCore IPC", () => {
       // Exactly one final delivered, not two.
       expect(replies.length).toBe(1);
       expect(replies[0].text).toBe("the answer");
+    });
+
+    it("synthesizes immediately when the reply nudge reaches no transport (deaf agent) (#261)", async () => {
+      // replyNudge is on by default, but makeBus() wires neither an IPC server
+      // nor a streamPromptHandler, so the nudge reaches nobody. Pre-fix this
+      // stranded the user until the reconciler respawned the agent (one full
+      // cycle of hang); now the bus must fall through and synthesize at once.
+      const b = makeBus();
+      const replies = captureReplies(b, "alpha");
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "webui",
+        origin_id: "deaf-1",
+        user_id: "u1",
+        text: "hi",
+      });
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "",
+        topic: "response.turn_end",
+        payload: { stop_reason: "end_turn", text: "recovered answer" },
+      });
+      // Delivered synchronously via synthesis — no waiting for a nudged turn.
+      expect(replies.length).toBe(1);
+      expect(replies[0].text).toBe("recovered answer");
+      expect(replies[0].synthesized).toBe(true);
     });
   });
 });
@@ -1373,5 +1678,269 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     });
     expect(delivered).toHaveLength(1);
     expect(delivered[0]).toContain("held");
+  });
+
+  // A backstop flush fires on a TIMER because replay_done never arrived. During
+  // an IPC-reconnect storm the session is still re-initialising, so the flushed
+  // keystroke is swallowed and never starts a turn (dossier 20260613T033017).
+  //
+  // Turn-start proof is ATTRIBUTED (#252): the tailer `prompt` event carries the
+  // ingested user line, which is the exact wrapped string the bus delivered. The
+  // verify is cancelled only when the event's `text` matches a pending prompt —
+  // so `turnEvt` must echo the delivered text, and an unrelated prompt's turn
+  // (different text) must NOT cancel.
+  const turnEvt = (agent: string, ingestedText: string): BusEvent => ({
+    ts: 1,
+    agent_id: agent,
+    session_id: "s",
+    topic: "prompt", // tailer: claude wrote the ingested user line = turn started
+    payload: { text: ingestedText },
+  });
+
+  it("re-delivers ONCE when a backstop-flushed prompt never starts a turn (idle-REPL wedge)", async () => {
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 20,
+      flushVerifyMs: 30,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "held");
+    expect(delivered).toHaveLength(0);
+    await new Promise((r) => setTimeout(r, 45)); // > backstop → first (swallowed) flush
+    expect(delivered).toHaveLength(1);
+    await new Promise((r) => setTimeout(r, 45)); // > flushVerify, no turn activity → re-deliver
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]).toContain("held");
+    await new Promise((r) => setTimeout(r, 45)); // never more than once
+    expect(delivered).toHaveLength(2);
+  });
+
+  it("does NOT re-deliver a backstop-flushed prompt that starts a turn", async () => {
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 20,
+      flushVerifyMs: 30,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "held");
+    await new Promise((r) => setTimeout(r, 45)); // > backstop → flush
+    expect(delivered).toHaveLength(1);
+    // tailer `prompt` echoing the delivered (wrapped) line proves THIS prompt
+    // started its turn → cancel its pending re-delivery.
+    bus.ingestSessionEvent(turnEvt("alpha", delivered[0]));
+    await new Promise((r) => setTimeout(r, 45)); // > flushVerify
+    expect(delivered).toHaveLength(1); // not re-delivered
+  });
+
+  it("re-delivers when only an UNRELATED prompt starts a turn (attribution, #252)", async () => {
+    // The bug: a later unrelated prompt's turn activity cancelled the swallowed
+    // prompt's pending re-delivery, dropping it silently. Attribution by ingested
+    // text fixes it — a non-matching `prompt` event must NOT cancel.
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 20,
+      flushVerifyMs: 30,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "held");
+    await new Promise((r) => setTimeout(r, 45)); // > backstop → first (swallowed) flush
+    expect(delivered).toHaveLength(1);
+    // A DIFFERENT prompt's turn-start lands — must not satisfy the swallowed one
+    // (attribution), though it does mark the agent's turn active so the verify
+    // defers until that turn ends.
+    bus.ingestSessionEvent(turnEvt("alpha", "<channel>some other prompt</channel>"));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "response.turn_end",
+      payload: { text: "" },
+    }); // the unrelated turn ends → REPL free → "held"'s verify can now fire
+    await new Promise((r) => setTimeout(r, 60)); // > flushVerify + grace → swallowed prompt re-delivered
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]).toContain("held");
+  });
+
+  it("attributes a MULTI-LINE prompt's turn-start despite PTY newline sanitization (#252 ultra HIGH)", async () => {
+    // The PTY layer runs sanitizePtyPromptText before typing — newlines collapse
+    // to spaces — and the tailer's `prompt` event carries that sanitized form.
+    // The verify must key on the sanitized text, else a multi-line prompt's
+    // healthy turn never matches and the prompt is spuriously re-delivered
+    // (double-submit). This test fails on the raw-key implementation.
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 20,
+      flushVerifyMs: 30,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "line one\nline two"); // multi-line user text
+    await new Promise((r) => setTimeout(r, 45)); // > backstop → flush
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toContain("\n"); // raw wrapped still carries the newline
+    // The tailer records what claude received = the PTY-sanitized line (newlines
+    // collapsed to spaces). Emitting THAT must still cancel the verify.
+    const sanitized = delivered[0].replace(/\r\n?|\n/g, " ");
+    bus.ingestSessionEvent(turnEvt("alpha", sanitized));
+    await new Promise((r) => setTimeout(r, 45)); // > flushVerify
+    expect(delivered).toHaveLength(1); // attributed → NOT re-delivered
+  });
+
+  it("does NOT re-deliver while a delivery handler is still in-flight (compaction, #252)", async () => {
+    // The regression: flushVerify fired at flushVerifyMs (8s) while the delivery
+    // handler legitimately held through auto-compaction (up to 240s), so the
+    // prompt got submitted twice once compaction finished. The in-flight guard
+    // defers re-delivery until the handler settles.
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 20,
+      flushVerifyMs: 30,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    let release!: () => void;
+    const handlerDone = new Promise<void>((r) => {
+      release = r;
+    });
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+      await handlerDone; // simulate a handler blocked on compaction
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "held");
+    await new Promise((r) => setTimeout(r, 45)); // > backstop → flush (handler now in-flight)
+    expect(delivered).toHaveLength(1);
+    await new Promise((r) => setTimeout(r, 80)); // well past flushVerify — must NOT double-submit
+    expect(delivered).toHaveLength(1); // deferred while in-flight
+    release(); // compaction finishes, handler settles, turn never started
+    await new Promise((r) => setTimeout(r, 45)); // next verify tick → re-deliver once
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]).toContain("held");
+  });
+
+  it("re-delivers a swallowed prompt AT MOST ONCE across repeated backstop cycles (#252)", async () => {
+    // A re-delivery that is itself held (agent re-initialising) and flushed by a
+    // SECOND backstop must NOT arm a second verify: a prompt gets one
+    // re-delivery for its whole lifetime, the watchdog is the net beyond that.
+    // The verify entry is left in the pending map after re-delivery precisely so
+    // a later armFlushVerify for the same key is a no-op.
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 50,
+      flushVerifyMs: 60,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "held");
+    await new Promise((r) => setTimeout(r, 90)); // > backstop → flush#1 (d=1), verify armed
+    expect(delivered).toHaveLength(1);
+    bus.ingestSessionEvent(initEvt("alpha")); // re-init: the imminent re-delivery is held
+    // verify fires (~110) → grace → re-deliver (~125), queued (initialising);
+    // backstop#2 (~140) flushes it → d=2 and must NOT re-arm a third verify.
+    await new Promise((r) => setTimeout(r, 200)); // past backstop#2 + any spurious 3rd verify
+    expect(delivered).toHaveLength(2); // exactly one re-delivery, never a second
+  });
+
+  // Turn-end event helper for the back-to-back (neighbor-turn) tests.
+  const turnEndEvt = (agent: string): BusEvent => ({
+    ts: 1,
+    agent_id: agent,
+    session_id: "s",
+    topic: "response.turn_end",
+    payload: { text: "" }, // empty → the #215 synthesizer is a no-op
+  });
+
+  it("re-delivers a prompt queued behind a neighbor turn if it never starts its own (bus-level #250 HIGH)", async () => {
+    // A prompt delivered while a neighbor turn is STREAMING is only a queued
+    // keystroke in the REPL box; the PTY confirm-loop can misread the neighbor's
+    // stream as this prompt's turn-start. The bus arms a verify (reliable
+    // tailer attribution), DEFERS it while the neighbor turn is active (the
+    // prompt legitimately waits behind it — re-delivering sooner double-submits),
+    // and re-delivers only if no turn ever starts for it.
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      flushVerifyMs: 40,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(turnEvt("alpha", "<channel>neighbor</channel>")); // neighbor turn active
+    await prompt("alpha", "queued");
+    expect(delivered).toHaveLength(1); // delivered immediately (queued in the box)
+    await new Promise((r) => setTimeout(r, 100)); // > flushVerify, but neighbor still active
+    expect(delivered).toHaveLength(1); // DEFERRED — not re-delivered behind the live turn
+    bus.ingestSessionEvent(turnEndEvt("alpha")); // neighbor turn ends → REPL free
+    await new Promise((r) => setTimeout(r, 100)); // > flushVerify + grace, no turn for "queued"
+    expect(delivered).toHaveLength(2); // now re-delivered exactly once
+    expect(delivered[1]).toContain("queued");
+  });
+
+  it("does NOT re-deliver a queued prompt that starts its own turn after the neighbor ends (#252)", async () => {
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      flushVerifyMs: 40,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(turnEvt("alpha", "<channel>neighbor</channel>")); // neighbor turn active
+    await prompt("alpha", "queued");
+    expect(delivered).toHaveLength(1);
+    bus.ingestSessionEvent(turnEndEvt("alpha")); // neighbor ends
+    bus.ingestSessionEvent(turnEvt("alpha", delivered[0])); // "queued" starts its OWN turn → cancel
+    await new Promise((r) => setTimeout(r, 100)); // > flushVerify + grace
+    expect(delivered).toHaveLength(1); // attributed → not re-delivered
+  });
+
+  it("recovers a stuck neighbor-turn flag on replay_done so flush-verify is not disabled forever (#252 stack ultra HIGH)", async () => {
+    // A turn whose `response.turn_end` is never seen (interrupted by a reconciler
+    // restart whose new tailer seeks past it) would leave agentTurnActive stuck
+    // true, permanently DEFERRING every flush-verify for the agent. A new session
+    // generation (replay_done) must clear it so the safety net comes back.
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      flushVerifyMs: 40,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(turnEvt("alpha", "<channel>orphan</channel>")); // turn starts, NO turn_end ever
+    await prompt("alpha", "p1"); // immediate delivery during the (stuck) active turn → arms a verify
+    expect(delivered).toHaveLength(1);
+    await new Promise((r) => setTimeout(r, 70)); // > flushVerify: deferred while agentTurnActive stuck true
+    expect(delivered).toHaveLength(1); // not re-delivered — verify is (correctly) deferred...
+    bus.ingestSessionEvent(replayEvt("alpha")); // ...until a new generation clears the stuck flag
+    await new Promise((r) => setTimeout(r, 70)); // verify now fires → re-deliver "p1"
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]).toContain("p1");
   });
 });

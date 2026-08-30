@@ -29,7 +29,17 @@ export interface WatchdogLimits {
   maxRuntimeSeconds?: number;
   maxRepeatedTools?: number;
   repeatedToolThreshold?: number; // Number of repeated patterns before action
+  /**
+   * Hard-ceiling multiplier for `kill` escalation. A metric that reaches
+   * `limit * killCeilingMultiplier` — i.e. well past the `suspend` line — is a
+   * runaway that escalated to `kill` (terminate), not merely paused. Default 2.
+   * Set ≤1 to disable the kill tier (suspend stays the highest state).
+   */
+  killCeilingMultiplier?: number;
 }
+
+/** Default hard-ceiling multiple at which `suspend` escalates to `kill`. */
+export const DEFAULT_KILL_CEILING_MULTIPLIER = 2;
 
 export interface ExecutionMetrics {
   invocationId: string;
@@ -76,6 +86,10 @@ interface WatchdogIndex {
 }
 
 // Default configuration
+// Default: disabled. The activeInvocations lifecycle leak (#268) is now fixed —
+// runner.ts clears each record in a `finally` on every exit path — but the
+// default stays `false` pending a deliberate opt-in after production soak.
+// Enable via settings.governance.watchdog.enabled.
 let watchdogConfig: WatchdogConfig = {
   limits: {
     maxToolCalls: 100,
@@ -84,7 +98,7 @@ let watchdogConfig: WatchdogConfig = {
     maxRepeatedTools: 5,
     repeatedToolThreshold: 3, // 3+ repeated patterns triggers warning
   },
-  enabled: true,
+  enabled: false,
   checkIntervalMs: 5000, // Check every 5 seconds
 };
 
@@ -127,9 +141,24 @@ export async function initWatchdog(): Promise<void> {
     return initializationPromise;
   }
 
-  initializationPromise = doInit();
+  // Reset the cached promise if init rejects so it's retryable — otherwise a
+  // single transient failure (e.g. an index-write error during eviction) would
+  // poison every later checkLimits/clearInvocation for the process lifetime.
+  initializationPromise = doInit().catch((err) => {
+    initializationPromise = null;
+    throw err;
+  });
   return initializationPromise;
 }
+
+/**
+ * Hard cap on how long an `activeInvocations` record can live before startup
+ * eviction drops it. Defense-in-depth against the lifecycle leak (#268): even
+ * if the per-invocation `clearInvocation` hook misses, a daemon restart
+ * garbage-collects anything older than 24h so `maxRuntimeSeconds` can't trip
+ * on a record that's been forgotten about.
+ */
+const STARTUP_EVICTION_AGE_MS = 24 * 60 * 60 * 1000;
 
 async function doInit(): Promise<void> {
   // Ensure directory exists
@@ -144,7 +173,37 @@ async function doInit(): Promise<void> {
       activeInvocations: {},
       updatedAt: new Date().toISOString(),
     };
-    await saveWatchdogIndex();
+    // Best-effort: a write failure here must not poison init — the in-memory
+    // index is valid and the next save will persist it.
+    try {
+      await saveWatchdogIndex();
+    } catch (err) {
+      console.warn("[watchdog] initial index save failed:", err);
+    }
+    return;
+  }
+
+  // Defense-in-depth eviction (#268): drop records whose lastActivityAt is
+  // older than STARTUP_EVICTION_AGE_MS. If clearInvocation() is ever missed
+  // on the lifecycle hook, this guarantees a daemon restart resets the floor
+  // so an ancient record can't silently trip maxRuntimeSeconds.
+  const nowMs = Date.now();
+  let evicted = 0;
+  for (const [id, record] of Object.entries(watchdogIndex.activeInvocations)) {
+    const lastActivityMs = new Date(record.lastActivityAt).getTime();
+    if (Number.isNaN(lastActivityMs) || nowMs - lastActivityMs > STARTUP_EVICTION_AGE_MS) {
+      delete watchdogIndex.activeInvocations[id];
+      evicted++;
+    }
+  }
+  if (evicted > 0) {
+    // Best-effort GC persist: records are already dropped from the in-memory
+    // index, so a write failure here is non-fatal (the next clean save persists).
+    try {
+      await saveWatchdogIndex();
+    } catch (err) {
+      console.warn("[watchdog] eviction index save failed:", err);
+    }
   }
 }
 
@@ -230,6 +289,11 @@ export async function recordExecutionMetric(
     toolCalls?: Array<{ tool: string; input: unknown; timestamp?: string }>;
   },
 ): Promise<void> {
+  // Short-circuit when disabled — otherwise we keep writing activeInvocations
+  // records to disk even though checkLimits short-circuits. That's the leak
+  // PR #270's user-visible fix did not address (F3 from review).
+  if (!watchdogConfig.enabled) return;
+
   await initWatchdog();
 
   const now = new Date().toISOString();
@@ -280,6 +344,8 @@ export async function incrementToolCall(
   tool: string,
   input: unknown,
 ): Promise<void> {
+  if (!watchdogConfig.enabled) return;
+
   await initWatchdog();
 
   const now = new Date().toISOString();
@@ -312,6 +378,8 @@ export async function incrementToolCall(
  * Increment turn count for an invocation.
  */
 export async function incrementTurnCount(invocationId: string): Promise<void> {
+  if (!watchdogConfig.enabled) return;
+
   await initWatchdog();
 
   const now = new Date().toISOString();
@@ -336,6 +404,20 @@ export async function incrementTurnCount(invocationId: string): Promise<void> {
 /**
  * Check limits for an invocation.
  */
+const STATE_SEVERITY: Record<WatchdogState, number> = {
+  healthy: 0,
+  warn: 1,
+  suspend: 2,
+  kill: 3,
+};
+
+/** Escalate to the more severe of two states. A hard limit reached AFTER a
+ *  warning must still upgrade to `suspend` — the old `=== "healthy" ? ...`
+ *  guard left worstState stuck at "warn" so the suspend never fired. */
+function escalateState(current: WatchdogState, next: WatchdogState): WatchdogState {
+  return STATE_SEVERITY[next] > STATE_SEVERITY[current] ? next : current;
+}
+
 export async function checkLimits(context: {
   invocationId: string;
   sessionId?: string;
@@ -343,6 +425,22 @@ export async function checkLimits(context: {
   await initWatchdog();
 
   const now = new Date().toISOString();
+
+  // Short-circuit when disabled. The activeInvocations lifecycle leak (#268) —
+  // records were never cleared on turn-end, so watchdog-index.json grew
+  // unbounded — is now fixed (runner.ts clears each record in a `finally` on
+  // every exit path). `enabled` stays an operator opt-out pending prod soak.
+  if (!watchdogConfig.enabled) {
+    return {
+      invocationId: context.invocationId,
+      state: "healthy",
+      reason: "Watchdog disabled via config",
+      triggeredLimits: [],
+      recommendedAction: "continue",
+      evaluatedAt: now,
+    };
+  }
+
   const record = watchdogIndex!.activeInvocations[context.invocationId];
 
   if (!record) {
@@ -361,37 +459,53 @@ export async function checkLimits(context: {
   let worstState: WatchdogState = "healthy";
 
   const { limits } = watchdogConfig;
+  // Kill = a runaway well past the suspend line. `>1` gates the tier so a config
+  // of ≤1 keeps suspend as the highest state (opt-out).
+  const killMult = limits.killCeilingMultiplier ?? DEFAULT_KILL_CEILING_MULTIPLIER;
+  const killsAt = (limit: number): number | null => (killMult > 1 ? limit * killMult : null);
 
   // Check tool call limit
-  if (limits.maxToolCalls && record.toolCallCount >= limits.maxToolCalls) {
+  const toolKill = limits.maxToolCalls ? killsAt(limits.maxToolCalls) : null;
+  if (limits.maxToolCalls && toolKill !== null && record.toolCallCount >= toolKill) {
+    triggeredLimits.push(`maxToolCalls_kill=${record.toolCallCount}/${toolKill}`);
+    worstState = escalateState(worstState, "kill");
+  } else if (limits.maxToolCalls && record.toolCallCount >= limits.maxToolCalls) {
     triggeredLimits.push(`maxToolCalls=${record.toolCallCount}/${limits.maxToolCalls}`);
-    worstState = worstState === "healthy" ? "suspend" : worstState;
+    worstState = escalateState(worstState, "suspend");
   } else if (limits.maxToolCalls && record.toolCallCount >= limits.maxToolCalls * 0.8) {
     triggeredLimits.push(`maxToolCalls_warning=${record.toolCallCount}/${limits.maxToolCalls}`);
-    if (worstState === "healthy") worstState = "warn";
+    worstState = escalateState(worstState, "warn");
   }
 
   // Check turn limit
-  if (limits.maxTurns && record.turnCount >= limits.maxTurns) {
+  const turnKill = limits.maxTurns ? killsAt(limits.maxTurns) : null;
+  if (limits.maxTurns && turnKill !== null && record.turnCount >= turnKill) {
+    triggeredLimits.push(`maxTurns_kill=${record.turnCount}/${turnKill}`);
+    worstState = escalateState(worstState, "kill");
+  } else if (limits.maxTurns && record.turnCount >= limits.maxTurns) {
     triggeredLimits.push(`maxTurns=${record.turnCount}/${limits.maxTurns}`);
-    worstState = worstState === "healthy" ? "suspend" : worstState;
+    worstState = escalateState(worstState, "suspend");
   } else if (limits.maxTurns && record.turnCount >= limits.maxTurns * 0.8) {
     triggeredLimits.push(`maxTurns_warning=${record.turnCount}/${limits.maxTurns}`);
-    if (worstState === "healthy") worstState = "warn";
+    worstState = escalateState(worstState, "warn");
   }
 
   // Check runtime limit
   if (limits.maxRuntimeSeconds) {
     const startedAt = new Date(record.startedAt);
     const elapsedSeconds = (Date.now() - startedAt.getTime()) / 1000;
-    if (elapsedSeconds >= limits.maxRuntimeSeconds) {
+    const runtimeKill = killsAt(limits.maxRuntimeSeconds);
+    if (runtimeKill !== null && elapsedSeconds >= runtimeKill) {
+      triggeredLimits.push(`maxRuntimeSeconds_kill=${elapsedSeconds}/${runtimeKill}`);
+      worstState = escalateState(worstState, "kill");
+    } else if (elapsedSeconds >= limits.maxRuntimeSeconds) {
       triggeredLimits.push(`maxRuntimeSeconds=${elapsedSeconds}/${limits.maxRuntimeSeconds}`);
-      worstState = worstState === "healthy" ? "suspend" : worstState;
+      worstState = escalateState(worstState, "suspend");
     } else if (elapsedSeconds >= limits.maxRuntimeSeconds * 0.8) {
       triggeredLimits.push(
         `maxRuntimeSeconds_warning=${elapsedSeconds}/${limits.maxRuntimeSeconds}`,
       );
-      if (worstState === "healthy") worstState = "warn";
+      worstState = escalateState(worstState, "warn");
     }
   }
 
@@ -399,16 +513,23 @@ export async function checkLimits(context: {
   if (limits.maxRepeatedTools) {
     const repeatedPatterns = detectRepeatedPatterns(record.toolCalls);
     const totalRepeatedCalls = repeatedPatterns.reduce((sum, p) => sum + p.count, 0);
-    if (totalRepeatedCalls >= limits.maxRepeatedTools) {
+    const repeatedKill = killsAt(limits.maxRepeatedTools);
+    const patternDetail = repeatedPatterns.map((p) => `${p.pattern}=${p.count}`).join(", ");
+    if (repeatedKill !== null && totalRepeatedCalls >= repeatedKill) {
       triggeredLimits.push(
-        `maxRepeatedTools=${totalRepeatedCalls}/${limits.maxRepeatedTools} (patterns: ${repeatedPatterns.map((p) => `${p.pattern}=${p.count}`).join(", ")})`,
+        `maxRepeatedTools_kill=${totalRepeatedCalls}/${repeatedKill} (patterns: ${patternDetail})`,
       );
-      worstState = worstState === "healthy" ? "suspend" : worstState;
+      worstState = escalateState(worstState, "kill");
+    } else if (totalRepeatedCalls >= limits.maxRepeatedTools) {
+      triggeredLimits.push(
+        `maxRepeatedTools=${totalRepeatedCalls}/${limits.maxRepeatedTools} (patterns: ${patternDetail})`,
+      );
+      worstState = escalateState(worstState, "suspend");
     } else if (totalRepeatedCalls >= limits.maxRepeatedTools * 0.7) {
       triggeredLimits.push(
         `maxRepeatedTools_warning=${totalRepeatedCalls}/${limits.maxRepeatedTools}`,
       );
-      if (worstState === "healthy") worstState = "warn";
+      worstState = escalateState(worstState, "warn");
     }
   }
 
@@ -418,9 +539,10 @@ export async function checkLimits(context: {
 
   if (triggeredLimits.length > 0) {
     reason = `Limits triggered: ${triggeredLimits.join(", ")}`;
-    // Note: kill state escalation requires explicit handling at execution layer
-    // suspend is the highest state returned by checkLimits
-    recommendedAction = worstState === "suspend" ? "pause" : "review";
+    // kill (runaway past the hard ceiling) → terminate; suspend → pause; warn →
+    // review. handleTrigger() maps kill to the audited terminate path.
+    recommendedAction =
+      worstState === "kill" ? "terminate" : worstState === "suspend" ? "pause" : "review";
   }
 
   const decision: WatchdogDecision = {
@@ -455,6 +577,11 @@ export async function handleTrigger(
     sessionId?: string;
   },
   decision: WatchdogDecision,
+  options?: {
+    // Injected by the runner (killActive) so governance stays decoupled from the
+    // runtime — no governance→runner import cycle. Absent for audit-only callers.
+    terminate?: () => boolean | Promise<boolean>;
+  },
 ): Promise<{ action: string; success: boolean }> {
   await initWatchdog();
 
@@ -464,6 +591,20 @@ export async function handleTrigger(
     case "kill": {
       // Record kill in usage tracker for audit
       await recordInvocationKilled(context.invocationId, `Watchdog kill: ${decision.reason}`);
+
+      // Actually terminate the runaway. The terminator is injected by the runner
+      // (killActive) rather than imported, keeping governance decoupled from the
+      // runtime. With no terminator (audit-only callers / tests) the kill is
+      // recorded but no live process is signalled.
+      let terminated: boolean | null = null;
+      if (options?.terminate) {
+        try {
+          terminated = await options.terminate();
+        } catch (err) {
+          terminated = false;
+          console.error("[watchdog] terminate() threw during kill escalation:", err);
+        }
+      }
 
       // Remove from active invocations
       delete watchdogIndex!.activeInvocations[context.invocationId];
@@ -475,14 +616,16 @@ export async function handleTrigger(
         invocationId: context.invocationId,
         sessionId: context.sessionId,
         decision,
-        executedAction: "killed",
+        executedAction: terminated === false ? "kill-failed" : "killed",
         timestamp: now,
       };
       await appendWatchdogEvent(killEvent);
 
       return {
         action: "terminated",
-        success: true,
+        // A terminator that ran and reported false (nothing killed) is an honest
+        // failure; audit-only callers (no terminator) stay success:true.
+        success: terminated ?? true,
       };
     }
 
@@ -562,7 +705,9 @@ export async function getSessionActiveInvocations(sessionId: string): Promise<Ex
 }
 
 /**
- * Clear an invocation from the watchdog (when completed normally).
+ * Clear an invocation from the watchdog index. Called from runner.ts's `finally`
+ * on EVERY exit path (normal completion, early returns, throws); idempotent and
+ * a no-op when the id is absent.
  */
 export async function clearInvocation(invocationId: string): Promise<void> {
   await initWatchdog();

@@ -142,6 +142,28 @@ export function isTailerOriginEvent(event: BusEvent): boolean {
   return meta?.source === TAILER_EVENT_SOURCE;
 }
 
+/**
+ * Prefix shown on a silent-drop safety-net delivery (#240). The bus tags these
+ * `synthesized: true` (see `ingestReply`) because the agent ended its turn
+ * without calling the `reply` tool, so the text is raw, uncurated turn output
+ * rather than a message the agent chose to send. Surfaces prepend this so the
+ * user does not mistake it for a curated reply; the full text is preserved (the
+ * #217 safety net exists precisely because the user would otherwise get nothing).
+ */
+export const SYNTHESIZED_REPLY_NOTICE =
+  "⚠️ The agent ended its turn without sending a reply — raw output below:";
+
+/**
+ * Prepend {@link SYNTHESIZED_REPLY_NOTICE} when `payload.synthesized` is set
+ * (#240). No-op for curated replies and for empty text. Centralised so every
+ * channel adapter renders the same wording and gate, with no drift.
+ */
+export function withSynthesizedNotice(text: string, payload: unknown): string {
+  const synthesized = (payload as { synthesized?: boolean } | undefined)?.synthesized === true;
+  if (!synthesized || text.length === 0) return text;
+  return `${SYNTHESIZED_REPLY_NOTICE}\n\n${text}`;
+}
+
 /* ───────────────────────────────────────────────────────────────────── */
 /* Permission flow (§5.1 v2.2)                                           */
 /* ───────────────────────────────────────────────────────────────────── */
@@ -213,6 +235,8 @@ export type IpcMessage =
   | IpcAskAnswer
   | IpcCancel
   | IpcRequestHuman
+  | IpcJobRequest
+  | IpcJobResult
   | IpcPermissionRequest
   | IpcPermissionResponse
   | IpcError;
@@ -286,6 +310,52 @@ export interface IpcRequestHuman {
    */
   ask_id: string;
   question: string;
+}
+
+/**
+ * Agent-job control request — Bus MCP server → Bus core (issue #296 PR 3).
+ *
+ * The `AgentJobRunner` lives in the DAEMON (only it can spawn/track the
+ * headless `claude -p` job processes), while the four job tools
+ * (`dispatch_job` / `job_status` / `list_jobs` / `cancel_job`) are invoked in
+ * the per-agent MCP SUBPROCESS. So the MCP server routes each call over the
+ * socket as this one generic envelope and awaits the correlated
+ * {@link IpcJobResult}. Mirrors the `request_human` round-trip.
+ *
+ * `agent_id` is the DISPATCHER — the agent whose socket carried the request;
+ * Bus core stamps it as the job's dispatcher (never trusting a client-supplied
+ * value) so results route back to the caller. `op` selects the runner method;
+ * `payload` carries the tool args (validated by the runner, not here).
+ *
+ * The `schedule` / `list_scheduled` / `unschedule` ops back the durable
+ * scheduled-task tools (`schedule_task` etc.). Unlike the four AgentJobRunner
+ * ops they don't touch the runner at all — Bus core handles them directly via
+ * `schedule-ops.ts`, writing file-backed cron jobs in the daemon's cwd so the
+ * hot-reload loop schedules them. They're on this same envelope to reuse the
+ * correlated round-trip plumbing.
+ */
+export interface IpcJobRequest {
+  type: "job_request";
+  agent_id: string;
+  /** Correlation id the matching `IpcJobResult` must echo. */
+  req_id: string;
+  op: "dispatch" | "status" | "list" | "cancel" | "schedule" | "list_scheduled" | "unschedule";
+  payload: Record<string, unknown>;
+}
+
+/**
+ * Agent-job control result — Bus core → Bus MCP server, correlated by `req_id`.
+ * `ok:false` carries `error`; `ok:true` carries the op-specific `result`
+ * (dispatch → `{jobId,status}|{error}`, status → `JobView|null`,
+ * list → `JobView[]`, cancel → `{ok,error?}`) which the MCP server serialises
+ * straight back to the calling agent as the tool result.
+ */
+export interface IpcJobResult {
+  type: "job_result";
+  req_id: string;
+  ok: boolean;
+  result?: unknown;
+  error?: string;
 }
 
 export interface IpcPermissionRequest {

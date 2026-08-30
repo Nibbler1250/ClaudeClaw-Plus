@@ -11,8 +11,12 @@ import {
   getAggregates,
   getUsageStats,
   resetUsageTracker,
+  extractTranscriptUsage,
 } from "../../governance/usage-tracker";
 import { join } from "path";
+import { homedir } from "os";
+import { mkdir, writeFile, rm } from "fs/promises";
+import { randomUUID } from "crypto";
 
 // The usage tracker uses .claude/claudeclaw/usage/ - clean this for test isolation
 const USAGE_DIR = join(process.cwd(), ".claude", "claudeclaw", "usage");
@@ -50,6 +54,8 @@ describe("UsageTracker", () => {
     const context = {
       sessionId: "session-123",
       channelId: "telegram:12345",
+      userId: "user-42",
+      skillName: "quant",
       source: "telegram",
       provider: "anthropic",
       model: "claude-3-5-sonnet",
@@ -60,6 +66,10 @@ describe("UsageTracker", () => {
     expect(record.invocationId).toBeDefined();
     expect(record.sessionId).toBe("session-123");
     expect(record.channelId).toBe("telegram:12345");
+    // #258 item 1: userId/skillName threaded from the surface are persisted for
+    // per-user spend attribution and skill-level cost reporting.
+    expect(record.userId).toBe("user-42");
+    expect(record.skillName).toBe("quant");
     expect(record.provider).toBe("anthropic");
     expect(record.model).toBe("claude-3-5-sonnet");
     expect(record.status).toBe("started");
@@ -269,5 +279,63 @@ describe("UsageTracker", () => {
     expect(aggregates.completedInvocations).toBe(1);
     expect(aggregates.failedInvocations).toBe(1);
     expect(aggregates.killedInvocations).toBe(1);
+  });
+});
+
+describe("extractTranscriptUsage (budget wiring)", () => {
+  test("sums assistant usage from the session transcript, excluding turns before startedAt", async () => {
+    const cwd = `/tmp/claudeclaw-test-${randomUUID()}`;
+    const sessionId = randomUUID();
+    const dir = join(homedir(), ".claude", "projects", cwd.replace(/\//g, "-"));
+    const jsonl = join(dir, `${sessionId}.jsonl`);
+    await mkdir(dir, { recursive: true });
+    const lines = [
+      // before sinceIso → must be EXCLUDED
+      JSON.stringify({
+        type: "assistant",
+        timestamp: "2026-01-01T00:00:00.000Z",
+        message: { usage: { input_tokens: 999, output_tokens: 999 } },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        timestamp: "2026-06-15T22:00:00.000Z",
+        message: {
+          usage: {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_creation_input_tokens: 5,
+            cache_read_input_tokens: 100,
+          },
+        },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        timestamp: "2026-06-15T22:00:01.000Z",
+        message: { usage: { input_tokens: 3, output_tokens: 7 } },
+      }),
+      JSON.stringify({ type: "user", timestamp: "2026-06-15T22:00:02.000Z", message: {} }),
+    ].join("\n");
+    await writeFile(jsonl, lines);
+    try {
+      const u = await extractTranscriptUsage(cwd, sessionId, "2026-06-15T12:00:00.000Z");
+      expect(u).not.toBeNull();
+      expect(u?.inputTokens).toBe(13); // 10+3 (the 999 turn predates startedAt)
+      expect(u?.outputTokens).toBe(27); // 20+7
+      expect(u?.cacheCreationInputTokens).toBe(5);
+      expect(u?.cacheReadInputTokens).toBe(100);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("returns null for an unknown/missing session (no throw, finalize stays safe)", async () => {
+    expect(await extractTranscriptUsage("/tmp/x", "unknown", new Date().toISOString())).toBeNull();
+    expect(
+      await extractTranscriptUsage(
+        `/tmp/${randomUUID()}`,
+        randomUUID(),
+        "2020-01-01T00:00:00.000Z",
+      ),
+    ).toBeNull();
   });
 });
