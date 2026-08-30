@@ -80,16 +80,20 @@ interface CacheEntry {
 }
 
 /* ───────────────────────────────────────────────────────────────────── */
-/* Helpers — path encoding (matches claude's own scheme; Spike 0.5)      */
+/* Helpers — path encoding (matches claude's own scheme)                 */
 /* ───────────────────────────────────────────────────────────────────── */
 
 /**
  * Encode a realpath cwd into the directory name claude uses under
- * `~/.claude/projects/`. claude replaces `/` with `-` only — other
- * characters (dots, underscores) are preserved. Empirically confirmed
- * against fixture: cwd `/private/tmp/spike-0.2` encodes as
- * `-private-tmp-spike-0.2` (dot kept). Re-exported from
- * `jsonl-line-types.ts` so the Tailer and the probe stay in lock-step.
+ * `~/.claude/projects/`. Re-exported from `jsonl-line-types.ts` so the Tailer
+ * and the probe stay in lock-step; see that file for the rule and how it was
+ * derived.
+ *
+ * The previous note here claimed dots and underscores are preserved, citing a
+ * Spike 0.5 fixture. They are not: the CLI replaces every non-alphanumeric
+ * character, and truncates past 200 characters with a hash of the original
+ * cwd. Kept as a warning because a stale comment on a re-export is worse than
+ * none — it is read as documentation of the shared contract.
  */
 export { encodeCwdForProjectsDir as encodeCwd } from "./jsonl-line-types";
 import { encodeCwdForProjectsDir as _encodeCwdImpl } from "./jsonl-line-types";

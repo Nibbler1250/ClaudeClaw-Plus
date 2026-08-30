@@ -286,9 +286,19 @@ afterEach(() => {
 describe("encodeCwd", () => {
   it("replaces every non-alphanumeric character with a hyphen", () => {
     expect(encodeCwd("/private/tmp/abc")).toBe("-private-tmp-abc");
-    // claude preserves dots/underscores; only `/` becomes `-`. Confirmed
-    // against Spike 0.5 fixture `~/.claude/projects/-private-tmp-spike-0.2/...`.
-    expect(encodeCwd("/Users/a.b_c/Foo")).toBe("-Users-a.b_c-Foo");
+    // Re-measured against CLI 2.1.251: the CLI replaces EVERY
+    // non-alphanumeric character. The previous expectation cited a Spike 0.5
+    // fixture (`-private-tmp-spike-0.2`) that no longer exists, and across 29
+    // live project directories — each session file's recorded `cwd` against
+    // the directory it was written into — this rule matches 29 of 29, while
+    // "only `/`" misses every path containing `.` or `_`.
+    //
+    // Getting this wrong is silent: the tailer waits on a session file that
+    // can never appear, which is indistinguishable from "not written yet",
+    // so the silent-drop net is simply inert for that agent.
+    expect(encodeCwd("/Users/a.b_c/Foo")).toBe("-Users-a-b-c-Foo");
+    // Measured directly: this exact cwd produced this exact directory.
+    expect(encodeCwd("/tmp/enc:test.a_b")).toBe("-tmp-enc-test-a-b");
   });
 
   it("encodes Windows separators and the drive colon on win32", () => {
@@ -296,8 +306,43 @@ describe("encodeCwd", () => {
     expect(encodeCwd("C:\\Users\\foo\\bar", "win32")).toBe("C--Users-foo-bar");
     // Forward-slash Windows paths encode the same way.
     expect(encodeCwd("C:/Users/foo/bar", "win32")).toBe("C--Users-foo-bar");
-    // POSIX must NOT touch ':' (a legal path char) — only '/' becomes '-'.
-    expect(encodeCwd("/home/foo:bar/baz", "linux")).toBe("-home-foo:bar-baz");
+    // ':' is replaced on POSIX too. The previous expectation was an inference
+    // ("a legal path char"), not a measurement, and the CLI disagrees.
+    expect(encodeCwd("/home/foo:bar/baz", "linux")).toBe("-home-foo-bar-baz");
+  });
+
+  // The encoder has a second half: past 200 characters the CLI truncates and
+  // appends a hash. Read out of the CLI binary and confirmed by running it —
+  // a 205-char cwd produced a 207-char directory ending in `-1d9yzd`, which is
+  // what this reproduces. Without it the tailer binds to a path that cannot
+  // exist, and does so silently.
+  it("truncates past 200 characters and appends the CLI's hash", () => {
+    const cwd = `/tmp/${"d".repeat(200)}`;
+    const out = encodeCwd(cwd);
+    expect(out).toHaveLength(207);
+    expect(out.slice(0, 200)).toBe(`-tmp-${"d".repeat(195)}`);
+    expect(out.slice(200)).toBe("-1d9yzd");
+  });
+
+  it("leaves anything at or under 200 characters untruncated", () => {
+    const exact = `/${"a".repeat(199)}`; // encodes to exactly 200
+    expect(encodeCwd(exact)).toHaveLength(200);
+    expect(encodeCwd(exact)).not.toContain("--");
+  });
+
+  // The hash is over the ORIGINAL cwd, not the encoded string. Two paths that
+  // share their first 200 encoded characters must still land in different
+  // directories — hashing the truncated form would collide them.
+  it("hashes the original cwd, so paths sharing a prefix stay distinct", () => {
+    const a = `/tmp/${"d".repeat(200)}/alpha`;
+    const b = `/tmp/${"d".repeat(200)}/beta`;
+    expect(encodeCwd(a).slice(0, 200)).toBe(encodeCwd(b).slice(0, 200));
+    expect(encodeCwd(a)).not.toBe(encodeCwd(b));
+  });
+
+  it("is independent of the platform argument", () => {
+    const cwd = "/home/simon/a.b_c";
+    expect(encodeCwd(cwd, "win32")).toBe(encodeCwd(cwd, "linux"));
   });
 });
 
