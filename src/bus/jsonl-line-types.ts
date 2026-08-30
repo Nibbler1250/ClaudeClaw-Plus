@@ -219,25 +219,62 @@ export type JsonlLine =
 /* ───────────────────────────────────────────────────────────────────── */
 
 /**
- * Encode an absolute realpath'd cwd into the directory name Claude Code
- * uses under `~/.claude/projects/`. Claude replaces the platform's path
- * separators with `-`; case is preserved. Empirically:
- *   POSIX:   `/Users/foo/bar`        → `-Users-foo-bar`   (`/` only)
- *   Windows: `C:\Users\foo\bar`      → `C--Users-foo-bar` (`\`, `/` and the
- *            drive `:`) — verified against claude.exe on a Win11 host.
- * `:` must NOT be replaced on POSIX, where it is a legal path character.
+ * Session Manager calls `fs.realpathSync(cwd)` before handing the cwd to the
+ * Tailer (resolves the macOS `/tmp` → `/private/tmp` symlink, per Spike 0.5).
+ * The encoder below trusts that contract and does not resolve anything itself.
+ */
+/** Max length of the encoded segment before the CLI truncates it. */
+const PROJECTS_DIR_MAX_LEN = 200;
+
+/**
+ * The CLI's hash of the ORIGINAL cwd, appended when the encoded form is
+ * truncated. `(h << 5) - h` is `h * 31`; `| 0` keeps it a signed 32-bit int,
+ * and the result is rendered in base 36.
  *
- * `platform` is injectable so both branches are testable off-Windows.
+ * It hashes the cwd, not the encoded string, so it cannot be recovered after
+ * encoding — the truncated form has to be built from the original path.
+ */
+function hashCwdForProjectsDir(cwd: string): string {
+  let h = 0;
+  for (let i = 0; i < cwd.length; i++) {
+    h = ((h << 5) - h + cwd.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h).toString(36);
+}
+
+/**
+ * Reproduce the directory name the CLI writes a session transcript into.
  *
- * Session Manager already calls `fs.realpathSync(cwd)` before passing
- * cwd to the Tailer (resolves macOS `/tmp` → `/private/tmp` symlink per
- * Spike 0.5). Tailer trusts that contract.
+ * Two rules, both taken from the CLI implementation and confirmed by running
+ * it:
+ *
+ * 1. Every NON-ALPHANUMERIC character becomes `-` — not just separators. The
+ *    regex has no `u` flag, so it operates per UTF-16 code unit, and this
+ *    function must match that (an accented letter becomes one `-`, an
+ *    astral-plane emoji becomes two).
+ * 2. If the result exceeds 200 characters it is truncated to 200 and suffixed
+ *    with `-<hash>`, the hash being over the ORIGINAL cwd.
+ *
+ *      /home/simon/agent      -> -home-simon-agent
+ *      /tmp/enc:test.a_b      -> -tmp-enc-test-a-b
+ *      /tmp/<205 chars>       -> -tmp-<truncated to 200>-1d9yzd
+ *
+ * This is platform-independent: the CLI has a single encoder with no win32
+ * branch, and the same rule produces `C--Users-foo-bar` for `C:\Users\foo\bar`.
+ * `platform` is kept so existing callers and tests still compile.
+ *
+ * Getting this wrong is silent. `JsonlTailer.start()` polls for the session
+ * file with no timeout and nothing logged, so a wrong path is indistinguishable
+ * from "a fresh session has not written one yet" — the tail never starts and
+ * the silent-drop safety net is inert for that agent.
  */
 export function encodeCwdForProjectsDir(
   cwd: string,
-  platform: NodeJS.Platform = process.platform,
+  _platform: NodeJS.Platform = process.platform,
 ): string {
-  return platform === "win32" ? cwd.replace(/[/\\:]/g, "-") : cwd.replace(/\//g, "-");
+  const encoded = cwd.replace(/[^a-zA-Z0-9]/g, "-");
+  if (encoded.length <= PROJECTS_DIR_MAX_LEN) return encoded;
+  return `${encoded.slice(0, PROJECTS_DIR_MAX_LEN)}-${hashCwdForProjectsDir(cwd)}`;
 }
 
 /* ───────────────────────────────────────────────────────────────────── */
