@@ -235,6 +235,28 @@ describe("WebUiAdapter — /health", () => {
     expect(body.ok).toBe(true);
     expect(body.version.length).toBeGreaterThan(0);
   });
+
+  it("advertises a capability set, so a client detects instead of sniffing the version", async () => {
+    adapter = await startAdapter({ token: "sekret" });
+    const r = await fetch(`${baseUrl}/health`);
+    const body = (await r.json()) as { capabilities?: string[] };
+
+    expect(Array.isArray(body.capabilities)).toBe(true);
+    // Membership, never index or ordering: the array grows, and a client that
+    // depended on a position would break the first time an entry is added.
+    expect(body.capabilities).toContain("events.operation_id");
+  });
+
+  it("serves capabilities without auth, like the rest of /health", async () => {
+    // A client has to be able to ask what the daemon supports BEFORE it can
+    // present a credential — otherwise capability detection is unreachable
+    // for exactly the clients that need it.
+    adapter = await startAdapter({ token: "sekret" });
+    const r = await fetch(`${baseUrl}/health`);
+    expect(r.status).toBe(200);
+    const body = (await r.json()) as { capabilities?: string[] };
+    expect(body.capabilities?.length).toBeGreaterThan(0);
+  });
 });
 
 describe("WebUiAdapter — POST /prompt", () => {

@@ -186,7 +186,11 @@ export class WebUiAdapter {
     const url = new URL(req.url);
 
     if (url.pathname === "/health" && req.method === "GET") {
-      return jsonOk({ ok: true, version: ADAPTER_VERSION });
+      return jsonOk({
+        ok: true,
+        version: ADAPTER_VERSION,
+        capabilities: ADAPTER_CAPABILITIES,
+      });
     }
 
     if (url.pathname === "/prompt" && req.method === "POST") {
@@ -356,6 +360,23 @@ export class WebUiAdapter {
  * specific version; the field exists for forward-compatible client checks.
  */
 const ADAPTER_VERSION = "0.1.0";
+
+/**
+ * What this daemon supports, for clients that must detect capabilities rather
+ * than sniff the version (a client branching on "0.1.0" is doing the brittle
+ * thing).
+ *
+ * Entries name OBSERVABLE BEHAVIOUR, never internal module names: a consumer
+ * vendoring this core sees behaviour that survives a refactor, where an
+ * internal name would drift.
+ *
+ * The array grows; it does not reorder or repurpose entries. A client that
+ * checks for membership keeps working as it fills.
+ */
+const ADAPTER_CAPABILITIES = [
+  /** Every event published for a turn carries `promise_id` (the value `POST /prompt` returned). */
+  "events.operation_id",
+] as const;
 
 function parseBind(bind: string | undefined): { host: string; port: number } {
   // Default per spec §5.5.4 sketch.
