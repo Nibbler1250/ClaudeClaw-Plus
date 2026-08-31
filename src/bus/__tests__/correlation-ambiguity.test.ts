@@ -75,15 +75,49 @@ describe("correlation ambiguity on the envelope", () => {
     expect(flagged(events).length).toBeGreaterThan(0);
   });
 
-  it("the turn_end that ends the turn clears the taint for the next one", async () => {
+  it("draining every outstanding turn clears the taint for the next one", async () => {
+    // Two prompts went out, so two terminators are owed. One does not drain the
+    // agent — asserting that it did was asserting the bug below.
     const { bus, events } = makeBus();
     await prompt(bus, "a", "one");
     await prompt(bus, "a", "two");
+    bus.ingestSessionEvent(tailerEvent("a", "response.turn_end"));
     bus.ingestSessionEvent(tailerEvent("a", "response.turn_end"));
     await prompt(bus, "a", "three");
     events.length = 0;
     bus.ingestSessionEvent(tailerEvent("a", "response.text", { text: "clean" }));
     expect(flagged(events)).toEqual([]);
+  });
+
+  it("a lagged terminator does not strip the id of the turn still running", async () => {
+    // The failure this counting exists to prevent: P1 replies, P2 is submitted
+    // and takes the slot, P1's lagged `response.turn_end` lands. Releasing on
+    // the first terminator to arrive would leave the rest of P2's events with
+    // no operation id at all — correlation vanishing mid-run, which a client
+    // would read as a new operation starting.
+    const { bus, events } = makeBus();
+    await prompt(bus, "a", "P1");
+    bus.ingestReply({ agent_id: "a", intent: "final", text: "P1 done" } as never);
+    const { promise_id: p2 } = await prompt(bus, "a", "P2");
+    bus.ingestSessionEvent(tailerEvent("a", "response.turn_end")); // P1's, late
+    events.length = 0;
+    bus.ingestSessionEvent(tailerEvent("a", "response.text", { text: "P2 still going" }));
+    const seen = events.filter((e) => e.topic === "response.text");
+    expect(seen.length).toBeGreaterThan(0);
+    for (const e of seen) expect(e.promise_id).toBe(p2);
+  });
+
+  it("the prompt event of an ambiguous operation carries the flag", async () => {
+    // It mints its own id at the top level, so a stamper that returns early on
+    // an id already present skips the flag with it — and this is the first
+    // event a client sees for the operation.
+    const { bus, events } = makeBus();
+    await prompt(bus, "a", "one");
+    events.length = 0;
+    await prompt(bus, "a", "two");
+    const prompts = events.filter((e) => e.topic === "prompt");
+    expect(prompts.length).toBe(1);
+    expect((prompts[0] as { correlation_ambiguous?: true }).correlation_ambiguous).toBe(true);
   });
 
   it("agents stay apart — one agent's overlap does not taint another", async () => {
