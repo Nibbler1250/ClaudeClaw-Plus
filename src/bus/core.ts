@@ -324,6 +324,32 @@ export class BusCoreImpl implements BusCore {
   private readonly currentOperation = new Map<string, string>();
 
   /**
+   * Agents whose operation id is not trustworthy for the events now being
+   * stamped with it.
+   *
+   * Deliberately NOT `originAmbiguous`, which exists for security attribution
+   * and has the wrong lifetime for this job in two ways.
+   *
+   * It is cleared on `intent: "final"` alongside `lastPromptOrigin`, while the
+   * operation slot deliberately outlives the final reply — so `usage`,
+   * `response.turn_end` and the reply the silent-drop net synthesises would
+   * carry an id with the taint already gone. Those are exactly the events a
+   * client most needs correlated, reported as certain when they are not.
+   *
+   * And it is armed from `lastPromptOrigin`, which the final reply also
+   * clears — so it never sees the window between a turn's final reply and its
+   * lagged `response.turn_end`. That window is the sequential race (#217
+   * finding 3, deferred #239): P1 replies, P2 is submitted and takes the slot,
+   * P1's turn_end lands afterwards and is stamped with P2's id. A client
+   * cannot detect the lag, which is the whole reason to report it.
+   *
+   * Keyed on the operation slot instead, both cases collapse into one
+   * condition — a prompt arriving while a slot is still occupied — and the
+   * taint lives and dies with the id it qualifies.
+   */
+  private readonly correlationAmbiguous = new Set<string>();
+
+  /**
    * Agents whose `lastPromptOrigin` is currently AMBIGUOUS for security
    * attribution: a second prompt overwrote the slot while a prior prompt was
    * still in flight (the residual #239 interleave race). Best-effort *routing*
@@ -539,6 +565,7 @@ export class BusCoreImpl implements BusCore {
           // with the dead turn's id — a client would correlate them to an
           // operation that already finished.
           this.currentOperation.delete(agentId);
+          this.correlationAmbiguous.delete(agentId);
           this.currentTurnReplied.delete(agentId);
           this.currentTurnFinalPublished.delete(agentId);
           // Reply-tool enforcement (#215/#240): drop nudge state with the rest
@@ -607,6 +634,7 @@ export class BusCoreImpl implements BusCore {
     this.agentTurnActive.clear();
     this.originAmbiguous.clear();
     this.currentOperation.clear();
+    this.correlationAmbiguous.clear();
     this.pendingRedelivery.clear();
     this.replyNudged.clear();
     this.pendingNudgeText.clear();
@@ -647,6 +675,16 @@ export class BusCoreImpl implements BusCore {
     };
     // Remember the operation BEFORE publishing so the prompt event and every
     // event after it are stamped from the same slot.
+    //
+    // A slot still occupied means the previous turn has not reached its
+    // terminator, so events from here on cannot be attributed to one operation
+    // with confidence. Say so on the envelope rather than letting a client
+    // correlate confidently and wrongly.
+    if (this.currentOperation.has(req.agent_id)) {
+      this.correlationAmbiguous.add(req.agent_id);
+    } else {
+      this.correlationAmbiguous.delete(req.agent_id);
+    }
     this.currentOperation.set(req.agent_id, promise_id);
     this.publish(promptEvent);
     // Remember the origin so `ingestReply` can attach it to the
@@ -1344,6 +1382,7 @@ export class BusCoreImpl implements BusCore {
     // clearing alongside `agentTurnActive` above would strip it.
     if (e.topic === "response.turn_end" && e.agent_id) {
       this.currentOperation.delete(e.agent_id);
+      this.correlationAmbiguous.delete(e.agent_id);
     }
   }
 
@@ -1457,7 +1496,12 @@ export class BusCoreImpl implements BusCore {
   private stampOperation(event: BusEvent): BusEvent {
     if (event.promise_id !== undefined || !event.agent_id) return event;
     const op = this.currentOperation.get(event.agent_id);
-    return op === undefined ? event : { ...event, promise_id: op };
+    if (op === undefined) return event;
+    // The taint rides with the id it qualifies, never alone: an event carrying
+    // no operation id has nothing for the flag to be about.
+    return this.correlationAmbiguous.has(event.agent_id)
+      ? { ...event, promise_id: op, correlation_ambiguous: true }
+      : { ...event, promise_id: op };
   }
 
   private publish(incoming: BusEvent): void {
@@ -1704,6 +1748,7 @@ export class BusCoreImpl implements BusCore {
         // here too — otherwise the next turn's events carry the cancelled
         // turn's id.
         this.currentOperation.delete(agentId);
+        this.correlationAmbiguous.delete(agentId);
         // Silent-drop safety net (#215): cancelled turn won't produce
         // a real reply OR a `response.turn_end` event — drop the
         // tracking flag to keep the map bounded.
@@ -1806,6 +1851,7 @@ export class BusCoreImpl implements BusCore {
         // Same reason as `cancel`: no turn_end, so the slot must not survive
         // into the next turn.
         this.currentOperation.delete(agentId);
+        this.correlationAmbiguous.delete(agentId);
         // Silent-drop safety net (#215): error path won't produce a
         // turn_end either — clear tracking too.
         this.currentTurnReplied.delete(agentId);

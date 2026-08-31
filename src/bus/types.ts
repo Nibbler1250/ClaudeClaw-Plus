@@ -136,6 +136,21 @@ export interface BusEvent<P = unknown> {
    * this does not provide.
    */
   promise_id?: string;
+
+  /**
+   * The operation id on this event is ADVISORY rather than exact.
+   *
+   * Set when a prompt arrived while the agent's previous operation had not
+   * reached its terminator, so events from that point cannot be attributed to
+   * one operation with confidence. A client should render the run as
+   * correlation-uncertain rather than drawing a confident parent — §3.3's
+   * degrade-visibly rather than fail-silently, applied to correlation.
+   *
+   * Absent means the slot was free when the operation began. It does not mean
+   * exactness: `promise_id` is advisory in general, and exact correlation needs
+   * turn identity carried through the tailer (#239).
+   */
+  correlation_ambiguous?: true;
   /** Original JSONL line or MCP message — kept for audit. */
   raw?: unknown;
 }

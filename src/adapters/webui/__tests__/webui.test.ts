@@ -257,6 +257,38 @@ describe("WebUiAdapter — /health", () => {
     const body = (await r.json()) as { capabilities?: string[] };
     expect(body.capabilities?.length).toBeGreaterThan(0);
   });
+  it("reports an instance identity that changes when the daemon restarts", async () => {
+    adapter = await startAdapter({ token: "sekret" });
+    // A version cannot answer this: a restart onto the same build reports the
+    // same version, which is exactly the case a desktop must not mistake for
+    // continuity. A client that reconnects and sees a different instance knows
+    // its cached subscriptions, in-flight operation ids and sequence position
+    // belong to a process that no longer exists.
+    const r = await fetch(`${baseUrl}/health`);
+    const body = (await r.json()) as { instance_id?: string; started_at?: string };
+    expect(typeof body.instance_id).toBe("string");
+    expect(body.instance_id?.length).toBeGreaterThan(0);
+    expect(typeof body.started_at).toBe("string");
+    expect(Number.isNaN(Date.parse(body.started_at ?? ""))).toBe(false);
+  });
+
+  it("reports the SAME instance across calls while the process lives", async () => {
+    adapter = await startAdapter({ token: "sekret" });
+    // The other half of the property, and the one a naive implementation
+    // breaks: an id minted per request changes on every call, which reads as a
+    // restart on every poll.
+    const a = (await (await fetch(`${baseUrl}/health`)).json()) as { instance_id?: string };
+    const b = (await (await fetch(`${baseUrl}/health`)).json()) as { instance_id?: string };
+    expect(a.instance_id).toBe(b.instance_id);
+  });
+
+  it("advertises the instance-identity and ambiguity capabilities", async () => {
+    adapter = await startAdapter({ token: "sekret" });
+    const r = await fetch(`${baseUrl}/health`);
+    const body = (await r.json()) as { capabilities?: string[] };
+    expect(body.capabilities).toContain("health.instance_identity");
+    expect(body.capabilities).toContain("events.correlation_ambiguity");
+  });
 });
 
 describe("WebUiAdapter — POST /prompt", () => {

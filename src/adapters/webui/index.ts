@@ -190,6 +190,8 @@ export class WebUiAdapter {
         ok: true,
         version: ADAPTER_VERSION,
         capabilities: ADAPTER_CAPABILITIES,
+        instance_id: INSTANCE_ID,
+        started_at: STARTED_AT,
       });
     }
 
@@ -373,9 +375,38 @@ const ADAPTER_VERSION = "0.1.0";
  * The array grows; it does not reorder or repurpose entries. A client that
  * checks for membership keeps working as it fills.
  */
+/**
+ * Identity of this daemon PROCESS, minted once at module load.
+ *
+ * The only property that matters is the one a version cannot give: it changes
+ * when the daemon restarts and does not change when it has not. A client that
+ * reconnects and sees a different value knows its cached state — subscriptions,
+ * in-flight operation ids, the sequence number it had reached — belongs to a
+ * process that no longer exists, and can resynchronise instead of resuming
+ * against a daemon that never heard of any of it.
+ *
+ * Version cannot answer that: a restart onto the same build reports the same
+ * version, which is precisely the case a desktop must not mistake for
+ * continuity.
+ *
+ * `started_at` rides along because it answers "how long has this been up"
+ * without a second round trip, and it makes a restart legible in a log where a
+ * random id is not.
+ */
+const INSTANCE_ID = randomUUID();
+const STARTED_AT = new Date().toISOString();
+
 const ADAPTER_CAPABILITIES = [
   /** Every event published for a turn carries `promise_id` (the value `POST /prompt` returned). */
   "events.operation_id",
+  /**
+   * An event whose `promise_id` cannot be trusted carries
+   * `correlation_ambiguous: true`. A client that sees this capability can
+   * branch on the flag; one that does not must treat every id as advisory.
+   */
+  "events.correlation_ambiguity",
+  /** `/health` reports `instance_id` and `started_at`, which change on restart. */
+  "health.instance_identity",
 ] as const;
 
 function parseBind(bind: string | undefined): { host: string; port: number } {
