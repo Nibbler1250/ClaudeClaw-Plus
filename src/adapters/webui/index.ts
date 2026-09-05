@@ -397,12 +397,40 @@ const INSTANCE_ID = randomUUID();
 const STARTED_AT = new Date().toISOString();
 
 const ADAPTER_CAPABILITIES = [
-  /** Every event published for a turn carries `promise_id` (the value `POST /prompt` returned). */
+  /**
+   * Events published for a turn carry `promise_id` — the value `POST /prompt`
+   * returned — while the operation owns the agent's slot.
+   *
+   * Deliberately NOT "every event": `response.turn_end` reaches the bus from
+   * the JSONL tailer with no identity of its own, so the slot is held by
+   * counting the terminators an agent still owes. Counting cannot see turns the
+   * bus did not start — an operator typing in the agent's own TUI, a cron tick
+   * — so such a turn ends a live operation early.
+   *
+   * The consequence is worse than a missing id, and the `correlation_ambiguity`
+   * note below spells it out: the freed slot is taken by the next submission
+   * without being flagged, and the earlier operation's remaining events publish
+   * under that later id. Read this capability as "ids are emitted and are
+   * correct in the common case", never as a guarantee of attribution.
+   */
   "events.operation_id",
   /**
-   * An event whose `promise_id` cannot be trusted carries
-   * `correlation_ambiguous: true`. A client that sees this capability can
-   * branch on the flag; one that does not must treat every id as advisory.
+   * An event whose `promise_id` is known to be untrustworthy carries
+   * `correlation_ambiguous: true` — set when a submit lands while the slot is
+   * still occupied, and held for the whole life of that operation.
+   *
+   * KNOWN, and stronger than it may read: the flag covers overlapping submits,
+   * NOT the ambient-turn case above. There the slot is released early, so the
+   * next submission finds it free and is not flagged — and the first
+   * operation's remaining events, including its final answer, then publish
+   * under the SECOND operation's id with no flag at all. A client following the
+   * second operation receives the first one's answer as its own result, and the
+   * envelope asserts certainty.
+   *
+   * So a present id is ADVISORY, not authoritative: it is trustworthy only
+   * where the client has out-of-band evidence that no turn ran on that agent
+   * other than the ones it submitted. Threading identity from the submitting
+   * side is the complete fix, tracked as #239.
    */
   "events.correlation_ambiguity",
   /** `/health` reports `instance_id` and `started_at`, which change on restart. */
