@@ -22,6 +22,7 @@ import { join } from "node:path";
 import type { BusCore, SendPromptRequest } from "../core";
 import { encodeCwdForProjectsDir } from "../jsonl-line-types";
 import { JsonlTailer, SCHEMA_VERSION } from "../jsonl-tailer";
+import type { PromptIngestion } from "../jsonl-line-types";
 import type { BusEvent, BusEventTopic } from "../types";
 
 /* ───────────────────────────────────────────────────────────────────── */
@@ -854,5 +855,150 @@ describe("startAt: 'end' (issue #215 runtime wiring)", () => {
     await waitFor(events, (e) => e.some((x) => x.topic === "response.turn_end"));
     const te = events.find((e) => e.topic === "response.turn_end");
     expect((te?.payload as { text: string }).text).toBe("first turn of a brand new session");
+  });
+});
+
+/* ───────────────────────────────────────────────────────────────────── */
+/* Prompt-ingestion callbacks (issue #363)                               */
+/*                                                                       */
+/* Added after the adversarial pass found this half of the change        */
+/* covered by nothing: deleting the `operation === "enqueue"` filter AND  */
+/* the sidechain/isMeta exclusion left the whole suite green. The tests   */
+/* that existed called `notePromptIngested` directly, bypassing the code  */
+/* that decides which transcript records qualify in the first place.      */
+/* ───────────────────────────────────────────────────────────────────── */
+
+describe("prompt ingestion callbacks", () => {
+  /** A tailer wired to capture what it reports, rather than only bus events. */
+  function makeIngestTailer(bus: BusCore) {
+    const ingested: PromptIngestion[] = [];
+    let aliveCalls = 0;
+    const t = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => undefined,
+      onPromptIngested: (i) => ingested.push(i),
+      onTranscriptAlive: () => {
+        aliveCalls += 1;
+      },
+    });
+    return { t, ingested, alive: () => aliveCalls };
+  }
+
+  it("reports an enqueue record as an ingestion", async () => {
+    const { bus, events } = createMockBus();
+    const h = makeIngestTailer(bus);
+    tailer = h.t;
+    await writeFile(
+      sessionPath,
+      jsonl({
+        type: "queue-operation",
+        operation: "enqueue",
+        content: "run the nightly sync",
+        timestamp: "2026-09-07T15:00:00.000Z",
+      }),
+    );
+    await h.t.start();
+    await waitFor(events, (e) => e.some((x) => x.topic === "session.queue"));
+
+    expect(h.ingested).toHaveLength(1);
+    expect(h.ingested[0]?.source).toBe("enqueue");
+    expect(h.ingested[0]?.text).toBe("run the nightly sync");
+    expect(h.ingested[0]?.ingestedAtMs).toBe(Date.parse("2026-09-07T15:00:00.000Z"));
+  });
+
+  it("reports a dequeue as a withdrawal, not as an ingestion", async () => {
+    const { bus, events } = createMockBus();
+    const h = makeIngestTailer(bus);
+    tailer = h.t;
+    await writeFile(
+      sessionPath,
+      jsonl({
+        type: "queue-operation",
+        operation: "dequeue",
+        content: "a prompt taken back",
+        timestamp: "2026-09-07T15:00:00.000Z",
+      }),
+    );
+    await h.t.start();
+    await waitFor(events, (e) => e.some((x) => x.topic === "session.queue"));
+
+    expect(h.ingested).toHaveLength(1);
+    expect(h.ingested[0]?.source).toBe("dequeue");
+  });
+
+  it("ignores a queue operation that is neither an acceptance nor a withdrawal", async () => {
+    const { bus, events } = createMockBus();
+    const h = makeIngestTailer(bus);
+    tailer = h.t;
+    await writeFile(
+      sessionPath,
+      jsonl({
+        type: "queue-operation",
+        operation: "reorder",
+        content: "still queued",
+        timestamp: "2026-09-07T15:00:00.000Z",
+      }),
+    );
+    await h.t.start();
+    await waitFor(events, (e) => e.some((x) => x.topic === "session.queue"));
+
+    expect(h.ingested).toHaveLength(0);
+  });
+
+  it("does not report a sub-agent prompt as this process's delivery", async () => {
+    const { bus, events } = createMockBus();
+    const h = makeIngestTailer(bus);
+    tailer = h.t;
+    await writeFile(
+      sessionPath,
+      jsonl(
+        {
+          type: "user",
+          isSidechain: true,
+          message: { content: "a sub-agent's prompt" },
+          timestamp: "2026-09-07T15:00:00.000Z",
+        },
+        {
+          type: "user",
+          isMeta: true,
+          message: { content: "<command-name>/compact</command-name>" },
+          timestamp: "2026-09-07T15:00:01.000Z",
+        },
+        {
+          type: "user",
+          message: { content: "the real prompt" },
+          promptId: "pid-real",
+          timestamp: "2026-09-07T15:00:02.000Z",
+        },
+      ),
+    );
+    await h.t.start();
+    await waitFor(events, (e) => e.filter((x) => x.topic === "prompt").length >= 3);
+
+    // All three publish `prompt`; only the last is OUR delivery.
+    expect(h.ingested).toHaveLength(1);
+    expect(h.ingested[0]?.text).toBe("the real prompt");
+    expect(h.ingested[0]?.promptId).toBe("pid-real");
+  });
+
+  it("signals the transcript is alive exactly once, on the first line", async () => {
+    const { bus, events } = createMockBus();
+    const h = makeIngestTailer(bus);
+    tailer = h.t;
+    await writeFile(
+      sessionPath,
+      jsonl(
+        { type: "ai-title", aiTitle: "first", timestamp: "2026-09-07T15:00:00.000Z" },
+        { type: "ai-title", aiTitle: "second", timestamp: "2026-09-07T15:00:01.000Z" },
+      ),
+    );
+    await h.t.start();
+    await waitFor(events, (e) => e.filter((x) => x.topic === "session.title").length >= 2);
+
+    expect(h.alive()).toBe(1);
   });
 });

@@ -307,6 +307,25 @@ export class PtyAgentProcess implements AgentProcess {
   private readonly consumedPromptIds = new Set<string>();
   private static readonly CONSUMED_PROMPT_IDS_MAX = 64;
   /**
+   * How many `user` records we still owe to ALREADY-CONFIRMED deliveries,
+   * keyed by normalised text (issue #363 adversarial pass, finding 1).
+   *
+   * An `enqueue` record says the CLI took the keystrokes; the matching `user`
+   * line is written later, when it actually runs the prompt. If the bus
+   * re-delivers the same text in between — which `flushVerify` does verbatim,
+   * on a timer — that late `user` line is a FIRST sighting, so `consumedPromptIds`
+   * does not know it, and `user` records are deliberately exempt from the
+   * timestamp check because the CLI backdates them. Nothing else rejected it,
+   * so it confirmed the delivery still sitting un-submitted in the input box.
+   *
+   * Identity cannot separate the two: two submissions of byte-identical text
+   * carry different `promptId`s, and we never learn which one is ours. So we
+   * count instead. Confirming by `enqueue` owes one `user` record; the next
+   * matching `user` record pays that debt and is absorbed rather than credited.
+   */
+  private readonly userRecordsOwed = new Map<string, number>();
+  private static readonly USER_RECORDS_OWED_MAX = 32;
+  /**
    * True once a JSONL tailer is feeding `notePromptIngested`. Gates the
    * stricter post-compaction rule below: without a transcript there is nothing
    * better than the screen, so the original heuristics must stay in force.
@@ -462,7 +481,13 @@ export class PtyAgentProcess implements AgentProcess {
       // Issue #362: arm the transcript watcher BEFORE the write. The CLI can
       // ingest the prompt during the 200ms settle below — arming afterwards
       // would miss exactly the fast case and fall back to reading pixels.
-      this.pendingPromptMatch = normalizePromptForMatch(text);
+      // A prompt that normalises to nothing — whitespace only — would arm the
+      // empty string and then match ANY whitespace-only record in the
+      // transcript, confirming a delivery it has no evidence for. Nothing to
+      // compare on means nothing to confirm on: stay disarmed and let the
+      // screen heuristic decide (adversarial pass, finding 4).
+      const armed = normalizePromptForMatch(text);
+      this.pendingPromptMatch = armed === "" ? null : armed;
       this.pendingArmedAtMs = Date.now();
       this.promptIngested = false;
       const compactingAtWrite = this.compacting;
@@ -892,9 +917,31 @@ export class PtyAgentProcess implements AgentProcess {
     // never confirm. That failed in precisely the auto-compaction case this
     // mechanism exists for, and `enqueue` does not cover it: a prompt that
     // TRIGGERS a compaction is not queued behind a running turn.
+    // A withdrawal is not a delivery. It cancels what the matching `enqueue`
+    // claimed: the queue handed the prompt back, so nothing ran it (adversarial
+    // pass, finding 8). Un-confirm and drop the debt that enqueue booked —
+    // there is no `user` line coming for a prompt that was taken out.
+    if (ingestion.source === "dequeue") {
+      const withdrawn = normalizePromptForMatch(ingestion.text);
+      this.userRecordsOwed.delete(withdrawn);
+      if (this.pendingPromptMatch !== null && withdrawn === this.pendingPromptMatch) {
+        this.promptIngested = false;
+      }
+      return;
+    }
+
+    // An `enqueue` record carries no `promptId`, so keying on the id alone left
+    // it with no identity at all: never recorded, never deduped, and free to
+    // confirm again on any re-read of the same line (adversarial pass,
+    // finding 3). Its transcript timestamp is written once, at acceptance, so
+    // timestamp + text identifies the record even though it identifies no
+    // submission. A stamp we cannot read yields no key — and the timestamp
+    // check below refuses that record anyway.
     const key = ingestion.promptId
       ? `${ingestion.promptId}\u0000${normalizePromptForMatch(ingestion.text)}`
-      : null;
+      : ingestion.source === "enqueue" && ingestion.ingestedAtMs > 0
+        ? `enqueue\u0000${ingestion.ingestedAtMs}\u0000${normalizePromptForMatch(ingestion.text)}`
+        : null;
     const alreadySeen = key ? this.consumedPromptIds.has(key) : false;
     // Record the id FIRST, before any early return.
     //
@@ -913,21 +960,67 @@ export class PtyAgentProcess implements AgentProcess {
       this.consumedPromptIds.add(key);
     }
 
+    const normalised = normalizePromptForMatch(ingestion.text);
+
+    // Pay down what a previously-confirmed delivery still owes, BEFORE any
+    // arming check — the debt is owed whether or not something is armed now,
+    // and paying it late would leave it to absorb a legitimate later record.
+    if (ingestion.source === "user" && this.settleOwedUserRecord(normalised)) return;
+
     if (this.pendingPromptMatch === null) return;
     if (alreadySeen) return;
     // Staleness by timestamp applies to `enqueue` ONLY. Its timestamp tracks
     // acceptance within ~0.2s, whereas the CLI backdates `user` lines — observed
     // by up to 148s (a line written at 14:04:43 stamped 14:02:15). Judging a
     // `user` record stale on its own timestamp would discard live confirmations.
-    if (
-      ingestion.source === "enqueue" &&
-      ingestion.ingestedAtMs > 0 &&
-      ingestion.ingestedAtMs < this.pendingArmedAtMs - INGESTION_CLOCK_SKEW_MS
-    ) {
-      return;
+    //
+    // An unusable timestamp REFUSES the record instead of waving it through.
+    // The enqueue path carries no `promptId`, so this check is the only thing
+    // deciding which delivery it belongs to; treating a missing stamp as
+    // "recent enough" made a 60s-stale enqueue confirm whatever was armed
+    // (adversarial pass, finding 2). Refusing costs a fall back to the screen
+    // heuristic and its grace; accepting reports a delivery that never
+    // happened, which is the failure this whole mechanism exists to remove.
+    if (ingestion.source === "enqueue") {
+      if (ingestion.ingestedAtMs <= 0) return;
+      if (ingestion.ingestedAtMs < this.pendingArmedAtMs - INGESTION_CLOCK_SKEW_MS) return;
     }
-    if (normalizePromptForMatch(ingestion.text) !== this.pendingPromptMatch) return;
+    if (normalised !== this.pendingPromptMatch) return;
     this.promptIngested = true;
+    // The CLI writes the `user` line when it RUNS the prompt, which for a
+    // queued one is after this delivery has already resolved. Book it now so
+    // it cannot be credited to the next arming of the same text.
+    if (ingestion.source === "enqueue") this.oweUserRecord(normalised);
+  }
+
+  /**
+   * Book one `user` record owed to a delivery just confirmed by its `enqueue`.
+   * Bounded — only the recent past can plausibly still be in flight, and an
+   * unbounded map would grow for every queued prompt of a long-lived process.
+   */
+  private oweUserRecord(normalised: string): void {
+    if (
+      !this.userRecordsOwed.has(normalised) &&
+      this.userRecordsOwed.size >= PtyAgentProcess.USER_RECORDS_OWED_MAX
+    ) {
+      // Map iteration is insertion-ordered, so this is genuinely the oldest.
+      const oldest = this.userRecordsOwed.keys().next().value;
+      if (oldest !== undefined) this.userRecordsOwed.delete(oldest);
+    }
+    this.userRecordsOwed.set(normalised, (this.userRecordsOwed.get(normalised) ?? 0) + 1);
+  }
+
+  /**
+   * Absorb a `user` record that belongs to an already-confirmed delivery.
+   * Returns true when the record was consumed as payment and must NOT be
+   * allowed to confirm whatever is armed now.
+   */
+  private settleOwedUserRecord(normalised: string): boolean {
+    const owed = this.userRecordsOwed.get(normalised);
+    if (!owed) return false;
+    if (owed === 1) this.userRecordsOwed.delete(normalised);
+    else this.userRecordsOwed.set(normalised, owed - 1);
+    return true;
   }
 
   onData(handler: DataHandler): void {

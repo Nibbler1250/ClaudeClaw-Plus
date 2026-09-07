@@ -305,7 +305,15 @@ export interface PromptIngestion {
    * and a 0.27 s maximum. Neither record alone is sufficient: `enqueue` covers
    * only a quarter of prompts, and `user` has the 443 s tail.
    */
-  source: "user" | "enqueue";
+  source: "user" | "enqueue" | "dequeue";
+  /**
+   * `"dequeue"` is the same `queue-operation` record with the queue giving the
+   * prompt BACK — cancelled, or dropped by a restart before the CLI ran it. It
+   * carries no delivery, it withdraws one: an `enqueue` used to confirm
+   * permanently, and a prompt that left the queue kept its confirmation
+   * (adversarial pass, finding 8). Forwarded rather than filtered so the
+   * consumer, not the tailer, decides what a withdrawal means.
+   */
   /** CLI-assigned id. Present on `user` lines only, and it identifies a
    *  submission rather than a record — a compaction cluster shares one. */
   promptId?: string;

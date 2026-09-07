@@ -819,6 +819,12 @@ describe("PtyAgentProcess transcript-confirmed delivery (issue #362)", () => {
     // Held for the grace period without spending a nudge, then answered
     // "unknown" — exactly one submit CR, never re-nudged or re-typed.
     expect(writes.filter((w) => w === "\r").length).toBe(1);
+    // A single \r holds identically for `turn-started`, so it does not name the
+    // outcome this test is about: deleting the whole transcript branch left it
+    // green (adversarial pass, finding 6). `\x15` is the discriminator — the
+    // loop clears the input box only when it refuses to call the delivery
+    // confirmed.
+    expect(writes).toContain("\x15");
   });
 
   /**
@@ -1078,6 +1084,163 @@ describe("PtyAgentProcess enqueue-confirmed delivery (issue #363)", () => {
    * the common case — and leaving the id unrecorded let it confirm the next
    * verbatim re-delivery, which the bus produces on flush-verify.
    */
+  /**
+   * Adversarial pass, finding 1 — the phantom this whole mechanism exists to
+   * remove, still open until this test.
+   *
+   * `enqueue` confirms delivery #1 the moment the CLI takes the keystrokes.
+   * The matching `user` line is written later, when the prompt actually runs.
+   * `flushVerify` re-delivers the SAME text verbatim in between, so that late
+   * `user` line lands while delivery #2 is armed. It is a first sighting, so
+   * the consumed-ids set does not know it, and `user` records are exempt from
+   * the timestamp check because the CLI backdates them by up to 148 s.
+   * Nothing rejected it: delivery #2 was reported delivered while still
+   * sitting un-submitted in the input box.
+   */
+  it("does not let a late user record from an enqueue-confirmed delivery confirm the next one", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("late-user", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+    const text = "heartbeat: any new messages?";
+
+    // Delivery #1 — confirmed by its enqueue. Its `user` line has not landed.
+    const first = proc.send_prompt_stream(text);
+    const iv1 = setInterval(() => emit("streaming\n"), 5);
+    setTimeout(() => proc.notePromptIngested(enqueued(text)), 25);
+    await first;
+    clearInterval(iv1);
+
+    // Delivery #2 — same bytes, as flushVerify re-delivers them.
+    const before = writes.length;
+    const second = proc.send_prompt_stream(text);
+    const iv2 = setInterval(() => emit("streaming\n"), 5);
+    // Delivery #1's `user` line, arriving for the FIRST time, mid-delivery #2.
+    setTimeout(
+      () => proc.notePromptIngested({ text, source: "user", promptId: "pid-of-first", ingestedAtMs: Date.now() }),
+      30,
+    );
+    await second;
+    clearInterval(iv2);
+
+    // Un-submitted: the loop must have given up on the transcript, not been
+    // satisfied by a record that belonged to the delivery before it.
+    expect(writes.slice(before)).toContain("\x15");
+  });
+
+  /**
+   * Adversarial pass, finding 2 — an unusable timestamp used to wave the
+   * record through. The enqueue path carries no `promptId`, so the timestamp
+   * is the ONLY thing deciding which delivery a record belongs to; treating a
+   * missing stamp as "recent enough" let a stale enqueue confirm whatever
+   * happened to be armed.
+   */
+  it("refuses an enqueue whose timestamp is unusable instead of trusting it", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("no-stamp", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+    const text = "deploy the thing";
+
+    const p = proc.send_prompt_stream(text);
+    const iv = setInterval(() => emit("streaming\n"), 5);
+    setTimeout(() => proc.notePromptIngested(enqueued(text, { ingestedAtMs: 0 })), 30);
+    await p;
+    clearInterval(iv);
+
+    expect(writes).toContain("\x15");
+  });
+
+  /**
+   * Adversarial pass, finding 2 (the other half) — an enqueue stamped before
+   * this prompt was armed belongs to an earlier delivery.
+   */
+  it("refuses an enqueue stamped before the prompt was armed", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("stale-enqueue", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+    const text = "deploy the other thing";
+
+    const p = proc.send_prompt_stream(text);
+    const iv = setInterval(() => emit("streaming\n"), 5);
+    setTimeout(
+      () => proc.notePromptIngested(enqueued(text, { ingestedAtMs: Date.now() - 60_000 })),
+      30,
+    );
+    await p;
+    clearInterval(iv);
+
+    expect(writes).toContain("\x15");
+  });
+
+  /**
+   * Adversarial pass, finding 8 — an enqueue confirmed permanently. A prompt
+   * the queue hands back was never run, so the confirmation must be withdrawn
+   * with it.
+   */
+  it("withdraws the confirmation when the queue gives the prompt back", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("dequeued", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+    const text = "a prompt that gets cancelled";
+
+    const p = proc.send_prompt_stream(text);
+    const iv = setInterval(() => emit("streaming\n"), 5);
+    setTimeout(() => proc.notePromptIngested(enqueued(text)), 25);
+    setTimeout(() => proc.notePromptIngested({ text, source: "dequeue", ingestedAtMs: Date.now() }), 35);
+    await p;
+    clearInterval(iv);
+
+    expect(writes).toContain("\x15");
+  });
+
+  /**
+   * Adversarial pass, finding 4 — a whitespace-only prompt normalises to the
+   * empty string, which then matched ANY whitespace-only record in the
+   * transcript. Nothing to compare on means nothing to confirm on.
+   */
+  it("does not arm on a prompt that normalises to nothing", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("blank", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+
+    const p = proc.send_prompt_stream("   ");
+    const iv = setInterval(() => emit("streaming\n"), 5);
+    // A different whitespace-only record — normalises to "" just the same.
+    setTimeout(
+      () =>
+        proc.notePromptIngested({
+          text: "\t\n",
+          source: "user",
+          promptId: "pid-blank",
+          ingestedAtMs: Date.now(),
+        }),
+      30,
+    );
+    await p;
+    clearInterval(iv);
+
+    expect(writes).toContain("\x15");
+  });
+
   it("consumes an id seen while unarmed, so it cannot confirm a later delivery", async () => {
     const { handle, writes, emit } = bootPty();
     const proc = new PtyAgentProcess("unarmed", handle, {

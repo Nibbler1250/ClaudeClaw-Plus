@@ -415,14 +415,20 @@ export class JsonlTailer {
    */
   private notifyEnqueue(line: Record<string, unknown>): void {
     if (!this.onPromptIngested) return;
-    if (line.operation !== "enqueue") return;
+    // `enqueue` reports acceptance; `dequeue`/`remove` report the queue giving
+    // the prompt back. Both are facts about the same delivery, so both are
+    // forwarded — filtering the withdrawal left a cancelled prompt confirmed
+    // for good (adversarial pass, finding 8). Anything else this record type
+    // grows in a future CLI is still ignored: the test stays positive.
+    const withdrawal = line.operation === "dequeue" || line.operation === "remove";
+    if (line.operation !== "enqueue" && !withdrawal) return;
     const content = line.content;
     if (typeof content !== "string") return;
     const ts = typeof line.timestamp === "string" ? Date.parse(line.timestamp) : Number.NaN;
     try {
       this.onPromptIngested({
         text: content,
-        source: "enqueue",
+        source: withdrawal ? "dequeue" : "enqueue",
         ingestedAtMs: Number.isFinite(ts) ? ts : 0,
       });
     } catch (err) {
