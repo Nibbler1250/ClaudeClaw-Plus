@@ -1033,7 +1033,7 @@ describe("PtyAgentProcess enqueue-confirmed delivery (issue #363)", () => {
     expect(writes).not.toContain("\x15");
   });
 
-  it("ignores a de-queue: only operation=enqueue is an ingestion", async () => {
+  it("refuses to confirm from the screen when the transcript says nothing at all", async () => {
     const { handle, writes, emit } = bootPty();
     const proc = new PtyAgentProcess("q2", handle, {
       submitConfirmMs: 20,
@@ -1044,8 +1044,14 @@ describe("PtyAgentProcess enqueue-confirmed delivery (issue #363)", () => {
 
     const p = proc.send_prompt_stream("dropped prompt");
     const iv = setInterval(() => emit("repaint noise\n"), 5);
-    // A `remove` record is filtered at the tailer, so nothing reaches the
-    // process. Assert the process still refuses to confirm from the screen.
+    // Nothing is injected: this is the transcript-silent case, and the point is
+    // that the screen alone never confirms.
+    //
+    // Renamed. It used to be called "ignores a de-queue: only operation=enqueue
+    // is an ingestion" and its comment said a `remove` record was filtered at
+    // the tailer — both false since withdrawals became a forwarded signal, and
+    // neither was ever true of this body, which injects no record at all. The
+    // withdrawal paths are covered by their own tests above.
     await p;
     clearInterval(iv);
 
@@ -1239,6 +1245,204 @@ describe("PtyAgentProcess enqueue-confirmed delivery (issue #363)", () => {
     clearInterval(iv);
 
     expect(writes).toContain("\x15");
+  });
+
+  /**
+   * Second adversarial pass, finding 1 — the headline. The first cut booked the
+   * queue entry only where an `enqueue` actually CONFIRMED a delivery, so an
+   * enqueue seen while nothing was armed (the common case: it lands after the
+   * confirm loop has already resolved) booked nothing. The CLI still had the
+   * prompt queued and still wrote its `user` line later, which then confirmed
+   * the next delivery of the same text — the original phantom, untouched.
+   */
+  it("counts an enqueue seen while unarmed, so its later user line cannot confirm the next delivery", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("unarmed-enqueue", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+    const text = "heartbeat: any new messages?";
+
+    // The CLI accepted a submission of this text while nothing was armed.
+    proc.notePromptIngested(enqueued(text));
+
+    // A later delivery of the same bytes. Its `user` line is the one owed to
+    // the submission above, not evidence about this delivery.
+    const p = proc.send_prompt_stream(text);
+    const iv = setInterval(() => emit("streaming\n"), 5);
+    setTimeout(
+      () =>
+        proc.notePromptIngested({
+          text,
+          source: "user",
+          promptId: "pid-of-the-queued-one",
+          ingestedAtMs: Date.now(),
+        }),
+      30,
+    );
+    await p;
+    clearInterval(iv);
+
+    expect(writes).toContain("\x15");
+  });
+
+  /**
+   * Second adversarial pass, finding 1, second shape — a refused enqueue must
+   * still be counted. Refusing an unusable timestamp is a statement about which
+   * DELIVERY the record belongs to; it says nothing about whether the CLI
+   * queued the prompt. Skipping the booking made that guard manufacture the
+   * phantom it exists to prevent.
+   */
+  it("counts an enqueue even when its timestamp makes it unusable as a confirmation", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("refused-enqueue", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+    const text = "run the nightly sync";
+
+    // Delivery #1: the enqueue is refused as a confirmation (no usable stamp),
+    // but the prompt IS queued.
+    const first = proc.send_prompt_stream(text);
+    const iv1 = setInterval(() => emit("streaming\n"), 5);
+    setTimeout(() => proc.notePromptIngested(enqueued(text, { ingestedAtMs: 0 })), 25);
+    await first;
+    clearInterval(iv1);
+
+    // Delivery #2, same bytes. Delivery #1's `user` line must not confirm it.
+    const before = writes.length;
+    const second = proc.send_prompt_stream(text);
+    const iv2 = setInterval(() => emit("streaming\n"), 5);
+    setTimeout(
+      () =>
+        proc.notePromptIngested({
+          text,
+          source: "user",
+          promptId: "pid-of-first",
+          ingestedAtMs: Date.now(),
+        }),
+      30,
+    );
+    await second;
+    clearInterval(iv2);
+
+    expect(writes.slice(before)).toContain("\x15");
+  });
+
+  /**
+   * Second adversarial pass, finding 3 — a withdrawal used to un-confirm by
+   * text alone. When other submissions of the same text are still outstanding,
+   * the withdrawal plausibly took one of THOSE, and tearing down a live
+   * confirmation on that basis makes the bus re-deliver a prompt the agent is
+   * already running.
+   */
+  it("keeps a live confirmation when a withdrawal can belong to another queued copy", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("withdraw-other", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+    const text = "a prompt queued twice";
+
+    // An earlier submission is already outstanding.
+    proc.notePromptIngested(enqueued(text));
+
+    const p = proc.send_prompt_stream(text);
+    const iv = setInterval(() => emit("streaming\n"), 5);
+    // This delivery is confirmed by its OWN enqueue...
+    setTimeout(() => proc.notePromptIngested(enqueued(text)), 25);
+    // ...and then the earlier submission is withdrawn. One copy is still
+    // outstanding, so this withdrawal is not necessarily ours.
+    setTimeout(
+      () => proc.notePromptIngested({ text, source: "dequeue", ingestedAtMs: Date.now() }),
+      35,
+    );
+    await p;
+    clearInterval(iv);
+
+    expect(writes).not.toContain("\x15");
+  });
+
+  /**
+   * Second adversarial pass, fix 2 — `NaN` fails every comparison it appears
+   * in, so a bare `< armed` test let it through, and a stamp in the future
+   * passed both bounds while also poisoning the dedupe key built from it.
+   */
+  it("refuses an enqueue whose timestamp is not a usable instant", async () => {
+    for (const stamp of [Number.NaN, Date.parse("2099-01-01T00:00:00.000Z")]) {
+      const { handle, writes, emit } = bootPty();
+      const proc = new PtyAgentProcess(`bad-stamp-${stamp}`, handle, {
+        submitConfirmMs: 20,
+        maxSubmitNudges: 2,
+        transcriptGraceMs: 60,
+      });
+      proc.enableTranscriptConfirmation();
+      const text = "deploy with a broken clock";
+
+      const p = proc.send_prompt_stream(text);
+      const iv = setInterval(() => emit("streaming\n"), 5);
+      setTimeout(() => proc.notePromptIngested(enqueued(text, { ingestedAtMs: stamp })), 30);
+      await p;
+      clearInterval(iv);
+
+      expect(writes).toContain("\x15");
+    }
+  });
+
+  /**
+   * Second adversarial pass — the enqueue identity key had no test at all:
+   * reverting it to `null` left the whole suite green. It is load-bearing
+   * because the queue count is a ledger: the same enqueue record presented
+   * twice must not book two outstanding submissions, or the second one absorbs
+   * a legitimate confirmation later.
+   */
+  it("counts a repeated enqueue record once, not twice", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("dup-enqueue", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+    const text = "a prompt whose enqueue is read twice";
+
+    // The identical record, twice — same text, same stamp, so same identity.
+    const stamped = enqueued(text, { ingestedAtMs: Date.now() });
+    proc.notePromptIngested({ ...stamped });
+    proc.notePromptIngested({ ...stamped });
+
+    // One outstanding submission, so one `user` line pays it off. The delivery
+    // below must then be confirmed by its OWN record, not starved by a phantom
+    // second entry.
+    proc.notePromptIngested({
+      text,
+      source: "user",
+      promptId: "pid-the-queued-one",
+      ingestedAtMs: Date.now(),
+    });
+
+    const p = proc.send_prompt_stream(text);
+    const iv = setInterval(() => emit("streaming\n"), 5);
+    setTimeout(
+      () =>
+        proc.notePromptIngested({
+          text,
+          source: "user",
+          promptId: "pid-this-delivery",
+          ingestedAtMs: Date.now(),
+        }),
+      30,
+    );
+    await p;
+    clearInterval(iv);
+
+    expect(writes).not.toContain("\x15");
   });
 
   it("consumes an id seen while unarmed, so it cannot confirm a later delivery", async () => {

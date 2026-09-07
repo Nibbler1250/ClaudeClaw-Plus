@@ -323,8 +323,18 @@ export class PtyAgentProcess implements AgentProcess {
    * count instead. Confirming by `enqueue` owes one `user` record; the next
    * matching `user` record pays that debt and is absorbed rather than credited.
    */
-  private readonly userRecordsOwed = new Map<string, number>();
-  private static readonly USER_RECORDS_OWED_MAX = 32;
+  private readonly outstandingEnqueues = new Map<string, { count: number; lastSeenMs: number }>();
+  private static readonly OUTSTANDING_ENQUEUE_MAX = 256;
+  /**
+   * How long an accepted-but-unrun submission stays outstanding. The measured
+   * `user`-line tail on a busy session is 443 s; this is that with room to
+   * spare. Past it, the queue entry is assumed gone — a session file rotated,
+   * a CLI that dropped the queue without writing a withdrawal — because an
+   * entry that never expires eventually absorbs a legitimate confirmation and
+   * makes the bus re-deliver a prompt the agent already ran (second
+   * adversarial pass, finding 4).
+   */
+  private static readonly OUTSTANDING_ENQUEUE_TTL_MS = 15 * 60_000;
   /**
    * True once a JSONL tailer is feeding `notePromptIngested`. Gates the
    * stricter post-compaction rule below: without a transcript there is nothing
@@ -917,14 +927,23 @@ export class PtyAgentProcess implements AgentProcess {
     // never confirm. That failed in precisely the auto-compaction case this
     // mechanism exists for, and `enqueue` does not cover it: a prompt that
     // TRIGGERS a compaction is not queued behind a running turn.
-    // A withdrawal is not a delivery. It cancels what the matching `enqueue`
-    // claimed: the queue handed the prompt back, so nothing ran it (adversarial
-    // pass, finding 8). Un-confirm and drop the debt that enqueue booked —
-    // there is no `user` line coming for a prompt that was taken out.
+    // A withdrawal is not a delivery: the queue handed the prompt back, so
+    // nothing ran it. It accounts for exactly ONE outstanding submission —
+    // deleting the whole entry wiped every copy of a text the bus had queued
+    // twice, and the survivor then confirmed a later delivery (second
+    // adversarial pass, finding 2).
+    //
+    // Whether it also un-confirms what is armed depends on what is left. If
+    // other submissions of this text are still outstanding, the withdrawal
+    // plausibly took one of THOSE, and tearing down a confirmation on that
+    // basis makes the bus re-deliver a prompt the agent is already running
+    // (finding 3). Only when nothing else is outstanding is the armed delivery
+    // necessarily the one withdrawn.
     if (ingestion.source === "dequeue") {
       const withdrawn = normalizePromptForMatch(ingestion.text);
-      this.userRecordsOwed.delete(withdrawn);
-      if (this.pendingPromptMatch !== null && withdrawn === this.pendingPromptMatch) {
+      this.consumeOutstandingEnqueue(withdrawn);
+      const stillQueued = (this.outstandingEnqueues.get(withdrawn)?.count ?? 0) > 0;
+      if (!stillQueued && this.pendingPromptMatch !== null && withdrawn === this.pendingPromptMatch) {
         this.promptIngested = false;
       }
       return;
@@ -962,10 +981,31 @@ export class PtyAgentProcess implements AgentProcess {
 
     const normalised = normalizePromptForMatch(ingestion.text);
 
-    // Pay down what a previously-confirmed delivery still owes, BEFORE any
-    // arming check — the debt is owed whether or not something is armed now,
-    // and paying it late would leave it to absorb a legitimate later record.
-    if (ingestion.source === "user" && this.settleOwedUserRecord(normalised)) return;
+    // ── The queue is a conservation law, not a side effect of confirming ──
+    //
+    // First cut booked the debt only where an `enqueue` actually confirmed a
+    // delivery. Every enqueue refused for any other reason booked nothing —
+    // yet the CLI still had the prompt queued and still wrote its `user` line
+    // later, which then confirmed the NEXT delivery of the same text. The
+    // original phantom, untouched. Worse, refusing an unusable timestamp is
+    // what SKIPPED the booking, so that guard manufactured the very failure it
+    // was added to prevent (second adversarial pass, finding 1).
+    //
+    // What the transcript actually tells us is a count: how many submissions
+    // of this text the CLI has accepted but not yet run. `enqueue` increments
+    // it, `user` and a withdrawal decrement it. Whether any of them confirms
+    // one of OUR deliveries is a separate question, asked afterwards.
+    // Gated on `alreadySeen`: the count is a ledger, and a record presented
+    // twice must not be counted twice in either direction. This is what makes
+    // the identity key above load-bearing rather than decorative — without the
+    // gate, a re-read enqueue books a phantom queue entry that later absorbs a
+    // legitimate confirmation, and a re-read `user` line pays down two.
+    if (!alreadySeen && ingestion.source === "enqueue") this.noteEnqueueObserved(normalised);
+    if (!alreadySeen && ingestion.source === "user" && this.consumeOutstandingEnqueue(normalised)) {
+      // This `user` line belongs to a submission accepted earlier and only now
+      // running. It is evidence about that one, not about whatever is armed.
+      return;
+    }
 
     if (this.pendingPromptMatch === null) return;
     if (alreadySeen) return;
@@ -981,46 +1021,88 @@ export class PtyAgentProcess implements AgentProcess {
     // (adversarial pass, finding 2). Refusing costs a fall back to the screen
     // heuristic and its grace; accepting reports a delivery that never
     // happened, which is the failure this whole mechanism exists to remove.
-    if (ingestion.source === "enqueue") {
-      if (ingestion.ingestedAtMs <= 0) return;
-      if (ingestion.ingestedAtMs < this.pendingArmedAtMs - INGESTION_CLOCK_SKEW_MS) return;
+    if (ingestion.source === "enqueue" && !this.enqueueStampBelongsToThisDelivery(ingestion)) {
+      return;
     }
     if (normalised !== this.pendingPromptMatch) return;
     this.promptIngested = true;
-    // The CLI writes the `user` line when it RUNS the prompt, which for a
-    // queued one is after this delivery has already resolved. Book it now so
-    // it cannot be credited to the next arming of the same text.
-    if (ingestion.source === "enqueue") this.oweUserRecord(normalised);
   }
 
   /**
-   * Book one `user` record owed to a delivery just confirmed by its `enqueue`.
-   * Bounded — only the recent past can plausibly still be in flight, and an
-   * unbounded map would grow for every queued prompt of a long-lived process.
+   * Whether an `enqueue` record's timestamp places it inside the delivery
+   * currently in flight. Every way a stamp can be unusable is refused rather
+   * than waved through: the enqueue path carries no `promptId`, so this is the
+   * only thing deciding which delivery the record belongs to.
+   *
+   * `NaN` fails every comparison it appears in, so a bare `< armed` test let it
+   * through; `Number.isFinite` is what actually excludes it. A stamp in the
+   * future is equally unusable — a forward clock skew on the CLI is not
+   * hypothetical, and an absurd one also poisons the dedupe key built from it
+   * (second adversarial pass, fix 2).
+   *
+   * Refusing costs a fall back to the screen heuristic and its grace period.
+   * Accepting reports a delivery that never happened — the failure this whole
+   * mechanism exists to remove — so the asymmetry is deliberate.
    */
-  private oweUserRecord(normalised: string): void {
-    if (
-      !this.userRecordsOwed.has(normalised) &&
-      this.userRecordsOwed.size >= PtyAgentProcess.USER_RECORDS_OWED_MAX
-    ) {
-      // Map iteration is insertion-ordered, so this is genuinely the oldest.
-      const oldest = this.userRecordsOwed.keys().next().value;
-      if (oldest !== undefined) this.userRecordsOwed.delete(oldest);
+  private enqueueStampBelongsToThisDelivery(ingestion: PromptIngestion): boolean {
+    const ts = ingestion.ingestedAtMs;
+    if (!Number.isFinite(ts) || ts <= 0) return false;
+    if (ts > Date.now() + INGESTION_CLOCK_SKEW_MS) return false;
+    return ts >= this.pendingArmedAtMs - INGESTION_CLOCK_SKEW_MS;
+  }
+
+  /**
+   * Record that the CLI accepted one more submission of this text. Called for
+   * EVERY `enqueue` record seen, whatever it goes on to confirm — the count is
+   * a fact about the CLI's queue, not about our confirmation logic.
+   */
+  private noteEnqueueObserved(normalised: string): void {
+    this.expireOutstandingEnqueues();
+    const entry = this.outstandingEnqueues.get(normalised);
+    if (entry) {
+      entry.count += 1;
+      entry.lastSeenMs = Date.now();
+      return;
     }
-    this.userRecordsOwed.set(normalised, (this.userRecordsOwed.get(normalised) ?? 0) + 1);
+    if (this.outstandingEnqueues.size >= PtyAgentProcess.OUTSTANDING_ENQUEUE_MAX) {
+      // Only reachable when 256 distinct texts are queued and unrun inside the
+      // TTL. Dropping the oldest restores the phantom for that one text, which
+      // is worse than the memory — but unbounded growth in a daemon that runs
+      // for weeks is not acceptable either, so bound generously and evict only
+      // after the TTL sweep above has already failed to free anything.
+      const oldest = this.outstandingEnqueues.keys().next().value;
+      if (oldest !== undefined) this.outstandingEnqueues.delete(oldest);
+    }
+    this.outstandingEnqueues.set(normalised, { count: 1, lastSeenMs: Date.now() });
   }
 
   /**
-   * Absorb a `user` record that belongs to an already-confirmed delivery.
-   * Returns true when the record was consumed as payment and must NOT be
-   * allowed to confirm whatever is armed now.
+   * Account one outstanding submission of this text as run (or withdrawn).
+   * Returns true when there WAS one — meaning the record just seen belongs to
+   * that earlier submission and must not be credited to whatever is armed now.
+   *
+   * Decrements by one. The first cut deleted the whole entry, so a single
+   * withdrawal wiped every outstanding copy of a text the bus had queued twice
+   * — and the survivor's `user` line then confirmed the next delivery (second
+   * adversarial pass, finding 2).
    */
-  private settleOwedUserRecord(normalised: string): boolean {
-    const owed = this.userRecordsOwed.get(normalised);
-    if (!owed) return false;
-    if (owed === 1) this.userRecordsOwed.delete(normalised);
-    else this.userRecordsOwed.set(normalised, owed - 1);
+  private consumeOutstandingEnqueue(normalised: string): boolean {
+    this.expireOutstandingEnqueues();
+    const entry = this.outstandingEnqueues.get(normalised);
+    if (!entry || entry.count <= 0) return false;
+    entry.count -= 1;
+    entry.lastSeenMs = Date.now();
+    if (entry.count === 0) this.outstandingEnqueues.delete(normalised);
     return true;
+  }
+
+  /** Drop queue entries old enough that their `user` line is never coming. */
+  private expireOutstandingEnqueues(): void {
+    if (this.outstandingEnqueues.size === 0) return;
+    const cutoff = Date.now() - PtyAgentProcess.OUTSTANDING_ENQUEUE_TTL_MS;
+    for (const [text, entry] of this.outstandingEnqueues) {
+      if (entry.lastSeenMs < cutoff) this.outstandingEnqueues.delete(text);
+    }
   }
 
   onData(handler: DataHandler): void {
