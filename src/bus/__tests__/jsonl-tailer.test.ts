@@ -910,27 +910,54 @@ describe("prompt ingestion callbacks", () => {
     expect(h.ingested[0]?.ingestedAtMs).toBe(Date.parse("2026-09-07T15:00:00.000Z"));
   });
 
-  it("reports a dequeue as a withdrawal, not as an ingestion", async () => {
+  /**
+   * A `dequeue` is the queue handing the prompt to the RUNNER, not handing it
+   * back. `docs/spikes/fixtures/jsonl/01-headless-text-only.jsonl` shows it
+   * 1 ms after the enqueue and 2 s before the `user` line of a normal
+   * delivery, and it carries no `content`. Two rounds of review read it as a
+   * cancellation; a test asserted that reading, against a record shape the CLI
+   * does not write.
+   */
+  it("does not report a dequeue as an ingestion", async () => {
     const { bus, events } = createMockBus();
     const h = makeIngestTailer(bus);
     tailer = h.t;
     await writeFile(
       sessionPath,
-      jsonl({
-        type: "queue-operation",
-        operation: "dequeue",
-        content: "a prompt taken back",
-        timestamp: "2026-09-07T15:00:00.000Z",
-      }),
+      jsonl(
+        {
+          type: "queue-operation",
+          operation: "enqueue",
+          content: "the prompt",
+          timestamp: "2026-09-07T15:00:00.000Z",
+        },
+        // The fixture's own shape: 1 ms later, no `content`.
+        {
+          type: "queue-operation",
+          operation: "dequeue",
+          timestamp: "2026-09-07T15:00:00.001Z",
+        },
+        // And the shape that would actually reach the consumer if a future CLI
+        // started writing `content` on this line. Without the operation filter
+        // this one IS forwarded, and the delivery it names gets un-confirmed —
+        // so this is the assertion that holds the guard in place, not the one
+        // above (which the missing `content` would drop anyway).
+        {
+          type: "queue-operation",
+          operation: "dequeue",
+          content: "the prompt",
+          timestamp: "2026-09-07T15:00:00.002Z",
+        },
+      ),
     );
     await h.t.start();
-    await waitFor(events, (e) => e.some((x) => x.topic === "session.queue"));
+    await waitFor(events, (e) => e.filter((x) => x.topic === "session.queue").length >= 3);
 
     expect(h.ingested).toHaveLength(1);
-    expect(h.ingested[0]?.source).toBe("dequeue");
+    expect(h.ingested[0]?.source).toBe("enqueue");
   });
 
-  it("ignores a queue operation that is neither an acceptance nor a withdrawal", async () => {
+  it("ignores a queue operation that is not an acceptance", async () => {
     const { bus, events } = createMockBus();
     const h = makeIngestTailer(bus);
     tailer = h.t;

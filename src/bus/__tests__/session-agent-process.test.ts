@@ -1190,31 +1190,6 @@ describe("PtyAgentProcess enqueue-confirmed delivery (issue #363)", () => {
   });
 
   /**
-   * Adversarial pass, finding 8 — an enqueue confirmed permanently. A prompt
-   * the queue hands back was never run, so the confirmation must be withdrawn
-   * with it.
-   */
-  it("withdraws the confirmation when the queue gives the prompt back", async () => {
-    const { handle, writes, emit } = bootPty();
-    const proc = new PtyAgentProcess("dequeued", handle, {
-      submitConfirmMs: 20,
-      maxSubmitNudges: 2,
-      transcriptGraceMs: 60,
-    });
-    proc.enableTranscriptConfirmation();
-    const text = "a prompt that gets cancelled";
-
-    const p = proc.send_prompt_stream(text);
-    const iv = setInterval(() => emit("streaming\n"), 5);
-    setTimeout(() => proc.notePromptIngested(enqueued(text)), 25);
-    setTimeout(() => proc.notePromptIngested({ text, source: "dequeue", ingestedAtMs: Date.now() }), 35);
-    await p;
-    clearInterval(iv);
-
-    expect(writes).toContain("\x15");
-  });
-
-  /**
    * Adversarial pass, finding 4 — a whitespace-only prompt normalises to the
    * empty string, which then matched ANY whitespace-only record in the
    * transcript. Nothing to compare on means nothing to confirm on.
@@ -1334,40 +1309,17 @@ describe("PtyAgentProcess enqueue-confirmed delivery (issue #363)", () => {
   });
 
   /**
-   * Second adversarial pass, finding 3 — a withdrawal used to un-confirm by
-   * text alone. When other submissions of the same text are still outstanding,
-   * the withdrawal plausibly took one of THOSE, and tearing down a live
-   * confirmation on that basis makes the bus re-deliver a prompt the agent is
-   * already running.
+   * A `dequeue` record is NOT a cancellation, and nothing here treats it as one.
+   *
+   * Two rounds of review built a withdrawal path on the opposite reading. The
+   * repo's own fixtures settle it: in
+   * `docs/spikes/fixtures/jsonl/01-headless-text-only.jsonl` the `dequeue`
+   * fires 1 ms after the `enqueue` and 2 s before the `user` line, in a normal
+   * successful delivery — the queue handing the prompt to the runner. It also
+   * carries no `content`. The tests that covered the withdrawal synthesised a
+   * record the CLI does not write, and the code they covered would have
+   * un-confirmed every delivery the day the CLI started writing it.
    */
-  it("keeps a live confirmation when a withdrawal can belong to another queued copy", async () => {
-    const { handle, writes, emit } = bootPty();
-    const proc = new PtyAgentProcess("withdraw-other", handle, {
-      submitConfirmMs: 20,
-      maxSubmitNudges: 2,
-      transcriptGraceMs: 60,
-    });
-    proc.enableTranscriptConfirmation();
-    const text = "a prompt queued twice";
-
-    // An earlier submission is already outstanding.
-    proc.notePromptIngested(enqueued(text));
-
-    const p = proc.send_prompt_stream(text);
-    const iv = setInterval(() => emit("streaming\n"), 5);
-    // This delivery is confirmed by its OWN enqueue...
-    setTimeout(() => proc.notePromptIngested(enqueued(text)), 25);
-    // ...and then the earlier submission is withdrawn. One copy is still
-    // outstanding, so this withdrawal is not necessarily ours.
-    setTimeout(
-      () => proc.notePromptIngested({ text, source: "dequeue", ingestedAtMs: Date.now() }),
-      35,
-    );
-    await p;
-    clearInterval(iv);
-
-    expect(writes).not.toContain("\x15");
-  });
 
   /**
    * Second adversarial pass, fix 2 — `NaN` fails every comparison it appears

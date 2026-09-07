@@ -415,20 +415,21 @@ export class JsonlTailer {
    */
   private notifyEnqueue(line: Record<string, unknown>): void {
     if (!this.onPromptIngested) return;
-    // `enqueue` reports acceptance; `dequeue`/`remove` report the queue giving
-    // the prompt back. Both are facts about the same delivery, so both are
-    // forwarded — filtering the withdrawal left a cancelled prompt confirmed
-    // for good (adversarial pass, finding 8). Anything else this record type
-    // grows in a future CLI is still ignored: the test stays positive.
-    const withdrawal = line.operation === "dequeue" || line.operation === "remove";
-    if (line.operation !== "enqueue" && !withdrawal) return;
+    // Only `enqueue`. A `dequeue` is NOT the queue giving the prompt back — the
+    // fixtures in `docs/spikes/fixtures/jsonl/` show it firing 1 ms after the
+    // enqueue and 2 s before the `user` line of a normal delivery, i.e. the
+    // queue handing the prompt to the runner. A round of review read it as a
+    // cancellation and this forwarded it as one; every delivery it touched
+    // would have been un-confirmed. Positive test, so any other operation a
+    // future CLI adds is ignored rather than guessed at.
+    if (line.operation !== "enqueue") return;
     const content = line.content;
     if (typeof content !== "string") return;
     const ts = typeof line.timestamp === "string" ? Date.parse(line.timestamp) : Number.NaN;
     try {
       this.onPromptIngested({
         text: content,
-        source: withdrawal ? "dequeue" : "enqueue",
+        source: "enqueue",
         ingestedAtMs: Number.isFinite(ts) ? ts : 0,
       });
     } catch (err) {

@@ -305,14 +305,17 @@ export interface PromptIngestion {
    * and a 0.27 s maximum. Neither record alone is sufficient: `enqueue` covers
    * only a quarter of prompts, and `user` has the 443 s tail.
    *
-   * - `"dequeue"` is the same `queue-operation` record with the queue giving
-   *   the prompt BACK — cancelled, or dropped by a restart before the CLI ran
-   *   it. It carries no delivery, it withdraws one: an `enqueue` used to
-   *   confirm permanently, so a prompt that left the queue kept its
-   *   confirmation. Forwarded rather than filtered, so the consumer — not the
-   *   tailer — decides what a withdrawal means.
+   * `"dequeue"` is deliberately NOT one of these. A round of review read it as
+   * the queue handing the prompt BACK and built a withdrawal path on that. The
+   * repo's own fixtures say otherwise: in
+   * `docs/spikes/fixtures/jsonl/01-headless-text-only.jsonl` a `dequeue` fires
+   * 1 ms after the `enqueue` and 2 s before the `user` line, in a normal
+   * successful single-prompt delivery. It means the queue handed the prompt to
+   * the RUNNER. Treating it as a cancellation un-confirms every delivery it
+   * touches. It also carries no `content`, so it cannot be attributed to a
+   * text even if one wanted to.
    */
-  source: "user" | "enqueue" | "dequeue";
+  source: "user" | "enqueue";
   /** CLI-assigned id. Present on `user` lines only, and it identifies a
    *  submission rather than a record — a compaction cluster shares one. */
   promptId?: string;

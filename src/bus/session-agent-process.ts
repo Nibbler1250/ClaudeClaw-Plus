@@ -927,28 +927,6 @@ export class PtyAgentProcess implements AgentProcess {
     // never confirm. That failed in precisely the auto-compaction case this
     // mechanism exists for, and `enqueue` does not cover it: a prompt that
     // TRIGGERS a compaction is not queued behind a running turn.
-    // A withdrawal is not a delivery: the queue handed the prompt back, so
-    // nothing ran it. It accounts for exactly ONE outstanding submission —
-    // deleting the whole entry wiped every copy of a text the bus had queued
-    // twice, and the survivor then confirmed a later delivery (second
-    // adversarial pass, finding 2).
-    //
-    // Whether it also un-confirms what is armed depends on what is left. If
-    // other submissions of this text are still outstanding, the withdrawal
-    // plausibly took one of THOSE, and tearing down a confirmation on that
-    // basis makes the bus re-deliver a prompt the agent is already running
-    // (finding 3). Only when nothing else is outstanding is the armed delivery
-    // necessarily the one withdrawn.
-    if (ingestion.source === "dequeue") {
-      const withdrawn = normalizePromptForMatch(ingestion.text);
-      this.consumeOutstandingEnqueue(withdrawn);
-      const stillQueued = (this.outstandingEnqueues.get(withdrawn)?.count ?? 0) > 0;
-      if (!stillQueued && this.pendingPromptMatch !== null && withdrawn === this.pendingPromptMatch) {
-        this.promptIngested = false;
-      }
-      return;
-    }
-
     // An `enqueue` record carries no `promptId`, so keying on the id alone left
     // it with no identity at all: never recorded, never deduped, and free to
     // confirm again on any re-read of the same line (adversarial pass,
@@ -1034,11 +1012,17 @@ export class PtyAgentProcess implements AgentProcess {
    * than waved through: the enqueue path carries no `promptId`, so this is the
    * only thing deciding which delivery the record belongs to.
    *
-   * `NaN` fails every comparison it appears in, so a bare `< armed` test let it
-   * through; `Number.isFinite` is what actually excludes it. A stamp in the
-   * future is equally unusable — a forward clock skew on the CLI is not
-   * hypothetical, and an absurd one also poisons the dedupe key built from it
-   * (second adversarial pass, fix 2).
+   * A stamp in the future is unusable too — a forward clock skew on the CLI is
+   * not hypothetical, and an absurd one also poisons the dedupe key built from
+   * it.
+   *
+   * There is deliberately no `Number.isFinite` guard. A previous round added
+   * one and justified it with "a bare `< armed` test let NaN through" — but
+   * the comparison below is `>=` inside a `return`, and `NaN >= x` is false,
+   * so NaN was already refused. Deleting the guard left every test green: it
+   * was dead code dressed as a fix, the exact thing the round before it was
+   * criticised for. The tailer also maps non-finite stamps to `0`
+   * (`jsonl-tailer.ts`), which `ts <= 0` catches.
    *
    * Refusing costs a fall back to the screen heuristic and its grace period.
    * Accepting reports a delivery that never happened — the failure this whole
@@ -1046,7 +1030,7 @@ export class PtyAgentProcess implements AgentProcess {
    */
   private enqueueStampBelongsToThisDelivery(ingestion: PromptIngestion): boolean {
     const ts = ingestion.ingestedAtMs;
-    if (!Number.isFinite(ts) || ts <= 0) return false;
+    if (ts <= 0) return false;
     if (ts > Date.now() + INGESTION_CLOCK_SKEW_MS) return false;
     return ts >= this.pendingArmedAtMs - INGESTION_CLOCK_SKEW_MS;
   }
