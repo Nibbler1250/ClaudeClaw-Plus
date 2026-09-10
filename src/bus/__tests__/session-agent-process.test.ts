@@ -1126,7 +1126,13 @@ describe("PtyAgentProcess enqueue-confirmed delivery (issue #363)", () => {
     const iv2 = setInterval(() => emit("streaming\n"), 5);
     // Delivery #1's `user` line, arriving for the FIRST time, mid-delivery #2.
     setTimeout(
-      () => proc.notePromptIngested({ text, source: "user", promptId: "pid-of-first", ingestedAtMs: Date.now() }),
+      () =>
+        proc.notePromptIngested({
+          text,
+          source: "user",
+          promptId: "pid-of-first",
+          ingestedAtMs: Date.now(),
+        }),
       30,
     );
     await second;
