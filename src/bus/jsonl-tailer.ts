@@ -417,7 +417,7 @@ export class JsonlTailer {
     if (!this.onPromptIngested) return;
     // Only `enqueue`. A `dequeue` is NOT the queue giving the prompt back — the
     // fixtures in `docs/spikes/fixtures/jsonl/` show it firing 1 ms after the
-    // enqueue and 2 s before the `user` line of a normal delivery, i.e. the
+    // enqueue and 13 ms before the `user` line of a normal delivery, i.e. the
     // queue handing the prompt to the runner. A round of review read it as a
     // cancellation and this forwarded it as one; every delivery it touched
     // would have been un-confirmed. Positive test, so any other operation a

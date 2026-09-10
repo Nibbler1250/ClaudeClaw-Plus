@@ -1320,7 +1320,7 @@ describe("PtyAgentProcess enqueue-confirmed delivery (issue #363)", () => {
    * Two rounds of review built a withdrawal path on the opposite reading. The
    * repo's own fixtures settle it: in
    * `docs/spikes/fixtures/jsonl/01-headless-text-only.jsonl` the `dequeue`
-   * fires 1 ms after the `enqueue` and 2 s before the `user` line, in a normal
+   * fires 1 ms after the `enqueue` and 13 ms before the `user` line, in a normal
    * successful delivery — the queue handing the prompt to the runner. It also
    * carries no `content`. The tests that covered the withdrawal synthesised a
    * record the CLI does not write, and the code they covered would have
