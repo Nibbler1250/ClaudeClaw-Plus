@@ -414,6 +414,14 @@ interface PtyEntry {
   /** Last time `runOnPty` was called against this key. Drives LRU eviction
    *  when `pty.maxConcurrent` is hit. Adhoc-only — named agents are exempt. */
   lastAccessedAt: number;
+  /** The first-turn spawn while it is still running. A caller that abandons the
+   *  spawn on its own deadline leaves this behind, so the next caller on the key
+   *  awaits the SAME spawn instead of starting a second one. Two spawns on one
+   *  entry would each set `entry.pty`, orphaning whichever landed first — a
+   *  claude process plus its MCP fleet with no path to `dispose()`, since only
+   *  the entry is tracked in `state.ptys`. Cleared once the spawn settles, so a
+   *  failed spawn can be retried by a later turn. */
+  spawnInFlight?: Promise<void>;
   /** Wall-clock at the most recent spawn (or respawn). Used by `reapIdle` to
    *  time out PTYs that never complete a first turn after a (re)spawn
    *  (issue #65 item 6). Reset on every respawn so a healthy long-lived PTY
@@ -1425,17 +1433,26 @@ async function runTurnWithRetries(
   // `getOrCreateEntry` does not spawn; the only `spawnEntry` call reachable on
   // the first-turn path is this one.
   if (!entry.pty) {
+    // Abandoning the wait must not abandon ownership: keep the in-flight spawn
+    // on the entry so the next caller awaits THIS one rather than starting a
+    // second. Cleared on settle so a failed spawn stays retryable.
+    if (!entry.spawnInFlight) {
+      const inFlight = spawnEntry(
+        entry,
+        callOpts.modelOverride,
+        callOpts.api,
+        callOpts.securityArgs,
+        callOpts.appendSystemPrompt,
+      ).finally(() => {
+        if (entry.spawnInFlight === inFlight) entry.spawnInFlight = undefined;
+      });
+      // A caller that walks away leaves nobody awaiting this; keep its rejection
+      // from surfacing unhandled. Real callers still see it through their own await.
+      inFlight.catch(() => {});
+      entry.spawnInFlight = inFlight;
+    }
     try {
-      await withDeadline(
-        spawnEntry(
-          entry,
-          callOpts.modelOverride,
-          callOpts.api,
-          callOpts.securityArgs,
-          callOpts.appendSystemPrompt,
-        ),
-        callOpts.timeoutMs,
-      );
+      await withDeadline(entry.spawnInFlight, callOpts.timeoutMs);
     } catch (err) {
       if (err instanceof DeadlineExceeded) {
         return errorResult(

@@ -1844,4 +1844,43 @@ describe("pty-supervisor bounded admission (issue #369)", () => {
     expect((await third).exitCode).toBe(0);
     expect(maxInFlight).toBe(1);
   });
+
+  it("abandoning a slow spawn never spawns a second PTY on the same entry", async () => {
+    // Bounding the spawn must not abandon ownership of it. If the timeout path
+    // let the next caller start its own spawn, both would land and each set
+    // `entry.pty` — orphaning whichever arrived first: a claude process plus its
+    // MCP fleet with no dispose path, since only the entry is tracked.
+    let releaseSpawn: () => void = () => {};
+    const spawnHeld = new Promise<void>((resolve) => {
+      releaseSpawn = resolve;
+    });
+    let spawnCalls = 0;
+
+    const inner = makeSpawnTracker(() => makeFakePty("slow-spawn", {}));
+    const slowSpawn: SpawnPty = async (o) => {
+      spawnCalls += 1;
+      await spawnHeld;
+      return inner.spawn(o);
+    };
+    injectSpawnPty(slowSpawn);
+    await initSupervisor();
+
+    // First caller gives up on the spawn.
+    const first = await runOnPty("thread:spawn1", "one", {
+      timeoutMs: 60,
+      threadId: "spawn1",
+    });
+    expect(first.exitCode).toBe(1);
+    expect(first.stderr).toContain("did not come up");
+
+    // Second caller arrives while that spawn is still in flight. It must join it,
+    // not start another.
+    const second = runOnPty("thread:spawn1", "two", { timeoutMs: 30_000, threadId: "spawn1" });
+    await new Promise((r) => setTimeout(r, 100));
+    expect(spawnCalls).toBe(1);
+
+    releaseSpawn();
+    expect((await second).exitCode).toBe(0);
+    expect(spawnCalls).toBe(1);
+  });
 });
