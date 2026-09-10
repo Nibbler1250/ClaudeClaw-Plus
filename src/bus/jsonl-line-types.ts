@@ -309,7 +309,7 @@ export interface PromptIngestion {
    * the queue handing the prompt BACK and built a withdrawal path on that. The
    * repo's own fixtures say otherwise: in
    * `docs/spikes/fixtures/jsonl/01-headless-text-only.jsonl` a `dequeue` fires
-   * 1 ms after the `enqueue` and 2 s before the `user` line, in a normal
+   * 1 ms after the `enqueue` and 13 ms before the `user` line, in a normal
    * successful single-prompt delivery. It means the queue handed the prompt to
    * the RUNNER. Treating it as a cancellation un-confirms every delivery it
    * touches. It also carries no `content`, so it cannot be attributed to a
