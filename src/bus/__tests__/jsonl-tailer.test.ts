@@ -913,7 +913,7 @@ describe("prompt ingestion callbacks", () => {
   /**
    * A `dequeue` is the queue handing the prompt to the RUNNER, not handing it
    * back. `docs/spikes/fixtures/jsonl/01-headless-text-only.jsonl` shows it
-   * 1 ms after the enqueue and 2 s before the `user` line of a normal
+   * 1 ms after the enqueue and 13 ms before the `user` line of a normal
    * delivery, and it carries no `content`. Two rounds of review read it as a
    * cancellation; a test asserted that reading, against a record shape the CLI
    * does not write.
