@@ -1787,4 +1787,61 @@ describe("pty-supervisor bounded admission (issue #369)", () => {
     });
     expect(third.exitCode).toBe(0);
   });
+
+  it("a caller that abandons the lock wait never lets two turns run on one PTY", async () => {
+    // The regression this guards: releasing the installed lock on the timeout
+    // path hands the chain to the next caller while the predecessor's turn is
+    // still running — two turns interleaved on one PTY. The previous test could
+    // not see it, because it only issued the third call *after* awaiting the
+    // first. This one issues it while the first is still held.
+    let releaseFirstTurn: () => void = () => {};
+    const firstTurnHeld = new Promise<void>((resolve) => {
+      releaseFirstTurn = resolve;
+    });
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let turns = 0;
+
+    const { spawn } = makeSpawnTracker(() =>
+      makeFakePty("serialised", {
+        onTurn: async (prompt: string) => {
+          turns += 1;
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          try {
+            if (turns === 1) await firstTurnHeld;
+            return {
+              text: `echo:${prompt}`,
+              bytesCaptured: prompt.length,
+              cleanBoundary: true,
+              sessionId: "session-serialised",
+            };
+          } finally {
+            inFlight -= 1;
+          }
+        },
+      }),
+    );
+    injectSpawnPty(spawn);
+    await initSupervisor();
+
+    const first = runOnPty("thread:ser", "one", { timeoutMs: 30_000, threadId: "ser" });
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Gives up on the wait; must not hand the chain on while `first` runs.
+    const second = await runOnPty("thread:ser", "two", { timeoutMs: 60, threadId: "ser" });
+    expect(second.exitCode).toBe(1);
+
+    // Issued while the first turn is STILL held.
+    const third = runOnPty("thread:ser", "three", { timeoutMs: 30_000, threadId: "ser" });
+    await new Promise((r) => setTimeout(r, 150));
+
+    expect(maxInFlight).toBe(1);
+    expect(turns).toBe(1);
+
+    releaseFirstTurn();
+    expect((await first).exitCode).toBe(0);
+    expect((await third).exitCode).toBe(0);
+    expect(maxInFlight).toBe(1);
+  });
 });

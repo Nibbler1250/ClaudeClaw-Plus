@@ -681,8 +681,12 @@ export async function runOnPty(
   // caller's `timeoutMs` elapsed and nothing fired. That is the difference
   // between a job failing cleanly and a job wedging.
   //
-  // Both stages are now bounded by the caller's own `timeoutMs`. Nothing new to
-  // configure, and no caller waits longer than it already asked to.
+  // Each stage is bounded by the caller's own `timeoutMs`. Note this is a
+  // per-stage bound, not a total: admission, the lock wait, the spawn and each
+  // of `maxRetries + 1` turns are each bounded by it, so the worst case is a
+  // multiple of `timeoutMs`, not `timeoutMs`. The retry multiplication predates
+  // this change; what changes here is that the stages ahead of the retry loop
+  // are bounded at all instead of being able to hang forever.
   let entry: PtyEntry;
   let supervisorOpts: ReturnType<typeof readSupervisorOptions>;
   try {
@@ -720,16 +724,25 @@ export async function runOnPty(
   entry.lock = new Promise<void>((resolve) => {
     release = resolve;
   });
+  // The lock is a chain: each caller captures its predecessor, installs its own,
+  // awaits the predecessor, and releases in `finally`. Giving up on the wait is
+  // therefore delicate — releasing immediately would hand the chain to the next
+  // caller while the predecessor's turn is *still running*, putting two turns on
+  // one PTY with interleaved writes and reads. Bounding the wait must not cost
+  // the serialisation it is bounding.
+  //
+  // So on timeout this call abandons its own wait but leaves the chain intact:
+  // its lock is released only once the predecessor actually settles.
+  let releaseOnExit = true;
   try {
-    // The per-entry lock serialises turns on one session. A previous turn that
-    // never settles used to block every later turn on that key forever. Bound
-    // the wait — and note the `finally` below still runs, so timing out here
-    // releases the lock this call installed instead of wedging the entry for
-    // its successors, which would reproduce the very bug being fixed.
     try {
       await withDeadline(previousLock, opts.timeoutMs);
     } catch (err) {
       if (err instanceof DeadlineExceeded) {
+        // Not `release()` — see above. Successors keep waiting behind the
+        // predecessor that is still running, and are unblocked when it ends.
+        releaseOnExit = false;
+        void previousLock.finally(release);
         return errorResult(
           `[pty-supervisor] waited ${opts.timeoutMs}ms for the previous turn on ${sessionKey} to finish; it never did`,
         );
@@ -738,7 +751,7 @@ export async function runOnPty(
     }
     return await runTurnWithRetries(entry, prompt, opts, supervisorOpts);
   } finally {
-    release();
+    if (releaseOnExit) release();
   }
 }
 
