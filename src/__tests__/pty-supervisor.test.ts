@@ -1710,3 +1710,81 @@ describe("pty-supervisor housekeeping (issue #65)", () => {
     expect(spawned[1].disposed).toBe(true);
   });
 });
+
+describe("pty-supervisor bounded admission (issue #369)", () => {
+  it("a spawn that never settles fails the call instead of hanging it", async () => {
+    // `timeoutMs` used to bound only the turn. Admission — supervisor init,
+    // the concurrency gate, the spawn itself — ran ahead of it with no
+    // deadline, so a spawn that never returned hung the caller forever: the
+    // caller's own timeout elapsed and nothing fired.
+    const neverSettles: SpawnPty = () => new Promise<never>(() => {});
+    injectSpawnPty(neverSettles);
+    await initSupervisor();
+
+    const started = Date.now();
+    const r = await runOnPty("thread:stuck-spawn", "x", {
+      timeoutMs: 60,
+      threadId: "stuck-spawn",
+    });
+    const elapsed = Date.now() - started;
+
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("PTY spawn for");
+    expect(r.stderr).toContain("did not come up");
+    expect(r.stderr).toContain("thread:stuck-spawn");
+    // Bounded, not hung. Generous ceiling so a loaded runner cannot flake it;
+    // the property under test is "returns at all", not "returns fast".
+    expect(elapsed).toBeLessThan(5_000);
+  });
+
+  it("a slow turn does not wedge the entry for the calls behind it", async () => {
+    // Turns on one session are serialised through a per-entry lock. A caller
+    // that gave up waiting used to leave the lock it had already installed
+    // unreleased — wedging every later turn on that key. Timing out here must
+    // still release, or the fix reproduces the bug it is fixing.
+    let releaseFirstTurn: () => void = () => {};
+    const firstTurnHeld = new Promise<void>((resolve) => {
+      releaseFirstTurn = resolve;
+    });
+    let turns = 0;
+
+    const { spawn } = makeSpawnTracker(() =>
+      makeFakePty("slow", {
+        onTurn: async (prompt: string) => {
+          turns += 1;
+          if (turns === 1) await firstTurnHeld;
+          return {
+            text: `echo:${prompt}`,
+            bytesCaptured: prompt.length,
+            cleanBoundary: true,
+            sessionId: "session-slow",
+          };
+        },
+      }),
+    );
+    injectSpawnPty(spawn);
+    await initSupervisor();
+
+    const first = runOnPty("thread:slow", "one", { timeoutMs: 30_000, threadId: "slow" });
+    // Let the first call take the lock before the second one asks for it.
+    await new Promise((r) => setTimeout(r, 50));
+
+    const second = await runOnPty("thread:slow", "two", {
+      timeoutMs: 60,
+      threadId: "slow",
+    });
+    expect(second.exitCode).toBe(1);
+    expect(second.stderr).toContain("previous turn");
+
+    releaseFirstTurn();
+    const firstResult = await first;
+    expect(firstResult.exitCode).toBe(0);
+
+    // The entry survived the abandoned wait: a later turn still runs.
+    const third = await runOnPty("thread:slow", "three", {
+      timeoutMs: 30_000,
+      threadId: "slow",
+    });
+    expect(third.exitCode).toBe(0);
+  });
+});
