@@ -848,6 +848,12 @@ export class SessionManager {
     // fire-and-forget: it must not block returning the proc, and a tail
     // failure must never fail the spawn.
     if (this.options.bus) {
+      // Widen to the interface: `proc` is the concrete union
+      // `PtyAgentProcess | ChildAgentProcess`, and an optional member on the
+      // interface is not visible through a union of the classes implementing
+      // it. Both implement `AgentProcess`, so the transcript hooks are reached
+      // through it — and a runtime without them stays a no-op via `?.`.
+      const confirmable: AgentProcess = proc;
       const tailer = new JsonlTailer({
         bus: this.options.bus,
         agent_id: agent.id,
@@ -855,7 +861,20 @@ export class SessionManager {
         cwd: realCwd,
         startAt: "end",
         projectsDir: this.options.projectsDir,
+        // Issue #362: feed the transcript's prompt-ingestion fact back to the
+        // PTY delivery-confirm loop, which otherwise has only the rendered
+        // terminal to judge by and cannot distinguish a submitted prompt from
+        // a repaint. `startAt: "end"` above is what makes this safe on a
+        // resumed session: historical prompts are never replayed, so this can
+        // only ever fire for a prompt typed by this process.
+        onPromptIngested: (ingestion) => confirmable.notePromptIngested?.(ingestion),
+        // Only once a line has actually been read does the process stop
+        // trusting a post-compaction repaint. Enabling it at wiring time would
+        // strand any agent whose transcript path does not resolve: the strict
+        // branch would wait for a signal that can never arrive.
+        onTranscriptAlive: () => confirmable.enableTranscriptConfirmation?.(),
       });
+
       record.tailer = tailer;
       void tailer
         .start()
