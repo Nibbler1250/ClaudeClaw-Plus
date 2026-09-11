@@ -414,6 +414,14 @@ interface PtyEntry {
   /** Last time `runOnPty` was called against this key. Drives LRU eviction
    *  when `pty.maxConcurrent` is hit. Adhoc-only — named agents are exempt. */
   lastAccessedAt: number;
+  /** The first-turn spawn while it is still running. A caller that abandons the
+   *  spawn on its own deadline leaves this behind, so the next caller on the key
+   *  awaits the SAME spawn instead of starting a second one. Two spawns on one
+   *  entry would each set `entry.pty`, orphaning whichever landed first — a
+   *  claude process plus its MCP fleet with no path to `dispose()`, since only
+   *  the entry is tracked in `state.ptys`. Cleared once the spawn settles, so a
+   *  failed spawn can be retried by a later turn. */
+  spawnInFlight?: Promise<void>;
   /** Wall-clock at the most recent spawn (or respawn). Used by `reapIdle` to
    *  time out PTYs that never complete a first turn after a (re)spawn
    *  (issue #65 item 6). Reset on every respawn so a healthy long-lived PTY
@@ -601,6 +609,41 @@ export function snapshotSupervisor(): SupervisorSnapshot {
 }
 
 /**
+ * Thrown by `withDeadline` when the wrapped promise does not settle in time.
+ * A distinct type so callers can tell "we gave up waiting" apart from a real
+ * failure the operation itself reported.
+ */
+class DeadlineExceeded extends Error {
+  constructor(ms: number) {
+    super(`deadline of ${ms}ms exceeded`);
+    this.name = "DeadlineExceeded";
+  }
+}
+
+/**
+ * Resolve `p`, or reject with `DeadlineExceeded` after `ms`.
+ *
+ * The loser of the race is not abandoned silently: the timer is always cleared,
+ * and a late rejection from `p` is swallowed so it cannot surface as an
+ * unhandled rejection after we have already returned. `p` itself keeps running —
+ * there is no cancellation to hand it — so this bounds the WAIT, not the work.
+ * That is the right shape here: an admission that eventually completes leaves a
+ * usable entry behind for the next call.
+ */
+function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
+  if (!Number.isFinite(ms) || ms <= 0) return p;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return new Promise<T>((resolve, reject) => {
+    timer = setTimeout(() => reject(new DeadlineExceeded(ms)), ms);
+    (timer as { unref?: () => void }).unref?.();
+    p.then(resolve, reject);
+  }).finally(() => {
+    if (timer) clearTimeout(timer);
+    p.catch(() => {});
+  });
+}
+
+/**
  * Run a single turn on the PTY associated with `sessionKey`.
  * See SPEC §3.2 for the contract.
  *
@@ -638,30 +681,85 @@ export async function runOnPty(
   // daemon runtime enters PTY mode through `runOnPty` directly and never
   // calls `initSupervisor`, so without this `settings.pty.idleReapMinutes`
   // would be ignored in production.
-  await ensureSupervisorInitialised();
-
-  const supervisorOpts = readSupervisorOptions();
-
-  // Phase D fix #5: enforce maxConcurrent cap with LRU eviction BEFORE
-  // allocating a new entry. Named agents are exempt — they're always-alive
-  // by design.
+  // Issue #369: `timeoutMs` is consumed inside `runTurnWithRetries`, so it
+  // bounds the TURN. Everything before it — supervisor init, admission (lock
+  // wait, `enforceMaxConcurrent`, spawning claude plus the MCP fleet), and the
+  // wait on the previous turn's lock — ran with no deadline at all. A stall in
+  // any of those was an unbounded hang rather than a recoverable timeout: the
+  // caller's `timeoutMs` elapsed and nothing fired. That is the difference
+  // between a job failing cleanly and a job wedging.
   //
-  // Issue #65 item 2: enforce + create must be a single critical section.
-  // `enforceMaxConcurrent` awaits on `dispose()`, opening a window where two
-  // concurrent admissions can both see "under cap" and both add entries —
-  // exceeding the cap. Serialize through `_admissionLock`.
-  const entry = await admitEntry(sessionKey, opts);
+  // Each stage is bounded by the caller's own `timeoutMs`. Note this is a
+  // per-stage bound, not a total: admission, the lock wait, the spawn and each
+  // of `maxRetries + 1` turns are each bounded by it, so the worst case is a
+  // multiple of `timeoutMs`, not `timeoutMs`. The retry multiplication predates
+  // this change; what changes here is that the stages ahead of the retry loop
+  // are bounded at all instead of being able to hang forever.
+  let entry: PtyEntry;
+  let supervisorOpts: ReturnType<typeof readSupervisorOptions>;
+  try {
+    ({ entry, supervisorOpts } = await withDeadline(
+      (async () => {
+        await ensureSupervisorInitialised();
+        // Read settings before admission, as before: never cached across calls,
+        // so hot-reload keeps working.
+        const so = readSupervisorOptions();
+        // Phase D fix #5: enforce maxConcurrent cap with LRU eviction BEFORE
+        // allocating a new entry. Named agents are exempt — they're always-alive
+        // by design.
+        //
+        // Issue #65 item 2: enforce + create must be a single critical section.
+        // `enforceMaxConcurrent` awaits on `dispose()`, opening a window where two
+        // concurrent admissions can both see "under cap" and both add entries —
+        // exceeding the cap. Serialize through `_admissionLock`.
+        const e = await admitEntry(sessionKey, opts);
+        return { entry: e, supervisorOpts: so };
+      })(),
+      opts.timeoutMs,
+    ));
+  } catch (err) {
+    if (err instanceof DeadlineExceeded) {
+      return errorResult(
+        `[pty-supervisor] admission stage exceeded ${opts.timeoutMs}ms for ${sessionKey} — supervisor init, concurrency admission, or PTY spawn did not settle`,
+      );
+    }
+    throw err;
+  }
+
   entry.lastAccessedAt = _clock();
   const previousLock = entry.lock;
   let release: () => void = () => {};
   entry.lock = new Promise<void>((resolve) => {
     release = resolve;
   });
+  // The lock is a chain: each caller captures its predecessor, installs its own,
+  // awaits the predecessor, and releases in `finally`. Giving up on the wait is
+  // therefore delicate — releasing immediately would hand the chain to the next
+  // caller while the predecessor's turn is *still running*, putting two turns on
+  // one PTY with interleaved writes and reads. Bounding the wait must not cost
+  // the serialisation it is bounding.
+  //
+  // So on timeout this call abandons its own wait but leaves the chain intact:
+  // its lock is released only once the predecessor actually settles.
+  let releaseOnExit = true;
   try {
-    await previousLock;
+    try {
+      await withDeadline(previousLock, opts.timeoutMs);
+    } catch (err) {
+      if (err instanceof DeadlineExceeded) {
+        // Not `release()` — see above. Successors keep waiting behind the
+        // predecessor that is still running, and are unblocked when it ends.
+        releaseOnExit = false;
+        void previousLock.finally(release);
+        return errorResult(
+          `[pty-supervisor] waited ${opts.timeoutMs}ms for the previous turn on ${sessionKey} to finish; it never did`,
+        );
+      }
+      throw err;
+    }
     return await runTurnWithRetries(entry, prompt, opts, supervisorOpts);
   } finally {
-    release();
+    if (releaseOnExit) release();
   }
 }
 
@@ -1323,16 +1421,44 @@ async function runTurnWithRetries(
   supervisorOpts: SupervisorOptions,
 ): Promise<RunOnPtyResult> {
   // Lazy spawn on first turn for this key.
+  //
+  // Issue #369: this is where the unbounded wait actually lived. `timeoutMs`
+  // is applied inside the retry loop below, so it bounds the TURN — but the
+  // spawn that boots claude and the MCP fleet runs ahead of that loop with no
+  // deadline of its own. A spawn that never settles hung the caller for as long
+  // as the process lived: reported as "given timeoutMs 600_000 it sat the full
+  // 600s", which is exactly this path.
+  //
+  // The issue attributed the stall to `admitEntry` -> `getOrCreateEntry`.
+  // `getOrCreateEntry` does not spawn; the only `spawnEntry` call reachable on
+  // the first-turn path is this one.
   if (!entry.pty) {
-    try {
-      await spawnEntry(
+    // Abandoning the wait must not abandon ownership: keep the in-flight spawn
+    // on the entry so the next caller awaits THIS one rather than starting a
+    // second. Cleared on settle so a failed spawn stays retryable.
+    if (!entry.spawnInFlight) {
+      const inFlight = spawnEntry(
         entry,
         callOpts.modelOverride,
         callOpts.api,
         callOpts.securityArgs,
         callOpts.appendSystemPrompt,
-      );
+      ).finally(() => {
+        if (entry.spawnInFlight === inFlight) entry.spawnInFlight = undefined;
+      });
+      // A caller that walks away leaves nobody awaiting this; keep its rejection
+      // from surfacing unhandled. Real callers still see it through their own await.
+      inFlight.catch(() => {});
+      entry.spawnInFlight = inFlight;
+    }
+    try {
+      await withDeadline(entry.spawnInFlight, callOpts.timeoutMs);
     } catch (err) {
+      if (err instanceof DeadlineExceeded) {
+        return errorResult(
+          `[pty-supervisor] PTY spawn for ${entry.sessionKey} exceeded ${callOpts.timeoutMs}ms — claude or the MCP fleet did not come up`,
+        );
+      }
       return errorResult(
         `[pty-supervisor] failed to spawn PTY for ${entry.sessionKey}: ${(err as Error).message}`,
       );
