@@ -13,6 +13,7 @@ import { join } from "path";
 
 import {
   runOnPty,
+  type RunOnPtyResult,
   initSupervisor,
   shutdownSupervisor,
   snapshotSupervisor,
@@ -1882,5 +1883,240 @@ describe("pty-supervisor bounded admission (issue #369)", () => {
     releaseSpawn();
     expect((await second).exitCode).toBe(0);
     expect(spawnCalls).toBe(1);
+  });
+});
+
+describe("pty-supervisor bounded respawn (issue #385)", () => {
+  it("a respawn that never settles fails the call instead of hanging it", async () => {
+    // #369 bounded the first-turn spawn. The crash-recovery respawn does the
+    // same work — boot claude plus the MCP fleet — one loop later, and still
+    // ran with no deadline: a respawn that never returned hung the turn for as
+    // long as the process lived, up to `respawnRetries` times over.
+    injectSleep(async () => {});
+    injectMaxRetriesForTests(1);
+    injectRespawnRetriesForTests(3);
+
+    let spawnCalls = 0;
+    const spawn: SpawnPty = async () => {
+      spawnCalls += 1;
+      if (spawnCalls === 1) {
+        return makeFakePty("dies", {
+          onTurn: async () => {
+            throw new PtyClosedError("dies", 1, "SIGKILL");
+          },
+        });
+      }
+      return new Promise<never>(() => {});
+    };
+    injectSpawnPty(spawn);
+    await initSupervisor();
+
+    const started = Date.now();
+    // 500 ms, not 60: the first-turn spawn ahead of the crash does real disk
+    // I/O and must NOT be the stage that hits the deadline here.
+    const r = await runOnPty("thread:stuck-respawn", "x", {
+      timeoutMs: 500,
+      threadId: "stuck-respawn",
+    });
+    const elapsed = Date.now() - started;
+
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("respawn failed for thread:stuck-respawn");
+    expect(r.stderr).toContain("respawn attempt 1 of 3");
+    expect(r.stderr).toContain("did not come up");
+    // Bounded, not hung. Generous ceiling so a loaded runner cannot flake it.
+    expect(elapsed).toBeLessThan(5_000);
+    // One initial spawn, one respawn: no second spawn was started beside the
+    // one still in flight. (Whether the deadline rolled into attempts 2 and 3
+    // is what the "attempt 1 of 3" message above pins — a retry would have
+    // joined the same in-flight promise and left this count at 2.)
+    expect(spawnCalls).toBe(2);
+  });
+
+  it("abandoning a slow respawn never spawns a second PTY on the same entry", async () => {
+    // Bounding the respawn must not abandon ownership of it. The respawn nulls
+    // `entry.pty` before spawning; a later turn that saw only that would start
+    // its own first-turn spawn beside the one still running, and both would
+    // land on the entry — orphaning one claude process plus its MCP fleet.
+    injectSleep(async () => {});
+    injectMaxRetriesForTests(1);
+    injectRespawnRetriesForTests(3);
+
+    let releaseRespawn: () => void = () => {};
+    const respawnHeld = new Promise<void>((resolve) => {
+      releaseRespawn = resolve;
+    });
+    let spawnCalls = 0;
+    const inner = makeSpawnTracker(() => makeFakePty("respawned", {}));
+    const spawn: SpawnPty = async (o) => {
+      spawnCalls += 1;
+      if (spawnCalls === 1) {
+        return makeFakePty("dies", {
+          onTurn: async () => {
+            throw new PtyClosedError("dies", 1, "SIGKILL");
+          },
+        });
+      }
+      await respawnHeld;
+      return inner.spawn(o);
+    };
+    injectSpawnPty(spawn);
+    await initSupervisor();
+
+    // First caller: turn dies, respawn stalls, caller gives up.
+    const first = await runOnPty("thread:slow-respawn", "one", {
+      timeoutMs: 500,
+      threadId: "slow-respawn",
+    });
+    expect(first.exitCode).toBe(1);
+    // It was the RESPAWN that hit the deadline, not the first-turn spawn.
+    expect(first.stderr).toContain("respawn failed");
+    expect(first.stderr).toContain("did not come up");
+    expect(spawnCalls).toBe(2);
+
+    // Second caller arrives while that respawn is still in flight. It must
+    // join it, not start another.
+    const second = runOnPty("thread:slow-respawn", "two", {
+      timeoutMs: 30_000,
+      threadId: "slow-respawn",
+    });
+    try {
+      await new Promise((r) => setTimeout(r, 100));
+      expect(spawnCalls).toBe(2);
+    } finally {
+      // A failed assertion must still let `second` settle, or afterEach hangs.
+      releaseRespawn();
+    }
+    const secondResult = await second;
+    expect(secondResult.exitCode).toBe(0);
+    expect(secondResult.rawStdout).toBe("echo:two");
+    expect(spawnCalls).toBe(2);
+    expect(inner.spawned).toHaveLength(1);
+  });
+
+  it("a respawn abandoned before the dead PTY was released is joined, not raced", async () => {
+    // `respawnEntry` disposes the dead PTY before it nulls `entry.pty`. A caller
+    // whose deadline fires during that dispose leaves `entry.pty` pointing at
+    // the dead one. The next turn must not run on it (it would only die into a
+    // second respawn) and must not start a spawn of its own; it joins the one
+    // in flight.
+    injectSleep(async () => {});
+    injectMaxRetriesForTests(1);
+    injectRespawnRetriesForTests(3);
+
+    let releaseDispose: () => void = () => {};
+    const disposeHeld = new Promise<void>((resolve) => {
+      releaseDispose = resolve;
+    });
+    let spawnCalls = 0;
+    let dead: FakePtyHandle | null = null;
+    const inner = makeSpawnTracker(() => makeFakePty("respawned", {}));
+    const spawn: SpawnPty = async (o) => {
+      spawnCalls += 1;
+      if (spawnCalls === 1) {
+        dead = makeFakePty("dies", {
+          onTurn: async () => {
+            throw new PtyClosedError("dies", 1, "SIGKILL");
+          },
+        });
+        dead.dispose = async () => {
+          await disposeHeld;
+        };
+        return dead;
+      }
+      return inner.spawn(o);
+    };
+    injectSpawnPty(spawn);
+    await initSupervisor();
+
+    const first = await runOnPty("thread:mid-dispose", "one", {
+      timeoutMs: 500,
+      threadId: "mid-dispose",
+    });
+    // Everything from here on runs under the release, so a failed assertion
+    // cannot leave `dispose()` held and hang afterEach.
+    let second: Promise<RunOnPtyResult> | undefined;
+    try {
+      expect(first.exitCode).toBe(1);
+      // It was the RESPAWN that hit the deadline, not the first-turn spawn.
+      expect(first.stderr).toContain("respawn failed");
+      expect(first.stderr).toContain("did not come up");
+      // Still stuck in dispose: nothing respawned yet.
+      expect(spawnCalls).toBe(1);
+
+      second = runOnPty("thread:mid-dispose", "two", {
+        timeoutMs: 30_000,
+        threadId: "mid-dispose",
+      });
+      await new Promise((r) => setTimeout(r, 100));
+      // No turn was attempted on the dead PTY, and no spawn was started beside
+      // the respawn still waiting on dispose.
+      expect(dead?.turnCount).toBe(1);
+      expect(spawnCalls).toBe(1);
+    } finally {
+      releaseDispose();
+    }
+    const secondResult = await second!;
+    expect(secondResult.exitCode).toBe(0);
+    expect(secondResult.rawStdout).toBe("echo:two");
+    expect(spawnCalls).toBe(2);
+    expect(dead?.turnCount).toBe(1);
+  });
+
+  it("a respawn that lands after the entry was killed is disposed, not orphaned", async () => {
+    // The deadline bounds the wait, not the work: an abandoned respawn keeps
+    // running. If `/kill` (or eviction, reaping, shutdown) removes the entry
+    // meanwhile, the late arrival must not be assigned to an entry nothing
+    // tracks — that is a claude process plus its MCP fleet with no dispose
+    // path, and the next turn on the key would spawn a second one beside it.
+    injectSleep(async () => {});
+    injectMaxRetriesForTests(1);
+    injectRespawnRetriesForTests(3);
+
+    let releaseRespawn: () => void = () => {};
+    const respawnHeld = new Promise<void>((resolve) => {
+      releaseRespawn = resolve;
+    });
+    let spawnCalls = 0;
+    const inner = makeSpawnTracker(() => makeFakePty("respawned", {}));
+    const spawn: SpawnPty = async (o) => {
+      spawnCalls += 1;
+      if (spawnCalls === 1) {
+        return makeFakePty("dies", {
+          onTurn: async () => {
+            throw new PtyClosedError("dies", 1, "SIGKILL");
+          },
+        });
+      }
+      if (spawnCalls === 2) await respawnHeld;
+      return inner.spawn(o);
+    };
+    injectSpawnPty(spawn);
+    await initSupervisor();
+
+    const first = await runOnPty("thread:killed", "one", { timeoutMs: 500, threadId: "killed" });
+    expect(first.exitCode).toBe(1);
+    expect(first.stderr).toContain("respawn failed");
+    expect(spawnCalls).toBe(2);
+
+    // Operator kills everything while that respawn is still in flight.
+    await killAllPtys();
+    expect(snapshotSupervisor().ptys).toHaveLength(0);
+
+    releaseRespawn();
+    await new Promise((r) => setTimeout(r, 50));
+    // The late PTY landed on a removed entry: disposed, and still untracked.
+    expect(inner.spawned).toHaveLength(1);
+    expect(inner.spawned[0]?.disposed).toBe(true);
+    expect(snapshotSupervisor().ptys).toHaveLength(0);
+
+    // The key is usable again, on a fresh entry with a fresh spawn — one PTY.
+    const next = await runOnPty("thread:killed", "two", { timeoutMs: 30_000, threadId: "killed" });
+    expect(next.exitCode).toBe(0);
+    expect(next.rawStdout).toBe("echo:two");
+    expect(spawnCalls).toBe(3);
+    expect(snapshotSupervisor().ptys).toHaveLength(1);
+    expect(inner.spawned).toHaveLength(2);
+    expect(inner.spawned[1]?.disposed).toBe(false);
   });
 });

@@ -414,7 +414,8 @@ interface PtyEntry {
   /** Last time `runOnPty` was called against this key. Drives LRU eviction
    *  when `pty.maxConcurrent` is hit. Adhoc-only — named agents are exempt. */
   lastAccessedAt: number;
-  /** The first-turn spawn while it is still running. A caller that abandons the
+  /** The first-turn spawn — or, since #385, a crash-recovery respawn — while it
+   *  is still running. A caller that abandons the
    *  spawn on its own deadline leaves this behind, so the next caller on the key
    *  awaits the SAME spawn instead of starting a second one. Two spawns on one
    *  entry would each set `entry.pty`, orphaning whichever landed first — a
@@ -690,11 +691,13 @@ export async function runOnPty(
   // between a job failing cleanly and a job wedging.
   //
   // Each stage is bounded by the caller's own `timeoutMs`. Note this is a
-  // per-stage bound, not a total: admission, the lock wait, the spawn and each
-  // of `maxRetries + 1` turns are each bounded by it, so the worst case is a
-  // multiple of `timeoutMs`, not `timeoutMs`. The retry multiplication predates
-  // this change; what changes here is that the stages ahead of the retry loop
-  // are bounded at all instead of being able to hang forever.
+  // per-stage bound, not a total: admission, the lock wait, the spawn, each
+  // of `maxRetries + 1` turns and (since #385) each of up to `respawnRetries`
+  // crash-recovery respawns between them are each bounded by it, so the worst
+  // case is a multiple of `timeoutMs`, not `timeoutMs`. The retry
+  // multiplication predates this change; what changes here is that the stages
+  // ahead of and between the turns are bounded at all instead of being able to
+  // hang forever.
   let entry: PtyEntry;
   let supervisorOpts: ReturnType<typeof readSupervisorOptions>;
   try {
@@ -1187,6 +1190,32 @@ async function ensureSpawnPty(): Promise<SpawnPty> {
   }
 }
 
+/**
+ * Land a freshly spawned PTY on its entry — or dispose it if the entry is gone.
+ *
+ * Issue #385: a spawn or respawn whose caller gave up on its deadline keeps
+ * running (`withDeadline` bounds the wait, not the work), and the entry can be
+ * removed before it lands — LRU-evicted, reaped, `/kill`ed or shut down; each of
+ * those disposes `entry.pty`, which is null or the dead PTY while a spawn is in
+ * flight. Assigning `entry.pty` on an entry nothing tracks would orphan a claude
+ * process plus its MCP fleet, and the next turn on the key would spawn a second
+ * one beside it. Dispose the late arrival instead and fail the spawn.
+ */
+async function landPty(entry: PtyEntry, pty: PtyProcess): Promise<void> {
+  if (state.ptys.get(entry.sessionKey) === entry) {
+    entry.pty = pty;
+    return;
+  }
+  try {
+    await pty.dispose();
+  } catch {
+    // best-effort
+  }
+  throw new Error(
+    `[pty-supervisor] ${entry.sessionKey} was removed while its spawn was in flight — disposed the late PTY`,
+  );
+}
+
 async function spawnEntry(
   entry: PtyEntry,
   modelOverride: string | undefined,
@@ -1222,7 +1251,7 @@ async function spawnEntry(
   }
 
   try {
-    entry.pty = await spawn(spawnOpts);
+    await landPty(entry, await spawn(spawnOpts));
     // Stamp the (re)spawn time so the reaper's spawn-grace window restarts
     // from now — see PtyEntry.lastSpawnedAt + reapIdle.
     entry.lastSpawnedAt = _clock();
@@ -1349,7 +1378,7 @@ async function respawnEntry(
     }
   }
   entry.pty = null;
-  entry.pty = await spawn(opts);
+  await landPty(entry, await spawn(opts));
   entry.spawnOpts = opts;
   // Reset the spawn-grace window on respawn so a healthy long-lived PTY that
   // crashes doesn't get immediately reaped before its first post-respawn turn
@@ -1383,18 +1412,58 @@ async function respawnEntry(
  * fallback when there were prior failures (`i > 0`) so `respawnRetries=1`
  * (the documented pre-#175 opt-out) keeps its original behaviour and never
  * abandons the session unilaterally.
+ *
+ * Issue #385: each attempt is bounded by the caller's `timeoutMs` and the
+ * in-flight respawn is owned by the entry (`spawnInFlight`), mirroring the
+ * first-turn spawn path from #369. A deadline ends the loop rather than
+ * retrying: the respawn that did not settle is still running, and a second one
+ * beside it would orphan whichever PTY landed first.
  */
-async function respawnEntryWithRetries(entry: PtyEntry, opts: SupervisorOptions): Promise<void> {
+async function respawnEntryWithRetries(
+  entry: PtyEntry,
+  opts: SupervisorOptions,
+  timeoutMs: number,
+): Promise<void> {
   const attempts = Math.max(1, opts.respawnRetries);
   let lastErr: unknown = new Error("respawnEntryWithRetries: no attempts made");
   for (let i = 0; i < attempts; i++) {
     const isFinalAttempt = i === attempts - 1;
     const hadPriorFailures = i > 0;
     const dropResume = isFinalAttempt && hadPriorFailures;
+    // Issue #385: each attempt is bounded by the caller's `timeoutMs`, the
+    // same way the first-turn spawn is. `respawnEntry` does the same work —
+    // boot claude plus the MCP fleet — and ran here with no deadline, on the
+    // crash-recovery path that a host under pressure is most likely to take.
+    //
+    // Ownership follows the first-turn rule: the in-flight respawn lives on
+    // `entry.spawnInFlight`, so a caller that gives up leaves the next turn
+    // joining it rather than spawning a second PTY onto the same entry. If one
+    // is already in flight when we get here (a previous caller abandoned it
+    // mid-`dispose()`, before `entry.pty` was nulled), join that one. The
+    // joined respawn counts as this caller's attempt `i`: if it rejects, the
+    // loop continues with its own backoff and, on its final attempt, its own
+    // `dropResume` — the #177 escape hatch still fires, one attempt later.
+    let inFlight = entry.spawnInFlight;
+    if (!inFlight) {
+      const started: Promise<void> = respawnEntry(entry, { dropResume }).finally(() => {
+        if (entry.spawnInFlight === started) entry.spawnInFlight = undefined;
+      });
+      started.catch(() => {});
+      entry.spawnInFlight = started;
+      inFlight = started;
+    }
     try {
-      await respawnEntry(entry, { dropResume });
+      await withDeadline(inFlight, timeoutMs);
       return;
     } catch (err) {
+      if (err instanceof DeadlineExceeded) {
+        // The respawn has not failed — it has not settled. Retrying now would
+        // start a second spawn beside it, which is the orphan this guards
+        // against. Stop here; the respawn stays owned by the entry.
+        throw new Error(
+          `respawn attempt ${i + 1} of ${attempts} for ${entry.sessionKey} exceeded ${timeoutMs}ms — claude or the MCP fleet did not come up; not retrying while it is still in flight`,
+        );
+      }
       lastErr = err;
       if (isFinalAttempt) break;
       const delay = pickBackoff(opts.backoffMs, i);
@@ -1432,7 +1501,12 @@ async function runTurnWithRetries(
   // The issue attributed the stall to `admitEntry` -> `getOrCreateEntry`.
   // `getOrCreateEntry` does not spawn; the only `spawnEntry` call reachable on
   // the first-turn path is this one.
-  if (!entry.pty) {
+  //
+  // Issue #385: an abandoned RESPAWN is also in flight here (see
+  // `respawnEntryWithRetries`). While it runs, `entry.pty` may still be the
+  // dead PTY it is replacing; running a turn on that would only fail into a
+  // second respawn. Join the in-flight one instead.
+  if (!entry.pty || entry.spawnInFlight) {
     // Abandoning the wait must not abandon ownership: keep the in-flight spawn
     // on the entry so the next caller awaits THIS one rather than starting a
     // second. Cleared on settle so a failed spawn stays retryable.
@@ -1502,10 +1576,10 @@ async function runTurnWithRetries(
       attempt += 1;
       await _sleep(delay);
       try {
-        await respawnEntryWithRetries(entry, supervisorOpts);
+        await respawnEntryWithRetries(entry, supervisorOpts, callOpts.timeoutMs);
       } catch (respawnErr) {
         return errorResult(
-          `[pty-supervisor] respawn failed for ${entry.sessionKey} after ${supervisorOpts.respawnRetries} attempt(s) (outer turn-retry ${attempt}): ${(respawnErr as Error).message}`,
+          `[pty-supervisor] respawn failed for ${entry.sessionKey} after up to ${supervisorOpts.respawnRetries} attempt(s) (outer turn-retry ${attempt}): ${(respawnErr as Error).message}`,
         );
       }
     }
