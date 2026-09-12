@@ -49,6 +49,26 @@ import {
 // pull it from `pty-process` (and through `runner/index`) keep working without
 // loading bun-pty just to get the helper.
 import { sanitizePtyPromptText } from "./pty-prompt-sanitizer";
+import { appendFileSync } from "node:fs";
+
+/**
+ * Raw PTY trace, off unless `CLAUDECLAW_PTY_DUMP=<file>` is set. Every chunk
+ * claude emits and every write we make lands in the file, timestamped, with
+ * the parser state at that instant. Issue #369 was found this way: a
+ * standalone capture harness reproduces claude's boot but not our input
+ * protocol, so its silence says nothing about the daemon (see the issue's
+ * caveat) — this trace is the daemon's own bytes. Best-effort: a failed write
+ * never touches the turn.
+ */
+function dumpPtyTrace(tag: string, payload: string): void {
+  const file = process.env.CLAUDECLAW_PTY_DUMP;
+  if (!file) return;
+  try {
+    appendFileSync(file, `\n@@${new Date().toISOString()} ${tag}\n${payload}`, { mode: 0o600 });
+  } catch {
+    /* diagnostic only */
+  }
+}
 export { sanitizePtyPromptText };
 
 // ─── Public types (FROZEN per SPEC §3.1) ────────────────────────────────────
@@ -506,6 +526,10 @@ class PtyProcessImpl implements PtyProcess {
     // bun-pty delivers strings; re-encode for the byte-level parser.
     const bytes = new TextEncoder().encode(data);
     const now = this._now();
+    dumpPtyTrace(
+      `<< pid=${this._pid} state=${this._parser.state} turn=${this._turnInProgress} n=${bytes.length}`,
+      data,
+    );
     if (this._firstDataAt === 0) this._firstDataAt = now;
 
     // Buffer for the current turn (so idle-fallback can return content).
@@ -629,6 +653,7 @@ class PtyProcessImpl implements PtyProcess {
     // Write prompt + CR (TUI submits on Enter). Sanitize embedded CR/LF so
     // they don't submit mid-prompt.
     try {
+      dumpPtyTrace(`>> pid=${this._pid} write prompt`, `${JSON.stringify(prompt).slice(0, 80)}+CR`);
       this._pty.write(sanitizePtyPromptText(prompt) + "\r");
     } catch (err) {
       this._turnInProgress = false;
@@ -674,6 +699,7 @@ class PtyProcessImpl implements PtyProcess {
     if (!this._turnInProgress || !this._activeSentinelBytes) return;
     if (this._parser.state !== "accumulating") return;
     try {
+      dumpPtyTrace(`>> pid=${this._pid} write sentinel`, "");
       this._pty.write(this._activeSentinelString);
     } catch (err) {
       this._rejectTurn(err instanceof Error ? err : new Error(String(err)));
