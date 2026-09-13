@@ -94,6 +94,12 @@ export interface AgentProcess {
    * parsed as model output.
    */
   readonly lastDataAt: number | null;
+  /**
+   * Optional (issue #393): the last lines of ANSI-stripped output the process
+   * produced, for the exit / stuck-at-boot log lines. Never parsed as model
+   * output. Implementations without a screen omit it.
+   */
+  recentOutputTail?(): string;
   /** Relay a slash command (e.g. `compact`, `clear`, `quit`). No leading slash. */
   send_slash(cmd: string): Promise<void>;
   /** Send a stream-json line. Only valid in `process-stream-json` mode. */
@@ -152,6 +158,9 @@ export class PtyAgentProcess implements AgentProcess {
     return this._lastDataAt;
   }
   private _exited = false;
+  /** Set with `_exited` (issue #393): the code a late `onExit` subscriber is
+   *  replayed with. */
+  private _exitCode = -1;
   /** Serializes the write/settle/CR sequence so concurrent prompts can't
    *  interleave in the PTY input buffer (review #141 P1). */
   private writeChain: Promise<void> = Promise.resolve();
@@ -347,7 +356,14 @@ export class PtyAgentProcess implements AgentProcess {
    *  changes the footer text), the watcher disengages anyway so it never
    *  buffers PTY output for the whole process lifetime. */
   private static readonly BOOT_DIALOG_MAX_MS = 15_000;
+  private readonly bootDialogMaxMs: number;
   private bootDialogTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Issue #393: the last ~1.5 KB of ANSI-stripped output, never cleared
+   *  (unlike `recentOut`, which the delivery-confirm loop resets). This is
+   *  what the "stuck at boot" and "exited outside stop()" log lines quote, so
+   *  an operator reads "Select login method" in the daemon log instead of
+   *  reproducing the spawn by hand (#390). */
+  private outputTail = "";
 
   constructor(
     agent_id: string,
@@ -365,6 +381,8 @@ export class PtyAgentProcess implements AgentProcess {
        *  has a measured p95 of 0.25s and a 0.27s maximum across 56 deliveries,
        *  so this default is roughly 10x the observed worst case. */
       transcriptGraceMs?: number;
+      /** Bound on the boot-dialog watch window (test seam; default 15 s). */
+      bootDialogMaxMs?: number;
     } = {},
   ) {
     this.agent_id = agent_id;
@@ -374,10 +392,8 @@ export class PtyAgentProcess implements AgentProcess {
     this.transcriptGraceMs = opts.transcriptGraceMs ?? 3000;
     this.maxSubmitNudges = opts.maxSubmitNudges ?? 2;
     this.maxCompactionWaitMs = opts.maxCompactionWaitMs ?? 240_000;
-    this.bootDialogTimer = setTimeout(
-      () => this.endBootDialogPhase(),
-      PtyAgentProcess.BOOT_DIALOG_MAX_MS,
-    );
+    this.bootDialogMaxMs = opts.bootDialogMaxMs ?? PtyAgentProcess.BOOT_DIALOG_MAX_MS;
+    this.bootDialogTimer = setTimeout(() => this.onBootWindowExpired(), this.bootDialogMaxMs);
     pty.onData((chunk) => {
       this._lastDataAt = Date.now();
       if (this.bootDialogActive) this.handleBootDialog(chunk);
@@ -386,6 +402,7 @@ export class PtyAgentProcess implements AgentProcess {
       // start) -- see the delivery-confirm loop. Observation only.
       const cleanChunk = stripAnsiEscapes(chunk);
       this.recentOut = (this.recentOut + cleanChunk).slice(-2000);
+      this.outputTail = (this.outputTail + cleanChunk).slice(-1500);
       // Sticky compaction latch (see `compacting`): set on the banner, cleared
       // only on POSITIVE evidence the compaction ended -- the "Compacted"
       // confirmation or the idle REPL footer coming back. A spinner frame in
@@ -422,7 +439,11 @@ export class PtyAgentProcess implements AgentProcess {
     });
     pty.onExit((e) => {
       this._exited = true;
+      // A process that exited is not "stuck at boot": the exit log line
+      // (session-manager, issue #393) is the one that speaks for it.
+      this.endBootDialogPhase();
       const code = typeof e.exitCode === "number" ? e.exitCode : -1;
+      this._exitCode = code;
       for (const h of this.exitHandlers) {
         try {
           h(code);
@@ -785,6 +806,56 @@ export class PtyAgentProcess implements AgentProcess {
     }
   }
 
+  /** Issue #393: the watch window closed without the REPL footer. Until now
+   *  this disengaged silently and threw the boot buffer away — which is how
+   *  an agent parked on claude's login-method prompt (#390: onboarding state
+   *  missing from `~/.claude.json` while `.credentials.json` held a valid
+   *  token) looked exactly like a boot crash from the outside: `connections:
+   *  0` and a reconcile-restart loop, with nothing to read. Say so, and quote
+   *  what claude last printed. No key is sent: a login prompt has no safe
+   *  default, and the watcher only ever answers dialogs it recognises. */
+  private onBootWindowExpired(): void {
+    if (!this.bootDialogActive || this._exited) return;
+    const tail = this.recentOutputTail();
+    console.error(
+      `[boot-dialog] agent=${this.agent_id} pid=${this.pid}: no REPL footer within ${this.bootDialogMaxMs}ms — ` +
+        "either still booting (slow host), or stuck at a startup screen the watcher " +
+        "does not recognise (a login or onboarding prompt, or a new dialog). Nothing was auto-answered. " +
+        `Last output:\n${tail || "    (nothing was printed)"}`,
+    );
+    this.endBootDialogPhase();
+  }
+
+  /** The last lines of ANSI-stripped output (issue #393), indented for a log
+   *  line and bounded so a busy screen cannot flood the log. */
+  recentOutputTail(): string {
+    return PtyAgentProcess.formatOutputTail(this.outputTail);
+  }
+
+  /** Keep the last `maxLines` non-blank lines of an already-ANSI-stripped
+   *  screen tail, each trimmed and capped, so the quote reads as what a human
+   *  would have seen (the prompt text, its options) rather than as a render
+   *  stream. */
+  static formatOutputTail(raw: string, maxLines = 8, maxLineChars = 160): string {
+    const lines = raw
+      .split(/\r?\n/)
+      // Drop the C0/C1 controls the ANSI stripper leaves (BEL, backspace,
+      // 8-bit CSI): four backspaces would erase the indent below and let a
+      // child forge a top-level log line.
+      .map((l) =>
+        l
+          // biome-ignore lint/suspicious/noControlCharactersInRegex: that is the point.
+          .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "")
+          .replace(/\s+/g, " ")
+          .trim(),
+      )
+      .filter((l) => l.length > 0);
+    return lines
+      .slice(-maxLines)
+      .map((l) => `    ${l.length > maxLineChars ? `${l.slice(0, maxLineChars)}…` : l}`)
+      .join("\n");
+  }
+
   /** Answer claude's interactive startup confirmation dialogs by inspecting
    *  early PTY output (issue #193), then disengage once the REPL is up.
    *
@@ -898,8 +969,23 @@ export class PtyAgentProcess implements AgentProcess {
     }
   }
 
+  /** Issue #393: replays an exit that already happened. bun-pty runs its read
+   *  loop in a microtask queued by the constructor and does not yield while
+   *  `read` returns bytes, so a process that prints and exits at once (a
+   *  broken install, `/bin/false`) has delivered its data AND its exit before
+   *  the `await` in `spawnPty` resumes the caller — whose `onExit` cleanup
+   *  therefore never ran: a dead registry entry, and no exit log line for the
+   *  exact case that needs one. Handlers are push-only; replaying with the
+   *  recorded code closes both. */
   onExit(handler: ExitHandler): void {
     this.exitHandlers.push(handler);
+    if (this._exited) {
+      try {
+        handler(this._exitCode);
+      } catch {
+        /* swallow, as the live path does */
+      }
+    }
   }
 
   /**
@@ -1120,6 +1206,10 @@ export class ChildAgentProcess implements AgentProcess {
     return this._lastDataAt;
   }
   private _exited = false;
+  /** See `PtyAgentProcess._exitCode` (issue #393). */
+  private _exitCode = -1;
+  /** See `PtyAgentProcess.outputTail` (issue #393): stdout + stderr here. */
+  private outputTail = "";
 
   constructor(agent_id: string, supervision: SupervisionMode, child: ChildProcess) {
     this.agent_id = agent_id;
@@ -1130,6 +1220,7 @@ export class ChildAgentProcess implements AgentProcess {
     // this is purely a crash-signal channel (spec §5.3).
     const forward = (chunk: Buffer | string): void => {
       this._lastDataAt = Date.now();
+      this.outputTail = (this.outputTail + stripAnsiEscapes(String(chunk))).slice(-1500);
       const s = typeof chunk === "string" ? chunk : chunk.toString("utf8");
       for (const h of this.dataHandlers) {
         try {
@@ -1144,6 +1235,7 @@ export class ChildAgentProcess implements AgentProcess {
     child.on("exit", (code) => {
       this._exited = true;
       const exitCode = typeof code === "number" ? code : -1;
+      this._exitCode = exitCode;
       for (const h of this.exitHandlers) {
         try {
           h(exitCode);
@@ -1194,8 +1286,28 @@ export class ChildAgentProcess implements AgentProcess {
     return Promise.resolve();
   }
 
+  /** The last lines of output (issue #393); see `PtyAgentProcess.recentOutputTail`. */
+  recentOutputTail(): string {
+    return PtyAgentProcess.formatOutputTail(this.outputTail);
+  }
+
+  /** Issue #393: replays an exit that already happened. bun-pty runs its read
+   *  loop in a microtask queued by the constructor and does not yield while
+   *  `read` returns bytes, so a process that prints and exits at once (a
+   *  broken install, `/bin/false`) has delivered its data AND its exit before
+   *  the `await` in `spawnPty` resumes the caller — whose `onExit` cleanup
+   *  therefore never ran: a dead registry entry, and no exit log line for the
+   *  exact case that needs one. Handlers are push-only; replaying with the
+   *  recorded code closes both. */
   onExit(handler: ExitHandler): void {
     this.exitHandlers.push(handler);
+    if (this._exited) {
+      try {
+        handler(this._exitCode);
+      } catch {
+        /* swallow, as the live path does */
+      }
+    }
   }
 
   onData(handler: DataHandler): void {

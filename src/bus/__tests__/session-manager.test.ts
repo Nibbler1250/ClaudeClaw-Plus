@@ -758,6 +758,7 @@ describe("session-id collision rotation", () => {
   });
 
   it("gives up after one retry if the collision persists", async () => {
+    const warned: string[] = [];
     // Always-fail-with-marker stand-in.
     const STALE = "11111111-1111-1111-1111-111111111bad";
     const mgr = new SessionManager({
@@ -784,12 +785,24 @@ describe("session-id collision rotation", () => {
       // flake again, suspect that ordering rather than raising the bound.
       sessionCollisionDetectMs: 2000,
       persistRotatedSessionId: async () => {},
-      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      logger: {
+        warn: (...a: unknown[]) => warned.push(a.map(String).join(" ")),
+        info: () => {},
+        error: () => {},
+      },
     });
     const agent = mkAgent({ id: "rot-loop", session_id: STALE });
     await expect(mgr.spawnAgent(agent, "cron")).rejects.toThrow(
       /collision persisted after rotation/,
     );
+    // Issue #393: both collision exits are logged, and the verdict tells the
+    // first (retried) from the second (given up on) — `retry` is per spawn.
+    const exits = warned.filter(
+      (l) => l.includes("agent=rot-loop") && l.includes("exited outside stop()"),
+    );
+    expect(exits).toHaveLength(2);
+    expect(exits[0]).toContain("retried with a fresh id");
+    expect(exits[1]).toContain("collision persisted after rotation");
   });
 
   it("does NOT rotate on non-collision exit-1 (no marker in output)", async () => {
@@ -987,5 +1000,67 @@ describe("JSONL tailer wiring (issue #215)", () => {
     const proc = await noBus.spawnAgent(agent, "telegram");
     expect(proc.agent_id).toBe("nobus-agent");
     await noBus.stop(agent.id);
+  });
+});
+
+/* ───────────────────────────────────────────────────────────────────── */
+/* Issue #393 — an exit the daemon did not ask for is logged             */
+/* ───────────────────────────────────────────────────────────────────── */
+
+describe("exit outside stop() is logged with code, uptime and the last output (issue #393)", () => {
+  let pmDir: string;
+  let warned: string[];
+  const origWarn = console.warn;
+
+  beforeEach(() => {
+    pmDir = mkdtempSync(join(tmpdir(), "ccaw-pm-"));
+    warned = [];
+    console.warn = (...args: unknown[]) => {
+      warned.push(args.map(String).join(" "));
+    };
+  });
+
+  afterEach(() => {
+    console.warn = origWarn;
+    rmSync(pmDir, { recursive: true, force: true });
+  });
+
+  function mgrRunning(script: string): SessionManager {
+    return new SessionManager({
+      commandOverride: "/bin/sh",
+      argsOverride: ["-c", script],
+      busSocketPath: "/tmp/test-bus.sock",
+      persistRotatedSessionId: async () => {},
+      postMortemDir: pmDir,
+    });
+  }
+
+  it("a process that dies on its own is reported: agent id, exit code, uptime, boot-failure flag, screen tail", async () => {
+    // #390: claude printed its startup screen and went away; before #393 the
+    // registry was cleaned up and nothing was written anywhere.
+    const mgr = mgrRunning("echo 'Select login method:'; echo '1. Claude account'; exit 3");
+    const agent = mkAgent({ id: "dies-at-boot" });
+    const proc = await mgr.spawnAgent(agent, "discord");
+    await waitForExit(proc);
+    await waitFor(() => warned.some((l) => l.includes("[bus-session] agent=dies-at-boot")));
+    const line = warned.find((l) => l.includes("[bus-session] agent=dies-at-boot")) ?? "";
+    expect(line).toContain("exited outside stop()");
+    expect(line).toContain("code=3");
+    expect(line).toMatch(/uptime=\d+\.\d+s/);
+    expect(line).toContain("startup failure");
+    expect(line).toContain("Select login method");
+    expect(line).toContain("1. Claude account");
+    expect(mgr.getAgent(agent.id)).toBeUndefined();
+  });
+
+  it("an exit that stop() asked for stays quiet", async () => {
+    const mgr = mgrRunning("cat");
+    const agent = mkAgent({ id: "stopped-on-purpose" });
+    const proc = await mgr.spawnAgent(agent, "discord");
+    const exited = waitForExit(proc, 6000);
+    await mgr.stop(agent.id);
+    await exited;
+    await new Promise((r) => setTimeout(r, 50));
+    expect(warned.filter((l) => l.includes("[bus-session] agent=stopped-on-purpose"))).toEqual([]);
   });
 });
