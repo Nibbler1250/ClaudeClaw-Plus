@@ -471,6 +471,10 @@ export function resolveClaudeclawPluginRoot(): string {
  * without delaying happy-path spawns by more than a second.
  */
 const DEFAULT_COLLISION_DETECT_MS = 2000;
+/** Issue #393: an exit this soon after spawn is a boot failure (claude never
+ *  reached the REPL — auth, a dialog it could not pass, a broken install), and
+ *  the exit log line names it as one instead of leaving it to be inferred. */
+const BOOT_FAILURE_WINDOW_MS = 20_000;
 
 /**
  * Restart rate-limit (Terry's required add on the respawn primitive). More
@@ -619,6 +623,13 @@ interface AgentRecord {
    * `agent.mcp_config`, or dormant multiplexer).
    */
   mcpConfigCwd?: string;
+  /** Epoch ms of the spawn (issue #393): the exit log line reports uptime,
+   *  and an exit within seconds of it is a boot failure and is named as one. */
+  spawnedAt: number;
+  /** Set by `stop()` before it asks the process to quit (issue #393), so the
+   *  spawn-time `onExit` cleanup can tell an exit the daemon asked for from
+   *  one it did not — only the latter is logged. */
+  stopping?: boolean;
   /**
    * Live session JSONL tailer (issue #215). Present when `options.bus`
    * is set; feeds `response.turn_end` events so the bus can synthesize a
@@ -761,12 +772,46 @@ export class SessionManager {
     // `ChildAgentProcess.onExit` are push-only and don't replay past
     // exits. The cleanup never fires, leaving a dead entry in
     // `this.agents` that breaks the next `already spawned` guard.
-    const record: AgentRecord = { agent, origin, mode, proc, mcpConfigCwd };
+    const record: AgentRecord = {
+      agent,
+      origin,
+      mode,
+      proc,
+      mcpConfigCwd,
+      spawnedAt: Date.now(),
+    };
     this.agents.set(agent.id, record);
     // Auto-cleanup: drop registry entry on exit so restart() can reuse the id.
-    proc.onExit(() => {
+    proc.onExit((code) => {
       const current = this.agents.get(agent.id);
       if (current && current.proc === proc) {
+        // Issue #393: an exit the daemon did not ask for used to be silent —
+        // no agent id, no exit code, no output — so a claude that died at
+        // boot every restart (#390) left the operator with `spawned` and
+        // `reconcile-restart-ok` lines that all read as success. Say what
+        // happened and quote the last lines of the screen. `stop()` sets
+        // `stopping` first, so its exits stay quiet.
+        if (!current.stopping) {
+          const uptimeMs = Date.now() - current.spawnedAt;
+          const tailFn = (proc as AgentProcess).recentOutputTail;
+          const tail = tailFn ? tailFn.call(proc) : undefined;
+          const verdict =
+            tail !== undefined && SESSION_COLLISION_PATTERN.test(tail)
+              ? retry === 0
+                ? " — session-id collision; the spawn is retried with a fresh id"
+                : " — session-id collision persisted after rotation"
+              : uptimeMs < BOOT_FAILURE_WINDOW_MS
+                ? " — exited during boot; treat as a startup failure"
+                : "";
+          const quoted =
+            tail === undefined
+              ? "    (no output captured in this supervision mode)"
+              : tail || "    (nothing was printed)";
+          (this.options.logger ?? console).warn(
+            `[bus-session] agent=${agent.id} pid=${proc.pid} exited outside stop(): ` +
+              `code=${code} uptime=${(uptimeMs / 1000).toFixed(1)}s${verdict}. Last output:\n${quoted}`,
+          );
+        }
         // Issue #215: tear down the session tailer on natural exit too.
         void current.tailer?.stop();
         // Issue #165 (PR #184 re-review): a natural exit (crash, OOM,
@@ -1038,6 +1083,8 @@ export class SessionManager {
   stop(agent_id: string): Promise<void> {
     const record = this.agents.get(agent_id);
     if (!record) return Promise.resolve();
+    // Issue #393: this exit is asked for — keep the spawn-time exit log quiet.
+    record.stopping = true;
     return new Promise<void>((resolve) => {
       const finalise = (): void => {
         // Issue #215: tear down the session tailer.
