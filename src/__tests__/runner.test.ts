@@ -564,3 +564,28 @@ describe("buildSecurityArgs — native scheduling-tool block", () => {
     for (const t of NATIVE) expect(args[toolsIdx + 1].split(",")).not.toContain(t);
   });
 });
+
+describe("killActive reaches a PTY session that is still booting (#394)", () => {
+  it("gates the PTY kill on the entry count, not on the snapshot of live PTYs", async () => {
+    // `snapshotSupervisor().ptys` omits an entry whose spawn has not landed
+    // (no pid to show), so `/kill` against a session that was still booting
+    // was a no-op — and its late spawn then landed on an entry nothing had
+    // retired. The gate now reads the entry count.
+    const sup = await import("../runner/pty-supervisor");
+    const count = spyOn(sup, "supervisorEntryCount").mockReturnValue(1);
+    const snapshot = spyOn(sup, "snapshotSupervisor").mockReturnValue({ ptys: [] });
+    const kill = spyOn(sup, "killAllPtys").mockResolvedValue(0);
+    try {
+      expect(runnerMod.killActive()).toBe(true);
+      expect(kill).toHaveBeenCalledTimes(1);
+
+      count.mockReturnValue(0);
+      expect(runnerMod.killActive()).toBe(false);
+      expect(kill).toHaveBeenCalledTimes(1);
+    } finally {
+      count.mockRestore();
+      snapshot.mockRestore();
+      kill.mockRestore();
+    }
+  });
+});
