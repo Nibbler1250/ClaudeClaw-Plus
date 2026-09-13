@@ -71,7 +71,7 @@ import { validateModelString } from "./jobs";
 import { selectModel } from "./model-router";
 import { recordResult, abortReason, clearSession, startSession } from "./watchdog";
 import { getPluginManager, type EventContext } from "./plugins";
-import { runOnPty, killAllPtys, snapshotSupervisor } from "./runner/pty-supervisor";
+import { runOnPty, killAllPtys, supervisorEntryCount } from "./runner/pty-supervisor";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
 
@@ -583,7 +583,10 @@ export function killActive(): boolean {
   // Best-effort async PTY disposal. We don't await because killActive is
   // historically synchronous; PTY callers see PtyClosedError on their next
   // tick which surfaces as a structured error via the supervisor's lock.
-  const ptyCountBefore = snapshotSupervisor().ptys.length;
+  // #394: count entries, not live PTYs — an entry whose spawn has not landed
+  // yet has no pid and is absent from the snapshot, and `/kill` must reach it
+  // (the retirement refuses its late landing) rather than skip it.
+  const ptyCountBefore = supervisorEntryCount();
   if (ptyCountBefore > 0) {
     void killAllPtys();
     killed = true;
