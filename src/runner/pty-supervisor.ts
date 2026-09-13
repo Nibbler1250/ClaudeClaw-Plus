@@ -378,6 +378,7 @@ export function __resetSupervisorForTests(): void {
     state.reapTimer = null;
   }
   state.initialised = false;
+  state.shuttingDown = false;
   _initPromise = null;
   _admissionLock = Promise.resolve();
   _spawnPty = null;
@@ -414,7 +415,8 @@ interface PtyEntry {
   /** Last time `runOnPty` was called against this key. Drives LRU eviction
    *  when `pty.maxConcurrent` is hit. Adhoc-only — named agents are exempt. */
   lastAccessedAt: number;
-  /** The first-turn spawn while it is still running. A caller that abandons the
+  /** The first-turn spawn — or, since #385, a crash-recovery respawn — while it
+   *  is still running. A caller that abandons the
    *  spawn on its own deadline leaves this behind, so the next caller on the key
    *  awaits the SAME spawn instead of starting a second one. Two spawns on one
    *  entry would each set `entry.pty`, orphaning whichever landed first — a
@@ -422,6 +424,24 @@ interface PtyEntry {
    *  the entry is tracked in `state.ptys`. Cleared once the spawn settles, so a
    *  failed spawn can be retried by a later turn. */
   spawnInFlight?: Promise<void>;
+  /** Set — synchronously, before any await — by the removal path that is
+   *  retiring this entry (reap, LRU eviction, `/kill`, shutdown); resolves once
+   *  the PTY is disposed, the MCP identity released and the entry out of the
+   *  map. While set: `landPty` disposes anything that lands, no respawn starts,
+   *  and `getOrCreateEntry` waits for it before creating a replacement for the
+   *  key — identity and config are keyed by sessionKey, so two entries on one
+   *  key must never overlap (#385, Copilot on #391). */
+  retiring?: Promise<void>;
+  /** The in-flight `dispose()` of `pty`, when a respawn started one. A second
+   *  `dispose()` on the same PTY returns at once, so a retirement racing that
+   *  respawn must join THIS promise or it would release the key and admit a
+   *  replacement while the old process is still being torn down. */
+  disposing?: Promise<void>;
+  /** A failed first-turn spawn's own identity/config release while it runs.
+   *  A retirement starting meanwhile joins it before its own release, so the
+   *  replacement it unblocks cannot be admitted while this release — keyed by
+   *  sessionKey — could still touch the key. */
+  releasing?: Promise<void>;
   /** Wall-clock at the most recent spawn (or respawn). Used by `reapIdle` to
    *  time out PTYs that never complete a first turn after a (re)spawn
    *  (issue #65 item 6). Reset on every respawn so a healthy long-lived PTY
@@ -435,13 +455,28 @@ interface SupervisorState {
   ptys: Map<string, PtyEntry>;
   reapTimer: ReturnType<typeof setInterval> | null;
   initialised: boolean;
+  /** True from the first synchronous step of `shutdownSupervisor` until it
+   *  returns. Admission refuses new entries meanwhile (#385): a caller that was
+   *  waiting for a retiring entry on its key must not create the replacement
+   *  the shutdown would then have to chase. Cleared on return so the next
+   *  caller re-initialises normally. */
+  shuttingDown: boolean;
 }
 
 const state: SupervisorState = {
   ptys: new Map(),
   reapTimer: null,
   initialised: false,
+  shuttingDown: false,
 };
+
+/** Thrown by admission while the supervisor is shutting down. */
+class SupervisorShuttingDownError extends Error {
+  constructor(sessionKey: string) {
+    super(`[pty-supervisor] supervisor is shutting down — not admitting ${sessionKey}`);
+    this.name = "SupervisorShuttingDownError";
+  }
+}
 
 /**
  * Phase D fix #3 (Codex review HIGH #3): cache the in-flight init promise so
@@ -520,21 +555,23 @@ export async function shutdownSupervisor(): Promise<void> {
     clearInterval(state.reapTimer);
     state.reapTimer = null;
   }
-  const disposals: Promise<void>[] = [];
-  for (const entry of state.ptys.values()) {
-    if (entry.pty) {
-      disposals.push(
-        entry.pty.dispose().catch(() => {
-          // Best-effort.
-        }),
-      );
+  // Retire every entry (#385): `retiring` is set before the first await, so a
+  // (re)spawn still in flight for one of them is disposed by `landPty` when it
+  // lands, whenever that is. A `runOnPty` racing this shutdown is not
+  // reconciled here — that race predates this change.
+  // Refuse admissions from here on (synchronously, before the first await):
+  // a caller waiting for a retiring entry on its key would otherwise create
+  // the replacement right as we finish and leave it untracked. Anything that
+  // was already past admission is in the map and retired below; the loop
+  // catches an entry added between the snapshot and the settle.
+  state.shuttingDown = true;
+  try {
+    while (state.ptys.size > 0) {
+      await Promise.allSettled([...state.ptys.values()].map(retireEntry));
     }
-    // Release multiplexer identity + delete synthesized config (SPEC §4.5).
-    // Best-effort, doesn't block dispose.
-    disposals.push(releaseMcpIdentityFor(entry));
+  } finally {
+    state.shuttingDown = false;
   }
-  await Promise.allSettled(disposals);
-  state.ptys.clear();
   state.initialised = false;
   _initPromise = null;
   _admissionLock = Promise.resolve();
@@ -565,22 +602,8 @@ export async function shutdownSupervisor(): Promise<void> {
 export async function killAllPtys(): Promise<number> {
   const entries = [...state.ptys.values()];
   if (entries.length === 0) return 0;
-  let killed = 0;
-  const disposals: Promise<void>[] = [];
-  for (const entry of entries) {
-    if (entry.pty) {
-      killed += 1;
-      disposals.push(
-        entry.pty.dispose().catch(() => {
-          // best-effort
-        }),
-      );
-    }
-    // Release multiplexer identity + delete synthesized config (SPEC §4.5).
-    disposals.push(releaseMcpIdentityFor(entry));
-    state.ptys.delete(entry.sessionKey);
-  }
-  await Promise.allSettled(disposals);
+  const killed = entries.filter((e) => e.pty).length;
+  await Promise.allSettled(entries.map(retireEntry));
   return killed;
 }
 
@@ -690,11 +713,13 @@ export async function runOnPty(
   // between a job failing cleanly and a job wedging.
   //
   // Each stage is bounded by the caller's own `timeoutMs`. Note this is a
-  // per-stage bound, not a total: admission, the lock wait, the spawn and each
-  // of `maxRetries + 1` turns are each bounded by it, so the worst case is a
-  // multiple of `timeoutMs`, not `timeoutMs`. The retry multiplication predates
-  // this change; what changes here is that the stages ahead of the retry loop
-  // are bounded at all instead of being able to hang forever.
+  // per-stage bound, not a total: admission, the lock wait, the spawn, each
+  // of `maxRetries + 1` turns and (since #385) each of up to `respawnRetries`
+  // crash-recovery respawns between them are each bounded by it, so the worst
+  // case is a multiple of `timeoutMs`, not `timeoutMs`. The retry
+  // multiplication predates this change; what changes here is that the stages
+  // ahead of and between the turns are bounded at all instead of being able to
+  // hang forever.
   let entry: PtyEntry;
   let supervisorOpts: ReturnType<typeof readSupervisorOptions>;
   try {
@@ -723,6 +748,7 @@ export async function runOnPty(
         `[pty-supervisor] admission stage exceeded ${opts.timeoutMs}ms for ${sessionKey} — supervisor init, concurrency admission, or PTY spawn did not settle`,
       );
     }
+    if (err instanceof SupervisorShuttingDownError) return errorResult(err.message);
     throw err;
   }
 
@@ -785,14 +811,17 @@ function classifyKey(sessionKey: string, threadId?: string, agentName?: string):
   return "global";
 }
 
-async function getOrCreateEntry(
+function getOrCreateEntry(
   sessionKey: string,
   opts: {
     threadId?: string;
     agentName?: string;
     modelOverride?: string;
   },
-): Promise<PtyEntry> {
+): PtyEntry {
+  // A retiring entry is waited for in `admitEntry`, outside the global lock.
+  // One that started retiring during `enforceMaxConcurrent` is returned as is:
+  // every (re)spawn site refuses to act on it, so the turn fails bounded.
   const existing = state.ptys.get(sessionKey);
   if (existing) return existing;
 
@@ -857,17 +886,35 @@ async function admitEntry(
     modelOverride?: string;
   },
 ): Promise<PtyEntry> {
-  const prev = _admissionLock;
-  let release: () => void = () => {};
-  _admissionLock = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  try {
-    await prev;
-    await enforceMaxConcurrent(sessionKey);
-    return await getOrCreateEntry(sessionKey, opts);
-  } finally {
-    release();
+  for (;;) {
+    // #385: an entry on this key that is mid-retirement must finish before a
+    // replacement is created — identity and config are keyed by sessionKey.
+    // That wait happens OUTSIDE the global admission lock: a slow retirement
+    // (reap, `/kill`, shutdown, a hung dispose or revoke) must stall this key
+    // only, not admission for every other key. Bounded by the caller's
+    // admission deadline like the rest of admission.
+    const retiring = state.ptys.get(sessionKey)?.retiring;
+    if (retiring) {
+      await retiring.catch(() => {});
+      continue;
+    }
+    if (state.shuttingDown) throw new SupervisorShuttingDownError(sessionKey);
+    const prev = _admissionLock;
+    let release: () => void = () => {};
+    _admissionLock = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    try {
+      await prev;
+      // A retirement may have started on this key while we queued for the
+      // lock; go back to waiting for it without holding the lock.
+      if (state.ptys.get(sessionKey)?.retiring) continue;
+      if (state.shuttingDown) throw new SupervisorShuttingDownError(sessionKey);
+      await enforceMaxConcurrent(sessionKey);
+      return getOrCreateEntry(sessionKey, opts);
+    } finally {
+      release();
+    }
   }
 }
 
@@ -897,12 +944,17 @@ async function enforceMaxConcurrent(incomingKey: string): Promise<void> {
   }
   if (!Number.isFinite(cap) || cap <= 0) return; // disabled
   if (state.ptys.has(incomingKey)) return; // existing key, no new allocation
-  if (state.ptys.size < cap) return; // headroom available
+  // #385: an entry being retired is on its way out; it neither counts against
+  // the cap nor is an eviction candidate — awaiting its retirement here would
+  // hold the global admission lock on a removal already in progress.
+  let live = 0;
+  for (const entry of state.ptys.values()) if (!entry.retiring) live += 1;
+  if (live < cap) return; // headroom available
 
-  // Find LRU candidate among adhoc entries (skip named + global).
+  // Find LRU candidate among adhoc entries (skip named + global + retiring).
   let lruEntry: PtyEntry | null = null;
   for (const entry of state.ptys.values()) {
-    if (entry.kind !== "adhoc") continue;
+    if (entry.kind !== "adhoc" || entry.retiring) continue;
     if (!lruEntry || entry.lastAccessedAt < lruEntry.lastAccessedAt) {
       lruEntry = entry;
     }
@@ -916,17 +968,9 @@ async function enforceMaxConcurrent(incomingKey: string): Promise<void> {
     return;
   }
 
-  // Dispose and remove. Errors are best-effort.
-  if (lruEntry.pty) {
-    try {
-      await lruEntry.pty.dispose();
-    } catch {
-      // ignore
-    }
-  }
-  // Release multiplexer identity + delete synthesized config (SPEC §4.5).
-  await releaseMcpIdentityFor(lruEntry);
-  state.ptys.delete(lruEntry.sessionKey);
+  // Dispose and remove (#385: through `retireEntry`, which fences late spawns
+  // and same-key replacements). Errors are best-effort.
+  await retireEntry(lruEntry);
 }
 
 async function buildSpawnOptions(
@@ -1029,9 +1073,19 @@ async function buildSpawnOptions(
   // Otherwise: skip — leave mcpConfigPath unset so buildClaudeArgs emits no
   // --mcp-config flag and the PTY's claude falls back to default MCP discovery.
   // This preserves byte-identical behaviour with today (settings.mcp.shared=[]).
+  // #385: everything above awaited. If the entry was retired meanwhile — and
+  // possibly replaced on the same key — synthesizing here would overwrite the
+  // replacement's sessionKey-scoped config and rotate its bearer. Check right
+  // before the (synchronous) synthesis, so there is no window.
+  if (!isCurrentEntry(entry)) {
+    throw new EntryRemovedError(
+      entry.sessionKey,
+      "not synthesizing MCP config for a retired entry",
+    );
+  }
   const mcpConfigPath = synthesizeMcpConfigIfActive(entry.sessionKey, cwd, settings);
 
-  return {
+  const opts: PtyProcessOptions = {
     sessionId,
     newSessionId,
     cwd,
@@ -1048,6 +1102,11 @@ async function buildSpawnOptions(
     sentinelMaxWaitMs: settings.pty.sentinelMaxWaitMs,
     ...(mcpConfigPath ? { mcpConfigPath } : {}),
   };
+  // Recorded on the entry in the same synchronous step as the synthesis, so a
+  // retirement that starts before `spawnEntry` resumes still sees the config
+  // it has to release.
+  entry.spawnOpts = opts;
+  return opts;
 }
 
 /**
@@ -1187,6 +1246,84 @@ async function ensureSpawnPty(): Promise<SpawnPty> {
   }
 }
 
+/**
+ * Land a freshly spawned PTY on its entry — or dispose it if the entry is gone.
+ *
+ * Issue #385: a spawn or respawn whose caller gave up on its deadline keeps
+ * running (`withDeadline` bounds the wait, not the work), and the entry can be
+ * removed before it lands — LRU-evicted, reaped, `/kill`ed or shut down; each of
+ * those disposes `entry.pty`, which is null or the dead PTY while a spawn is in
+ * flight. Assigning `entry.pty` on an entry nothing tracks would orphan a claude
+ * process plus its MCP fleet, and the next turn on the key would spawn a second
+ * one beside it. Dispose the late arrival instead and fail the spawn.
+ */
+async function landPty(entry: PtyEntry, pty: PtyProcess): Promise<void> {
+  if (isCurrentEntry(entry)) {
+    entry.pty = pty;
+    return;
+  }
+  try {
+    await pty.dispose();
+  } catch {
+    // best-effort
+  }
+  throw new EntryRemovedError(entry.sessionKey, "disposed the late PTY");
+}
+
+/** True while `entry` is the live entry for its key: tracked in `state.ptys`
+ *  and not being retired. Every removal path sets `retiring` synchronously
+ *  before its first await, so a (re)spawn landing at any point of a removal
+ *  sees `false` — there is no window. */
+function isCurrentEntry(entry: PtyEntry): boolean {
+  return state.ptys.get(entry.sessionKey) === entry && !entry.retiring;
+}
+
+/**
+ * Retire an entry: dispose its PTY, release its MCP identity and config, and
+ * take it out of the map — in that order, with `retiring` set before the first
+ * await. The single removal primitive for reap, LRU eviction, `/kill` and
+ * shutdown (#385, Copilot on #391). Keeping the entry in the map until the
+ * release has finished is what stops a replacement on the same key from being
+ * admitted while the old identity is still being revoked; `retiring` is what
+ * stops a late (re)spawn from landing on it meanwhile. Idempotent: a second
+ * caller joins the first retirement.
+ */
+function retireEntry(entry: PtyEntry): Promise<void> {
+  if (entry.retiring) return entry.retiring;
+  const run = (async () => {
+    // A first-turn spawn failure may be releasing this key right now; let it
+    // finish before releasing again, so nothing keyed by sessionKey is still
+    // in flight when the replacement this retirement unblocks is admitted.
+    if (entry.releasing) await entry.releasing.catch(() => {});
+    // Dispose and release CONCURRENTLY, as `/kill` and shutdown always did: a
+    // PTY whose exit never arrives must not keep the bearer and config live.
+    // Join a dispose a respawn already started — a second `dispose()` on the
+    // same PTY returns immediately, which would let this retirement finish
+    // while the old process is still being torn down.
+    const disposal = entry.disposing ?? entry.pty?.dispose() ?? Promise.resolve();
+    await Promise.allSettled([
+      disposal,
+      // Release multiplexer identity + delete synthesized config (SPEC §4.5).
+      releaseMcpIdentityFor(entry),
+    ]);
+    if (state.ptys.get(entry.sessionKey) === entry) state.ptys.delete(entry.sessionKey);
+  })();
+  entry.retiring = run;
+  return run;
+}
+
+/**
+ * The entry a (re)spawn was working for is being retired or is gone. Distinct
+ * type so the callers can tell it from a spawn failure: there is nothing to
+ * retry — the key may already have a NEW entry.
+ */
+class EntryRemovedError extends Error {
+  constructor(sessionKey: string, detail: string) {
+    super(`[pty-supervisor] ${sessionKey} was retired while its spawn was in flight — ${detail}`);
+    this.name = "EntryRemovedError";
+  }
+}
+
 async function spawnEntry(
   entry: PtyEntry,
   modelOverride: string | undefined,
@@ -1222,7 +1359,13 @@ async function spawnEntry(
   }
 
   try {
-    entry.pty = await spawn(spawnOpts);
+    // #385: `ensureTrustAccepted` awaited above; a retirement that started
+    // meanwhile has already released this key's identity and config. Do not
+    // spawn a claude nobody will track.
+    if (!isCurrentEntry(entry)) {
+      throw new EntryRemovedError(entry.sessionKey, "not spawning for a retired entry");
+    }
+    await landPty(entry, await spawn(spawnOpts));
     // Stamp the (re)spawn time so the reaper's spawn-grace window restarts
     // from now — see PtyEntry.lastSpawnedAt + reapIdle.
     entry.lastSpawnedAt = _clock();
@@ -1230,8 +1373,23 @@ async function spawnEntry(
     // If the spawn itself failed AFTER we synthesized an --mcp-config file,
     // clean up the on-disk artifact so the next attempt doesn't leak it on
     // permanent failure. Best-effort — caller surfaces the spawn error.
-    if (spawnOpts.mcpConfigPath) {
-      await releaseMcpIdentityFor(entry);
+    //
+    // Only while this entry is still the live one for its key (#385). Once a
+    // retirement has started, its own release covers this key's identity and
+    // config (synthesis after that point is refused above, so nothing newer
+    // exists), and a release from here could overlap the admission of a
+    // replacement on the same key and revoke ITS bearer — identity and config
+    // are keyed by sessionKey. Deciding on `isCurrentEntry` right before the
+    // release is safe: a retirement cannot start between the check and the
+    // release's first effect without `retiring` being set first.
+    if (spawnOpts.mcpConfigPath && isCurrentEntry(entry)) {
+      // Published on the entry so a retirement that starts during this await
+      // joins it before its own release (see `retireEntry`).
+      const releasing = releaseMcpIdentityFor(entry).finally(() => {
+        if (entry.releasing === releasing) entry.releasing = undefined;
+      });
+      entry.releasing = releasing;
+      await releasing;
       entry.spawnOpts = { ...spawnOpts, mcpConfigPath: undefined };
     }
     throw err;
@@ -1242,7 +1400,10 @@ async function spawnEntry(
   // daemon dies between spawn and the first response (idle reap, /kill,
   // crash, restart), the conversation is still resumable via --resume <id>
   // on next message for the same sessionKey.
-  if (spawnOpts.newSessionId) {
+  // #385: not for an entry retired while the spawn landed — its write could
+  // land after a same-key replacement's and point the next resume at the
+  // wrong session.
+  if (spawnOpts.newSessionId && isCurrentEntry(entry)) {
     try {
       await persistSessionId(entry, spawnOpts.newSessionId);
     } catch {
@@ -1340,16 +1501,26 @@ async function respawnEntry(
   }
 
   const spawn = await ensureSpawnPty();
-  // Best-effort dispose of the dead one (may already be exited).
+  // Best-effort dispose of the dead one (may already be exited). Kept on the
+  // entry while it runs so a retirement racing this respawn joins it (#385).
   if (entry.pty) {
+    const disposal = entry.pty.dispose().finally(() => {
+      if (entry.disposing === disposal) entry.disposing = undefined;
+    });
+    entry.disposing = disposal;
     try {
-      await entry.pty.dispose();
+      await disposal;
     } catch {
       // ignore
     }
   }
   entry.pty = null;
-  entry.pty = await spawn(opts);
+  // #385: the awaits above are where a retirement can start. Do not boot a
+  // claude for a retired entry — it would run untracked until it landed.
+  if (!isCurrentEntry(entry)) {
+    throw new EntryRemovedError(entry.sessionKey, "not respawning a retired entry");
+  }
+  await landPty(entry, await spawn(opts));
   entry.spawnOpts = opts;
   // Reset the spawn-grace window on respawn so a healthy long-lived PTY that
   // crashes doesn't get immediately reaped before its first post-respawn turn
@@ -1383,18 +1554,67 @@ async function respawnEntry(
  * fallback when there were prior failures (`i > 0`) so `respawnRetries=1`
  * (the documented pre-#175 opt-out) keeps its original behaviour and never
  * abandons the session unilaterally.
+ *
+ * Issue #385: each attempt is bounded by the caller's `timeoutMs` and the
+ * in-flight respawn is owned by the entry (`spawnInFlight`), mirroring the
+ * first-turn spawn path from #369. A deadline ends the loop rather than
+ * retrying: the respawn that did not settle is still running, and a second one
+ * beside it would orphan whichever PTY landed first.
  */
-async function respawnEntryWithRetries(entry: PtyEntry, opts: SupervisorOptions): Promise<void> {
+async function respawnEntryWithRetries(
+  entry: PtyEntry,
+  opts: SupervisorOptions,
+  timeoutMs: number,
+): Promise<void> {
   const attempts = Math.max(1, opts.respawnRetries);
   let lastErr: unknown = new Error("respawnEntryWithRetries: no attempts made");
   for (let i = 0; i < attempts; i++) {
     const isFinalAttempt = i === attempts - 1;
     const hadPriorFailures = i > 0;
     const dropResume = isFinalAttempt && hadPriorFailures;
+    // Issue #385: each attempt is bounded by the caller's `timeoutMs`, the
+    // same way the first-turn spawn is. `respawnEntry` does the same work —
+    // boot claude plus the MCP fleet — and ran here with no deadline, on the
+    // crash-recovery path that a host under pressure is most likely to take.
+    //
+    // Ownership follows the first-turn rule: the in-flight respawn lives on
+    // `entry.spawnInFlight`, so a caller that gives up leaves the next turn
+    // joining it rather than spawning a second PTY onto the same entry. If one
+    // is already in flight when we get here (a previous caller abandoned it
+    // mid-`dispose()`, before `entry.pty` was nulled), join that one. The
+    // joined respawn counts as this caller's attempt `i`: if it rejects, the
+    // loop continues with its own backoff and, on its final attempt, its own
+    // `dropResume` — the #177 escape hatch still fires, one attempt later.
+    // The entry may have been evicted, reaped, killed or shut down while the
+    // previous attempt ran. Respawning it would synthesize MCP config under a
+    // key that may now belong to a replacement entry. Stop instead.
+    if (!isCurrentEntry(entry)) {
+      throw new EntryRemovedError(entry.sessionKey, "not respawning a removed entry");
+    }
+    let inFlight = entry.spawnInFlight;
+    if (!inFlight) {
+      const started: Promise<void> = respawnEntry(entry, { dropResume }).finally(() => {
+        if (entry.spawnInFlight === started) entry.spawnInFlight = undefined;
+      });
+      started.catch(() => {});
+      entry.spawnInFlight = started;
+      inFlight = started;
+    }
     try {
-      await respawnEntry(entry, { dropResume });
+      await withDeadline(inFlight, timeoutMs);
       return;
     } catch (err) {
+      if (err instanceof DeadlineExceeded) {
+        // The respawn has not failed — it has not settled. Retrying now would
+        // start a second spawn beside it, which is the orphan this guards
+        // against. Stop here; the respawn stays owned by the entry.
+        throw new Error(
+          `respawn attempt ${i + 1} of ${attempts} for ${entry.sessionKey} exceeded ${timeoutMs}ms — claude or the MCP fleet did not come up; not retrying while it is still in flight`,
+        );
+      }
+      // Same reason as the check above: the attempt landed on a removed entry.
+      // A retry is not a recovery, it is a second spawn for a dead key.
+      if (err instanceof EntryRemovedError) throw err;
       lastErr = err;
       if (isFinalAttempt) break;
       const delay = pickBackoff(opts.backoffMs, i);
@@ -1432,7 +1652,12 @@ async function runTurnWithRetries(
   // The issue attributed the stall to `admitEntry` -> `getOrCreateEntry`.
   // `getOrCreateEntry` does not spawn; the only `spawnEntry` call reachable on
   // the first-turn path is this one.
-  if (!entry.pty) {
+  //
+  // Issue #385: an abandoned RESPAWN is also in flight here (see
+  // `respawnEntryWithRetries`). While it runs, `entry.pty` may still be the
+  // dead PTY it is replacing; running a turn on that would only fail into a
+  // second respawn. Join the in-flight one instead.
+  if (!entry.pty || entry.spawnInFlight) {
     // Abandoning the wait must not abandon ownership: keep the in-flight spawn
     // on the entry so the next caller awaits THIS one rather than starting a
     // second. Cleared on settle so a failed spawn stays retryable.
@@ -1502,10 +1727,10 @@ async function runTurnWithRetries(
       attempt += 1;
       await _sleep(delay);
       try {
-        await respawnEntryWithRetries(entry, supervisorOpts);
+        await respawnEntryWithRetries(entry, supervisorOpts, callOpts.timeoutMs);
       } catch (respawnErr) {
         return errorResult(
-          `[pty-supervisor] respawn failed for ${entry.sessionKey} after ${supervisorOpts.respawnRetries} attempt(s) (outer turn-retry ${attempt}): ${(respawnErr as Error).message}`,
+          `[pty-supervisor] respawn failed for ${entry.sessionKey} after up to ${supervisorOpts.respawnRetries} attempt(s) (outer turn-retry ${attempt}): ${(respawnErr as Error).message}`,
         );
       }
     }
@@ -1590,15 +1815,6 @@ async function reapIdle(opts: SupervisorOptions): Promise<void> {
     if (last < cutoff) toReap.push(entry);
   }
   for (const entry of toReap) {
-    if (entry.pty) {
-      try {
-        await entry.pty.dispose();
-      } catch {
-        // ignore
-      }
-    }
-    // Release multiplexer identity + delete synthesized config (SPEC §4.5).
-    await releaseMcpIdentityFor(entry);
-    state.ptys.delete(entry.sessionKey);
+    await retireEntry(entry);
   }
 }
