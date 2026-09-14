@@ -1668,11 +1668,11 @@ describe("BusCore IPC", () => {
       expect(finals[0].synthesized).toBe(true);
     });
 
-    it("does not re-reset a bus-opened turn at its tailer prompt: a final that beat the tailer is not synthesized twice", async () => {
-      // `sendPrompt` resets BEFORE delivery, so a bus turn's final can never
-      // precede its reset. If the tailer prompt reset unconditionally, a final
-      // IPC that lands before the (fs.watch-lagged) prompt event would be
-      // wiped from the flags and re-synthesized at turn_end.
+    it("delivers exactly once when a final beats the lagged tailer prompt of its own turn", async () => {
+      // The reset at the tailer prompt now runs for bus-opened turns too. If the
+      // final IPC lands before the (fs.watch-lagged) prompt event, the flags are
+      // wiped after the final — and turn_end must still not synthesize a second
+      // delivery. What holds it: the final also cleared `lastPromptOrigin`.
       const b = makeBus();
       const finals = captureFinals(b, "alpha");
       await b.sendPrompt({
