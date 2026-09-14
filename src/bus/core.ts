@@ -51,6 +51,7 @@ import type {
   IpcPrompt,
   PermissionRequest,
   PermissionResponse,
+  PromptDeliveryOutcome,
 } from "./types";
 import { CHANNEL_DRIVEN_ORIGINS } from "./types";
 import type { AgentJobHandler, JobView } from "./agent-jobs";
@@ -145,8 +146,14 @@ export type SlashCommandHandler = (agent_id: string, cmd: string) => Promise<voi
  * it in addition to the `notifications/claude/channel` IPC notification, so
  * headless (daemon-spawned) claudes — which don't start a turn from the MCP
  * notification alone — receive the prompt as typed input and reliably respond.
+ *
+ * May resolve with the process's delivery verdict (issue #361). A handler
+ * that resolves `void` is taken at its word, as before.
  */
-export type StreamPromptHandler = (agent_id: string, text: string) => Promise<void>;
+export type StreamPromptHandler = (
+  agent_id: string,
+  text: string,
+) => Promise<PromptDeliveryOutcome | void>;
 
 export interface BusCoreOptions {
   /** Path to bind the UDS server. If omitted, no IPC server is started. */
@@ -449,6 +456,14 @@ export class BusCoreImpl implements BusCore {
    * defers until the handler settles instead.
    */
   private readonly inFlightDeliveries = new Map<string, number>();
+  /** Per agent: the deliveries whose handler has not resolved yet, keyed by
+   *  the text the tailer will observe → whether the transcript already proved
+   *  that prompt (a `prompt` line or an absorption record) while the handler
+   *  was still deciding. The #361 verdict is read AFTER the handler resolves,
+   *  so without this a proof that arrived mid-loop would already have
+   *  cancelled its verify and left nothing for the give-up to find — it would
+   *  re-arm a prompt the model already handled (adversarial finding 2). */
+  private readonly inFlightProof = new Map<string, Map<string, boolean>>();
   /**
    * Agents with a turn currently streaming (tailer `prompt` seen, no
    * `response.turn_end` yet). A prompt delivered while a neighbor turn is in
@@ -649,6 +664,7 @@ export class BusCoreImpl implements BusCore {
       for (const entry of pending.values()) clearTimeout(entry.timer);
     this.flushVerify.clear();
     this.inFlightDeliveries.clear();
+    this.inFlightProof.clear();
     this.agentTurnActive.clear();
     this.originAmbiguous.clear();
     this.currentOperation.clear();
@@ -856,12 +872,64 @@ export class BusCoreImpl implements BusCore {
     // that is legitimately being processed (e.g. holding through compaction)
     // from one that was silently swallowed (#252).
     this.inFlightDeliveries.set(agent_id, (this.inFlightDeliveries.get(agent_id) ?? 0) + 1);
+    const key = sanitizePtyPromptText(wrapped);
+    let proofs = this.inFlightProof.get(agent_id);
+    if (!proofs) {
+      proofs = new Map();
+      this.inFlightProof.set(agent_id, proofs);
+    }
+    proofs.set(key, false);
     void this.streamPromptHandler(agent_id, wrapped)
+      .then((outcome) => {
+        // Issue #361: the PTY confirm loop gave up — an auto-compaction (or a
+        // redraw) swallowed the keystrokes, the screen could not prove a turn,
+        // and the loop has already cleared the input box. Until now that
+        // verdict died in a log line: nothing re-delivered, and the sender
+        // learned of it at the 5 min receipt timeout. The prompt is no longer
+        // anywhere the CLI could pick it up on its own, so the only way it
+        // still reaches the model is if the CLI had already taken it — in
+        // which case the transcript says so (`prompt`, or an absorption,
+        // cancels the verify — or, if it spoke while the handler was still
+        // deciding, `inFlightProof` remembers it) or its turn is running (the
+        // verify defers). Otherwise re-deliver it once, through the same
+        // at-most-once verify the backstop flush uses. `void` (a handler that
+        // cannot judge) and `turn-started` arm nothing, exactly as before.
+        //
+        // Two give-ups are deliberately NOT re-delivered:
+        //  - `stuck-compaction`: the CLI can buffer the keystrokes through an
+        //    auto-compaction and submit them itself when it ends. The bus has
+        //    no "still compacting" signal to defer on (the tailer only reports
+        //    the compaction boundary once it is over), so re-typing here would
+        //    land a second copy in the same buffer — two runs. That verdict
+        //    keeps the pre-#361 behaviour (a log line, `delivery_outcome` on
+        //    the receipt) rather than trading a possible loss for a sure double.
+        //  - a bus-injected `<system-reminder>` (the reply nudge): the
+        //    synthesized fallback already backs it, and a stale nudge re-typed
+        //    ten seconds later would open a fresh turn whose `reply` is not
+        //    deduplicated against that fallback.
+        // The in-flight record must still be there and unproven: `stop()`
+        // clears it, so a handler that resolves after shutdown arms no timer
+        // on a bus that has already torn its verifies down.
+        if (
+          typeof outcome === "string" &&
+          outcome !== "turn-started" &&
+          outcome !== "stuck-compaction" &&
+          this.inFlightProof.get(agent_id)?.get(key) === false &&
+          !wrapped.startsWith("<system-reminder>")
+        ) {
+          this.armFlushVerify(agent_id, [wrapped]);
+        }
+      })
       .catch((err) => this.onError(err, { ctx: "streamPromptHandler", agent_id }))
       .finally(() => {
         const n = (this.inFlightDeliveries.get(agent_id) ?? 1) - 1;
         if (n <= 0) this.inFlightDeliveries.delete(agent_id);
         else this.inFlightDeliveries.set(agent_id, n);
+        const p = this.inFlightProof.get(agent_id);
+        if (p) {
+          p.delete(key);
+          if (p.size === 0) this.inFlightProof.delete(agent_id);
+        }
       });
   }
 
@@ -931,7 +999,8 @@ export class BusCoreImpl implements BusCore {
     if (viaBackstop) this.armFlushVerify(agent_id, q);
   }
 
-  /** Arm per-prompt turn-start verification after a backstop flush. Each flushed
+  /** Arm per-prompt turn-start verification after a backstop flush — or after
+   *  a delivery the PTY layer reported as a give-up (#361). Each such
    *  prompt gets its own one-shot timer; a prompt already awaiting verification
    *  is left untouched (a second flush ADDS to the set, never discards pending
    *  ones — #252). The timer is cancelled by `noteFlushTurnStart` when the
@@ -1004,7 +1073,7 @@ export class BusCoreImpl implements BusCore {
       // socket close / shutdown (clearFlushVerify).
       this.onError(
         new Error(
-          `backstop-flushed prompt produced no turn within ${this.flushVerifyMs}ms; re-delivering once for agent_id=${agent_id}`,
+          `delivered prompt produced no turn within ${this.flushVerifyMs}ms; re-delivering once for agent_id=${agent_id}`,
         ),
         { ctx: "flushVerify", agent_id },
       );
@@ -1020,12 +1089,16 @@ export class BusCoreImpl implements BusCore {
    *  same text, same exact-match lookup: the prompt reached the model inside
    *  the running turn instead of opening its own. */
   private noteFlushTurnStart(agent_id: string, ingestedText: string): boolean {
-    const pending = this.flushVerify.get(agent_id);
-    if (!pending) return false;
     // ingestedText is the line claude recorded (already PTY-sanitized) and the
     // map keys are sanitized too; sanitize again — it is idempotent — to be
     // robust against any residual normalization before the exact-match lookup.
     const key = sanitizePtyPromptText(ingestedText);
+    // Proof for a delivery whose handler is still deciding (#361): remember
+    // it, so a later give-up verdict for that same prompt arms nothing.
+    const proofs = this.inFlightProof.get(agent_id);
+    if (proofs?.has(key)) proofs.set(key, true);
+    const pending = this.flushVerify.get(agent_id);
+    if (!pending) return false;
     const entry = pending.get(key);
     if (!entry) return false;
     clearTimeout(entry.timer);
