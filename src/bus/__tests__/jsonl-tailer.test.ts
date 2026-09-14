@@ -797,6 +797,54 @@ describe("JsonlTailer — real fixtures", () => {
   });
 });
 
+describe("JsonlTailer — prompt absorbed mid-turn (issue #389)", () => {
+  /**
+   * Fixture 04 is the real record (CLI 2.1.270) of a prompt the CLI folded
+   * into the running turn instead of starting its own: `enqueue` → `remove`
+   * with `reason: "absorbed_mid_turn"` → a `queued_command` attachment carrying
+   * the same text, and NO `user` line ever. The core cancels that prompt's
+   * flush-verify on either of the last two; this pins that both reach it with
+   * the text intact, and that the tailer's own delivery-confirm channel (#363)
+   * still counts the enqueue only.
+   */
+  it("forwards the remove (with reason and content) and the attachment (with prompt) to the bus", async () => {
+    const fs = await import("node:fs/promises");
+    const fixture = await fs.readFile(
+      join(process.cwd(), "docs/spikes/fixtures/jsonl/04-absorbed-mid-turn.jsonl"),
+      "utf8",
+    );
+    writeFileSync(sessionPath, fixture);
+    const { bus, events } = createMockBus();
+    const ingested: PromptIngestion[] = [];
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => undefined,
+      onPromptIngested: (i) => ingested.push(i),
+    });
+    await tailer.start();
+
+    const text = (JSON.parse(fixture.split("\n")[0] ?? "{}") as { content: string }).content;
+    expect(text).toContain('message_id="18786"');
+
+    const queue = events
+      .filter((e) => e.topic === "session.queue")
+      .map((e) => e.payload as { operation?: string; reason?: string; content?: string });
+    expect(queue.map((q) => q.operation)).toEqual(["enqueue", "remove"]);
+    expect(queue[1]).toMatchObject({ reason: "absorbed_mid_turn", content: text });
+
+    const attachment = events.find((e) => e.topic === "attachment.queued_command");
+    expect(attachment).toBeDefined();
+    expect((attachment?.payload as { prompt?: string }).prompt).toBe(text);
+
+    expect(events.some((e) => e.topic === "prompt")).toBe(false);
+    expect(ingested.map((i) => i.source)).toEqual(["enqueue"]);
+  });
+});
+
 describe("startAt: 'end' (issue #215 runtime wiring)", () => {
   function endTurn(text: string, ts = "2026-06-02T10:00:00.000Z"): object {
     return {
