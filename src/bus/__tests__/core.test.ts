@@ -1511,6 +1511,183 @@ describe("BusCore IPC", () => {
       expect(replies[0].synthesized).toBe(true);
     });
   });
+
+  describe("final reply in a turn the bus did not open (issue #392)", () => {
+    // The per-turn flags (`currentTurnReplied`, `currentTurnFinalPublished`)
+    // were only ever reset by `sendPrompt`. A turn that opens by any other door
+    // — a `<task-notification>` user line, a flush-verify re-delivery, a prompt
+    // that waited behind an active turn — inherited the previous turn's
+    // `currentTurnFinalPublished = true`, so its `final` was swallowed by the
+    // #217 cross-transport dedup as if it were the race loser. The tool had
+    // already answered `delivered`.
+    function makeBus(): BusCore {
+      return createBusCore({
+        eventLogAppend: createMockEventLog().append,
+        replyNudge: false,
+        streamPromptHandler: async () => {},
+      });
+    }
+
+    function captureFinals(b: BusCore, agentId: string) {
+      const finals: { text: string; synthesized?: boolean }[] = [];
+      b.subscribe({ agent_id: agentId, topics: ["response.text"] }, (event) => {
+        const payload = event.payload as { text?: string; intent?: string; synthesized?: boolean };
+        if (payload?.intent === "final") {
+          finals.push({ text: payload.text ?? "", synthesized: payload.synthesized });
+        }
+      });
+      return finals;
+    }
+
+    const tailerPrompt = (agent: string, text: string): BusEvent => ({
+      ts: Date.now(),
+      agent_id: agent,
+      session_id: "s",
+      topic: "prompt",
+      payload: { text },
+    });
+    const tailerTurnEnd = (agent: string, text = ""): BusEvent => ({
+      ts: Date.now(),
+      agent_id: agent,
+      session_id: "s",
+      topic: "response.turn_end",
+      payload: { stop_reason: "end_turn", text },
+    });
+
+    // The wrapped form `sendPrompt` types into the PTY, as the tailer re-emits it.
+    const wrappedFor = (text: string) =>
+      `<channel source="telegram" chat_id="c1" user_id="u1">${text}</channel>`;
+
+    async function completeBusTurn(b: BusCore, text: string, answer: string) {
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "telegram",
+        origin_id: "c1",
+        user_id: "u1",
+        text,
+      });
+      b.ingestSessionEvent(tailerPrompt("alpha", wrappedFor(text)));
+      b.ingestReply({ agent_id: "alpha", text: answer, intent: "final" });
+      b.ingestSessionEvent(tailerTurnEnd("alpha"));
+    }
+
+    it("publishes the final of a turn opened by a task notification after a bus turn ended (#392 row 3)", async () => {
+      const b = makeBus();
+      const finals = captureFinals(b, "alpha");
+      await completeBusTurn(b, "hi", "hello");
+      expect(finals.map((f) => f.text)).toEqual(["hello"]);
+
+      // A background task finishes: the CLI opens a turn with a user line the
+      // bus never sent. The agent reacts and calls `reply` final.
+      b.ingestSessionEvent(
+        tailerPrompt("alpha", "<task-notification>ci went red</task-notification>"),
+      );
+      b.ingestReply({ agent_id: "alpha", text: "CI is red on #1", intent: "final" });
+      b.ingestSessionEvent(tailerTurnEnd("alpha"));
+
+      expect(finals.map((f) => f.text)).toEqual(["hello", "CI is red on #1"]);
+      expect(finals[1].synthesized).toBeUndefined();
+    });
+
+    it("publishes the final of a prompt that waited behind an active turn (same root, not in the #392 table)", async () => {
+      const b = makeBus();
+      const finals = captureFinals(b, "alpha");
+
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "telegram",
+        origin_id: "c1",
+        user_id: "u1",
+        text: "A",
+      });
+      b.ingestSessionEvent(tailerPrompt("alpha", wrappedFor("A")));
+      // B lands while A is streaming: it is a queued keystroke in the REPL box.
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "telegram",
+        origin_id: "c1",
+        user_id: "u1",
+        text: "B",
+      });
+      b.ingestReply({ agent_id: "alpha", text: "answer A", intent: "final" });
+      b.ingestSessionEvent(tailerTurnEnd("alpha"));
+      // B's turn starts only now.
+      b.ingestSessionEvent(tailerPrompt("alpha", wrappedFor("B")));
+      b.ingestReply({ agent_id: "alpha", text: "answer B", intent: "final" });
+      b.ingestSessionEvent(tailerTurnEnd("alpha"));
+
+      expect(finals.map((f) => f.text)).toEqual(["answer A", "answer B"]);
+    });
+
+    it("publishes the final of a later non-bus turn even when a bus prompt was absorbed mid-turn (#389 shape)", async () => {
+      const b = makeBus();
+      const finals = captureFinals(b, "alpha");
+
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "telegram",
+        origin_id: "c1",
+        user_id: "u1",
+        text: "A",
+      });
+      b.ingestSessionEvent(tailerPrompt("alpha", wrappedFor("A")));
+      // B is absorbed into A's running turn: it never gets a user line of its own.
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "telegram",
+        origin_id: "c1",
+        user_id: "u1",
+        text: "B",
+      });
+      b.ingestReply({ agent_id: "alpha", text: "answer A+B", intent: "final" });
+      b.ingestSessionEvent(tailerTurnEnd("alpha"));
+      // Next turn is not the bus's.
+      b.ingestSessionEvent(
+        tailerPrompt("alpha", "<task-notification>job done</task-notification>"),
+      );
+      b.ingestReply({ agent_id: "alpha", text: "job report", intent: "final" });
+      b.ingestSessionEvent(tailerTurnEnd("alpha"));
+
+      expect(finals.map((f) => f.text)).toEqual(["answer A+B", "job report"]);
+    });
+
+    it("keeps the #217 dedup: a real final landing after the synthesized one for the SAME turn is still suppressed", async () => {
+      const b = makeBus();
+      const finals = captureFinals(b, "alpha");
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "telegram",
+        origin_id: "c1",
+        user_id: "u1",
+        text: "A",
+      });
+      b.ingestSessionEvent(tailerPrompt("alpha", wrappedFor("A")));
+      b.ingestSessionEvent(tailerTurnEnd("alpha", "the answer")); // tailer wins → synthesized
+      b.ingestReply({ agent_id: "alpha", text: "the answer", intent: "final" }); // late real final
+      expect(finals.map((f) => f.text)).toEqual(["the answer"]);
+      expect(finals[0].synthesized).toBe(true);
+    });
+
+    it("does not re-reset a bus-opened turn at its tailer prompt: a final that beat the tailer is not synthesized twice", async () => {
+      // `sendPrompt` resets BEFORE delivery, so a bus turn's final can never
+      // precede its reset. If the tailer prompt reset unconditionally, a final
+      // IPC that lands before the (fs.watch-lagged) prompt event would be
+      // wiped from the flags and re-synthesized at turn_end.
+      const b = makeBus();
+      const finals = captureFinals(b, "alpha");
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "telegram",
+        origin_id: "c1",
+        user_id: "u1",
+        text: "A",
+      });
+      b.ingestReply({ agent_id: "alpha", text: "fast answer", intent: "final" }); // IPC beats the tailer
+      b.ingestSessionEvent(tailerPrompt("alpha", wrappedFor("A"))); // lagged turn-start
+      b.ingestSessionEvent(tailerTurnEnd("alpha", "fast answer"));
+      expect(finals.map((f) => f.text)).toEqual(["fast answer"]);
+    });
+  });
 });
 
 describe("BusCore delivery gate (session.init / replay_done)", () => {

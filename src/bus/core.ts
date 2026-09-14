@@ -510,6 +510,27 @@ export class BusCoreImpl implements BusCore {
   private readonly currentTurnFinalPublished = new Map<string, boolean>();
 
   /**
+   * Turn-start ownership of the per-turn flags (#392). `sendPrompt` resets
+   * `currentTurnReplied` / `currentTurnFinalPublished` / the nudge state BEFORE
+   * it delivers, and that was the only reset there was. A turn that opens by
+   * any other door — a `<task-notification>` user line, a flush-verify
+   * re-delivery, a prompt that waited behind an active turn — inherited the
+   * previous turn's `currentTurnFinalPublished = true`, and its `final` was
+   * dropped by the #217 dedup as if it were the race loser (the tool had already
+   * answered `delivered`).
+   *
+   * The agent is in this set while its per-turn flags are in the state a
+   * `sendPrompt` (or nudge) left them: reset, and not yet claimed by a turn
+   * start nor dirtied by a final. The tailer `prompt` event — the turn start
+   * the bus can observe for EVERY turn — consumes the entry if present (the
+   * bus-opened turn is starting; its early reset stands) and otherwise resets
+   * the flags itself: no bus prompt opened this turn. A final removes the
+   * entry, so a bus prompt absorbed into a running turn (#389) or queued behind
+   * one cannot lend its reset to a later turn.
+   */
+  private readonly turnStateFresh = new Set<string>();
+
+  /**
    * Reply-tool enforcement (#215/#240). `replyNudged` records that the agent
    * was already nudged once for the in-flight turn, so a nudged turn that again
    * ends without `reply` falls through to the synthesized safety net instead of
@@ -585,6 +606,7 @@ export class BusCoreImpl implements BusCore {
           this.pendingTurns.delete(agentId);
           this.currentTurnReplied.delete(agentId);
           this.currentTurnFinalPublished.delete(agentId);
+          this.turnStateFresh.delete(agentId); // #392: nothing standing for a dead turn
           // Reply-tool enforcement (#215/#240): drop nudge state with the rest
           // of the per-turn flags so a dead session can't leave it dangling.
           this.replyNudged.delete(agentId);
@@ -742,6 +764,9 @@ export class BusCoreImpl implements BusCore {
     // state from the previous turn so this turn gets its own one-shot nudge.
     this.replyNudged.delete(req.agent_id);
     this.pendingNudgeText.delete(req.agent_id);
+    // #392: the flags are reset ahead of this prompt's turn start; the tailer
+    // `prompt` event that opens it must not reset them a second time.
+    this.turnStateFresh.add(req.agent_id);
 
     const ipcMsg: IpcPrompt = {
       type: "prompt",
@@ -1199,7 +1224,25 @@ export class BusCoreImpl implements BusCore {
       // nudge successfully produced) — clear the nudge state for the turn.
       this.replyNudged.delete(req.agent_id);
       this.pendingNudgeText.delete(req.agent_id);
+      // #392: the flags now describe a turn that has delivered. A pending
+      // `sendPrompt` reset (a prompt absorbed into, or queued behind, this
+      // turn) no longer stands — the next turn start must reset afresh.
+      this.turnStateFresh.delete(req.agent_id);
     }
+  }
+
+  /**
+   * Open the per-turn flags for a turn the bus did not open (#392): the tailer
+   * saw a user line start a turn and no `sendPrompt` reset is standing for it.
+   * Same reset as `sendPrompt`'s, minus the origin bookkeeping — there is no
+   * inbound origin for such a turn, and `ingestReply` already publishes
+   * origin-less events that adapters route to the agent's last surface.
+   */
+  private openUnpromptedTurn(agentId: string): void {
+    this.currentTurnReplied.set(agentId, false);
+    this.currentTurnFinalPublished.set(agentId, false);
+    this.replyNudged.delete(agentId);
+    this.pendingNudgeText.delete(agentId);
   }
 
   /**
@@ -1330,6 +1373,8 @@ export class BusCoreImpl implements BusCore {
       "intent:'final' to send your answer for this turn.";
     this.currentTurnReplied.set(agentId, false);
     this.currentTurnFinalPublished.set(agentId, false);
+    // #392: as in `sendPrompt` — the nudged turn's start must not reset again.
+    this.turnStateFresh.add(agentId);
     // IPC path (best-effort, no reconciler): reach an MCP-connected agent.
     // Wrapped so a synchronous send() throw can't skip the PTY path below or
     // propagate to the turn-end handler — the send is best-effort, mirroring
@@ -1382,6 +1427,12 @@ export class BusCoreImpl implements BusCore {
         // arms — and defers — its own verify.
         if (typeof text === "string") this.noteFlushTurnStart(e.agent_id, text);
         this.agentTurnActive.add(e.agent_id);
+        // #392: a turn is starting. If `sendPrompt` (or a nudge) reset the
+        // per-turn flags for it, that reset stands — consume it. Otherwise this
+        // turn opened by another door (task notification, re-delivery, a prompt
+        // that waited behind an active turn) and inherits nothing: reset now,
+        // so its `final` is not dropped as a #217 race loser.
+        if (!this.turnStateFresh.delete(e.agent_id)) this.openUnpromptedTurn(e.agent_id);
       }
     }
     // Silent-drop safety net (#215): the JSONL tailer publishes a
@@ -1791,6 +1842,7 @@ export class BusCoreImpl implements BusCore {
         // tracking flag to keep the map bounded.
         this.currentTurnReplied.delete(agentId);
         this.currentTurnFinalPublished.delete(agentId);
+        this.turnStateFresh.delete(agentId); // #392: nothing standing for a dead turn
         // Reply-tool enforcement (#215/#240): no turn_end is coming — drop the
         // nudge state too so it can't leak into a later turn for this agent.
         this.replyNudged.delete(agentId);
@@ -1894,6 +1946,7 @@ export class BusCoreImpl implements BusCore {
         // turn_end either — clear tracking too.
         this.currentTurnReplied.delete(agentId);
         this.currentTurnFinalPublished.delete(agentId);
+        this.turnStateFresh.delete(agentId); // #392: nothing standing for a dead turn
         // Reply-tool enforcement (#215/#240): no turn_end is coming — drop the
         // nudge state too so it can't leak into a later turn for this agent.
         this.replyNudged.delete(agentId);
