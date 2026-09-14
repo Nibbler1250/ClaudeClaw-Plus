@@ -734,10 +734,9 @@ export class BusCoreImpl implements BusCore {
     // Silent-drop safety net (#215): new prompt → reset the "did this
     // turn call reply?" flag. If the agent ends the turn (response.turn_end)
     // without ever setting this to true, we'll synthesize delivery.
-    this.currentTurnReplied.set(req.agent_id, false);
     // #217 finding 2: a new turn starts undelivered — clear the
     // cross-transport "final already published" dedup flag.
-    this.currentTurnFinalPublished.set(req.agent_id, false);
+    this.openTurn(req.agent_id);
     // Reply-tool enforcement (#215/#240): a fresh user turn — drop any nudge
     // state from the previous turn so this turn gets its own one-shot nudge.
     this.replyNudged.delete(req.agent_id);
@@ -1203,6 +1202,34 @@ export class BusCoreImpl implements BusCore {
   }
 
   /**
+   * A new turn starts undelivered (#392): clear the two per-turn delivery
+   * flags. Called from `sendPrompt` (ahead of delivery) and from the tailer
+   * `prompt` event — the turn start the bus observes for EVERY turn, whoever
+   * opened it. Before #392 only `sendPrompt` reset them, so a turn opened by
+   * any other door — a `<task-notification>` user line, a flush-verify
+   * re-delivery, a prompt that waited behind (or was absorbed into) an active
+   * turn — inherited the previous turn's `currentTurnFinalPublished = true`,
+   * and its `final` was dropped by the #217 dedup as if it were the race
+   * loser (the tool had already answered `delivered`).
+   *
+   * Resetting again for a bus-opened turn is harmless: a final also clears
+   * `lastPromptOrigin`, without which the turn-end synthesizer cannot deliver,
+   * so wiping the flags after a final cannot make it deliver twice.
+   *
+   * The nudge state (`replyNudged` / `pendingNudgeText`) is deliberately NOT
+   * touched here: the nudge's own injected reminder is a user line, hence a
+   * tailer `prompt`, and the stash must survive until the nudged turn ends.
+   * Its owners stay `sendPrompt`, a final, the synthesizer, cancel, error and
+   * disconnect. No origin bookkeeping either: a turn the bus did not open has
+   * no inbound origin, and `ingestReply` publishes origin-less events that
+   * adapters route by their own fallback (Telegram: the agent's last chat).
+   */
+  private openTurn(agentId: string): void {
+    this.currentTurnReplied.set(agentId, false);
+    this.currentTurnFinalPublished.set(agentId, false);
+  }
+
+  /**
    * Silent-drop safety net handler (issue #215). Wired by
    * `ingestSessionEvent`/JSONL tailer when it observes a `response.turn_end`
    * with `stop_reason: "end_turn"`. If the agent ended the turn with
@@ -1382,6 +1409,12 @@ export class BusCoreImpl implements BusCore {
         // arms — and defers — its own verify.
         if (typeof text === "string") this.noteFlushTurnStart(e.agent_id, text);
         this.agentTurnActive.add(e.agent_id);
+        // #392: a turn is starting, whoever opened it (a bus prompt, a task
+        // notification, a re-delivery, a prompt that waited behind an active
+        // turn). Its delivery flags start clean, so its `final` is not dropped
+        // as a #217 race loser of the previous turn. The nudge state is left
+        // alone — see `openTurn`.
+        this.openTurn(e.agent_id);
       }
     }
     // Silent-drop safety net (#215): the JSONL tailer publishes a
