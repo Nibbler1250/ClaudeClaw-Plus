@@ -1258,6 +1258,52 @@ describe("BusCore IPC", () => {
       expect(replies[0].synthesized).toBe(true);
     });
 
+    // The injected reminder is itself a user line in the transcript, so the
+    // tailer emits a `prompt` for it — the turn start that #392 hooks. The
+    // nudge state must survive that event, or the net loses its one shot.
+    const nudgePromptLine = (b: BusCore, agent: string, text: string) =>
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: agent,
+        session_id: "s",
+        topic: "prompt",
+        payload: { text },
+      });
+
+    it("keeps the stashed text across the nudge's own tailer prompt (nudged turn ends empty) (#392)", async () => {
+      const nudges: string[] = [];
+      const b = makeBus({ nudges });
+      const replies = captureReplies(b, "alpha");
+
+      await promptTg(b, "alpha");
+      turnEnd(b, "alpha", "the original answer"); // → nudge (text stashed)
+      await tick();
+      expect(nudges.length).toBe(1);
+      nudgePromptLine(b, "alpha", nudges[0]); // the reminder's user line opens the nudged turn
+      turnEnd(b, "alpha", ""); // nudged turn ends empty, still no reply
+      await tick();
+
+      expect(replies.map((r) => r.text)).toEqual(["the original answer"]);
+      expect(replies[0].synthesized).toBe(true);
+    });
+
+    it("stays bounded to one nudge across the nudge's own tailer prompt (nudged turn ends with text) (#392)", async () => {
+      const nudges: string[] = [];
+      const b = makeBus({ nudges });
+      const replies = captureReplies(b, "alpha");
+
+      await promptTg(b, "alpha");
+      turnEnd(b, "alpha", "first draft"); // → nudge
+      await tick();
+      nudgePromptLine(b, "alpha", nudges[0]);
+      turnEnd(b, "alpha", "second draft, still no reply"); // must synthesize, not nudge again
+      await tick();
+
+      expect(nudges.length).toBe(1);
+      expect(replies.map((r) => r.text)).toEqual(["second draft, still no reply"]);
+      expect(replies[0].synthesized).toBe(true);
+    });
+
     it("does NOT synthesize when the agent already called reply with intent: final", async () => {
       const b = makeBus();
       const replies = captureReplies(b, "alpha");
@@ -1651,7 +1697,7 @@ describe("BusCore IPC", () => {
       expect(finals.map((f) => f.text)).toEqual(["answer A+B", "job report"]);
     });
 
-    it("keeps the #217 dedup: a real final landing after the synthesized one for the SAME turn is still suppressed", async () => {
+    it("keeps the #217 dedup: a real final landing after the synthesized one for the SAME turn is still suppressed (until the next turn's user line)", async () => {
       const b = makeBus();
       const finals = captureFinals(b, "alpha");
       await b.sendPrompt({

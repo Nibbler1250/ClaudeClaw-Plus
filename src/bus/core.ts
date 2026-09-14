@@ -510,23 +510,6 @@ export class BusCoreImpl implements BusCore {
   private readonly currentTurnFinalPublished = new Map<string, boolean>();
 
   /**
-   * Turn start resets the per-turn flags (#392). `sendPrompt` resets
-   * `currentTurnReplied` / `currentTurnFinalPublished` / the nudge state BEFORE
-   * it delivers, and that was the only reset there was. A turn that opens by
-   * any other door — a `<task-notification>` user line, a flush-verify
-   * re-delivery, a prompt that waited behind (or was absorbed into) an active
-   * turn — inherited the previous turn's `currentTurnFinalPublished = true`,
-   * and its `final` was dropped by the #217 dedup as if it were the race loser
-   * (the tool had already answered `delivered`). The tailer `prompt` event is
-   * the turn start the bus observes for EVERY turn, so {@link openTurn} runs
-   * there too. Resetting again for a bus-opened turn is harmless: a final
-   * cannot precede the user line that starts its turn by more than the
-   * tailer's lag, and a final also clears `lastPromptOrigin`, which is what
-   * the turn-end synthesizer needs — so wiping the flags after a final cannot
-   * make it deliver twice.
-   */
-
-  /**
    * Reply-tool enforcement (#215/#240). `replyNudged` records that the agent
    * was already nudged once for the in-flight turn, so a nudged turn that again
    * ends without `reply` falls through to the synthesized safety net instead of
@@ -753,9 +736,11 @@ export class BusCoreImpl implements BusCore {
     // without ever setting this to true, we'll synthesize delivery.
     // #217 finding 2: a new turn starts undelivered — clear the
     // cross-transport "final already published" dedup flag.
+    this.openTurn(req.agent_id);
     // Reply-tool enforcement (#215/#240): a fresh user turn — drop any nudge
     // state from the previous turn so this turn gets its own one-shot nudge.
-    this.openTurn(req.agent_id);
+    this.replyNudged.delete(req.agent_id);
+    this.pendingNudgeText.delete(req.agent_id);
 
     const ipcMsg: IpcPrompt = {
       type: "prompt",
@@ -1217,18 +1202,31 @@ export class BusCoreImpl implements BusCore {
   }
 
   /**
-   * Reset the per-turn flags for a turn that is starting (#392). Called from
-   * `sendPrompt` (ahead of delivery) and from the tailer `prompt` event (the
-   * turn start itself, whoever opened it). No origin bookkeeping: a turn the
-   * bus did not open has no inbound origin, and `ingestReply` already
-   * publishes origin-less events that adapters route to the agent's last
-   * surface.
+   * A new turn starts undelivered (#392): clear the two per-turn delivery
+   * flags. Called from `sendPrompt` (ahead of delivery) and from the tailer
+   * `prompt` event — the turn start the bus observes for EVERY turn, whoever
+   * opened it. Before #392 only `sendPrompt` reset them, so a turn opened by
+   * any other door — a `<task-notification>` user line, a flush-verify
+   * re-delivery, a prompt that waited behind (or was absorbed into) an active
+   * turn — inherited the previous turn's `currentTurnFinalPublished = true`,
+   * and its `final` was dropped by the #217 dedup as if it were the race
+   * loser (the tool had already answered `delivered`).
+   *
+   * Resetting again for a bus-opened turn is harmless: a final also clears
+   * `lastPromptOrigin`, without which the turn-end synthesizer cannot deliver,
+   * so wiping the flags after a final cannot make it deliver twice.
+   *
+   * The nudge state (`replyNudged` / `pendingNudgeText`) is deliberately NOT
+   * touched here: the nudge's own injected reminder is a user line, hence a
+   * tailer `prompt`, and the stash must survive until the nudged turn ends.
+   * Its owners stay `sendPrompt`, a final, the synthesizer, cancel, error and
+   * disconnect. No origin bookkeeping either: a turn the bus did not open has
+   * no inbound origin, and `ingestReply` publishes origin-less events that
+   * adapters route by their own fallback (Telegram: the agent's last chat).
    */
   private openTurn(agentId: string): void {
     this.currentTurnReplied.set(agentId, false);
     this.currentTurnFinalPublished.set(agentId, false);
-    this.replyNudged.delete(agentId);
-    this.pendingNudgeText.delete(agentId);
   }
 
   /**
@@ -1413,8 +1411,9 @@ export class BusCoreImpl implements BusCore {
         this.agentTurnActive.add(e.agent_id);
         // #392: a turn is starting, whoever opened it (a bus prompt, a task
         // notification, a re-delivery, a prompt that waited behind an active
-        // turn). Its flags start clean, so its `final` is not dropped as a
-        // #217 race loser of the previous turn.
+        // turn). Its delivery flags start clean, so its `final` is not dropped
+        // as a #217 race loser of the previous turn. The nudge state is left
+        // alone — see `openTurn`.
         this.openTurn(e.agent_id);
       }
     }
