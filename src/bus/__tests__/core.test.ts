@@ -2167,6 +2167,173 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     expect(delivered[1]).toContain("p1");
   });
 
+  describe("delivery verdict from the PTY layer (issue #361)", () => {
+    // The PTY confirm loop can give up — an auto-compaction swallowed the
+    // keystrokes, the screen could not prove a turn — and it clears the input
+    // box when it does. Before #361 that verdict never left the process: the
+    // handler resolved `void`, the bus assumed delivery, and the sender found
+    // out at the 5 min receipt timeout. Now the handler resolves with the
+    // outcome and a give-up arms the same at-most-once verify the backstop
+    // flush uses. The tailer `prompt` event for the delivered text is the only
+    // thing that cancels it (attribution, #252) — the transcript, not a guess.
+    const turnEvt = (agent: string, ingestedText: string): BusEvent => ({
+      ts: 1,
+      agent_id: agent,
+      session_id: "s",
+      topic: "prompt",
+      payload: { text: ingestedText },
+    });
+    const turnEndEvt = (agent: string): BusEvent => ({
+      ts: 1,
+      agent_id: agent,
+      session_id: "s",
+      topic: "response.turn_end",
+      payload: { text: "" },
+    });
+    const verdictBus = (
+      verdicts: Array<
+        "turn-started" | "unconfirmed-live" | "unconfirmed-idle" | "stuck-compaction" | undefined
+      >,
+    ) => {
+      bus = createBusCore({
+        eventLogAppend: createMockEventLog().append,
+        flushVerifyMs: 30,
+        onError: () => {},
+      });
+      const delivered: string[] = [];
+      bus.setStreamPromptHandler(async (_a, text) => {
+        delivered.push(text);
+        return verdicts[delivered.length - 1];
+      });
+      return delivered;
+    };
+
+    it("re-delivers ONCE a prompt whose delivery ended unconfirmed-live, and never a third time", async () => {
+      const delivered = verdictBus(["unconfirmed-live", "unconfirmed-live", "unconfirmed-live"]);
+      await prompt("alpha", "swallowed by compaction");
+      expect(delivered).toHaveLength(1);
+      await new Promise((r) => setTimeout(r, 60)); // > flushVerify + grace, transcript silent → re-deliver
+      expect(delivered).toHaveLength(2);
+      expect(delivered[1]).toBe(delivered[0]); // verbatim: same wrapped text
+      await new Promise((r) => setTimeout(r, 90)); // the re-delivery also gave up → at-most-once holds
+      expect(delivered).toHaveLength(2);
+    });
+
+    it("re-delivers once on the unconfirmed-idle verdict too", async () => {
+      const delivered = verdictBus(["unconfirmed-idle", "turn-started"]);
+      await prompt("alpha", "lost");
+      await new Promise((r) => setTimeout(r, 60));
+      expect(delivered).toHaveLength(2);
+    });
+
+    it("arms nothing on turn-started, nothing on stuck-compaction, and nothing when the handler has no verdict", async () => {
+      // stuck-compaction: the CLI may have buffered the keystrokes through the
+      // compaction and will submit them itself; the bus has no "still
+      // compacting" signal to defer on, so re-typing would double-submit.
+      const delivered = verdictBus(["turn-started", "stuck-compaction", undefined]);
+      await prompt("alpha", "confirmed");
+      await prompt("alpha", "buffered by the compaction");
+      await prompt("alpha", "legacy handler");
+      expect(delivered).toHaveLength(3);
+      await new Promise((r) => setTimeout(r, 90));
+      expect(delivered).toHaveLength(3); // none was re-delivered
+    });
+
+    it("does NOT re-deliver when the transcript records the prompt after all (late user line)", async () => {
+      // unconfirmed-live means the transcript stayed silent past the process's
+      // grace, not that it will never speak. A `user` line for THIS text
+      // inside the verify window proves the CLI took it: re-delivering would
+      // submit it twice. The turn is ended right away so the verify is NOT
+      // merely deferred by agentTurnActive — it must fire, find no entry, and
+      // do nothing (attribution by text is the guard under test).
+      const delivered = verdictBus(["unconfirmed-live"]);
+      await prompt("alpha", "slow but taken");
+      expect(delivered).toHaveLength(1);
+      bus.ingestSessionEvent(turnEvt("alpha", delivered[0] as string));
+      bus.ingestSessionEvent(turnEndEvt("alpha"));
+      await new Promise((r) => setTimeout(r, 120));
+      expect(delivered).toHaveLength(1);
+    });
+
+    it("does NOT re-deliver when the proof landed while the handler was still deciding", async () => {
+      // The verdict is read after the handler resolves. The transcript can
+      // prove the prompt (user line, or an absorption into the running turn)
+      // while the confirm loop is still in its grace — e.g. an absorption the
+      // loop cannot see because it only watches `enqueue`/`user`. That proof
+      // must survive to the verdict, or a handled prompt gets re-armed.
+      let resolveHandler: (v: "unconfirmed-live") => void = () => {};
+      bus = createBusCore({
+        eventLogAppend: createMockEventLog().append,
+        flushVerifyMs: 30,
+        onError: () => {},
+      });
+      const delivered: string[] = [];
+      bus.setStreamPromptHandler(
+        (_a, text) =>
+          new Promise((resolve) => {
+            delivered.push(text);
+            resolveHandler = resolve;
+          }),
+      );
+      await prompt("alpha", "taken mid-loop");
+      expect(delivered).toHaveLength(1);
+      bus.ingestSessionEvent(turnEvt("alpha", delivered[0] as string)); // proof, handler still pending
+      bus.ingestSessionEvent(turnEndEvt("alpha"));
+      resolveHandler("unconfirmed-live"); // the loop never saw it
+      await new Promise((r) => setTimeout(r, 120));
+      expect(delivered).toHaveLength(1);
+    });
+
+    it("arms nothing when the handler resolves its give-up after bus.stop()", async () => {
+      let resolveHandler: (v: "unconfirmed-idle") => void = () => {};
+      bus = createBusCore({
+        eventLogAppend: createMockEventLog().append,
+        flushVerifyMs: 30,
+        onError: () => {},
+      });
+      const delivered: string[] = [];
+      bus.setStreamPromptHandler(
+        (_a, text) =>
+          new Promise((resolve) => {
+            delivered.push(text);
+            resolveHandler = resolve;
+          }),
+      );
+      await prompt("alpha", "in flight at shutdown");
+      await bus.stop(); // tears every verify down; the handler is still pending
+      resolveHandler("unconfirmed-idle");
+      await new Promise((r) => setTimeout(r, 90));
+      expect(delivered).toHaveLength(1); // no timer was armed on the stopped bus
+    });
+
+    it("never re-delivers a bus-injected <system-reminder> (the reply nudge) on a give-up", async () => {
+      const delivered = verdictBus(["turn-started", "unconfirmed-idle"]);
+      await prompt("alpha", "hi");
+      bus.ingestSessionEvent({
+        ts: 1,
+        agent_id: "alpha",
+        session_id: "s",
+        topic: "response.turn_end",
+        payload: { text: "scratch, no reply" },
+      }); // → nudge delivered over the same seam, and it "gives up"
+      await new Promise((r) => setTimeout(r, 10));
+      expect(delivered).toHaveLength(2);
+      expect(delivered[1]).toContain("<system-reminder>");
+      await new Promise((r) => setTimeout(r, 90));
+      expect(delivered).toHaveLength(2); // the nudge was not re-typed
+    });
+
+    it("an UNRELATED prompt's turn does not cancel the re-delivery (attribution)", async () => {
+      const delivered = verdictBus(["unconfirmed-live", "turn-started"]);
+      await prompt("alpha", "still lost");
+      bus.ingestSessionEvent(turnEvt("alpha", "<channel>someone else</channel>"));
+      bus.ingestSessionEvent(turnEndEvt("alpha")); // that turn ends → the verify is free to fire
+      await new Promise((r) => setTimeout(r, 90));
+      expect(delivered).toHaveLength(2);
+      expect(delivered[1]).toContain("still lost");
+    });
+  });
+
   describe("prompt absorbed into the running turn is not re-delivered (issue #389)", () => {
     // A prompt delivered while a neighbor turn streams may be FOLDED into that
     // turn by the CLI ("The user sent a new message while you were working")

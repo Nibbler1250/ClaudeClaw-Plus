@@ -944,6 +944,89 @@ describe("PtyAgentProcess transcript-confirmed delivery (issue #362)", () => {
   });
 });
 
+describe("PtyAgentProcess.send_prompt_stream resolves with its verdict (issue #361)", () => {
+  // The loop's give-up used to be a log line and a Ctrl-U; the caller got
+  // `undefined` either way and assumed delivery. The verdict now travels with
+  // the promise so the bus can re-deliver. Each case pins the outcome the
+  // existing behaviour tests above already establish by other means. (Exit
+  // mid-confirm still rejects — pinned in the #wedge block above.)
+
+  it("turn-started when the screen shows a turn and no transcript is live", async () => {
+    const { handle, emit } = bootPty();
+    const proc = new PtyAgentProcess("v1", handle, { submitConfirmMs: 30, maxSubmitNudges: 2 });
+    const p = proc.send_prompt_stream("hello");
+    const iv = setInterval(() => emit("assistant is streaming a response chunk here"), 8);
+    const outcome = await p;
+    clearInterval(iv);
+    expect(outcome).toBe("turn-started");
+  });
+
+  it("turn-started when the transcript records the prompt, whatever the screen shows", async () => {
+    const { handle, emit } = bootPty();
+    const proc = new PtyAgentProcess("v2", handle, {
+      submitConfirmMs: 30,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 5000,
+    });
+    proc.enableTranscriptConfirmation();
+    const p = proc.send_prompt_stream("hello there");
+    const iv = setInterval(() => emit("earlier turn text being repainted\n"), 5);
+    setTimeout(
+      () =>
+        proc.notePromptIngested({
+          text: "hello there",
+          source: "user",
+          promptId: "pid-v2",
+          ingestedAtMs: Date.now(),
+        }),
+      40,
+    );
+    const outcome = await p;
+    clearInterval(iv);
+    expect(outcome).toBe("turn-started");
+  });
+
+  it("unconfirmed-live when the screen claims a turn but a live transcript stays silent", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("v3", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+    const p = proc.send_prompt_stream("please summarise");
+    const iv = setInterval(() => emit("earlier turn text being repainted\n"), 5);
+    const outcome = await p;
+    clearInterval(iv);
+    expect(outcome).toBe("unconfirmed-live");
+    expect(writes).toContain("\x15"); // the box was cleared: the prompt is nowhere else now
+  });
+
+  it("unconfirmed-idle when the idle footer survives every nudge", async () => {
+    const { handle, emit } = bootPty();
+    const proc = new PtyAgentProcess("v4", handle, { submitConfirmMs: 30, maxSubmitNudges: 2 });
+    const p = proc.send_prompt_stream("hello");
+    const iv = setInterval(() => emit("\n⏵ accept edits on (shift+tab to cycle)"), 8);
+    const outcome = await p;
+    clearInterval(iv);
+    expect(outcome).toBe("unconfirmed-idle");
+  });
+
+  it("stuck-compaction when the compaction never ends within its budget", async () => {
+    const { handle, emit } = bootPty();
+    const proc = new PtyAgentProcess("v5", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      maxCompactionWaitMs: 80,
+    });
+    const p = proc.send_prompt_stream("hello");
+    const iv = setInterval(() => emit("\nCompacting conversation… (esc to interrupt)"), 8);
+    const outcome = await p;
+    clearInterval(iv);
+    expect(outcome).toBe("stuck-compaction");
+  });
+});
+
 describe("PtyAgentProcess enqueue-confirmed delivery (issue #363)", () => {
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   const enqueued = (text: string, over: Partial<PromptIngestion> = {}): PromptIngestion => ({
