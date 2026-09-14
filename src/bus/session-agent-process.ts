@@ -26,7 +26,7 @@ import { sanitizePtyPromptText } from "../runner/pty-prompt-sanitizer";
 // cursor-move→space expander does NOT pull the native PTY dep into the bus
 // module — same rationale as importing the sanitiser above.
 import { expandCursorForwardToSpaces } from "../runner/pty-output-parser";
-import type { SupervisionMode } from "./types";
+import type { PromptDeliveryOutcome, SupervisionMode } from "./types";
 
 /** Strip ANSI OSC/CSI escape sequences so dialog matching survives the
  *  cursor-positioning escapes the CLI interleaves into rendered text. Without
@@ -102,8 +102,14 @@ export interface AgentProcess {
   recentOutputTail?(): string;
   /** Relay a slash command (e.g. `compact`, `clear`, `quit`). No leading slash. */
   send_slash(cmd: string): Promise<void>;
-  /** Send a stream-json line. Only valid in `process-stream-json` mode. */
-  send_prompt_stream(line: string): Promise<void>;
+  /**
+   * Send a stream-json line. Only valid in `process-stream-json` mode.
+   *
+   * Resolves with how the delivery ended when the implementation can tell
+   * (the PTY confirm loop, issue #361); `void` from one that cannot. A
+   * rejection still means the write itself failed, never a give-up.
+   */
+  send_prompt_stream(line: string): Promise<PromptDeliveryOutcome | void>;
   /**
    * Optional: report that the session transcript recorded the CLI ingesting
    * `text` as a top-level user prompt (issue #362). Implementations that have
@@ -163,7 +169,7 @@ export class PtyAgentProcess implements AgentProcess {
   private _exitCode = -1;
   /** Serializes the write/settle/CR sequence so concurrent prompts can't
    *  interleave in the PTY input buffer (review #141 P1). */
-  private writeChain: Promise<void> = Promise.resolve();
+  private writeChain: Promise<unknown> = Promise.resolve();
   /** ANSI-stripped tail of PTY output, reset after each submit so the
    *  delivery-confirm check only inspects post-submit frames (#wedge). */
   private recentOut = "";
@@ -462,7 +468,7 @@ export class PtyAgentProcess implements AgentProcess {
     return Promise.resolve();
   }
 
-  send_prompt_stream(line: string): Promise<void> {
+  send_prompt_stream(line: string): Promise<PromptDeliveryOutcome> {
     if (this._exited) return Promise.reject(new Error(`agent ${this.agent_id} has exited`));
     // NOTE (Codex P2 on PR #195): we deliberately do NOT disengage the
     // boot-dialog watcher here. An early heartbeat/scheduler prompt can be
@@ -554,8 +560,7 @@ export class PtyAgentProcess implements AgentProcess {
       // NEVER silently -- the stranded input line is cleared and a diagnostic is
       // surfaced, since a silently-dropped prompt is the failure this loop fixes.
       const compactionDeadline = Date.now() + this.maxCompactionWaitMs;
-      let outcome: "turn-started" | "stuck-compaction" | "unconfirmed-idle" | "unconfirmed-live" =
-        "unconfirmed-idle";
+      let outcome: PromptDeliveryOutcome = "unconfirmed-idle";
       // When the screen first claimed a turn while a live transcript had not
       // yet spoken. Bounds how long that claim is held unresolved.
       let screenClaimedTurnAtMs = 0;
@@ -788,6 +793,10 @@ export class PtyAgentProcess implements AgentProcess {
             `the REPL footer marker changed in the CLI.`,
         );
       }
+      // Issue #361: a give-up used to end here, with the prompt already
+      // cleared from the input box and nothing upstream told. The caller is
+      // the only layer that can re-deliver, so hand it the verdict.
+      return outcome;
     });
     // Keep the chain alive past a rejected write so later prompts still run.
     this.writeChain = run.catch(() => {});

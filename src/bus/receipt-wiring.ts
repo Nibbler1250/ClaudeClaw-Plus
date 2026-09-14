@@ -7,7 +7,7 @@
  * without booting the full bus runtime.
  */
 import { getDefaultReceiptStore, hashPrompt, type OpenReceipt, type ReceiptStore } from "./receipt";
-import type { BusOrigin } from "./types";
+import type { BusOrigin, PromptDeliveryOutcome } from "./types";
 
 /**
  * Recover the original prompt text from the `<channel source=... chat_id=...
@@ -65,10 +65,15 @@ export function openInboundReceipt(params: OpenInboundReceiptParams): OpenReceip
  *  Declared here so the helper doesn't drag in `session-agent-process.ts`. */
 export interface AgentProcessLike {
   readonly pid: number;
-  send_prompt_stream?(line: string): Promise<void>;
+  send_prompt_stream?(line: string): Promise<PromptDeliveryOutcome | void>;
 }
 
-export type StreamPromptHandler = (agent_id: string, text: string) => Promise<void>;
+/** Resolves with the process's delivery verdict when it reports one (issue
+ *  #361), so the bus can act on a give-up instead of assuming success. */
+export type StreamPromptHandler = (
+  agent_id: string,
+  text: string,
+) => Promise<PromptDeliveryOutcome | void>;
 
 export interface PromptStreamHandlerOptions {
   /** Receipt store to back-fill into. Defaults to the process-wide singleton. */
@@ -85,7 +90,12 @@ export interface PromptStreamHandlerOptions {
  *   2. Looks up an open receipt by `hashPrompt(text)`.
  *   3. If both present, stamps `process_pid`, `process_generation`,
  *      `route_resolved_at` BEFORE writing to the PTY.
- *   4. Writes the prompt; on success, stamps `stdin_written_at`. On failure,
+ *   4. Writes the prompt; on success, stamps `stdin_written_at` — and
+ *      `delivery_outcome` when the process reports one (issue #361), so a
+ *      receipt that later times out says the PTY layer gave up rather than
+ *      looking like a delivery that simply went unanswered (a bus
+ *      re-delivery's verdict lands in `redelivery_outcome`, the first one is
+ *      kept). On failure,
  *      closes the receipt as `stale_session` so the cause is visible in the
  *      receipts log (the caller can still close it later — `close` is
  *      idempotent).
@@ -103,7 +113,7 @@ export function createPromptStreamHandler(
   const now = opts.now ?? (() => new Date());
   const generationByAgent = new Map<string, { pid: number; gen: number }>();
 
-  return async (agent_id: string, text: string): Promise<void> => {
+  return async (agent_id: string, text: string): Promise<PromptDeliveryOutcome | void> => {
     const proc = getAgent(agent_id);
     // `BusCoreImpl.sendPrompt` wraps the prompt in a `<channel ...>...</channel>`
     // block before invoking us, so the receipt — keyed on the *raw* prompt at
@@ -128,12 +138,25 @@ export function createPromptStreamHandler(
         });
       }
       try {
-        await proc.send_prompt_stream(text);
+        const outcome = await proc.send_prompt_stream(text);
         if (receipt) {
+          // A bus re-delivery (#361) comes back through this same handler and
+          // finds the same open receipt: keep the first verdict, record the
+          // retry's under its own key, so a give-up followed by a clean retry
+          // still reads as "re-delivered", not as a first-try success.
+          const outcomeKey =
+            receipt.record.notes?.delivery_outcome === undefined
+              ? "delivery_outcome"
+              : "redelivery_outcome";
           receipt.patch({
-            notes: { ...receipt.record.notes, stdin_written_at: now().toISOString() },
+            notes: {
+              ...receipt.record.notes,
+              stdin_written_at: now().toISOString(),
+              ...(typeof outcome === "string" ? { [outcomeKey]: outcome } : {}),
+            },
           });
         }
+        return outcome;
       } catch (err) {
         // PTY write failed — `stale_session` reflects "the process was
         // there when we checked but rejected the write". The caller

@@ -55,6 +55,18 @@ export function defaultSupervisionFor(origin: BusOrigin): SupervisionMode {
   return CHANNEL_DRIVEN_ORIGINS.has(origin) ? "pty-stdin" : "process-stream-json";
 }
 
+/**
+ * How a PTY-stdin delivery ended, as judged by the delivery-confirm loop
+ * (issue #361). Only `turn-started` means the CLI took the prompt. Every
+ * other value means the loop gave up and cleared the input box, so the
+ * prompt is no longer anywhere the CLI could still pick it up on its own.
+ */
+export type PromptDeliveryOutcome =
+  | "turn-started" // confirmed: transcript record, or the screen showed a turn
+  | "stuck-compaction" // an auto-compaction never finished within its budget
+  | "unconfirmed-idle" // the idle footer (or silence) survived every submit nudge
+  | "unconfirmed-live"; // the screen claimed a turn but a live transcript stayed silent
+
 /* ───────────────────────────────────────────────────────────────────── */
 /* BusEvent — single normalised event shape                              */
 /* ───────────────────────────────────────────────────────────────────── */
