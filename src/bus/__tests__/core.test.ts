@@ -2166,4 +2166,175 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     expect(delivered).toHaveLength(2);
     expect(delivered[1]).toContain("p1");
   });
+
+  describe("prompt absorbed into the running turn is not re-delivered (issue #389)", () => {
+    // A prompt delivered while a neighbor turn streams may be FOLDED into that
+    // turn by the CLI ("The user sent a new message while you were working")
+    // instead of starting its own. It then never gets a `user` line, so the
+    // `prompt` proof never comes and the #250 verify re-delivers it after the
+    // turn ends — the agent handles it twice. The transcript records the
+    // absorption in two places, each carrying the prompt text; either is proof.
+    // Shapes are the real records of a CLI 2.1.270 session (see the issue).
+    const queueEvt = (agent: string, line: Record<string, unknown>): BusEvent => ({
+      ts: 1,
+      agent_id: agent,
+      session_id: "s",
+      topic: "session.queue",
+      payload: { type: "queue-operation", ...line },
+    });
+    const absorbedEvt = (agent: string, content: string) =>
+      queueEvt(agent, { operation: "remove", reason: "absorbed_mid_turn", content });
+    const queuedCommandEvt = (agent: string, prompt: string): BusEvent => ({
+      ts: 1,
+      agent_id: agent,
+      session_id: "s",
+      topic: "attachment.queued_command",
+      payload: { type: "queued_command", prompt, commandMode: "prompt", origin: { kind: "human" } },
+    });
+    // Neighbor turn active → deliver "queued" (arms a deferred verify) → the
+    // caller injects the absorption proof → neighbor ends → wait past verify +
+    // grace. Returns what the PTY handler received.
+    const absorbedScenario = async (proof: (delivered: string) => BusEvent[]) => {
+      bus = createBusCore({
+        eventLogAppend: createMockEventLog().append,
+        flushVerifyMs: 40,
+        onError: () => {},
+      });
+      const delivered: string[] = [];
+      bus.setStreamPromptHandler(async (_a, text) => {
+        delivered.push(text);
+      });
+      bus.ingestSessionEvent(turnEvt("alpha", "<channel>neighbor</channel>"));
+      await prompt("alpha", "queued");
+      expect(delivered).toHaveLength(1);
+      for (const e of proof(delivered[0])) bus.ingestSessionEvent(e);
+      bus.ingestSessionEvent(turnEndEvt("alpha"));
+      await new Promise((r) => setTimeout(r, 100)); // > flushVerify + grace
+      return delivered;
+    };
+
+    it("the queue's `remove` with reason absorbed_mid_turn cancels the verify", async () => {
+      const delivered = await absorbedScenario((d) => [absorbedEvt("alpha", d)]);
+      expect(delivered).toHaveLength(1);
+    });
+
+    it("the `queued_command` attachment cancels the verify", async () => {
+      const delivered = await absorbedScenario((d) => [queuedCommandEvt("alpha", d)]);
+      expect(delivered).toHaveLength(1);
+    });
+
+    // What the envelope stamps onto an idle event: `promise_id` is the slot's
+    // owner, `correlation_ambiguous` says another counted turn is still open.
+    const stampOf = (b: BusCore) => {
+      const seen: BusEvent[] = [];
+      b.subscribe({ agent_id: "alpha", topics: ["tool_result"] }, (e) => seen.push(e));
+      b.ingestSessionEvent({
+        ts: 1,
+        agent_id: "alpha",
+        session_id: "s",
+        topic: "tool_result",
+        payload: { x: 1 },
+      });
+      return { promise_id: seen[0]?.promise_id, ambiguous: seen[0]?.correlation_ambiguous };
+    };
+
+    it("releases the turn counted for the absorbed prompt: the running turn's end frees the slot", async () => {
+      // `sendPrompt` counted a turn for B; B never gets a `turn_end` of its own.
+      // Before the fix the re-delivery's turn ended and balanced the count by
+      // accident. Without releasing it here, A's `turn_end` leaves one turn
+      // "in flight" forever: every later event carries B's stale promise_id
+      // and `correlation_ambiguous`, until some turn the bus did not open ends.
+      bus = createBusCore({
+        eventLogAppend: createMockEventLog().append,
+        flushVerifyMs: 40,
+        onError: () => {},
+      });
+      const delivered: string[] = [];
+      bus.setStreamPromptHandler(async (_a, text) => {
+        delivered.push(text);
+      });
+      const a = await prompt("alpha", "A"); // counted
+      bus.ingestSessionEvent(turnEvt("alpha", delivered[0] as string)); // A's turn starts
+      const b = await prompt("alpha", "absorbed"); // counted, delivered behind A
+      bus.ingestSessionEvent(absorbedEvt("alpha", delivered[1] as string));
+      bus.ingestSessionEvent(turnEndEvt("alpha")); // A ends; nothing is in flight
+      await new Promise((r) => setTimeout(r, 100)); // > flushVerify + grace
+      expect(delivered).toHaveLength(2); // not re-delivered
+      expect(stampOf(bus)).toEqual({ promise_id: undefined, ambiguous: undefined });
+      expect(a.promise_id).not.toBe(b.promise_id);
+    });
+
+    it("both records for the same prompt (the real file order) release it once, not twice", async () => {
+      // A running, B absorbed (both records), C delivered and waiting behind A.
+      // Counted turns: A, B, C. The absorption releases B only; A's end then
+      // leaves C's turn owning the slot. A second release on the second record
+      // would free the slot under C.
+      bus = createBusCore({
+        eventLogAppend: createMockEventLog().append,
+        flushVerifyMs: 40,
+        onError: () => {},
+      });
+      const delivered: string[] = [];
+      bus.setStreamPromptHandler(async (_a, text) => {
+        delivered.push(text);
+      });
+      bus.ingestSessionEvent(turnEvt("alpha", "<channel>neighbor</channel>"));
+      await prompt("alpha", "A");
+      await prompt("alpha", "absorbed");
+      const c = await prompt("alpha", "waiting");
+      const b = delivered[1] as string;
+      for (const e of [
+        queueEvt("alpha", { operation: "enqueue", content: b }),
+        absorbedEvt("alpha", b),
+        queuedCommandEvt("alpha", b),
+      ])
+        bus.ingestSessionEvent(e);
+      bus.ingestSessionEvent(turnEndEvt("alpha")); // A ends → C's turn owns the slot
+      expect(stampOf(bus).promise_id).toBe(c.promise_id);
+    });
+
+    it("an absorption record for ANOTHER prompt does not silence this one's verify (#252 attribution)", async () => {
+      const delivered = await absorbedScenario(() => [
+        absorbedEvt("alpha", "<channel>someone else</channel>"),
+        queuedCommandEvt("alpha", "<channel>someone else</channel>"),
+      ]);
+      expect(delivered).toHaveLength(2); // still re-delivered exactly once
+      expect(delivered[1]).toContain("queued");
+    });
+
+    it("a `dequeue`, or a `remove` without the absorbed reason, proves nothing (positive test, #363)", async () => {
+      const delivered = await absorbedScenario((d) => [
+        queueEvt("alpha", { operation: "dequeue", content: d }),
+        queueEvt("alpha", { operation: "remove", content: d }),
+        queueEvt("alpha", { operation: "remove", reason: "cancelled", content: d }),
+      ]);
+      expect(delivered).toHaveLength(2);
+    });
+
+    it("an absorption record does not reset the running turn's reply flags (#217 dedup stays whole)", async () => {
+      // The absorbing turn already published its final. The absorption is an
+      // event INSIDE that turn, not a turn start: it must not `openTurn`, or a
+      // late second final from the same turn would reach the surface. The
+      // absorbed text is a task notification — the real 03:39:56 record — so
+      // no `sendPrompt` (which opens a turn by design) is involved.
+      bus = createBusCore({
+        eventLogAppend: createMockEventLog().append,
+        replyNudge: false,
+        onError: () => {},
+      });
+      const finals: string[] = [];
+      bus.subscribe({ agent_id: "alpha", topics: ["response.text"] }, (e) => {
+        const p = e.payload as { text?: string; intent?: string };
+        if (p?.intent === "final") finals.push(p.text ?? "");
+      });
+      bus.setStreamPromptHandler(async () => {});
+      bus.ingestSessionEvent(turnEvt("alpha", "<channel>A</channel>"));
+      bus.ingestReply({ agent_id: "alpha", text: "final of A", intent: "final" });
+      const absorbed = "<task-notification>done</task-notification>";
+      bus.ingestSessionEvent(absorbedEvt("alpha", absorbed));
+      bus.ingestSessionEvent(queuedCommandEvt("alpha", absorbed));
+      bus.ingestReply({ agent_id: "alpha", text: "second final of A", intent: "final" });
+      expect(finals).toEqual(["final of A"]);
+    });
+  });
 });

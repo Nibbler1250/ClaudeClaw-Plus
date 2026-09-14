@@ -419,7 +419,8 @@ export class BusCoreImpl implements BusCore {
    * After such a flush we watch for proof THAT prompt started a turn — a tailer
    * `prompt` event whose ingested text matches the wrapped string we delivered
    * (exact attribution; an unrelated later prompt's turn must not satisfy an
-   * earlier swallowed one) — and, if none lands within `flushVerifyMs`,
+   * earlier swallowed one), or the CLI's record that it absorbed that prompt
+   * into the turn already running (#389) — and, if neither lands within `flushVerifyMs`,
    * re-deliver THAT prompt ONCE through the gate. Per-prompt timers, not one
    * per agent: a second flush adds to the set instead of discarding pending
    * ones, and each prompt is verified/re-delivered independently. The watchdog
@@ -1015,19 +1016,52 @@ export class BusCoreImpl implements BusCore {
    *  ingested text is the user line claude recorded = the wrapped string we
    *  delivered. Cancel only the matching pending verify, so an unrelated later
    *  prompt's turn never silences a still-swallowed earlier prompt's
-   *  re-delivery (#252). */
-  private noteFlushTurnStart(agent_id: string, ingestedText: string): void {
+   *  re-delivery (#252). The absorption records (#389) are the other proof —
+   *  same text, same exact-match lookup: the prompt reached the model inside
+   *  the running turn instead of opening its own. */
+  private noteFlushTurnStart(agent_id: string, ingestedText: string): boolean {
     const pending = this.flushVerify.get(agent_id);
-    if (!pending) return;
+    if (!pending) return false;
     // ingestedText is the line claude recorded (already PTY-sanitized) and the
     // map keys are sanitized too; sanitize again — it is idempotent — to be
     // robust against any residual normalization before the exact-match lookup.
     const key = sanitizePtyPromptText(ingestedText);
     const entry = pending.get(key);
-    if (!entry) return;
+    if (!entry) return false;
     clearTimeout(entry.timer);
     pending.delete(key);
     if (pending.size === 0) this.flushVerify.delete(agent_id);
+    return true;
+  }
+
+  /** #389: the CLI folded a delivered prompt into the turn already running.
+   *  Its verify is satisfied (the prompt reached the model), and the turn
+   *  `sendPrompt` counted for it will never terminate on its own — it is the
+   *  running turn's. Release that count now, so the running turn's `turn_end`
+   *  frees the operation slot instead of leaving it held (and every later
+   *  event stamped with a stale `promise_id` + `correlation_ambiguous`) until
+   *  some turn the bus did not open happens to end. Only a prompt whose
+   *  verify was pending is counted: that is the one `sendPrompt` incremented
+   *  for and the tailer never opened a turn for. */
+  private noteAbsorbedPrompt(agent_id: string, text: string): void {
+    if (!this.noteFlushTurnStart(agent_id, text)) return;
+    this.releaseTurn(agent_id);
+  }
+
+  /** One turn the bus counted has reached its end (its `turn_end`, or its
+   *  absorption into another turn). Free the operation slot when no counted
+   *  turn is left in flight. */
+  private releaseTurn(agent_id: string): void {
+    const left = (this.pendingTurns.get(agent_id) ?? 1) - 1;
+    if (left > 0) {
+      // A lagged terminator for an earlier turn. Another turn still owns the
+      // slot; releasing here would strip its id mid-flight.
+      this.pendingTurns.set(agent_id, left);
+    } else {
+      this.pendingTurns.delete(agent_id);
+      this.currentOperation.delete(agent_id);
+      this.correlationAmbiguous.delete(agent_id);
+    }
   }
 
   /** Cancel and drop every pending flush-verify for an agent (socket close, or
@@ -1416,6 +1450,35 @@ export class BusCoreImpl implements BusCore {
         // alone — see `openTurn`.
         this.openTurn(e.agent_id);
       }
+      // #389: a prompt the CLI absorbed into the running turn never gets a
+      // `user` line of its own, so the `prompt` proof above never comes and the
+      // verify armed at delivery re-delivers it once the turn ends — the agent
+      // then handles it twice. The transcript records the absorption in the
+      // queue's own `remove` (reason `absorbed_mid_turn`; carries the text on
+      // 2.1.270, not on 2.1.269) and in the `queued_command` attachment the
+      // CLI renders to the model mid-turn (always carries it). Either is proof
+      // the prompt reached the model; either cancels only ITS verify (same
+      // exact attribution as `prompt`) and releases the turn `sendPrompt`
+      // counted for it. Not a turn start: `openTurn` is not called here — the
+      // running turn keeps its reply flags (`sendPrompt` already reset them on
+      // arrival; the absorption must not reset them a second time), and a
+      // `dequeue` still proves nothing (its `user` line follows within ms —
+      // #363 stands).
+      else if (e.topic === "session.queue") {
+        const q = e.payload as
+          | { operation?: unknown; reason?: unknown; content?: unknown }
+          | undefined;
+        if (
+          q?.operation === "remove" &&
+          q.reason === "absorbed_mid_turn" &&
+          typeof q.content === "string"
+        ) {
+          this.noteAbsorbedPrompt(e.agent_id, q.content);
+        }
+      } else if (e.topic === "attachment.queued_command") {
+        const prompt = (e.payload as { prompt?: unknown } | undefined)?.prompt;
+        if (typeof prompt === "string") this.noteAbsorbedPrompt(e.agent_id, prompt);
+      }
     }
     // Silent-drop safety net (#215): the JSONL tailer publishes a
     // `response.turn_end` event when claude stops with `end_turn`. Hook
@@ -1432,18 +1495,7 @@ export class BusCoreImpl implements BusCore {
     // Release the operation slot only AFTER `response.turn_end` has been
     // published: that event is the one a client most needs correlated, and
     // clearing alongside `agentTurnActive` above would strip it.
-    if (e.topic === "response.turn_end" && e.agent_id) {
-      const left = (this.pendingTurns.get(e.agent_id) ?? 1) - 1;
-      if (left > 0) {
-        // A lagged terminator for an earlier turn. Another turn still owns the
-        // slot; releasing here would strip its id mid-flight.
-        this.pendingTurns.set(e.agent_id, left);
-      } else {
-        this.pendingTurns.delete(e.agent_id);
-        this.currentOperation.delete(e.agent_id);
-        this.correlationAmbiguous.delete(e.agent_id);
-      }
-    }
+    if (e.topic === "response.turn_end" && e.agent_id) this.releaseTurn(e.agent_id);
   }
 
   /**
