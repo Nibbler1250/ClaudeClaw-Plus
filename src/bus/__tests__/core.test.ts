@@ -2167,6 +2167,38 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     expect(delivered[1]).toContain("p1");
   });
 
+  it("clears the neighbor-turn flag on a turn_end whatever its stop_reason — contract pin for #401 (the tailer now emits max_tokens/stop_sequence)", async () => {
+    // A turn can end on `max_tokens` / `stop_sequence`; the tailer now surfaces
+    // those as `response.turn_end` too. Core keys on the topic, not the reason
+    // (this test passes on the base too — it pins the contract the tailer
+    // change relies on): the flag must clear on that terminator like on
+    // `end_turn`, so a deferred flush-verify fires after THIS turn rather than
+    // after the next clean one.
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      flushVerifyMs: 40,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(turnEvt("alpha", "<channel>neighbor</channel>")); // neighbor turn active
+    await prompt("alpha", "p1"); // delivered during the active turn → arms a verify
+    expect(delivered).toHaveLength(1);
+    expect(bus.isAgentTurnActive("alpha")).toBe(true);
+    await new Promise((r) => setTimeout(r, 70)); // > flushVerify: deferred while the turn is active
+    expect(delivered).toHaveLength(1);
+    bus.ingestSessionEvent({
+      ...turnEndEvt("alpha"),
+      payload: { stop_reason: "max_tokens", text: "" }, // empty → the #215 synthesizer is a no-op
+    }); // the neighbor stops on max_tokens — the turn is over
+    expect(bus.isAgentTurnActive("alpha")).toBe(false);
+    await new Promise((r) => setTimeout(r, 70)); // verify now fires → re-deliver "p1"
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]).toContain("p1");
+  });
+
   describe("delivery verdict from the PTY layer (issue #361)", () => {
     // The PTY confirm loop can give up — an auto-compaction swallowed the
     // keystrokes, the screen could not prove a turn — and it clears the input

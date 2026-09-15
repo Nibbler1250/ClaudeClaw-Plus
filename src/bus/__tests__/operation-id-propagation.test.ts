@@ -94,6 +94,45 @@ describe("operation id propagation", () => {
     expect(late[0].promise_id).toBeUndefined();
   });
 
+  it("releases the slot once per message when a multi-line message ends a turn twice (#405)", async () => {
+    // The CLI repeats the terminal stop_reason on the thinking line AND the text
+    // line of one message, so the tailer hands over two turn_end events with the
+    // same message_id. The first releases turn A's slot; a prompt B counted in
+    // between must keep its own id on its events — the second line of A's
+    // message is not B's terminator.
+    const { bus, events } = makeBus();
+    const a = await prompt(bus, "alpha", "for A");
+    bus.ingestSessionEvent(
+      tailerEvent("alpha", "response.turn_end", { text: "", message_id: "msg_A" }),
+    );
+    const b = await prompt(bus, "alpha", "for B");
+    bus.ingestSessionEvent(
+      tailerEvent("alpha", "response.turn_end", { text: "A's text", message_id: "msg_A" }),
+    );
+    bus.ingestSessionEvent(tailerEvent("alpha", "response.text", { text: "B streaming" }));
+
+    const ends = events.filter((e) => e.topic === "response.turn_end");
+    expect(ends).toHaveLength(2);
+    expect(ends[0].promise_id).toBe(a.promise_id);
+    const bText = events.find((e) => e.topic === "response.text");
+    expect(bText?.promise_id).toBe(b.promise_id); // B still owns the slot
+    // B's own terminator (a different message) releases it.
+    bus.ingestSessionEvent(
+      tailerEvent("alpha", "response.turn_end", { text: "", message_id: "msg_B" }),
+    );
+    bus.ingestSessionEvent(tailerEvent("alpha", "response.text", { text: "late" }));
+    const late = events.filter((e) => e.topic === "response.text").at(-1);
+    expect(late?.promise_id).toBeUndefined();
+  });
+
+  it("still releases on every turn_end that carries no message_id (older tailers)", async () => {
+    const { bus, events } = makeBus();
+    await prompt(bus, "alpha", "one");
+    bus.ingestSessionEvent(tailerEvent("alpha", "response.turn_end", { text: "" }));
+    bus.ingestSessionEvent(tailerEvent("alpha", "response.text", { text: "after" }));
+    expect(events.filter((e) => e.topic === "response.text")[0].promise_id).toBeUndefined();
+  });
+
   it("keeps agents apart — one agent's turn never stamps another's events", async () => {
     const { bus, events } = makeBus();
     const a = await prompt(bus, "alpha", "for alpha");

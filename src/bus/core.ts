@@ -476,6 +476,9 @@ export class BusCoreImpl implements BusCore {
    * sooner would double-submit), then re-delivers only if no turn ever starts.
    */
   private readonly agentTurnActive = new Set<string>();
+  /** #405: message id of the last `turn_end` that released the operation slot,
+   *  per agent — a later line of the same message must not release it again. */
+  private readonly lastTurnEndMessageId = new Map<string, string>();
   /**
    * Prompts that were outstanding (held in the delivery queue, or flushed and
    * awaiting turn-start verification) when an agent's socket closed — typically
@@ -492,7 +495,7 @@ export class BusCoreImpl implements BusCore {
    * current turn has called the `reply` MCP tool with `intent: "final"`.
    * Reset on every new inbound prompt (`sendPrompt`), set to `true` when
    * an `intent: "final"` `ingestReply` lands. On `response.turn_end`
-   * (emitted by the JSONL tailer when `stop_reason === "end_turn"`), if
+   * (emitted by the JSONL tailer on any terminal `stop_reason`, #401), if
    * this is still `false` and the turn produced non-empty text, the
    * agent ended the turn without delivering — we synthesize an
    * `ingestReply` so the user actually receives the response.
@@ -666,6 +669,7 @@ export class BusCoreImpl implements BusCore {
     this.inFlightDeliveries.clear();
     this.inFlightProof.clear();
     this.agentTurnActive.clear();
+    this.lastTurnEndMessageId.clear();
     this.originAmbiguous.clear();
     this.currentOperation.clear();
     this.correlationAmbiguous.clear();
@@ -1339,7 +1343,7 @@ export class BusCoreImpl implements BusCore {
   /**
    * Silent-drop safety net handler (issue #215). Wired by
    * `ingestSessionEvent`/JSONL tailer when it observes a `response.turn_end`
-   * with `stop_reason: "end_turn"`. If the agent ended the turn with
+   * (any terminal `stop_reason`, #401). If the agent ended the turn with
    * non-empty text but never called the `reply` tool for this prompt,
    * synthesize an `ingestReply` so the user actually receives the
    * response. Without this, the text sits in the session `.jsonl` and
@@ -1554,21 +1558,36 @@ export class BusCoreImpl implements BusCore {
       }
     }
     // Silent-drop safety net (#215): the JSONL tailer publishes a
-    // `response.turn_end` event when claude stops with `end_turn`. Hook
-    // into it before the generic publish so we can synthesize a
-    // delivery for turns that produced text but never called reply.
+    // `response.turn_end` event when claude stops for any terminal reason
+    // (`end_turn`, `max_tokens`, `stop_sequence`, … — #401). Hook into it
+    // before the generic publish so we can synthesize a delivery for turns
+    // that produced text but never called reply.
+    // #405: the CLI repeats the terminal stop_reason on every content-block
+    // line of a message, so one turn can end in two `turn_end` events (thinking
+    // line, then text line). Both feed the net — the text line is the one that
+    // matters there — but the operation slot is released once per MESSAGE: a
+    // second release for the same message id would free the slot of a prompt
+    // counted in between and stamp its events with no `promise_id`.
+    let releaseSlot = false;
     if (e.topic === "response.turn_end" && e.agent_id) {
-      const payload = e.payload as { text?: string };
+      const payload = e.payload as { text?: string; message_id?: string };
       this.handleTurnEnd(e.agent_id, payload?.text ?? "");
       // The turn ended → the REPL is free, so a prompt queued behind it can now
       // start; stop deferring its flush-verify (see agentTurnActive).
       this.agentTurnActive.delete(e.agent_id);
+      const id = payload?.message_id;
+      if (id && this.lastTurnEndMessageId.get(e.agent_id) === id) {
+        releaseSlot = false; // another line of the message that already released
+      } else {
+        releaseSlot = true;
+        if (id) this.lastTurnEndMessageId.set(e.agent_id, id);
+      }
     }
     this.publish(e);
     // Release the operation slot only AFTER `response.turn_end` has been
     // published: that event is the one a client most needs correlated, and
     // clearing alongside `agentTurnActive` above would strip it.
-    if (e.topic === "response.turn_end" && e.agent_id) this.releaseTurn(e.agent_id);
+    if (releaseSlot && e.agent_id) this.releaseTurn(e.agent_id);
   }
 
   /**
