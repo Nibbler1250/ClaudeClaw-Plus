@@ -476,6 +476,9 @@ export class BusCoreImpl implements BusCore {
    * sooner would double-submit), then re-delivers only if no turn ever starts.
    */
   private readonly agentTurnActive = new Set<string>();
+  /** #405: message id of the last `turn_end` that released the operation slot,
+   *  per agent — a later line of the same message must not release it again. */
+  private readonly lastTurnEndMessageId = new Map<string, string>();
   /**
    * Prompts that were outstanding (held in the delivery queue, or flushed and
    * awaiting turn-start verification) when an agent's socket closed — typically
@@ -666,6 +669,7 @@ export class BusCoreImpl implements BusCore {
     this.inFlightDeliveries.clear();
     this.inFlightProof.clear();
     this.agentTurnActive.clear();
+    this.lastTurnEndMessageId.clear();
     this.originAmbiguous.clear();
     this.currentOperation.clear();
     this.correlationAmbiguous.clear();
@@ -1558,18 +1562,32 @@ export class BusCoreImpl implements BusCore {
     // (`end_turn`, `max_tokens`, `stop_sequence`, … — #401). Hook into it
     // before the generic publish so we can synthesize a delivery for turns
     // that produced text but never called reply.
+    // #405: the CLI repeats the terminal stop_reason on every content-block
+    // line of a message, so one turn can end in two `turn_end` events (thinking
+    // line, then text line). Both feed the net — the text line is the one that
+    // matters there — but the operation slot is released once per MESSAGE: a
+    // second release for the same message id would free the slot of a prompt
+    // counted in between and stamp its events with no `promise_id`.
+    let releaseSlot = false;
     if (e.topic === "response.turn_end" && e.agent_id) {
-      const payload = e.payload as { text?: string };
+      const payload = e.payload as { text?: string; message_id?: string };
       this.handleTurnEnd(e.agent_id, payload?.text ?? "");
       // The turn ended → the REPL is free, so a prompt queued behind it can now
       // start; stop deferring its flush-verify (see agentTurnActive).
       this.agentTurnActive.delete(e.agent_id);
+      const id = payload?.message_id;
+      if (id && this.lastTurnEndMessageId.get(e.agent_id) === id) {
+        releaseSlot = false; // another line of the message that already released
+      } else {
+        releaseSlot = true;
+        if (id) this.lastTurnEndMessageId.set(e.agent_id, id);
+      }
     }
     this.publish(e);
     // Release the operation slot only AFTER `response.turn_end` has been
     // published: that event is the one a client most needs correlated, and
     // clearing alongside `agentTurnActive` above would strip it.
-    if (e.topic === "response.turn_end" && e.agent_id) this.releaseTurn(e.agent_id);
+    if (releaseSlot && e.agent_id) this.releaseTurn(e.agent_id);
   }
 
   /**

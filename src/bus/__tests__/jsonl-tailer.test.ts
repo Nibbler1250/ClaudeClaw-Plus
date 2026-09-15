@@ -490,6 +490,48 @@ describe("JsonlTailer — assistant lines", () => {
     expect(events.find((e) => e.topic === "response.turn_end")).toBeUndefined();
   });
 
+  it("tags each boundary line of a multi-line message with its message_id (#405)", async () => {
+    // Live shape on current CLIs: thinking line and text line, same message id,
+    // the terminal stop_reason repeated on both.
+    writeFileSync(
+      sessionPath,
+      jsonl(
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "msg_MULTI",
+            content: [{ type: "thinking", thinking: "…" }],
+            stop_reason: "end_turn",
+          },
+          timestamp: "2026-06-02T10:00:08.000Z",
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "msg_MULTI",
+            content: [{ type: "text", text: "the answer" }],
+            stop_reason: "end_turn",
+          },
+          timestamp: "2026-06-02T10:00:08.100Z",
+          sessionId: SESSION_ID,
+        },
+      ),
+    );
+    const { bus, events } = createMockBus();
+    tailer = makeTailer(bus);
+    await tailer.start();
+
+    const ends = events.filter((e) => e.topic === "response.turn_end");
+    expect(ends).toHaveLength(2);
+    const ids = ends.map((e) => (e.payload as { message_id?: string }).message_id);
+    expect(ids).toEqual(["msg_MULTI", "msg_MULTI"]);
+    // The text line still carries the text the #215 net needs.
+    expect((ends[1].payload as { text: string }).text).toBe("the answer");
+  });
+
   it("does NOT emit response.turn_end when stop_reason is pause_turn (server-tool turn resumes, #401)", async () => {
     writeFileSync(
       sessionPath,

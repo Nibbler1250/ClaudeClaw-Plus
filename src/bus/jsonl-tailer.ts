@@ -663,11 +663,17 @@ export class JsonlTailer {
             .map((b) => (b as { text?: string }).text ?? "")
             .join("\n")
             .trim();
+      // The CLI writes one line per content block and repeats the message's
+      // stop_reason on every line, so a thinking+text message yields TWO
+      // boundary lines for one turn. Each is still published (the text line is
+      // the one the #215 net needs), tagged with the message id so bus core
+      // releases the operation slot once per message, not once per line (#405).
       this.publish(
         "response.turn_end",
         {
           stop_reason: stopReason,
           text: turnText,
+          message_id: line.message?.id,
           ...(synthetic ? { synthetic: true } : {}),
         },
         line,
