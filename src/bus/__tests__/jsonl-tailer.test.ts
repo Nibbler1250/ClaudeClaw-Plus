@@ -357,6 +357,227 @@ describe("JsonlTailer — assistant lines", () => {
     expect(turnEnd).toBeUndefined();
   });
 
+  it("emits response.turn_end carrying the real stop_reason when the turn stops on max_tokens (#401)", async () => {
+    writeFileSync(
+      sessionPath,
+      jsonl({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          id: "msg_MT",
+          content: [{ type: "text", text: "A long answer that got cut" }],
+          stop_reason: "max_tokens",
+        },
+        timestamp: "2026-06-02T10:00:02.000Z",
+        sessionId: SESSION_ID,
+      }),
+    );
+    const { bus, events } = createMockBus();
+    tailer = makeTailer(bus);
+    await tailer.start();
+
+    const turnEnd = events.find((e) => e.topic === "response.turn_end");
+    expect(turnEnd).toBeDefined();
+    const payload = turnEnd?.payload as { stop_reason: string; text: string };
+    expect(payload.stop_reason).toBe("max_tokens");
+    expect(payload.text).toBe("A long answer that got cut");
+  });
+
+  it("emits response.turn_end when the turn stops on stop_sequence (#401)", async () => {
+    // Observed live: the CLI's synthetic error line ("Prompt is too long …")
+    // stops with `stop_sequence` and the next transcript line is the next
+    // prompt — the turn is over, and nothing else will terminate it.
+    writeFileSync(
+      sessionPath,
+      jsonl({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          id: "msg_SS",
+          content: [{ type: "text", text: "Prompt is too long" }],
+          stop_reason: "stop_sequence",
+        },
+        timestamp: "2026-06-02T10:00:03.000Z",
+        sessionId: SESSION_ID,
+      }),
+    );
+    const { bus, events } = createMockBus();
+    tailer = makeTailer(bus);
+    await tailer.start();
+
+    const turnEnd = events.find((e) => e.topic === "response.turn_end");
+    expect(turnEnd).toBeDefined();
+    expect((turnEnd?.payload as { stop_reason: string }).stop_reason).toBe("stop_sequence");
+  });
+
+  it("emits an empty-text response.turn_end for a synthetic API-error line, so the turn releases without a nudge (#401)", async () => {
+    // Live shape: the CLI writes `model: "<synthetic>"` + `isApiErrorMessage`
+    // for "Prompt is too long …" / "You've hit your session limit …", stopping
+    // with `stop_sequence`; the next transcript line is `last-prompt`.
+    writeFileSync(
+      sessionPath,
+      jsonl({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          id: "msg_ERR",
+          model: "<synthetic>",
+          content: [{ type: "text", text: "Prompt is too long · the request is ~3664273 tokens" }],
+          stop_reason: "stop_sequence",
+        },
+        isApiErrorMessage: true,
+        error: "invalid_request",
+        apiErrorStatus: "400",
+        timestamp: "2026-06-02T10:00:06.000Z",
+        sessionId: SESSION_ID,
+      }),
+    );
+    const { bus, events } = createMockBus();
+    tailer = makeTailer(bus);
+    await tailer.start();
+
+    const turnEnd = events.find((e) => e.topic === "response.turn_end");
+    expect(turnEnd).toBeDefined();
+    const payload = turnEnd?.payload as { stop_reason: string; text: string; synthetic?: boolean };
+    expect(payload.stop_reason).toBe("stop_sequence");
+    expect(payload.text).toBe(""); // never handed to the #215 synthesizer
+    expect(payload.synthetic).toBe(true);
+    // The error itself still reaches subscribers through its own topic — and
+    // BEFORE the boundary, so it is still stamped with the turn's promise_id
+    // when bus core releases the operation slot on turn_end.
+    const apiErrorAt = events.findIndex((e) => e.topic === "system.api_error");
+    const turnEndAt = events.findIndex((e) => e.topic === "response.turn_end");
+    expect(apiErrorAt).toBeGreaterThanOrEqual(0);
+    expect(apiErrorAt).toBeLessThan(turnEndAt);
+  });
+
+  it("does NOT emit response.turn_end for the synthetic 'No response requested.' placeholder (#401)", async () => {
+    // Live shape: an SDK-enqueued prompt produces a meta user line, then this
+    // placeholder, then the REAL user prompt ~90 ms later. It precedes the
+    // turn, so it must not terminate anything.
+    writeFileSync(
+      sessionPath,
+      jsonl(
+        {
+          type: "user",
+          isMeta: true,
+          message: {
+            role: "user",
+            content: [{ type: "text", text: "Continue from where you left off." }],
+          },
+          timestamp: "2026-06-02T10:00:07.000Z",
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "msg_NRR",
+            model: "<synthetic>",
+            content: [{ type: "text", text: "No response requested." }],
+            stop_reason: "stop_sequence",
+          },
+          isApiErrorMessage: false,
+          timestamp: "2026-06-02T10:00:07.050Z",
+          sessionId: SESSION_ID,
+        },
+      ),
+    );
+    const { bus, events } = createMockBus();
+    tailer = makeTailer(bus);
+    await tailer.start();
+
+    expect(events.find((e) => e.topic === "response.turn_end")).toBeUndefined();
+  });
+
+  it("tags each boundary line of a multi-line message with its message_id (#405)", async () => {
+    // Live shape on current CLIs: thinking line and text line, same message id,
+    // the terminal stop_reason repeated on both.
+    writeFileSync(
+      sessionPath,
+      jsonl(
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "msg_MULTI",
+            content: [{ type: "thinking", thinking: "…" }],
+            stop_reason: "end_turn",
+          },
+          timestamp: "2026-06-02T10:00:08.000Z",
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "msg_MULTI",
+            content: [{ type: "text", text: "the answer" }],
+            stop_reason: "end_turn",
+          },
+          timestamp: "2026-06-02T10:00:08.100Z",
+          sessionId: SESSION_ID,
+        },
+      ),
+    );
+    const { bus, events } = createMockBus();
+    tailer = makeTailer(bus);
+    await tailer.start();
+
+    const ends = events.filter((e) => e.topic === "response.turn_end");
+    expect(ends).toHaveLength(2);
+    const ids = ends.map((e) => (e.payload as { message_id?: string }).message_id);
+    expect(ids).toEqual(["msg_MULTI", "msg_MULTI"]);
+    // The text line still carries the text the #215 net needs.
+    expect((ends[1].payload as { text: string }).text).toBe("the answer");
+  });
+
+  it("does NOT emit response.turn_end when stop_reason is pause_turn (server-tool turn resumes, #401)", async () => {
+    writeFileSync(
+      sessionPath,
+      jsonl({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          id: "msg_PT",
+          content: [{ type: "text", text: "searching…" }],
+          stop_reason: "pause_turn",
+        },
+        timestamp: "2026-06-02T10:00:05.000Z",
+        sessionId: SESSION_ID,
+      }),
+    );
+    const { bus, events } = createMockBus();
+    tailer = makeTailer(bus);
+    await tailer.start();
+
+    expect(events.find((e) => e.topic === "response.turn_end")).toBeUndefined();
+  });
+
+  it("does NOT emit response.turn_end for a content-block line whose stop_reason is null (still streaming, #401)", async () => {
+    writeFileSync(
+      sessionPath,
+      jsonl({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          id: "msg_NULL",
+          content: [{ type: "text", text: "partial" }],
+          stop_reason: null,
+        },
+        timestamp: "2026-06-02T10:00:04.000Z",
+        sessionId: SESSION_ID,
+      }),
+    );
+    const { bus, events } = createMockBus();
+    tailer = makeTailer(bus);
+    await tailer.start();
+
+    expect(events.find((e) => e.topic === "response.turn_end")).toBeUndefined();
+    // The text block itself is still surfaced.
+    expect(events.find((e) => e.topic === "response.text")).toBeDefined();
+  });
+
   it("surfaces api_error fields as system.api_error", async () => {
     writeFileSync(
       sessionPath,
