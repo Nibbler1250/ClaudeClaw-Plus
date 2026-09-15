@@ -492,7 +492,7 @@ export class BusCoreImpl implements BusCore {
    * current turn has called the `reply` MCP tool with `intent: "final"`.
    * Reset on every new inbound prompt (`sendPrompt`), set to `true` when
    * an `intent: "final"` `ingestReply` lands. On `response.turn_end`
-   * (emitted by the JSONL tailer when `stop_reason === "end_turn"`), if
+   * (emitted by the JSONL tailer on any terminal `stop_reason`, #401), if
    * this is still `false` and the turn produced non-empty text, the
    * agent ended the turn without delivering — we synthesize an
    * `ingestReply` so the user actually receives the response.
@@ -1339,7 +1339,7 @@ export class BusCoreImpl implements BusCore {
   /**
    * Silent-drop safety net handler (issue #215). Wired by
    * `ingestSessionEvent`/JSONL tailer when it observes a `response.turn_end`
-   * with `stop_reason: "end_turn"`. If the agent ended the turn with
+   * (any terminal `stop_reason`, #401). If the agent ended the turn with
    * non-empty text but never called the `reply` tool for this prompt,
    * synthesize an `ingestReply` so the user actually receives the
    * response. Without this, the text sits in the session `.jsonl` and
@@ -1554,9 +1554,10 @@ export class BusCoreImpl implements BusCore {
       }
     }
     // Silent-drop safety net (#215): the JSONL tailer publishes a
-    // `response.turn_end` event when claude stops with `end_turn`. Hook
-    // into it before the generic publish so we can synthesize a
-    // delivery for turns that produced text but never called reply.
+    // `response.turn_end` event when claude stops for any terminal reason
+    // (`end_turn`, `max_tokens`, `stop_sequence`, … — #401). Hook into it
+    // before the generic publish so we can synthesize a delivery for turns
+    // that produced text but never called reply.
     if (e.topic === "response.turn_end" && e.agent_id) {
       const payload = e.payload as { text?: string };
       this.handleTurnEnd(e.agent_id, payload?.text ?? "");

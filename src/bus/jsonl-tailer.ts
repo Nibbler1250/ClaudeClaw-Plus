@@ -141,6 +141,32 @@ export interface JsonlTailerOptions {
   onTranscriptAlive?: () => void;
 }
 
+/** `message.model` on assistant lines the CLI writes itself (errors, placeholders). */
+const SYNTHETIC_MODEL = "<synthetic>";
+
+/**
+ * Stop reasons after which the CLI continues the same turn: `tool_use` (the
+ * model resumes after the tool result) and `pause_turn` (a server-tool turn
+ * the client resumes by sending the response back). Neither is a boundary.
+ */
+const CONTINUING_STOP_REASONS: ReadonlySet<string> = new Set(["tool_use", "pause_turn"]);
+
+/**
+ * A `stop_reason` that ends the turn. A `null`/`undefined` reason is a
+ * content-block line still streaming, and {@link CONTINUING_STOP_REASONS}
+ * resume the turn. Everything else the API can return (`end_turn`,
+ * `max_tokens`, `stop_sequence`, `refusal`, …) is terminal for the transcript:
+ * the CLI writes no further assistant line for that turn (#401). Observed live
+ * so far: `tool_use`, `end_turn`, `stop_sequence`.
+ */
+export function isTerminalStopReason(stopReason: unknown): stopReason is string {
+  return (
+    typeof stopReason === "string" &&
+    stopReason.length > 0 &&
+    !CONTINUING_STOP_REASONS.has(stopReason)
+  );
+}
+
 export class JsonlTailer {
   private readonly bus: BusCore;
   private readonly agent_id: string;
@@ -593,33 +619,59 @@ export class JsonlTailer {
     if (line.message?.usage) {
       this.publish("usage", line.message.usage, line);
     }
-    // Turn-boundary surfacing — when the API stops with `end_turn`, the
-    // agent has signalled "I'm done with this turn". Emit a single event
-    // carrying the concatenated text blocks of this turn so downstream
-    // subscribers (silent-drop safety net in bus core) can detect the
-    // pattern where the agent ended the turn with text but never called
-    // the `reply` tool to deliver it to the user. `tool_use` stop_reason
-    // means the agent intends to continue after a tool result, so we
-    // don't emit on those.
-    if (line.message?.stop_reason === "end_turn") {
-      const turnText = blocks
-        .filter((b) => b.type === "text")
-        .map((b) => (b as { text?: string }).text ?? "")
-        .join("\n")
-        .trim();
+    // Degraded-turn surfacing — §5.2 mentions `error` / `isApiErrorMessage` /
+    // `apiErrorStatus` on assistant lines. Forward as `system.api_error`.
+    // Published BEFORE the turn boundary below: bus core releases the
+    // operation slot on `response.turn_end`, and the error is the one event a
+    // client most needs stamped with the failed prompt's `promise_id` (#401).
+    if (line.error || line.isApiErrorMessage) {
+      this.publish("system.api_error", { error: line.error, status: line.apiErrorStatus }, line);
+    }
+    // Turn-boundary surfacing — when the API stops for any terminal reason
+    // (`end_turn`, but also `max_tokens`, `stop_sequence`, `refusal`, …) the
+    // turn is over: the CLI writes no further assistant line for it and the
+    // next line is the next prompt. Emit a single event carrying the real
+    // `stop_reason` and the concatenated text blocks of this turn so
+    // downstream subscribers (silent-drop safety net in bus core, the
+    // `agentTurnActive` flag, the operation slot, the reconciler) all see the
+    // terminator. `tool_use`/`pause_turn` mean the turn resumes after the
+    // tool result, and a missing/null stop_reason is a partial line still
+    // streaming, so none of those is a turn boundary (#401 — previously only
+    // `end_turn` was surfaced, and a turn stopping on any other reason left
+    // `agentTurnActive` set until the next clean turn).
+    //
+    // Synthetic lines (`model: "<synthetic>"`) are written by the CLI, not the
+    // API, and all stop with `stop_sequence`. Two kinds, both observed live:
+    //  - an API error ("Prompt is too long …", "You've hit your session limit …",
+    //    `isApiErrorMessage: true`): the turn IS over — surface the boundary so
+    //    the flag and the operation slot release, but with empty text, so the
+    //    #215 net neither nudges an agent that cannot answer nor ships the raw
+    //    error string as a reply (the error is already published as
+    //    `system.api_error` above);
+    //  - a placeholder ("No response requested.", no error) that the CLI writes
+    //    for an SDK-enqueued prompt BEFORE that prompt's real turn starts: not a
+    //    boundary at all — emitting one would nudge the agent and free the slot
+    //    while the real turn is about to begin, so it is skipped as before.
+    const stopReason = line.message?.stop_reason;
+    const synthetic = line.message?.model === SYNTHETIC_MODEL;
+    const apiError = Boolean(line.error || line.isApiErrorMessage);
+    if (isTerminalStopReason(stopReason) && (!synthetic || apiError)) {
+      const turnText = synthetic
+        ? ""
+        : blocks
+            .filter((b) => b.type === "text")
+            .map((b) => (b as { text?: string }).text ?? "")
+            .join("\n")
+            .trim();
       this.publish(
         "response.turn_end",
         {
-          stop_reason: "end_turn",
+          stop_reason: stopReason,
           text: turnText,
+          ...(synthetic ? { synthetic: true } : {}),
         },
         line,
       );
-    }
-    // Degraded-turn surfacing — §5.2 mentions `error` / `isApiErrorMessage` /
-    // `apiErrorStatus` on assistant lines. Forward as `system.api_error`.
-    if (line.error || line.isApiErrorMessage) {
-      this.publish("system.api_error", { error: line.error, status: line.apiErrorStatus }, line);
     }
   }
 
