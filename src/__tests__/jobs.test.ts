@@ -234,6 +234,25 @@ describe("Phase 18 Plan 02: resolveJobModel cascade to agent defaultModel", () =
 });
 
 describe("Phase 18: loadJobs invalid model rejection", () => {
+  it("skips a flat-dir job with an invalid model and logs error (#378)", async () => {
+    const name = uniq("flatbad");
+    await writeFlatJob(name, "schedule: 0 9 * * *\nrecurring: true\nmodel: sonet");
+    const errSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const jobs = await loadJobs();
+      expect(jobs.find((j) => j.name === name)).toBeUndefined();
+      const line = errSpy.mock.calls
+        .map((c) => String(c[0] ?? ""))
+        .find((l) => l.includes(`Skipping job ${name}`));
+      expect(line).toBeDefined();
+      // The reason is the point of the change: the value and the allowed list.
+      expect(line).toContain(`Invalid model "sonet" in job file`);
+      expect(line).toContain("Allowed: opus, sonnet, haiku, glm");
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
   it("skips agent job with invalid model and logs error; valid sibling still loads", async () => {
     const agent = uniq("badmodel");
     await writeAgentJob(agent, "bad", "schedule: 0 9 * * *\nrecurring: true\nmodel: opuz");
