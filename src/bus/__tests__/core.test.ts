@@ -3708,3 +3708,42 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     });
   });
 });
+
+describe("busyAgents (#315)", () => {
+  it("is empty on a fresh bus and reports an agent whose turn is active", async () => {
+    const bus = createBusCore({ eventLogAppend: createMockEventLog().append }) as unknown as {
+      busyAgents: () => string[];
+      activeTurnAgents: () => string[];
+      ingestReply: (r: { agent_id: string; text: string; intent: string }) => void;
+    };
+    expect(bus.busyAgents()).toEqual([]);
+  });
+
+  it("covers the delivery states a turn-active flag does not: in-flight, queued, held, carried, verifying", () => {
+    const bus = createBusCore({ eventLogAppend: createMockEventLog().append }) as unknown as {
+      busyAgents: () => string[];
+      activeTurnAgents: () => string[];
+      inFlightDeliveries: Map<string, number>;
+      deliveryQueue: Map<string, string[]>;
+      compactionHeld: Map<string, Map<string, unknown>>;
+      pendingRedelivery: Map<string, string[]>;
+      flushVerify: Map<string, Map<string, { redelivered?: boolean }>>;
+      agentTurnActive: Set<string>;
+      pendingTurns: Map<string, number>;
+    };
+    bus.inFlightDeliveries.set("a", 1);
+    bus.deliveryQueue.set("b", ["<channel>x</channel>"]);
+    bus.compactionHeld.set("c", new Map([["k", {}]]));
+    bus.pendingRedelivery.set("d", ["<channel>y</channel>"]);
+    bus.flushVerify.set("e", new Map([["k", { redelivered: false }]]));
+    // an entry that already spent its one re-delivery is a marker, not work
+    bus.flushVerify.set("f", new Map([["k", { redelivered: true }]]));
+    bus.inFlightDeliveries.set("g", 0);
+    bus.agentTurnActive.add("h");
+    // accepted by sendPrompt, turn neither started in the transcript nor ended
+    bus.pendingTurns.set("i", 1);
+    bus.pendingTurns.set("j", 0);
+    expect(bus.activeTurnAgents()).toEqual(["h"]);
+    expect(bus.busyAgents().sort()).toEqual(["a", "b", "c", "d", "e", "h", "i"]);
+  });
+});

@@ -1,7 +1,13 @@
 import { writeFile, unlink, readdir, readFile } from "fs/promises";
 import { join } from "path";
 import { homedir } from "os";
-import { getPidPath, cleanupPidFile } from "../pid";
+import {
+  getPidPath,
+  cleanupPidFile,
+  waitForPidExit,
+  stopGraceMs,
+  readConfiguredDrainMs,
+} from "../pid";
 import { getSession } from "../sessions";
 import { loadSettings, type SecurityConfig } from "../config";
 import { getMemoryPath } from "../memory";
@@ -79,7 +85,37 @@ export async function stop() {
 
   try {
     process.kill(Number(pid), "SIGTERM");
-    console.log(`Stopped daemon (PID ${pid}).`);
+    // #315: the daemon drains its in-flight turns before exiting. Until it
+    // is gone it still owns the bus socket and the agents, so it is not
+    // "stopped" and its PID file must stay (a `start` meanwhile would launch
+    // a second daemon on the same resources). Wait for it; force it past
+    // the drain window, as a service manager would.
+    const graceMs = stopGraceMs(await readConfiguredDrainMs(process.cwd()));
+    console.log(
+      `Sent SIGTERM to daemon (PID ${pid}); waiting up to ${Math.round(graceMs / 1000)}s for it to finish in-flight turns...`,
+    );
+    if (await waitForPidExit(Number(pid), graceMs)) {
+      console.log(`Stopped daemon (PID ${pid}).`);
+    } else {
+      console.log(
+        `Daemon (PID ${pid}) still alive after ${Math.round(graceMs / 1000)}s — sending SIGKILL.`,
+      );
+      try {
+        process.kill(Number(pid), "SIGKILL");
+      } catch {
+        /* gone in between */
+      }
+      if (!(await waitForPidExit(Number(pid), 2000))) {
+        // Still there after SIGKILL (uninterruptible sleep, zombie without a
+        // reaper): it may still own the socket and the agents, so its PID
+        // file stays — removing it would let a replacement start on top.
+        console.log(
+          `Daemon (PID ${pid}) did not exit after SIGKILL — leaving ${pidFile} in place; check the process before starting another daemon.`,
+        );
+        await teardownStatusline();
+        process.exit(1);
+      }
+    }
   } catch {
     console.log(`Daemon process ${pid} already dead.`);
   }
@@ -122,10 +158,29 @@ export async function stopAll() {
     found++;
     try {
       process.kill(Number(pid), "SIGTERM");
-      console.log(`\x1b[33m■ Stopped\x1b[0m PID ${pid} — ${projectPath}`);
-      try {
-        await unlink(pidFile);
-      } catch {}
+      // #315: same as `stop` — the daemon drains before it exits; its PID
+      // file goes only once it is gone. Each project's own settings.json
+      // says how long its drain may take.
+      const graceMs = stopGraceMs(await readConfiguredDrainMs(projectPath));
+      let gone = await waitForPidExit(Number(pid), graceMs);
+      if (gone) {
+        console.log(`\x1b[33m■ Stopped\x1b[0m PID ${pid} — ${projectPath}`);
+      } else {
+        try {
+          process.kill(Number(pid), "SIGKILL");
+        } catch {}
+        gone = await waitForPidExit(Number(pid), 2000);
+        console.log(
+          gone
+            ? `\x1b[33m■ Killed\x1b[0m PID ${pid} — ${projectPath} (still alive after ${Math.round(graceMs / 1000)}s)`
+            : `\x1b[31m✗ Still alive after SIGKILL\x1b[0m PID ${pid} — ${projectPath} (PID file left in place)`,
+        );
+      }
+      if (gone) {
+        try {
+          await unlink(pidFile);
+        } catch {}
+      }
     } catch {
       console.log(`\x1b[31m✗ Failed to stop\x1b[0m PID ${pid} — ${projectPath}`);
     }
