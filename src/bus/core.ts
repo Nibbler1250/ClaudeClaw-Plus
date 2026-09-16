@@ -276,6 +276,8 @@ export interface BusCore {
   isAgentTurnActive(agentId: string): boolean;
   /** #315: ids of all agents with an in-flight turn (aggregate of {@link isAgentTurnActive}). */
   activeTurnAgents(): string[];
+  /** #315: agents with a turn in flight OR a prompt the bus still owes the model. */
+  busyAgents?(): string[];
   ingestReply(req: IngestReplyRequest): void;
   ingestSessionEvent(e: BusEvent): void;
   ingestPermissionDecision(req: IngestPermissionDecisionRequest): void;
@@ -1636,6 +1638,37 @@ export class BusCoreImpl implements BusCore {
 
   activeTurnAgents(): string[] {
     return [...this.agentTurnActive];
+  }
+
+  /**
+   * Agents a restart would cost something (#315): a turn in flight, or a
+   * prompt the bus still owes the model — a delivery whose user line is not
+   * in the transcript yet, one queued behind an initialising session, one
+   * held through a compaction, one carried over a socket close, or one whose
+   * turn-start is still being verified (an entry that already spent its one
+   * re-delivery is a marker, not pending work) — or a prompt accepted whose
+   * turn has not started nor ended yet (`pendingTurns`). `activeTurnAgents()`
+   * is the subset the dashboard shows; this is what the shutdown drain waits on.
+   */
+  busyAgents(): string[] {
+    const busy = new Set<string>(this.agentTurnActive);
+    // A prompt accepted by sendPrompt whose turn has neither started in the
+    // transcript nor ended: the window between the PTY delivery settling and
+    // the JSONL `prompt` line being ingested (Copilot on the PR).
+    for (const [agent, n] of this.pendingTurns) if (n > 0) busy.add(agent);
+    for (const [agent, n] of this.inFlightDeliveries) if (n > 0) busy.add(agent);
+    for (const [agent, q] of this.deliveryQueue) if (q.length > 0) busy.add(agent);
+    for (const [agent, held] of this.compactionHeld) if (held.size > 0) busy.add(agent);
+    for (const [agent, carried] of this.pendingRedelivery) if (carried.length > 0) busy.add(agent);
+    for (const [agent, pending] of this.flushVerify) {
+      for (const entry of pending.values()) {
+        if (!entry.redelivered) {
+          busy.add(agent);
+          break;
+        }
+      }
+    }
+    return [...busy];
   }
 
   /* ─────────────────────────────── subscriptions ─────────────────────────────── */

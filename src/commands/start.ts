@@ -28,8 +28,16 @@ import { cronMatches, nextCronMatch } from "../cron";
 import { clearJobSchedule, loadJobs, resolveJobModel, snapshotJobFrontmatter } from "../jobs";
 import { migrateLegacyAgentJobs } from "../migrations";
 import { ensureUserSymlinks } from "../install";
-import { writePidFile, cleanupPidFile, checkExistingDaemon } from "../pid";
 import {
+  writePidFile,
+  cleanupPidFile,
+  checkExistingDaemon,
+  waitForPidExit,
+  stopGraceMs,
+  readConfiguredDrainMs,
+} from "../pid";
+import {
+  getSettings,
   initConfig,
   loadSettings,
   reloadSettings,
@@ -37,6 +45,7 @@ import {
   type HeartbeatConfig,
   type Settings,
 } from "../config";
+import { DEFAULT_DRAIN_TURNS_MS, drainActiveTurns } from "../bus/shutdown-drain";
 import { getDayAndMinuteAtOffset, buildClockPromptPrefix } from "../timezone";
 import { isHeartbeatExcludedAt, isHeartbeatExcludedNow } from "../heartbeat-windows";
 import { startWebUi, type WebServerHandle } from "../web";
@@ -359,13 +368,31 @@ export async function start(args: string[] = []) {
       // ignore if process is already dead
     }
 
-    const deadline = Date.now() + 4000;
-    while (Date.now() < deadline) {
+    // #315: the old daemon drains its in-flight turns before it exits and
+    // owns the bus socket + agents until then. Starting the replacement
+    // after a fixed 4s would run two daemons on the same resources for the
+    // rest of the drain. Wait for its drain window (+ teardown margin), then
+    // force it, as a service manager would.
+    // Settings are loaded further down; the old daemon's drain window is
+    // read straight from this project's settings.json.
+    const graceMs = stopGraceMs(await readConfiguredDrainMs(process.cwd()));
+    console.log(
+      `Waiting up to ${Math.round(graceMs / 1000)}s for PID ${existingPid} to finish its in-flight turns...`,
+    );
+    if (!(await waitForPidExit(existingPid, graceMs))) {
+      console.log(
+        `PID ${existingPid} still alive after ${Math.round(graceMs / 1000)}s — sending SIGKILL.`,
+      );
       try {
-        process.kill(existingPid, 0);
-        await Bun.sleep(100);
+        process.kill(existingPid, "SIGKILL");
       } catch {
-        break;
+        // gone in between
+      }
+      if (!(await waitForPidExit(existingPid, 2000))) {
+        console.error(
+          `\x1b[31mAborted: PID ${existingPid} did not exit after SIGKILL — it may still own the bus socket and the agents.\x1b[0m`,
+        );
+        process.exit(1);
       }
     }
 
@@ -622,7 +649,46 @@ export async function start(args: string[] = []) {
 
   let mcpProxyStarted: Promise<void> = Promise.resolve();
 
+  let shuttingDown = false;
+  let abortDrain = false;
   async function shutdown() {
+    // A second SIGTERM/SIGINT does not start a second teardown: it aborts the
+    // drain below so the first one proceeds at once (Ctrl-C twice in a
+    // terminal, or an operator who does not want to wait).
+    if (shuttingDown) {
+      abortDrain = true;
+      return;
+    }
+    shuttingDown = true;
+    // #315: let the bus finish what it owes the model (bounded) BEFORE any
+    // adapter or the bus goes away — a restart mid-turn used to drop the
+    // reply silently. Nothing here may prevent the teardown that follows.
+    if (busCoreForWebUi) {
+      const bus = busCoreForWebUi;
+      try {
+        // `getSettings()` follows the hot reload and is safe before
+        // `currentSettings` is initialised (a SIGTERM during boot).
+        let drainMs = DEFAULT_DRAIN_TURNS_MS;
+        try {
+          drainMs = getSettings().shutdown.drainTurnsMs;
+        } catch {
+          /* settings not loaded yet — keep the default */
+        }
+        await drainActiveTurns(drainMs, {
+          busyAgents: () => (bus.busyAgents ? bus.busyAgents() : bus.activeTurnAgents()),
+          onTurnEnd: (handler) => {
+            const sub = bus.subscribe({ topics: ["response.turn_end"] }, (event) =>
+              handler(event.agent_id),
+            );
+            return () => sub.close();
+          },
+          shouldAbort: () => abortDrain,
+          log: (line) => console.log(`[${ts()}] ${line}`),
+        });
+      } catch (err) {
+        console.error(`[${ts()}] [shutdown] drain failed (continuing with teardown):`, err);
+      }
+    }
     await mcpProxyStarted.catch(() => {}); // drain start() before stop() clears server map
     await getMcpProxyPlugin().stop();
     await pluginManager.stopServices();

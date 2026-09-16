@@ -213,6 +213,10 @@ const DEFAULT_SETTINGS: Settings = {
   },
   sessionTimeoutMs: DEFAULT_SESSION_TIMEOUT_MS,
   timeouts: { telegram: 5, discord: 5, heartbeat: 15, job: 30, default: 5 },
+  // #315: on SIGTERM, wait this long for active agent turns to finish before
+  // stopping (0 = stop at once, the pre-#315 behaviour). Keep it below your
+  // service manager's stop timeout (systemd TimeoutStopSec defaults to 90s).
+  shutdown: { drainTurnsMs: 30_000 },
   pty: {
     // Opt-in by default. Operators flip this to true ONLY after the MCP
     // multiplexer follow-up lands and they've validated OAuth refresh on a
@@ -564,6 +568,12 @@ export interface McpConfig {
   };
 }
 
+/** #315: graceful drain on shutdown. */
+export interface ShutdownConfig {
+  /** Max time to wait for in-flight agent turns on SIGTERM/SIGINT; 0 disables. */
+  drainTurnsMs: number;
+}
+
 export interface PtyConfig {
   /** Master switch. When false (default), runner uses today's `claude -p` path
    *  for every callsite. Operators flip to true ONLY after the MCP multiplexer
@@ -697,6 +707,8 @@ export interface Settings {
   apiToken?: string;
   sessionTimeoutMs: number;
   timeouts: TimeoutsConfig;
+  /** #315: bounded wait for active turns before the daemon stops. */
+  shutdown: ShutdownConfig;
   /**
    * Daemon runtime selector. Defaults to `"bus"` (event-bus + per-agent
    * processes, multi-channel routing, MCP multiplexer) — subscription-billed
@@ -1106,6 +1118,12 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
         Number.isFinite(raw.timeouts?.default) && Number(raw.timeouts.default) > 0
           ? Number(raw.timeouts.default)
           : 5,
+    },
+    shutdown: {
+      drainTurnsMs:
+        Number.isFinite(raw.shutdown?.drainTurnsMs) && Number(raw.shutdown.drainTurnsMs) >= 0
+          ? Number(raw.shutdown.drainTurnsMs)
+          : 30_000,
     },
     pty: {
       enabled: raw.pty?.enabled === true, // default false — opt-in (see DEFAULT_SETTINGS.pty)
