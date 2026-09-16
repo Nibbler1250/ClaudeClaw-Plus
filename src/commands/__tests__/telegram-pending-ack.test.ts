@@ -2,6 +2,7 @@ import { describe, it, expect } from "bun:test";
 import {
   ackForAlready,
   ackForResolution,
+  decisionStripsKeyboard,
   parseResolverVerdict,
   redactResolverDiagnostics,
   describeResolverFailure,
@@ -150,6 +151,34 @@ describe("ackForResolution", () => {
     expect(ackForResolution("[pending] Telegram edit error: HTTP 429\nok", "approve")).toBe(
       "✅ Approuvé",
     );
+  });
+});
+
+describe("decisionStripsKeyboard (#375)", () => {
+  it("strips once a decision closed the action", () => {
+    expect(decisionStripsKeyboard("ok", "approve")).toBe(true);
+    expect(decisionStripsKeyboard("ok", "reject")).toBe(true);
+    expect(decisionStripsKeyboard("ok", "discuss")).toBe(true);
+    expect(decisionStripsKeyboard("ok", "something-the-resolver-accepted")).toBe(true);
+  });
+
+  it("strips when the buttons point at nothing (already resolved, unknown id)", () => {
+    expect(decisionStripsKeyboard("already", "approve")).toBe(true);
+    expect(decisionStripsKeyboard("not_found", "approve")).toBe(true);
+  });
+
+  it("keeps the keyboard for every value the classifier reads as informational or postponed", () => {
+    // `details` leaves the action pending on purpose and `skip` keeps its
+    // keyboard for a later tap; the other values share their ack class, and a
+    // resolver that treats them as terminal strips the keyboard itself.
+    expect(decisionStripsKeyboard("ok", "details")).toBe(false);
+    expect(decisionStripsKeyboard("ok", "DETAILS")).toBe(false);
+    expect(decisionStripsKeyboard("ok", "skip")).toBe(false);
+    expect(decisionStripsKeyboard("ok", "later")).toBe(false);
+  });
+
+  it("never edits when the resolver gave no verdict", () => {
+    expect(decisionStripsKeyboard("no_answer", "approve")).toBe(false);
   });
 });
 

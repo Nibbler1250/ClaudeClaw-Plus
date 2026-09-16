@@ -1880,6 +1880,39 @@ export function classifyDecision(decision: string): AckKind {
   return "unknown";
 }
 
+/**
+ * Whether a tap should take the inline keyboard away from the action's
+ * message (#375). Editing the message strips the keyboard, so it must happen
+ * only once the action is no longer waiting on the operator:
+ *
+ * - a verdict other than `ok` (`already`, `not_found`) means the action is
+ *   resolved or gone — the buttons point at nothing, strip them;
+ * - `ok` on a decision that closes the action (approve, reject, discuss, or an
+ *   unknown one the resolver accepted) — strip;
+ * - `ok` on `details` — the resolver deliberately leaves the action `pending`
+ *   so the buttons stay usable; stripping them would strand it: still pending
+ *   in the store, nothing re-sends it (the flush path only covers actions with
+ *   no message id, the reminder path only `skipped`);
+ * - `ok` on `skip` — the resolver keeps the keyboard on purpose so the
+ *   operator can tap again later; an edit afterwards would remove it.
+ *
+ * The vocabulary is `classifyDecision`'s, shared with the ack text: every
+ * value it reads as informational or postponed keeps its keyboard here. A
+ * resolver that treats one of those as terminal strips the keyboard itself
+ * when it records the decision, so nothing is left dangling either way; the
+ * one direction that would strand an action — a value the resolver leaves
+ * pending but the classifier reads as a decision — has no instance.
+ *
+ * `no_answer` never edits: the ack asks the operator to retry and must not
+ * delete the buttons it points them at.
+ */
+export function decisionStripsKeyboard(verdict: ResolverVerdict, decision: string): boolean {
+  if (verdict === "no_answer") return false;
+  if (verdict !== "ok") return true;
+  const kind = classifyDecision(decision);
+  return kind !== "informational" && kind !== "postponed";
+}
+
 export function ackForAlready(resolution: string): string {
   const rest = resolution.slice("already:".length);
   const sep = rest.indexOf(":");
@@ -2109,10 +2142,12 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
             `[Telegram] pending resolver reported no verdict for action ${actionId} (${how}): ${why}`,
           );
         }
-        // Edit the original message to record the decision — but only once we
-        // know one was taken. Editing strips the keyboard, and an ack that asks
-        // the user to retry must not delete the buttons it is pointing them at.
-        if (query.message && verdict !== "no_answer") {
+        // Edit the original message to record the decision — but only once the
+        // action is no longer waiting on the operator (#375). Editing strips the
+        // keyboard: an ack that asks the user to retry must not delete the
+        // buttons it points them at, and neither must `details` (the action
+        // stays pending) or `skip` (the resolver re-sent its own keyboard).
+        if (query.message && decisionStripsKeyboard(verdict, decision)) {
           const originalText = query.message.text ?? "";
           await callApi(config.token, "editMessageText", {
             chat_id: query.message.chat.id,
