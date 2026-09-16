@@ -809,10 +809,21 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
 
           const encoder = new TextEncoder();
           const onChat = opts.onChat;
+          // #390: the browser can drop the stream while the turn is still
+          // running (abort, tab closed, new message). Every write after that
+          // used to throw `Invalid state: Controller is already closed` out of
+          // the chunk callback and then again from the `finally` close. Track
+          // the closed state and make `send`/close no-ops once it is set.
+          let closed = false;
           const stream = new ReadableStream({
             async start(controller) {
               const send = (data: object) => {
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+                if (closed) return;
+                try {
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+                } catch {
+                  closed = true;
+                }
               };
               try {
                 await onChat(
@@ -832,7 +843,14 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
                 console.error("Chat stream error:", err);
                 send({ type: "error", message: "An internal error occurred" });
               } finally {
-                controller.close();
+                if (!closed) {
+                  closed = true;
+                  try {
+                    controller.close();
+                  } catch {
+                    /* the consumer cancelled between the check and the close */
+                  }
+                }
                 // Fire-and-forget cleanup of temp image files
                 for (const p of tempImagePaths) {
                   Bun.file(p)
@@ -845,6 +863,9 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
                     .catch(() => {});
                 }
               }
+            },
+            cancel() {
+              closed = true;
             },
           });
 
