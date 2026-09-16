@@ -148,6 +148,15 @@ export interface JsonlTailerOptions {
    * wiring, or it degrades every agent whose transcript is unreachable.
    */
   onTranscriptAlive?: () => void;
+  /**
+   * Called for EVERY newline-terminated line read, parseable or not (#383).
+   * Lets the process tell a transcript that is slow from one that is gone:
+   * after `/clear` the CLI writes to a NEW file, this tailer keeps watching
+   * the old one, and nothing ever arrives again — so a confirmation armed
+   * once by `onTranscriptAlive` would trust a transcript that no longer
+   * speaks for this process.
+   */
+  onTranscriptLine?: () => void;
 }
 
 /** `message.model` on assistant lines the CLI writes itself (errors, placeholders). */
@@ -187,6 +196,7 @@ export class JsonlTailer {
   private readonly onError: (err: unknown, ctx?: Record<string, unknown>) => void;
   private readonly onPromptIngested?: (ingestion: PromptIngestion) => void;
   private readonly onTranscriptAlive?: () => void;
+  private readonly onTranscriptLine?: () => void;
   private sawAnyLine = false;
   private readonly filePath: string;
   private readonly startAt: "begin" | "end";
@@ -227,6 +237,7 @@ export class JsonlTailer {
     this.startAt = opts.startAt ?? "begin";
     this.onPromptIngested = opts.onPromptIngested;
     this.onTranscriptAlive = opts.onTranscriptAlive;
+    this.onTranscriptLine = opts.onTranscriptLine;
     this.filePath = join(
       this.projectsDir,
       encodeCwdForProjectsDir(this.cwd),
@@ -408,6 +419,15 @@ export class JsonlTailer {
     while ((nl = this.buffer.indexOf("\n")) >= 0) {
       const raw = this.buffer.slice(0, nl);
       this.buffer = this.buffer.slice(nl + 1);
+      // #383: the transcript is being written to — that is the fact the
+      // process needs, and it holds for a blank line or one the parser rejects
+      // as much as for a record it accepts. Counted here, before any filtering
+      // or parsing, so neither can make a live transcript look rotated away.
+      try {
+        this.onTranscriptLine?.();
+      } catch (err) {
+        this.onError(err, { where: "onTranscriptLine", agent_id: this.agent_id });
+      }
       if (raw.length === 0) continue;
       this.handleRawLine(raw);
     }

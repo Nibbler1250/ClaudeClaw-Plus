@@ -919,6 +919,9 @@ export class SessionManager {
         // resumed session: historical prompts are never replayed, so this can
         // only ever fire for a prompt typed by this process.
         onPromptIngested: (ingestion) => confirmable.notePromptIngested?.(ingestion),
+        // #383: every line, so the process can tell a transcript that went
+        // quiet for good (rotated away by `/clear`) from one that is slow.
+        onTranscriptLine: () => confirmable.noteTranscriptActivity?.(),
         // Only once a line has actually been read does the process stop
         // trusting a post-compaction repaint. Enabling it at wiring time would
         // strand any agent whose transcript path does not resolve: the strict
