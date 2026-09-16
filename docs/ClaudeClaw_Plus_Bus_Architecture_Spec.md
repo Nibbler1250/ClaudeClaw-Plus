@@ -213,8 +213,8 @@ Both capabilities are mandatory (validated empirically in Spike 0.1 against aero
 - Claude Code receives the notification and treats it as a new turn in the conversation.
 
 **Outbound (from Claude → Plus Bus core):**
-- The MCP server exposes a `reply` tool with schema `{message: string, metadata?: { intent?: 'final' | 'progress' | 'tool_status' }}`.
-- When Claude calls `reply`, the MCP server forwards to the Bus core: `{type: 'reply', text, agent_id, intent}`.
+- The MCP server exposes a `reply` tool with schema `{message: string, metadata?: { intent?: 'final' | 'progress' | 'tool_status', in_reply_to?: string | number }}`. `in_reply_to` is the `chat_id` / `origin_id` of the `<channel …>` block the reply answers (#224); a number is stringified by the MCP server. The core honours it only for a chat that has prompted the agent, and deduplicates finals per chat the reply is routed to (named, or the last-prompt slot when unnamed).
+- When Claude calls `reply`, the MCP server forwards to the Bus core: `{type: 'reply', text, agent_id, intent, in_reply_to?}`.
 - The MCP server exposes an `ask` tool with schema `{question: string}` → returns `{ask_id: string}` immediately. The agent loop continues running other tools / thinking while waiting; the answer arrives asynchronously as a Bus event referencing the same `ask_id`. This matches aerolalit's reference plugin and is required for parity with the official Telegram channel plugin (§9 GA migration).
 - `request_human` — synchronous clarifying-question tool (blocks the agent loop until a reply arrives). Use sparingly; prefer `ask` for non-blocking flows.
 - `cancel` — graceful turn termination.

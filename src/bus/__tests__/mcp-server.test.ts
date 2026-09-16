@@ -303,6 +303,34 @@ describe("BusMcpServer — outbound tools", () => {
     expect(reply.intent).toBe("progress");
   });
 
+  it("`reply` tool forwards metadata.in_reply_to on the IpcReply (#224)", async () => {
+    await h.client.callTool({
+      name: "reply",
+      arguments: { message: "for chat A", metadata: { intent: "final", in_reply_to: "100" } },
+    });
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.in_reply_to).toBe("100");
+  });
+
+  it("`reply` tool omits in_reply_to when the agent did not set it", async () => {
+    await h.client.callTool({ name: "reply", arguments: { message: "x" } });
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect("in_reply_to" in reply).toBe(false);
+  });
+
+  it("`reply` tool accepts a numeric in_reply_to and forwards it as a string (#224)", async () => {
+    const result = await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", metadata: { in_reply_to: -1001234567890 } },
+    });
+    expect(result.isError).toBeFalsy();
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.in_reply_to).toBe("-1001234567890");
+  });
+
   it("`edit_message` tool emits IpcEditMessage", async () => {
     const result = await h.client.callTool({
       name: "edit_message",

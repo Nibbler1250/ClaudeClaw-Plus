@@ -314,6 +314,9 @@ export interface IpcReply {
   agent_id: string;
   text: string;
   intent: "final" | "progress" | "tool_status";
+  /** #224: the `chat_id` of the `<channel>` block this reply answers (its
+   *  `origin_id`). The bus honours it only for a chat that prompted the agent. */
+  in_reply_to?: string;
 }
 
 /**
