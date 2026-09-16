@@ -15,7 +15,11 @@ export const BUS_MCP_TOOLS = [
     description:
       "Send a reply to the originating surface (Discord/Telegram/Slack/Web UI). " +
       "Use `intent: 'final'` for the turn-final message, `'progress'` for streaming " +
-      "updates, `'tool_status'` for tool-execution notes.",
+      "updates, `'tool_status'` for tool-execution notes. " +
+      "When several chats talk to you, set `metadata.in_reply_to` to the `chat_id` " +
+      "(or `origin_id`) attribute of the <channel …> block you are answering, so the " +
+      "reply reaches that chat and not whichever one wrote last. One `final` per chat " +
+      "you answer; a second `final` to the same chat in one turn is dropped.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -24,6 +28,12 @@ export const BUS_MCP_TOOLS = [
           type: "object",
           properties: {
             intent: { type: "string", enum: ["final", "progress", "tool_status"] },
+            in_reply_to: {
+              type: ["string", "number"],
+              description:
+                "The chat_id (or origin_id) attribute of the <channel …> block this reply answers. " +
+                "Only chats that actually prompted you are honoured.",
+            },
           },
         },
       },
