@@ -43,6 +43,7 @@ import {
 import { createSession } from "../sessions";
 import type { BusCore } from "./core";
 import { JsonlTailer } from "./jsonl-tailer";
+import { confirmTurnReceipt } from "./receipt-wiring";
 import { capturePostMortem, type PostMortemOptions } from "./post-mortem";
 import type { ReceiptRecord } from "./receipt";
 import {
@@ -1010,6 +1011,8 @@ export class SessionManager {
         // resumed session: historical prompts are never replayed, so this can
         // only ever fire for a prompt typed by this process.
         onPromptIngested: (ingestion) => confirmable.notePromptIngested?.(ingestion),
+        // #212: the tailer saw the boundary — record its proof on the receipt.
+        onTurnObserved: (observation) => void confirmTurnReceipt(observation),
         // #383: every line, so the process can tell a transcript that went
         // quiet for good (rotated away by `/clear`) from one that is slow.
         onTranscriptLine: () => confirmable.noteTranscriptActivity?.(),

@@ -7,6 +7,7 @@
  * without booting the full bus runtime.
  */
 import { getDefaultReceiptStore, hashPrompt, type OpenReceipt, type ReceiptStore } from "./receipt";
+import type { TurnObservation } from "./jsonl-line-types";
 import type { BusOrigin, PromptDeliveryOutcome } from "./types";
 
 /**
@@ -63,6 +64,28 @@ export function openInboundReceipt(params: OpenInboundReceiptParams): OpenReceip
 
 /** Structural view of the bits an `AgentProcess` exposes that we touch.
  *  Declared here so the helper doesn't drag in `session-agent-process.ts`. */
+/**
+ * #212: tailer → receipt seam. The tailer hands over the prompt text as the CLI
+ * recorded it — the `<channel …>` wrapper the bus added around the surface's
+ * text — so the hash is taken on the unwrapped inner text, the same key the
+ * adapter opened the receipt with and the PTY seam patches it by.
+ * Synthetic boundaries (a CLI-written API error) are not a model turn and are
+ * not recorded as one. Never throws: the tailer must keep going.
+ */
+export function confirmTurnReceipt(
+  observation: TurnObservation,
+  store: ReceiptStore = getDefaultReceiptStore(),
+): Promise<"patched" | "side-table" | "unknown" | "skipped"> {
+  if (observation.synthetic) return Promise.resolve("skipped");
+  return store
+    .confirmTurn(hashPrompt(unwrapChannelText(observation.promptText)), {
+      claude_jsonl_path: observation.jsonlPath,
+      turn_event_offset: observation.offset,
+      message_id: observation.messageId,
+    })
+    .catch(() => "unknown" as const);
+}
+
 export interface AgentProcessLike {
   readonly pid: number;
   send_prompt_stream?(line: string): Promise<PromptDeliveryOutcome | void>;
