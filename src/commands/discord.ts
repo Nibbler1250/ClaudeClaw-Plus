@@ -25,6 +25,7 @@ import { normalizeDiscordMessage, type NormalizedEvent } from "../gateway/normal
 import type { EventRecord } from "../event-log";
 import type { GatewayRunResult } from "../event-processor";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
+import { encodeCwdForProjectsDir } from "../bus/jsonl-line-types";
 
 // --- Discord API constants ---
 
@@ -1475,7 +1476,7 @@ async function handleInteractionCreate(
         return;
       }
       const home = homedir();
-      const projectSlug = process.cwd().replace(/\//g, "-");
+      const projectSlug = encodeCwdForProjectsDir(process.cwd()); // #368
       const jsonlPath = `${home}/.claude/projects/${projectSlug}/${session.sessionId}.jsonl`;
       if (!existsSync(jsonlPath)) {
         await respondToInteraction(interaction, { content: "Conversation file not found." });

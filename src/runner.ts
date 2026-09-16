@@ -72,6 +72,7 @@ import { selectModel } from "./model-router";
 import { recordResult, abortReason, clearSession, startSession } from "./watchdog";
 import { getPluginManager, type EventContext } from "./plugins";
 import { runOnPty, killAllPtys, supervisorEntryCount } from "./runner/pty-supervisor";
+import { encodeCwdForProjectsDir } from "./bus/jsonl-line-types";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
 
@@ -2823,7 +2824,7 @@ const CLAUDE_SESSIONS_DIR = join(
   process.env.HOME ?? "/root",
   ".claude",
   "projects",
-  PROJECT_DIR.replace(/\//g, "-"),
+  encodeCwdForProjectsDir(PROJECT_DIR), // #368: the CLI's rule, not `/`-only
 );
 
 const FORK_SYSTEM_PROMPT = [
