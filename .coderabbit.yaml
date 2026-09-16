@@ -1,0 +1,35 @@
+# CodeRabbit on the fork's review mirrors (Nibbler1250/ClaudeClaw-Plus).
+# The mirror PR is the SDC's automated-review stage: one review per PR, on the
+# final commit, as demanding as the tool allows. Free plan = 1 review per hour,
+# so nothing here asks for more than that.
+language: en-US
+reviews:
+  profile: assertive
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: true
+  auto_review:
+    enabled: true
+    drafts: true
+    base_branches:
+      - sdc-base
+  path_filters:
+    - "src/**"
+    - "!src/**/__tests__/**"
+    - "!docs/**"
+    - "!.claude-plugin/**"
+  path_instructions:
+    - path: "src/bus/**"
+      instructions: >-
+        Delivery, session and compaction lifecycle code. Look for double
+        submission of a prompt, lost prompts, timers or maps that outlive the
+        session they were armed for, and state keyed by agent id that a
+        replacement process could inherit. Cite the exact sequence of events.
+    - path: "src/**"
+      instructions: >-
+        Report only defects you can state as a concrete sequence of inputs and
+        the wrong outcome. Skip style, naming and comment wording.
+chat:
+  auto_reply: false
