@@ -296,6 +296,24 @@ export function encodeCwdForProjectsDirPrefix(root: string): string {
  * cannot tell a fresh ingestion from a late event for an earlier delivery of
  * the identical string, and the bus re-delivers verbatim on flush-verify.
  */
+/**
+ * A turn boundary the tailer observed for a prompt it had ingested (#212).
+ * `jsonlPath` + `offset` locate the boundary line in the transcript: the proof
+ * a receipt records as `claude_jsonl_path` / `turn_event_offset`.
+ */
+export interface TurnObservation {
+  /** The top-level prompt text the boundary belongs to (as the CLI recorded it). */
+  promptText: string;
+  promptId?: string;
+  jsonlPath: string;
+  /** Byte offset of the boundary line in `jsonlPath`. */
+  offset: number;
+  messageId?: string;
+  stopReason: string;
+  /** A CLI-written synthetic boundary (API error), not a model turn. */
+  synthetic: boolean;
+}
+
 export interface PromptIngestion {
   text: string;
   /**
