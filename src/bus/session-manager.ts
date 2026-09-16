@@ -471,6 +471,19 @@ export function resolveClaudeclawPluginRoot(): string {
  * without delaying happy-path spawns by more than a second.
  */
 const DEFAULT_COLLISION_DETECT_MS = 2000;
+/**
+ * #326: how long the collision detector keeps listening after a NON-ZERO exit
+ * whose marker has not been seen yet. `onData` and `onExit` ride two
+ * independent PTY channels (a read loop and a wait loop), so under load the
+ * exit can be delivered ahead of the process's own last output; concluding
+ * "no collision" at that instant is what made the rotation tests flake. Only
+ * a boot crash without the marker pays this (a real collision resolves the
+ * moment its marker lands), and it is capped by the remaining window.
+ */
+const COLLISION_EXIT_DRAIN_MS = 250;
+/** Rolling window the collision marker is matched against — wide enough for
+ *  the marker line plus the escape codes the TUI wraps it in. */
+const COLLISION_MARKER_WINDOW_CHARS = 400;
 /** Issue #393: an exit this soon after spawn is a boot failure (claude never
  *  reached the REPL — auth, a dialog it could not pass, a broken install), and
  *  the exit log line names it as one instead of leaving it to be inferred. */
@@ -502,14 +515,38 @@ const SESSION_COLLISION_PATTERN = /Session ID [0-9a-fA-F-]{8,} is already in use
  * exit. Resolves false for: alive past the window, clean exit, exit
  * without the marker.
  */
-function detectSessionIdCollision(proc: AgentProcess, windowMs: number): Promise<boolean> {
+export function detectSessionIdCollision(
+  proc: Pick<AgentProcess, "onData" | "onExit" | "recentOutputTail">,
+  windowMs: number,
+  exitDrainMs: number = COLLISION_EXIT_DRAIN_MS,
+): Promise<boolean> {
   if (windowMs <= 0) return Promise.resolve(false);
   return new Promise((resolve) => {
+    const startedAt = Date.now();
     let resolved = false;
-    let markerSeen = false;
+    let exitedNonZero = false;
+    // Both timers are declared before any handler can run: `onExit` REPLAYS a
+    // past exit synchronously at registration (#393), so `finish` may execute
+    // inside the `proc.onExit(...)` call below.
+    let windowTimer: ReturnType<typeof setTimeout> | null = null;
+    let drainTimer: ReturnType<typeof setTimeout> | null = null;
+    // Output that landed before this detector attached is not replayed by
+    // `onData`; the process keeps its own tail. A marker already on screen at
+    // attach time (the child printed and exited before the spawn `await`
+    // resumed — the ordering a loaded host produces) counts as seen.
+    const tailHasMarker = () => {
+      const tail = proc.recentOutputTail?.();
+      return tail !== undefined && SESSION_COLLISION_PATTERN.test(tail);
+    };
+    let markerSeen = tailHasMarker();
+    // The marker can straddle two PTY chunks (Copilot on the PR): match on a
+    // rolling window of recent output, never on one chunk alone.
+    let recent = "";
     const finish = (value: boolean) => {
       if (resolved) return;
       resolved = true;
+      if (windowTimer) clearTimeout(windowTimer);
+      if (drainTimer) clearTimeout(drainTimer);
       resolve(value);
     };
     proc.onData((chunk) => {
@@ -520,14 +557,34 @@ function detectSessionIdCollision(proc: AgentProcess, windowMs: number): Promise
       // keeps the regex from running on every PTY chunk after the
       // detection window closes.
       if (resolved) return;
-      if (!markerSeen && SESSION_COLLISION_PATTERN.test(chunk)) {
+      recent = (recent + chunk).slice(-COLLISION_MARKER_WINDOW_CHARS);
+      if (!markerSeen && SESSION_COLLISION_PATTERN.test(recent)) {
         markerSeen = true;
+        // The exit already came in ahead of this chunk (#326): the verdict
+        // was only waiting for it.
+        if (exitedNonZero) finish(true);
       }
     });
     proc.onExit((code) => {
-      finish(markerSeen && code !== 0);
+      if (code === 0) {
+        finish(false);
+        return;
+      }
+      // The marker may have reached the process's tail without passing
+      // through our `onData` (delivered before we attached).
+      if (!markerSeen && tailHasMarker()) markerSeen = true;
+      if (markerSeen) {
+        finish(true);
+        return;
+      }
+      // Non-zero exit, marker not seen YET: its last output may still be in
+      // flight on the data channel. Hold the verdict for a short drain,
+      // bounded by the window that is left.
+      exitedNonZero = true;
+      const remaining = Math.max(0, windowMs - (Date.now() - startedAt));
+      drainTimer = setTimeout(() => finish(false), Math.min(exitDrainMs, remaining));
     });
-    setTimeout(() => finish(false), windowMs);
+    if (!resolved) windowTimer = setTimeout(() => finish(false), windowMs);
   });
 }
 
@@ -770,10 +827,11 @@ export class SessionManager {
     // during the detection window for a non-collision reason (auth
     // error, missing config, claude crash) and we register after the
     // await, our `proc.onExit` handler is pushed onto a handler array
-    // whose owning proc has already exited — `PtyAgentProcess.onExit` /
-    // `ChildAgentProcess.onExit` are push-only and don't replay past
-    // exits. The cleanup never fires, leaving a dead entry in
-    // `this.agents` that breaks the next `already spawned` guard.
+    // whose owning proc has already exited. (Since #393 `onExit` replays a
+    // past exit synchronously at registration, so this ordering is also a
+    // correctness guard for the detector below, which may resolve inside
+    // its own `onExit` call.) Registering after the await used to leave a
+    // dead entry in `this.agents` that broke the next `already spawned` guard.
     const record: AgentRecord = {
       agent,
       origin,
@@ -783,6 +841,11 @@ export class SessionManager {
       spawnedAt: Date.now(),
     };
     this.agents.set(agent.id, record);
+    // The collision detector's verdict for this spawn, once it is armed below.
+    // The exit log reads it so that "collision" is said by ONE judge (#326):
+    // deciding from the screen tail at the instant of the exit mis-described a
+    // collision whose marker was still in flight as "nothing was printed".
+    let collisionVerdict: Promise<boolean> | null = null;
     // Auto-cleanup: drop registry entry on exit so restart() can reuse the id.
     proc.onExit((code) => {
       const current = this.agents.get(agent.id);
@@ -795,24 +858,36 @@ export class SessionManager {
         // `stopping` first, so its exits stay quiet.
         if (!current.stopping) {
           const uptimeMs = Date.now() - current.spawnedAt;
-          const tailFn = (proc as AgentProcess).recentOutputTail;
-          const tail = tailFn ? tailFn.call(proc) : undefined;
-          const verdict =
-            tail !== undefined && SESSION_COLLISION_PATTERN.test(tail)
+          const verdictPromise = collisionVerdict;
+          void (async () => {
+            // Wait for the detector (it drains a non-zero exit for its marker,
+            // #326) so the line quotes the screen the verdict was made on.
+            const tailFn = (proc as AgentProcess).recentOutputTail;
+            const tail = tailFn ? tailFn.call(proc) : undefined;
+            // One judge: when the detector ran, its verdict is the verdict —
+            // a marker-like line in the tail after a clean exit or an expired
+            // window must not make the log disagree with the spawn path
+            // (Copilot on the PR). The tail decides only when no detector was
+            // armed (the exit replayed before it, or the window is 0).
+            const collision = verdictPromise
+              ? await verdictPromise
+              : tail !== undefined && SESSION_COLLISION_PATTERN.test(tail);
+            const verdict = collision
               ? retry === 0
                 ? " — session-id collision; the spawn is retried with a fresh id"
                 : " — session-id collision persisted after rotation"
               : uptimeMs < BOOT_FAILURE_WINDOW_MS
                 ? " — exited during boot; treat as a startup failure"
                 : "";
-          const quoted =
-            tail === undefined
-              ? "    (no output captured in this supervision mode)"
-              : tail || "    (nothing was printed)";
-          (this.options.logger ?? console).warn(
-            `[bus-session] agent=${agent.id} pid=${proc.pid} exited outside stop(): ` +
-              `code=${code} uptime=${(uptimeMs / 1000).toFixed(1)}s${verdict}. Last output:\n${quoted}`,
-          );
+            const quoted =
+              tail === undefined
+                ? "    (no output captured in this supervision mode)"
+                : tail || "    (nothing was printed)";
+            (this.options.logger ?? console).warn(
+              `[bus-session] agent=${agent.id} pid=${proc.pid} exited outside stop(): ` +
+                `code=${code} uptime=${(uptimeMs / 1000).toFixed(1)}s${verdict}. Last output:\n${quoted}`,
+            );
+          })();
         }
         // Issue #215: tear down the session tailer on natural exit too.
         void current.tailer?.stop();
@@ -843,7 +918,8 @@ export class SessionManager {
     const collisionWindow =
       this.options.sessionCollisionDetectMs ??
       (this.options.argsOverride !== undefined ? 0 : DEFAULT_COLLISION_DETECT_MS);
-    const collision = await detectSessionIdCollision(proc, collisionWindow);
+    collisionVerdict = detectSessionIdCollision(proc, collisionWindow);
+    const collision = await collisionVerdict;
     if (collision && retry === 0) {
       const fresh = randomUUID();
       (this.options.logger ?? console).warn(

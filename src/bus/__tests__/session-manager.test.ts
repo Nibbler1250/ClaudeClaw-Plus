@@ -30,6 +30,7 @@ import type { ReceiptRecord } from "../receipt";
 import {
   buildClaudeArgs,
   defaultSupervisionFor,
+  detectSessionIdCollision,
   resolveAgentCwd,
   SessionManager,
   type AgentProcess,
@@ -774,15 +775,13 @@ describe("session-id collision rotation", () => {
       // THAT EXITS WITHIN IT — the sibling at the top of this describe keeps
       // 500ms deliberately, because its retry stand-in `sleep 60`s and so
       // burns the whole window; do not "fix the inconsistency" by raising it.
-      // `detectSessionIdCollision` resolves as soon as `proc.onExit` fires,
-      // so a fast stand-in still finishes in ~ms and the suite pays nothing.
+      // `detectSessionIdCollision` resolves on `proc.onExit` — at once when
+      // the exit is clean or the marker is already seen, after a short drain
+      // (250ms, #326) when a non-zero exit arrives ahead of its own marker.
       // Observed: at 300ms these tests flaked under the CPU contention of
       // concurrently running test files; at 2000ms they passed 10/10 in
-      // isolation and across repeated full-suite runs.
-      // NOT claimed: that the window is the only race here. The detector
-      // also depends on the marker chunk arriving before `onExit`
-      // (session-manager.ts:421-435), which no window size fixes. If these
-      // flake again, suspect that ordering rather than raising the bound.
+      // isolation and across repeated full-suite runs. The remaining flake
+      // was the marker/exit ordering, closed in #326 (drain + output tail).
       sessionCollisionDetectMs: 2000,
       persistRotatedSessionId: async () => {},
       logger: {
@@ -797,9 +796,11 @@ describe("session-id collision rotation", () => {
     );
     // Issue #393: both collision exits are logged, and the verdict tells the
     // first (retried) from the second (given up on) — `retry` is per spawn.
-    const exits = warned.filter(
-      (l) => l.includes("agent=rot-loop") && l.includes("exited outside stop()"),
-    );
+    // The line is written once the detector has spoken (#326), so poll.
+    const exitLines = () =>
+      warned.filter((l) => l.includes("agent=rot-loop") && l.includes("exited outside stop()"));
+    await waitFor(() => exitLines().length === 2);
+    const exits = exitLines();
     expect(exits).toHaveLength(2);
     expect(exits[0]).toContain("retried with a fresh id");
     expect(exits[1]).toContain("collision persisted after rotation");
@@ -818,15 +819,13 @@ describe("session-id collision rotation", () => {
       // THAT EXITS WITHIN IT — the sibling at the top of this describe keeps
       // 500ms deliberately, because its retry stand-in `sleep 60`s and so
       // burns the whole window; do not "fix the inconsistency" by raising it.
-      // `detectSessionIdCollision` resolves as soon as `proc.onExit` fires,
-      // so a fast stand-in still finishes in ~ms and the suite pays nothing.
+      // `detectSessionIdCollision` resolves on `proc.onExit` — at once when
+      // the exit is clean or the marker is already seen, after a short drain
+      // (250ms, #326) when a non-zero exit arrives ahead of its own marker.
       // Observed: at 300ms these tests flaked under the CPU contention of
       // concurrently running test files; at 2000ms they passed 10/10 in
-      // isolation and across repeated full-suite runs.
-      // NOT claimed: that the window is the only race here. The detector
-      // also depends on the marker chunk arriving before `onExit`
-      // (session-manager.ts:421-435), which no window size fixes. If these
-      // flake again, suspect that ordering rather than raising the bound.
+      // isolation and across repeated full-suite runs. The remaining flake
+      // was the marker/exit ordering, closed in #326 (drain + output tail).
       sessionCollisionDetectMs: 2000,
       persistRotatedSessionId: async (agentId, sessionId) => {
         persisted.push({ agentId, sessionId });
@@ -857,15 +856,13 @@ describe("session-id collision rotation", () => {
       // THAT EXITS WITHIN IT — the sibling at the top of this describe keeps
       // 500ms deliberately, because its retry stand-in `sleep 60`s and so
       // burns the whole window; do not "fix the inconsistency" by raising it.
-      // `detectSessionIdCollision` resolves as soon as `proc.onExit` fires,
-      // so a fast stand-in still finishes in ~ms and the suite pays nothing.
+      // `detectSessionIdCollision` resolves on `proc.onExit` — at once when
+      // the exit is clean or the marker is already seen, after a short drain
+      // (250ms, #326) when a non-zero exit arrives ahead of its own marker.
       // Observed: at 300ms these tests flaked under the CPU contention of
       // concurrently running test files; at 2000ms they passed 10/10 in
-      // isolation and across repeated full-suite runs.
-      // NOT claimed: that the window is the only race here. The detector
-      // also depends on the marker chunk arriving before `onExit`
-      // (session-manager.ts:421-435), which no window size fixes. If these
-      // flake again, suspect that ordering rather than raising the bound.
+      // isolation and across repeated full-suite runs. The remaining flake
+      // was the marker/exit ordering, closed in #326 (drain + output tail).
       sessionCollisionDetectMs: 2000,
       logger: { warn: () => {}, info: () => {}, error: () => {} },
     });
@@ -1062,5 +1059,112 @@ describe("exit outside stop() is logged with code, uptime and the last output (i
     await exited;
     await new Promise((r) => setTimeout(r, 50));
     expect(warned.filter((l) => l.includes("[bus-session] agent=stopped-on-purpose"))).toEqual([]);
+  });
+});
+
+// #326: the marker chunk and the exit ride two independent PTY channels; the
+// exit may arrive first. These drive the detector with a scripted stand-in so
+// the ordering is chosen, not left to the scheduler.
+describe("detectSessionIdCollision — exit ahead of its own output (#326)", () => {
+  function scripted(opts: { tail?: string; replayExit?: number } = {}) {
+    const data: Array<(c: string) => void> = [];
+    const exit: Array<(code: number) => void> = [];
+    return {
+      proc: {
+        onData: (h: (c: string) => void) => {
+          data.push(h);
+        },
+        onExit: (h: (code: number) => void) => {
+          exit.push(h);
+          // #393: a past exit is replayed synchronously at registration.
+          if (opts.replayExit !== undefined) h(opts.replayExit);
+        },
+        recentOutputTail: opts.tail === undefined ? undefined : () => opts.tail as string,
+      },
+      emitData: (c: string) => {
+        for (const h of data) h(c);
+      },
+      emitExit: (code: number) => {
+        for (const h of exit) h(code);
+      },
+    };
+  }
+  const MARKER = "Error: Session ID 99999999-9999-9999-9999-999999999bad is already in use.\n";
+  // Timing is asserted through the DRAIN ARGUMENT, never the wall clock: a
+  // verdict that comes back with a 10s drain still pending proves it was the
+  // marker (or the exit) that resolved it, whatever the scheduler did.
+  const NEVER = 10_000;
+  const settled = (p: Promise<boolean>, ms = 1500) =>
+    Promise.race([p, new Promise<"pending">((r) => setTimeout(() => r("pending"), ms))]);
+
+  it("marker then non-zero exit → collision (the ordering the detector always handled)", async () => {
+    const s = scripted();
+    const verdict = detectSessionIdCollision(s.proc, 20_000, NEVER);
+    s.emitData(MARKER);
+    s.emitExit(1);
+    expect(await settled(verdict)).toBe(true);
+  });
+
+  it("non-zero exit then the marker inside the drain → collision, resolved on the marker", async () => {
+    const s = scripted();
+    const verdict = detectSessionIdCollision(s.proc, 20_000, NEVER);
+    s.emitExit(1);
+    setTimeout(() => s.emitData(MARKER), 20);
+    expect(await settled(verdict)).toBe(true);
+  });
+
+  it("non-zero exit with no marker at all → no collision once the drain ends", async () => {
+    const s = scripted();
+    const verdict = detectSessionIdCollision(s.proc, 20_000, 30);
+    s.emitExit(1);
+    expect(await settled(verdict)).toBe(false);
+  });
+
+  it("clean exit → no collision at once, even if a marker-like line follows", async () => {
+    const s = scripted();
+    const verdict = detectSessionIdCollision(s.proc, 20_000, NEVER);
+    s.emitExit(0);
+    s.emitData(MARKER);
+    expect(await settled(verdict)).toBe(false);
+  });
+
+  it("the drain never outlives the detection window", async () => {
+    const s = scripted();
+    const verdict = detectSessionIdCollision(s.proc, 60, NEVER);
+    setTimeout(() => s.emitExit(1), 10);
+    expect(await settled(verdict)).toBe(false);
+  });
+
+  it("marker AND exit both delivered before attach: the process's tail carries the marker", async () => {
+    // The loaded-host ordering: the child printed and died before the spawn
+    // `await` resumed. `onData` cannot replay the chunk; `onExit` replays the
+    // code; the tail is the only place the marker still exists.
+    const s = scripted({ tail: `boot noise\n${MARKER}`, replayExit: 1 });
+    expect(await settled(detectSessionIdCollision(s.proc, 20_000, NEVER))).toBe(true);
+  });
+
+  it("a replayed clean exit at attach resolves false immediately (no TDZ, no hang)", async () => {
+    const s = scripted({ replayExit: 0 });
+    expect(await settled(detectSessionIdCollision(s.proc, 20_000, NEVER))).toBe(false);
+  });
+
+  it("a replayed crash at attach with no marker anywhere → false after the drain", async () => {
+    const s = scripted({ tail: "segfault\n", replayExit: 1 });
+    expect(await settled(detectSessionIdCollision(s.proc, 20_000, 30))).toBe(false);
+  });
+
+  it("a marker split across two chunks after the exit still counts (rolling window, not per chunk)", async () => {
+    const s = scripted();
+    const verdict = detectSessionIdCollision(s.proc, 20_000, NEVER);
+    s.emitExit(1);
+    const cut = MARKER.indexOf("is already");
+    s.emitData(MARKER.slice(0, cut));
+    setTimeout(() => s.emitData(MARKER.slice(cut)), 10);
+    expect(await settled(verdict)).toBe(true);
+  });
+
+  it("windowMs 0 short-circuits to false", async () => {
+    const s = scripted();
+    expect(await detectSessionIdCollision(s.proc, 0)).toBe(false);
   });
 });

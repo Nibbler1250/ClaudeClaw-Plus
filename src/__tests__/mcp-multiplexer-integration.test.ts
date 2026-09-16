@@ -795,6 +795,7 @@ describe("mcp-multiplexer integration — the sweep and the replay path coexist"
       touch: async () => {},
       loadAll: async () => [],
       garbageCollect: async () => ({ scanned: 0, kept: 0, dropped: 0 }),
+      flush: async () => ({ settled: 0, failed: 0 }),
       drop: async () => {},
     };
     plugin = new McpMultiplexerPlugin({
@@ -1086,6 +1087,7 @@ describe("mcp-multiplexer integration — onsessionclosed is throw-proof", () =>
       touch: async () => {},
       loadAll: async () => [],
       garbageCollect: async () => ({ scanned: 0, kept: 0, dropped: 0 }),
+      flush: async () => ({ settled: 0, failed: 0 }),
       // The one that matters: a SYNCHRONOUS throw, not a rejected promise.
       // `drop()` is `async` today, so the `.catch()` in the callback always
       // attaches and this shape is unreachable — that is the point. The
