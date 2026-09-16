@@ -61,6 +61,7 @@ import {
 import { createThreadSession, removeThreadSession } from "../sessionManager";
 import { readdir } from "fs/promises";
 import { homedir } from "os";
+import { encodeCwdForProjectsDir } from "../bus/jsonl-line-types";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Environment & guards.
@@ -245,11 +246,11 @@ afterAll(async () => {
   }
 });
 
-// Slugify the cwd the same way Claude Code does for its JSONL directory.
-// Claude Code replaces both '/' and '.' with '-' to build the project dir
-// name under ~/.claude/projects/.
+// Slugify the cwd the same way Claude Code does for its JSONL directory —
+// through the one encoder production uses (#368), so this helper cannot pass
+// while production resolves to a directory that does not exist.
 function cwdSlug(cwd: string): string {
-  return cwd.replace(/[/.]/g, "-");
+  return encodeCwdForProjectsDir(cwd);
 }
 
 // Discover the session UUID Claude allocated for the current cwd. Returns the

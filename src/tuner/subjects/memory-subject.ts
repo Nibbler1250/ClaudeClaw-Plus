@@ -9,7 +9,8 @@ import {
   appendFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, resolve, sep } from "node:path";
+import { dirname, resolve, sep } from "node:path";
+import { encodeCwdForProjectsDir } from "../../bus/jsonl-line-types.js";
 import { BaseSubject } from "../../skills-tuner/subjects/base.js";
 import { sanitizeObservationContent } from "../../skills-tuner/core/security.js";
 import type { LLMClient } from "../../skills-tuner/core/llm.js";
@@ -43,13 +44,14 @@ const MEMORY_MAX_DEAD_RATIO = 0.05;
 /** Only treat index GROWTH as degradation once the index is genuinely sizable. */
 const MEMORY_SIZE_FLOOR = 18_000;
 
-/** Derive Claude Code's per-user memory index location.
- * Mirrors Claude Code's pattern: `~/.claude/projects/-home-<basename>/memory/MEMORY.md`.
+/** Derive Claude Code's per-user memory index location:
+ * `~/.claude/projects/<encoded $HOME>/memory/MEMORY.md`, through the one
+ * encoder the CLI's rule is implemented by (#368) — a hand-rolled
+ * `-home-<basename>` was wrong for any HOME outside `/home/<alnum>`.
  */
 function defaultMemoryIndex(): string {
   const home = homedir();
-  const slug = `-home-${basename(home)}`;
-  return `${home}/.claude/projects/${slug}/memory/MEMORY.md`;
+  return `${home}/.claude/projects/${encodeCwdForProjectsDir(home)}/memory/MEMORY.md`;
 }
 
 const MAX_INDEX_LINES = 200;

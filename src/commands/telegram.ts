@@ -33,6 +33,7 @@ import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wi
 import { markdownToTelegramHtml } from "../adapters/telegram/format";
 import type { EventRecord } from "../event-log";
 import type { GatewayRunResult } from "../event-processor";
+import { encodeCwdForProjectsDir } from "../bus/jsonl-line-types";
 
 // --- Outbox sandbox for send-file / voice directives ---
 
@@ -1196,7 +1197,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       return;
     }
     const home = homedir();
-    const projectSlug = process.cwd().replace(/\//g, "-");
+    const projectSlug = encodeCwdForProjectsDir(process.cwd()); // #368
     const jsonlPath = `${home}/.claude/projects/${projectSlug}/${session.sessionId}.jsonl`;
     if (!existsSync(jsonlPath)) {
       await sendMessage(config.token, chatId, "Conversation file not found.", threadId);

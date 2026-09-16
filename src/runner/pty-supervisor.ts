@@ -275,7 +275,8 @@ let _isSessionResumable: (cwd: string, sessionId: string) => Promise<boolean> = 
     const { homedir } = await import("node:os");
     const { resolve: resolvePath } = await import("node:path");
     const { existsSync } = await import("node:fs");
-    const mangled = resolvePath(cwd).replace(/\//g, "-");
+    const { encodeCwdForProjectsDir } = await import("../bus/jsonl-line-types");
+    const mangled = encodeCwdForProjectsDir(resolvePath(cwd)); // #368
     const jsonlPath = resolvePath(homedir(), ".claude", "projects", mangled, `${sessionId}.jsonl`);
     return existsSync(jsonlPath);
   } catch {
@@ -297,7 +298,8 @@ export function injectIsSessionResumable(
         const { homedir } = await import("node:os");
         const { resolve: resolvePath } = await import("node:path");
         const { existsSync } = await import("node:fs");
-        const mangled = resolvePath(cwd).replace(/\//g, "-");
+        const { encodeCwdForProjectsDir } = await import("../bus/jsonl-line-types");
+        const mangled = encodeCwdForProjectsDir(resolvePath(cwd)); // #368
         const jsonlPath = resolvePath(
           homedir(),
           ".claude",
