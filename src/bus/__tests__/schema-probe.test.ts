@@ -38,6 +38,7 @@ import {
   SchemaProbeFailure,
   SCHEMA_VERSION,
 } from "../schema-probe";
+import { encodeCwdForProjectsDirPrefix } from "../jsonl-line-types";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
 
@@ -343,6 +344,23 @@ describe("encodeCwd", () => {
   it("is independent of the platform argument", () => {
     const cwd = "/home/simon/a.b_c";
     expect(encodeCwd(cwd, "win32")).toBe(encodeCwd(cwd, "linux"));
+  });
+
+  // Prefix consumers (`encodeProjectDir` in the tuner scope, matched with
+  // `startsWith` against real directory names) need the form WITHOUT the hash:
+  // past 200 characters a root and each of its children carry different
+  // hashes, so the root's full name is a prefix of none of them.
+  it("prefix form: a long root still prefixes its own dir and its children's", () => {
+    const rootCwd = `/tmp/${"d".repeat(200)}`;
+    const prefix = encodeCwdForProjectsDirPrefix(rootCwd);
+    expect(prefix).toHaveLength(200);
+    expect(encodeCwd(rootCwd).startsWith(prefix)).toBe(true);
+    expect(encodeCwd(`${rootCwd}/child/project`).startsWith(prefix)).toBe(true);
+    // The full (hashed) name is NOT a usable prefix — the defect Copilot flagged.
+    expect(encodeCwd(`${rootCwd}/child/project`).startsWith(encodeCwd(rootCwd))).toBe(false);
+    // Under 200 characters both forms coincide.
+    expect(encodeCwdForProjectsDirPrefix("/home/user/agent")).toBe(encodeCwd("/home/user/agent"));
+    expect(encodeCwd("/home/user/agent/skills").startsWith("-home-user-agent")).toBe(true);
   });
 });
 
