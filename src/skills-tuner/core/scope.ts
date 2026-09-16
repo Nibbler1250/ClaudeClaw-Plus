@@ -36,7 +36,7 @@ import type {
   TelemetryProvider,
   TelemetryStream,
 } from "./telemetry.js";
-import { encodeCwdForProjectsDir } from "../../bus/jsonl-line-types";
+import { encodeCwdForProjectsDirPrefix } from "../../bus/jsonl-line-types";
 
 export const SCOPES = ["all", "agent"] as const;
 export type Scope = (typeof SCOPES)[number];
@@ -91,11 +91,12 @@ export interface AgentSurface {
  * Claude Code encodes a project cwd into a `~/.claude/projects` dir name —
  * every non-alphanumeric character becomes `-` (e.g. `/home/user/agent` →
  * `-home-user-agent`), hashed past 200 chars. We match dir-name PREFIXES with
- * this, so a deeper agent cwd still resolves under its root. Delegates to the
- * one encoder the tailer uses (#368) rather than carrying its own copy.
+ * this, so a deeper agent cwd still resolves under its root — hence the
+ * prefix form of the shared encoder (#368): the hash suffix differs between a
+ * root and its children, the first 200 characters do not.
  */
 export function encodeProjectDir(absPath: string): string {
-  return encodeCwdForProjectsDir(absPath);
+  return encodeCwdForProjectsDirPrefix(absPath);
 }
 
 /**

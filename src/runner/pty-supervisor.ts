@@ -261,9 +261,11 @@ let _newSessionId: () => string = () => crypto.randomUUID();
  * sessionId is a phantom (eager pre-allocation from a PTY whose first
  * turn failed) and `--resume` will exit 1 with "No conversation found".
  *
- * The mangling rule: replace each `/` in the absolute path with `-`. So
- * `/home/claw/project` → `-home-claw-project`. claude does this in its
- * own filesystem layout and we match it.
+ * The mangling rule is the one `encodeCwdForProjectsDir` implements (#368):
+ * every non-alphanumeric character becomes `-`, and a name past 200
+ * characters is truncated and suffixed with a hash of the original cwd.
+ * `/home/claw/project` → `-home-claw-project`. claude does this in its own
+ * filesystem layout and we match it through that one encoder.
  *
  * Injectable so tests can stub the filesystem layer.
  */

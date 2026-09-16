@@ -278,6 +278,18 @@ export function encodeCwdForProjectsDir(
 }
 
 /**
+ * The part of a projects-dir name that every cwd at or below `root` shares —
+ * for callers that match directory names by PREFIX (`startsWith`) rather than
+ * look one up. It is the encoding WITHOUT the hash suffix: past 200 characters
+ * a root and each of its children get different hashes, so the full name of
+ * the root is a prefix of none of them, while the first 200 characters are a
+ * prefix of all of them (#368, Copilot on the PR).
+ */
+export function encodeCwdForProjectsDirPrefix(root: string): string {
+  return root.replace(/[^a-zA-Z0-9]/g, "-").slice(0, PROJECTS_DIR_MAX_LEN);
+}
+
+/**
  * A transcript-confirmed prompt ingestion (issue #362).
  *
  * `promptId` and `ingestedAtMs` are what make this safe to act on: text alone
