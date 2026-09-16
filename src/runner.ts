@@ -743,6 +743,20 @@ export interface RunOptions {
   modelOverride?: string;
 }
 
+/**
+ * The model override as `run()` accepts it: the bare model string production
+ * passes today (`start.ts` job tick), or the `RunOptions` object the original
+ * wiring (7e6dae9) intended and the tests always used (#330). Anything else
+ * is treated as "no override" rather than reaching `primaryConfig.model`.
+ */
+export function resolveModelOverride(value: string | RunOptions | undefined): string | undefined {
+  if (typeof value === "string") return value.trim() || undefined;
+  if (value && typeof value === "object" && typeof value.modelOverride === "string") {
+    return value.modelOverride.trim() || undefined;
+  }
+  return undefined;
+}
+
 export async function runClaudeOnce(
   baseArgs: string[],
   model: string,
@@ -1667,6 +1681,38 @@ interface PolicyIdentity {
   skillName?: string;
 }
 
+/**
+ * Injectable seam for the PRIMARY exec of `execClaude` (#330): the step that
+ * runs the resolved `primaryConfig.model` through `runClaudeStream` (legacy)
+ * or `runOnPty` (supervisor). The modelOverride tests used to
+ * `spyOn(module, "runClaudeOnce")` — a function `execClaude` never calls for
+ * the primary run, and a module spy cannot intercept a local binding anyway —
+ * so eleven tests ran for three months without executing one assertion.
+ * When set, the seam receives the resolved model/api, the legacy-shaped args,
+ * cwd, timeout and which route the real call would have taken; PTY-only
+ * inputs (prompt, securityArgs, appendSystemPrompt) and the spawn env are not
+ * part of it. Only the PRIMARY exec is seamed: the result flows into the
+ * unchanged downstream (rate-limit fallback, corruption and stale-session
+ * recovery), which still spawns claude — so a seam should return a clean
+ * result or throw. Production never sets it.
+ */
+export interface PrimaryExecCall {
+  name: string;
+  args: string[];
+  model: string;
+  api: string;
+  cwd: string | undefined;
+  timeoutMs: number;
+  route: "legacy" | "pty";
+}
+type PrimaryExec = (
+  call: PrimaryExecCall,
+) => Promise<{ rawStdout: string; stderr: string; exitCode: number; sessionId?: string }>;
+let _primaryExecForTests: PrimaryExec | null = null;
+export function _setPrimaryExecForTests(fn: PrimaryExec | null): void {
+  _primaryExecForTests = fn;
+}
+
 async function execClaude(
   name: string,
   prompt: string,
@@ -1928,7 +1974,17 @@ async function execClaude(
     const isInfraCall = name === "bootstrap";
     const useLegacyPath = !settings.pty.enabled || isInfraCall;
     let exec: { rawStdout: string; stderr: string; exitCode: number; sessionId?: string };
-    if (useLegacyPath) {
+    if (_primaryExecForTests) {
+      exec = await _primaryExecForTests({
+        name,
+        args,
+        model: primaryConfig.model,
+        api: primaryConfig.api,
+        cwd: spawnCwd,
+        timeoutMs,
+        route: useLegacyPath ? "legacy" : "pty",
+      });
+    } else if (useLegacyPath) {
       exec = await runClaudeStream(
         args,
         primaryConfig.model,
@@ -2509,7 +2565,7 @@ export async function run(
   name: string,
   prompt: string,
   threadId?: string,
-  modelOverride?: string,
+  modelOverride?: string | RunOptions,
   timeoutMs?: number,
   agentName?: string,
   timeoutCategory?: string,
@@ -2523,7 +2579,7 @@ export async function run(
         name,
         prompt,
         threadId,
-        modelOverride,
+        resolveModelOverride(modelOverride),
         timeoutMs,
         agentName,
         timeoutCategory,
