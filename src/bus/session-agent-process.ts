@@ -122,6 +122,11 @@ export interface AgentProcess {
    * rendered terminal in the one window where the terminal is known to lie.
    */
   enableTranscriptConfirmation?(): void;
+  /**
+   * Optional: the tailer read a line — any line. Lets the process notice a
+   * transcript that has gone silent for good (#383).
+   */
+  noteTranscriptActivity?(): void;
   onExit(handler: ExitHandler): void;
   /**
    * Crash-signal observer ONLY. The Bus must NEVER parse model output from
@@ -356,7 +361,14 @@ export class PtyAgentProcess implements AgentProcess {
    * better than the screen, so the original heuristics must stay in force.
    */
   private transcriptAvailable = false;
+  /** #383: disarmed by a silent confirm window (vs never armed), so that a
+   *  line arriving later can re-arm without re-arming a runtime that has no
+   *  transcript at all. */
+  private transcriptDisarmed = false;
   private readonly transcriptGraceMs: number;
+  /** Count of lines the tailer has read (#383). `0` until it has; a counter
+   *  rather than a timestamp, so two lines in one millisecond cannot hide. */
+  private transcriptLineSeq = 0;
   /** Hard cap on the boot-dialog watch window (issue #193 / Codex P2). If no
    *  REPL-ready marker is observed within this window (e.g. a future CLI
    *  changes the footer text), the watcher disengages anyway so it never
@@ -470,6 +482,12 @@ export class PtyAgentProcess implements AgentProcess {
 
   send_prompt_stream(line: string): Promise<PromptDeliveryOutcome> {
     if (this._exited) return Promise.reject(new Error(`agent ${this.agent_id} has exited`));
+    // #383: what the transcript had said when this prompt was handed to us. If
+    // it says nothing more until the confirm loop gives up while the screen
+    // shows a turn, it is not slow — it is gone (rotated away by `/clear`).
+    // Taken here, not at write time: the write chain may wait behind an
+    // earlier delivery, and lines read meanwhile are activity all the same.
+    const transcriptLineBeforeWrite = this.transcriptLineSeq;
     // NOTE (Codex P2 on PR #195): we deliberately do NOT disengage the
     // boot-dialog watcher here. An early heartbeat/scheduler prompt can be
     // dispatched before a slow fresh-install boot has rendered its
@@ -785,6 +803,28 @@ export class PtyAgentProcess implements AgentProcess {
             `the session transcript did not record the prompt within ` +
             `${this.transcriptGraceMs}ms; reporting unconfirmed rather than guessing.`,
         );
+        // #383 (1): the screen showed a turn and the transcript wrote NOTHING
+        // — not the prompt, not a single line — since this prompt was handed
+        // to us. A slow transcript still writes the turn's lines; a silent one
+        // has been rotated away (`/clear` opens a new file the tailer bound to
+        // this process never sees). Trusting it would end every later
+        // delivery `unconfirmed-live` for the life of the process. Fall back
+        // to the screen; the next line this tailer reads — which a rotated
+        // file never produces — re-arms it (`markTranscriptLine`), as does a
+        // tailer bound by a later spawn (`enableTranscriptConfirmation`).
+        if (this.transcriptAvailable && this.transcriptLineSeq === transcriptLineBeforeWrite) {
+          this.transcriptAvailable = false;
+          this.transcriptDisarmed = true;
+          console.warn(
+            `[delivery-confirm] agent=${this.agent_id}: the session transcript wrote nothing ` +
+              `during the whole confirm window; treating it as rotated away and falling back ` +
+              `to screen confirmation until a tailer speaks again.`,
+          );
+        }
+        // #383 (2): this screen state used to resolve as `turn-started`, which
+        // re-armed the one-shot wedge warning. Keep that property, so a later
+        // genuine `unconfirmed-idle` on this long-lived process still speaks.
+        this.warnedUnconfirmedDelivery = false;
       } else if (outcome !== "turn-started" && !this.warnedUnconfirmedDelivery) {
         this.warnedUnconfirmedDelivery = true;
         console.warn(
@@ -1011,7 +1051,35 @@ export class PtyAgentProcess implements AgentProcess {
     this.transcriptAvailable = true;
   }
 
+  /** #383 — see `transcriptLineSeq`. Called by the tailer on every line. */
+  noteTranscriptActivity(): void {
+    this.markTranscriptLine();
+  }
+
+  /**
+   * A line was read from this process's transcript. Besides counting it, this
+   * re-arms transcript confirmation after a disarm: a transcript rotated away
+   * by `/clear` never speaks again, so a line arriving proves the disarm was
+   * a stall (a tailer or CLI pause longer than the confirm window), not a
+   * rotation — and the transcript is the better judge again. Same proof
+   * `onTranscriptAlive` uses to arm it the first time.
+   */
+  private markTranscriptLine(): void {
+    this.transcriptLineSeq++;
+    if (!this.transcriptAvailable && this.transcriptDisarmed) {
+      this.transcriptAvailable = true;
+      this.transcriptDisarmed = false;
+      console.warn(
+        `[delivery-confirm] agent=${this.agent_id}: the session transcript spoke again; ` +
+          `transcript confirmation re-armed.`,
+      );
+    }
+  }
+
   notePromptIngested(ingestion: PromptIngestion): void {
+    // A prompt record is transcript activity too (#383): the tailer feeds it
+    // from a line it just read, and tests feed it directly.
+    this.markTranscriptLine();
     // Key on promptId AND the text, never on promptId alone.
     //
     // A `promptId` identifies a submission, not a record: an auto-compaction

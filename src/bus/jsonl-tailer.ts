@@ -148,6 +148,14 @@ export interface JsonlTailerOptions {
    * wiring, or it degrades every agent whose transcript is unreachable.
    */
   onTranscriptAlive?: () => void;
+  /**
+   * Called for EVERY line read (#383). Lets the process tell a transcript that
+   * is slow from one that is gone: after `/clear` the CLI writes to a NEW
+   * file, this tailer keeps watching the old one, and nothing ever arrives
+   * again — so a confirmation armed once by `onTranscriptAlive` would trust a
+   * transcript that no longer speaks for this process.
+   */
+  onTranscriptLine?: () => void;
 }
 
 /** `message.model` on assistant lines the CLI writes itself (errors, placeholders). */
@@ -187,6 +195,7 @@ export class JsonlTailer {
   private readonly onError: (err: unknown, ctx?: Record<string, unknown>) => void;
   private readonly onPromptIngested?: (ingestion: PromptIngestion) => void;
   private readonly onTranscriptAlive?: () => void;
+  private readonly onTranscriptLine?: () => void;
   private sawAnyLine = false;
   private readonly filePath: string;
   private readonly startAt: "begin" | "end";
@@ -227,6 +236,7 @@ export class JsonlTailer {
     this.startAt = opts.startAt ?? "begin";
     this.onPromptIngested = opts.onPromptIngested;
     this.onTranscriptAlive = opts.onTranscriptAlive;
+    this.onTranscriptLine = opts.onTranscriptLine;
     this.filePath = join(
       this.projectsDir,
       encodeCwdForProjectsDir(this.cwd),
@@ -482,6 +492,11 @@ export class JsonlTailer {
       } catch (err) {
         this.onError(err, { where: "onTranscriptAlive", agent_id: this.agent_id });
       }
+    }
+    try {
+      this.onTranscriptLine?.();
+    } catch (err) {
+      this.onError(err, { where: "onTranscriptLine", agent_id: this.agent_id });
     }
     switch (line.type) {
       case "user":

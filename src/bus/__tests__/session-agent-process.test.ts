@@ -6,7 +6,7 @@
  *   - the boot-dialog watcher answers late dialogs and disengages on the
  *     REPL-ready marker, not on first prompt (issue #193 / Codex P2 on #195).
  */
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { PtyAgentProcess, type PromptIngestion, type PtyHandle } from "../session-agent-process";
 
 describe("PtyAgentProcess.send_prompt_stream", () => {
@@ -1000,6 +1000,128 @@ describe("PtyAgentProcess.send_prompt_stream resolves with its verdict (issue #3
     clearInterval(iv);
     expect(outcome).toBe("unconfirmed-live");
     expect(writes).toContain("\x15"); // the box was cleared: the prompt is nowhere else now
+  });
+
+  it("a transcript that writes nothing during the whole confirm window is treated as rotated away: screen confirmation resumes (#383)", async () => {
+    const { handle, emit } = bootPty();
+    const proc = new PtyAgentProcess("v5", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+    proc.noteTranscriptActivity(); // the tailer had spoken before — then `/clear` rotated the file
+    const warns: string[] = [];
+    const spy = spyOn(console, "warn").mockImplementation((m: unknown) => {
+      warns.push(String(m));
+    });
+    try {
+      const first = proc.send_prompt_stream("first after clear");
+      let iv = setInterval(() => emit("turn output streaming\n"), 5);
+      expect(await first).toBe("unconfirmed-live"); // silent transcript, as before
+      clearInterval(iv);
+      expect(warns.some((w) => w.includes("rotated away"))).toBe(true);
+      // Disarmed: the next delivery is judged by the screen again.
+      const second = proc.send_prompt_stream("second after clear");
+      iv = setInterval(() => emit("more turn output\n"), 5);
+      expect(await second).toBe("turn-started");
+      clearInterval(iv);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("a disarmed transcript that speaks again is trusted again (a stall, not a rotation) (#383)", async () => {
+    const { handle, emit } = bootPty();
+    const proc = new PtyAgentProcess("v8", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+    proc.noteTranscriptActivity();
+    const spy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      let p = proc.send_prompt_stream("during a stall");
+      let iv = setInterval(() => emit("turn output\n"), 5);
+      expect(await p).toBe("unconfirmed-live"); // silent window → disarmed
+      clearInterval(iv);
+      proc.noteTranscriptActivity(); // the tailer reads a line after all: it was a stall
+      p = proc.send_prompt_stream("after the stall");
+      iv = setInterval(() => emit("turn output\n"), 5);
+      expect(await p).toBe("unconfirmed-live"); // judged by the transcript again, not the screen
+      clearInterval(iv);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("a slow transcript that keeps writing other lines stays trusted: unconfirmed-live, still armed (#383)", async () => {
+    const { handle, emit } = bootPty();
+    const proc = new PtyAgentProcess("v6", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+    const spy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const first = proc.send_prompt_stream("slow one");
+      const iv = setInterval(() => {
+        emit("turn output\n");
+        proc.noteTranscriptActivity(); // the transcript is alive, just not recording THIS prompt yet
+      }, 5);
+      expect(await first).toBe("unconfirmed-live");
+      clearInterval(iv);
+      // Still armed: a second delivery with a silent screen-only turn is again unconfirmed-live.
+      const second = proc.send_prompt_stream("another");
+      const iv2 = setInterval(() => {
+        emit("turn output\n");
+        proc.noteTranscriptActivity();
+      }, 5);
+      expect(await second).toBe("unconfirmed-live");
+      clearInterval(iv2);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("unconfirmed-live re-arms the one-shot wedge warning, so a later unconfirmed-idle still warns (#383)", async () => {
+    const { handle, emit } = bootPty();
+    const proc = new PtyAgentProcess("v7", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    const warns: string[] = [];
+    const spy = spyOn(console, "warn").mockImplementation((m: unknown) => {
+      warns.push(String(m));
+    });
+    try {
+      // 1. an idle give-up latches the one-shot warning
+      let p = proc.send_prompt_stream("one");
+      let iv = setInterval(() => emit("\n⏵ accept edits on (shift+tab to cycle)"), 8);
+      expect(await p).toBe("unconfirmed-idle");
+      clearInterval(iv);
+      expect(warns.filter((w) => w.includes("submit not confirmed")).length).toBe(1);
+      // 2. an unconfirmed-live in between must re-arm it…
+      proc.enableTranscriptConfirmation();
+      p = proc.send_prompt_stream("two");
+      iv = setInterval(() => {
+        emit("turn output\n");
+        proc.noteTranscriptActivity();
+      }, 5);
+      expect(await p).toBe("unconfirmed-live");
+      clearInterval(iv);
+      // 3. …so a later genuine idle give-up warns again instead of being silenced.
+      p = proc.send_prompt_stream("three");
+      iv = setInterval(() => emit("\n⏵ accept edits on (shift+tab to cycle)"), 8);
+      expect(await p).toBe("unconfirmed-idle");
+      clearInterval(iv);
+      expect(warns.filter((w) => w.includes("submit not confirmed")).length).toBe(2);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("unconfirmed-idle when the idle footer survives every nudge", async () => {
