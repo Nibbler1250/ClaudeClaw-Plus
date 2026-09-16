@@ -39,6 +39,7 @@ import {
   type SystemLine,
   type ToolResultBlock,
   type UserLine,
+  type TurnObservation,
 } from "./jsonl-line-types";
 import { type BusEvent, type BusEventTopic, TAILER_EVENT_SOURCE } from "./types";
 
@@ -138,6 +139,18 @@ export interface JsonlTailerOptions {
    */
   onPromptIngested?: (ingestion: PromptIngestion) => void;
   /**
+   * #212: the tailer saw the turn boundary for the last top-level prompt it
+   * ingested. Carries the transcript path and the byte offset of the line so a
+   * receipt closed as `turn_observed` by the bridge can be confirmed by the
+   * tailer too — the last of the #207 ambiguities ("the tailer never saw the
+   * turn") becomes visible as a receipt with no offset. Called once per
+   * boundary line (a thinking+text message yields two, same `message_id`);
+   * an open receipt is patched twice with the same message (last offset wins,
+   * the text line), the side table dedupes on the message. Errors in the
+   * consumer never stop the tail.
+   */
+  onTurnObserved?: (observation: TurnObservation) => void;
+  /**
    * Called once, on the first line this tailer actually reads (issue #362).
    *
    * Being constructed is NOT evidence that a transcript is readable: the path
@@ -195,6 +208,17 @@ export class JsonlTailer {
   private readonly schemaVersion: string;
   private readonly onError: (err: unknown, ctx?: Record<string, unknown>) => void;
   private readonly onPromptIngested?: (ingestion: PromptIngestion) => void;
+  private readonly onTurnObserved?: (observation: TurnObservation) => void;
+  /** #212: the last top-level prompt this tailer ingested (the `user` line),
+   *  which the next turn boundary belongs to. */
+  private lastIngestedPrompt: { text: string; promptId?: string } | null = null;
+  private lastBoundaryMessageId: string | undefined;
+  /** Set when a prompt is adopted; cleared when a boundary consumes it. */
+  private promptSinceLastBoundary = false;
+  /** #212: byte offset in the file where `this.buffer` begins, and of the line
+   *  currently being dispatched. */
+  private bufferStartOffset = 0;
+  private currentLineOffset = 0;
   private readonly onTranscriptAlive?: () => void;
   private readonly onTranscriptLine?: () => void;
   private sawAnyLine = false;
@@ -211,7 +235,12 @@ export class JsonlTailer {
    * (#217 review).
    */
   private seekToEndPending = false;
-  private buffer = "";
+  /** Unconsumed bytes since the last newline. Kept as BYTES, not a string:
+   *  decoding a chunk that ends inside a multi-byte code point would yield
+   *  U+FFFD and change the byte length of the line, so every later offset
+   *  in that chunk would drift (#212 review). Lines are split on 0x0a and
+   *  decoded one at a time. */
+  private buffer: Buffer = Buffer.alloc(0);
   /** Set true once the first non-empty line emits `session.init`. */
   private initEmitted = false;
   private watcher: FSWatcher | null = null;
@@ -236,6 +265,7 @@ export class JsonlTailer {
     this.onError = opts.onError ?? ((err, ctx) => console.error("[jsonl-tailer]", err, ctx));
     this.startAt = opts.startAt ?? "begin";
     this.onPromptIngested = opts.onPromptIngested;
+    this.onTurnObserved = opts.onTurnObserved;
     this.onTranscriptAlive = opts.onTranscriptAlive;
     this.onTranscriptLine = opts.onTranscriptLine;
     this.filePath = join(
@@ -401,8 +431,11 @@ export class JsonlTailer {
       const length = size - this.offset;
       const buf = Buffer.alloc(length);
       await fh.read(buf, 0, length, this.offset);
+      // #212: an empty buffer starts at the byte we are about to read; a
+      // buffer holding a partial line keeps the offset of that line's start.
+      if (this.buffer.length === 0) this.bufferStartOffset = this.offset;
       this.offset = size;
-      this.buffer += buf.toString("utf8");
+      this.buffer = this.buffer.length === 0 ? buf : Buffer.concat([this.buffer, buf]);
       this.flushBufferedLines();
     } catch (err) {
       this.onError(err, { ctx: "drain-read" });
@@ -416,9 +449,14 @@ export class JsonlTailer {
     // Note: we keep any trailing partial line in `this.buffer` for the
     // next drain — JSONL writers can append a line in multiple syscalls.
     // biome-ignore lint/suspicious/noAssignInExpressions: idiomatic newline scan
-    while ((nl = this.buffer.indexOf("\n")) >= 0) {
-      const raw = this.buffer.slice(0, nl);
-      this.buffer = this.buffer.slice(nl + 1);
+    while ((nl = this.buffer.indexOf(0x0a)) >= 0) {
+      const raw = this.buffer.subarray(0, nl).toString("utf8");
+      this.buffer = this.buffer.subarray(nl + 1);
+      // #212: where this line starts in the file — what a receipt records as
+      // `turn_event_offset` when the line turns out to be a turn boundary.
+      // `nl` is the line's exact on-disk byte length (bytes, not code units).
+      this.currentLineOffset = this.bufferStartOffset;
+      this.bufferStartOffset += nl + 1;
       // #383: the transcript is being written to — that is the fact the
       // process needs, and it holds for a blank line or one the parser rejects
       // as much as for a record it accepts. Counted here, before any filtering
@@ -555,6 +593,7 @@ export class JsonlTailer {
       // Sub-agent prompts and harness meta lines are recorded the same way but
       // are not this process's delivery. Excluded at the source so no consumer
       // has to know the distinction.
+      this.adoptPromptForAttribution(line, content);
       if (
         this.onPromptIngested &&
         line.isSidechain !== true &&
@@ -585,12 +624,48 @@ export class JsonlTailer {
         // when claude carries other block types here. Forward-compat:
         // emit unknown so we don't drop silently.
         this.publish("bus.event.unknown", { raw, type: "user.array-no-tool-result" }, line);
+        // #212: a text prompt in array form (observed live: the CLI's
+        // `isMeta` "Continue from where you left off" after a compaction)
+        // starts a turn of its own. Attribute it if it reads as a prompt;
+        // otherwise nothing owns the next boundary.
+        const text = content
+          .filter((b) => b.type === "text" && typeof (b as { text?: unknown }).text === "string")
+          .map((b) => (b as unknown as { text: string }).text)
+          .join("\n");
+        this.adoptPromptForAttribution(line, text);
         return;
       }
       for (const block of results) {
         this.publishToolResult(block, line);
       }
     }
+  }
+
+  /**
+   * #212: decide whether the next turn boundary belongs to this user line.
+   * Learned from the live transcripts, not from the flags' names:
+   *  - a prompt the bus delivered over the MCP channel is recorded `isMeta:true`
+   *    — it still owns its turn (the `<channel …>` wrapper says so);
+   *  - a compaction summary (`isCompactSummary`) follows the prompt it
+   *    summarises and precedes that prompt's boundary — it owns nothing and
+   *    must not displace the prompt;
+   *  - a sub-agent (sidechain) line is not this process's delivery;
+   *  - any other meta line (a CLI continuation, a harness note) starts a turn
+   *    nobody's receipt is waiting for: clear the attribution so the boundary
+   *    is not pinned on an earlier prompt.
+   */
+  private adoptPromptForAttribution(line: UserLine, text: string): void {
+    if (line.isSidechain === true) return;
+    if ((line as { isCompactSummary?: boolean }).isCompactSummary) return;
+    const meta = Boolean((line as { isMeta?: boolean }).isMeta);
+    const channel = /^\s*<channel[\s>]/.test(text);
+    if (meta && !channel) {
+      this.lastIngestedPrompt = null;
+      return;
+    }
+    if (text.length === 0) return;
+    this.lastIngestedPrompt = { text, promptId: line.promptId };
+    this.promptSinceLastBoundary = true;
   }
 
   private publishToolResult(block: ToolResultBlock, line: UserLine): void {
@@ -709,6 +784,43 @@ export class JsonlTailer {
         },
         line,
       );
+      // #212: tailer-confirmed turn — out-of-band, so a consumer failure cannot
+      // take down the tail (the publish above is the contract).
+      // A sub-agent's boundary (sidechain assistant line) is not this
+      // process's turn: publish as before, but it owns no receipt and must not
+      // consume the parent's prompt (Copilot on the PR).
+      const sidechain = (line as { isSidechain?: boolean }).isSidechain === true;
+      // A boundary of a new message with no new prompt in between (a
+      // continuation the CLI started on its own) belongs to nobody.
+      if (
+        !sidechain &&
+        this.lastIngestedPrompt &&
+        this.lastBoundaryMessageId !== undefined &&
+        line.message?.id !== undefined &&
+        line.message.id !== this.lastBoundaryMessageId &&
+        !this.promptSinceLastBoundary
+      ) {
+        this.lastIngestedPrompt = null;
+      }
+      if (this.onTurnObserved && this.lastIngestedPrompt && !sidechain) {
+        this.promptSinceLastBoundary = false;
+        try {
+          this.onTurnObserved({
+            promptText: this.lastIngestedPrompt.text,
+            promptId: this.lastIngestedPrompt.promptId,
+            jsonlPath: this.filePath,
+            offset: this.currentLineOffset,
+            messageId: line.message?.id,
+            stopReason: String(stopReason),
+            synthetic,
+          });
+        } catch (err) {
+          this.onError(err, { where: "onTurnObserved", agent_id: this.agent_id });
+        }
+        // The two boundary lines of one message (thinking, then text) share
+        // the prompt; a boundary of a DIFFERENT message ends a later turn.
+        this.lastBoundaryMessageId = line.message?.id;
+      }
     }
   }
 

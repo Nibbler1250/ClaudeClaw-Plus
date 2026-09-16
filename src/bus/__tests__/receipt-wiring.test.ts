@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { createReceiptStore, hashPrompt, type ReceiptRecord, type ReceiptStore } from "../receipt";
 import {
   type AgentProcessLike,
+  confirmTurnReceipt,
   createPromptStreamHandler,
   openInboundReceipt,
   unwrapChannelText,
@@ -248,5 +249,53 @@ describe("openInboundReceipt (#211 — adapter boundary open)", () => {
       originId: "1",
     });
     expect(store.findByPromptHash(hashPrompt(raw))?.record.message_id).toBe("tg-8");
+  });
+});
+
+describe("confirmTurnReceipt — tailer → receipt seam (#212)", () => {
+  test("hashes the unwrapped channel text, so the tailer's proof lands on the adapter's receipt", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ccplus-turn-seam-"));
+    try {
+      const store = createReceiptStore({ path: join(dir, "receipts.jsonl") });
+      const r = store.open("tg:1:abcd", { prompt_hash: hashPrompt("allô") });
+      const where = await confirmTurnReceipt(
+        {
+          promptText: '<channel source="telegram" chat_id="1" user_id="u" ts="t">allô</channel>',
+          jsonlPath: "/x/s.jsonl",
+          offset: 512,
+          messageId: "msg_1",
+          stopReason: "end_turn",
+          synthetic: false,
+        },
+        store,
+      );
+      expect(where).toBe("patched");
+      expect(r.record.turn_event_offset).toBe(512);
+      expect(r.record.claude_jsonl_path).toBe("/x/s.jsonl");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a synthetic boundary (CLI-written API error) is not a model turn and is skipped", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ccplus-turn-seam-"));
+    try {
+      const store = createReceiptStore({ path: join(dir, "receipts.jsonl") });
+      const r = store.open("m", { prompt_hash: hashPrompt("x") });
+      const where = await confirmTurnReceipt(
+        {
+          promptText: "x",
+          jsonlPath: "/x",
+          offset: 1,
+          stopReason: "stop_sequence",
+          synthetic: true,
+        },
+        store,
+      );
+      expect(where).toBe("skipped");
+      expect(r.record.turn_event_offset).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

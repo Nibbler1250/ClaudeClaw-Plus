@@ -1,7 +1,7 @@
 /**
  * Tests for the per-message receipt chain (issue #207).
  */
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, it, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -235,5 +235,98 @@ describe("getDefaultReceiptStore", () => {
     expect(getDefaultReceiptStore()).toBe(fake);
     restore();
     expect(getDefaultReceiptStore()).toBe(original);
+  });
+});
+
+describe("confirmTurn — tailer proof on a receipt (#212)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "ccplus-receipt-turn-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const rows = (p: string) =>
+    existsSync(p)
+      ? readFileSync(p, "utf8")
+          .split("\n")
+          .filter(Boolean)
+          .map((l) => JSON.parse(l) as Record<string, unknown>)
+      : [];
+
+  it("patches an open receipt with the transcript path and offset", async () => {
+    const store = createReceiptStore({ path: join(dir, "receipts.jsonl") });
+    const r = store.open("m1", { prompt_hash: hashPrompt("allô") });
+    const where = await store.confirmTurn(hashPrompt("allô"), {
+      claude_jsonl_path: "/x/s.jsonl",
+      turn_event_offset: 4242,
+      message_id: "msg_T",
+    });
+    expect(where).toBe("patched");
+    expect(r.record.claude_jsonl_path).toBe("/x/s.jsonl");
+    expect(r.record.turn_event_offset).toBe(4242);
+    await r.close("turn_observed");
+    const [rec] = rows(join(dir, "receipts.jsonl"));
+    expect(rec.final_state).toBe("turn_observed");
+    expect(rec.turn_event_offset).toBe(4242);
+    expect(existsSync(join(dir, "receipt-turns.jsonl"))).toBe(false);
+  });
+
+  it("a receipt already closed is not reopened: the proof goes to the side table, joined by message_id", async () => {
+    const store = createReceiptStore({ path: join(dir, "receipts.jsonl") });
+    const r = store.open("m2", { prompt_hash: hashPrompt("late") });
+    await r.close("timeout"); // the bridge gave up first
+    const where = await store.confirmTurn(hashPrompt("late"), {
+      claude_jsonl_path: "/x/s.jsonl",
+      turn_event_offset: 99,
+    });
+    expect(where).toBe("side-table");
+    const [rec] = rows(join(dir, "receipts.jsonl"));
+    expect(rec.final_state).toBe("timeout"); // close is still the end
+    expect(rec.turn_event_offset).toBeUndefined();
+    const [side] = rows(join(dir, "receipt-turns.jsonl"));
+    expect(side).toMatchObject({
+      kind: "turn_confirmed",
+      message_id: "m2",
+      prompt_hash: hashPrompt("late"),
+      claude_jsonl_path: "/x/s.jsonl",
+      turn_event_offset: 99,
+    });
+    expect(typeof side.confirmed_at).toBe("string");
+  });
+
+  it("the two boundary lines of one message write ONE side-table row", async () => {
+    const store = createReceiptStore({ path: join(dir, "receipts.jsonl") });
+    const r = store.open("m3", { prompt_hash: hashPrompt("two lines") });
+    await r.close("timeout");
+    await store.confirmTurn(hashPrompt("two lines"), {
+      claude_jsonl_path: "/x",
+      turn_event_offset: 10,
+      message_id: "msg_X",
+    });
+    await store.confirmTurn(hashPrompt("two lines"), {
+      claude_jsonl_path: "/x",
+      turn_event_offset: 20,
+      message_id: "msg_X",
+    });
+    await store.confirmTurn(hashPrompt("two lines"), {
+      claude_jsonl_path: "/x",
+      turn_event_offset: 30,
+      message_id: "msg_Y",
+    });
+    const side = rows(join(dir, "receipt-turns.jsonl"));
+    expect(side.map((s) => s.transcript_message_id)).toEqual(["msg_X", "msg_Y"]);
+  });
+
+  it("a hash no receipt ever carried is recorded as unknown, still with the proof", async () => {
+    const store = createReceiptStore({ path: join(dir, "receipts.jsonl") });
+    const where = await store.confirmTurn(hashPrompt("never seen"), {
+      claude_jsonl_path: "/x/s.jsonl",
+      turn_event_offset: 7,
+    });
+    expect(where).toBe("unknown");
+    const [side] = rows(join(dir, "receipt-turns.jsonl"));
+    expect(side.message_id).toBeNull();
+    expect(side.turn_event_offset).toBe(7);
   });
 });

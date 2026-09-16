@@ -1399,3 +1399,394 @@ describe("prompt ingestion callbacks", () => {
     expect(h.alive()).toBe(1);
   });
 });
+
+describe("onTurnObserved — tailer-confirmed turn with transcript offset (#212)", () => {
+  it("reports the prompt the boundary belongs to, the file, and the byte offset of the boundary line", async () => {
+    const userLine = {
+      type: "user",
+      message: { role: "user", content: '<channel source="telegram" chat_id="1">allô</channel>' },
+      promptId: "p-1",
+      timestamp: "2026-06-02T10:00:10.000Z",
+      sessionId: SESSION_ID,
+    };
+    const thinkingLine = {
+      type: "assistant",
+      message: {
+        role: "assistant",
+        id: "msg_T",
+        content: [{ type: "thinking", thinking: "…" }],
+        stop_reason: "end_turn",
+      },
+      timestamp: "2026-06-02T10:00:11.000Z",
+      sessionId: SESSION_ID,
+    };
+    const textLine = {
+      type: "assistant",
+      message: {
+        role: "assistant",
+        id: "msg_T",
+        content: [{ type: "text", text: "salut — ça va très bien, merci à toi élève" }],
+        stop_reason: "end_turn",
+      },
+      timestamp: "2026-06-02T10:00:12.000Z",
+      sessionId: SESSION_ID,
+    };
+    writeFileSync(sessionPath, "");
+    const { bus } = createMockBus();
+    const seen: Array<{
+      promptText: string;
+      offset: number;
+      jsonlPath: string;
+      messageId?: string;
+      promptId?: string;
+    }> = [];
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => {},
+      onTurnObserved: (o) =>
+        seen.push({
+          promptText: o.promptText,
+          offset: o.offset,
+          jsonlPath: o.jsonlPath,
+          messageId: o.messageId,
+          promptId: o.promptId,
+        }),
+    });
+    await tailer.start();
+    const first = jsonl(userLine);
+    await appendFile(sessionPath, first);
+    // append the two boundary lines in a second write, splitting the last one across syscalls
+    // Split the second write INSIDE a multi-byte code point of the THINKING
+    // line (its "…"): a string-based buffer decodes U+FFFD on both sides of
+    // the cut, the line's byte length is miscounted, and the offset of the
+    // text line that follows in the same chunk drifts.
+    const secondBytes = Buffer.from(jsonl(thinkingLine, textLine), "utf8");
+    const dots = secondBytes.indexOf(Buffer.from("…", "utf8"));
+    expect(dots).toBeGreaterThan(0);
+    const cut = dots + 1; // one byte into the three-byte "…"
+    await appendFile(sessionPath, secondBytes.subarray(0, cut));
+    await new Promise((r) => setTimeout(r, 60));
+    await appendFile(sessionPath, secondBytes.subarray(cut));
+    for (let i = 0; i < 100 && seen.length < 2; i++) await new Promise((r) => setTimeout(r, 20));
+    expect(seen).toHaveLength(2); // one per boundary line, same message
+    const userBytes = Buffer.byteLength(first, "utf8");
+    const thinkingBytes = Buffer.byteLength(JSON.stringify(thinkingLine), "utf8") + 1;
+    expect(seen[0]).toEqual({
+      promptText: userLine.message.content,
+      promptId: "p-1",
+      jsonlPath: sessionPath,
+      offset: userBytes,
+      messageId: "msg_T",
+    });
+    expect(seen[1].offset).toBe(userBytes + thinkingBytes);
+    expect(seen[1].messageId).toBe("msg_T");
+  });
+
+  it("a prompt delivered over the MCP channel is recorded isMeta:true by the CLI and still owns its turn", async () => {
+    // Observed live: every `<channel source="plugin:claudeclaw-plus:plus-bus">`
+    // prompt carries isMeta:true. Skipping it pinned its boundary on the
+    // previous prompt — a wrong proof.
+    writeFileSync(sessionPath, "");
+    const { bus } = createMockBus();
+    const seen: Array<{ promptText: string; messageId?: string }> = [];
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => {},
+      onTurnObserved: (o) => seen.push({ promptText: o.promptText, messageId: o.messageId }),
+    });
+    await tailer.start();
+    const A = '<channel source="telegram" chat_id="1">A</channel>';
+    const B = '<channel source="plugin:claudeclaw-plus:plus-bus" chat_id="2">B</channel>';
+    await appendFile(
+      sessionPath,
+      jsonl(
+        { type: "user", message: { role: "user", content: A }, sessionId: SESSION_ID },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "mA",
+            content: [{ type: "text", text: "a" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "user",
+          isMeta: true,
+          message: { role: "user", content: B },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "mB",
+            content: [{ type: "text", text: "b" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+      ),
+    );
+    for (let i = 0; i < 100 && seen.length < 2; i++) await new Promise((r) => setTimeout(r, 20));
+    expect(seen).toEqual([
+      { promptText: A, messageId: "mA" },
+      { promptText: B, messageId: "mB" },
+    ]);
+  });
+
+  it("a compaction summary does not displace the prompt it summarises", async () => {
+    // Observed live: prompt, then the `isCompactSummary` user line, then the
+    // boundary pair — the boundary belongs to the prompt.
+    writeFileSync(sessionPath, "");
+    const { bus } = createMockBus();
+    const seen: string[] = [];
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => {},
+      onTurnObserved: (o) => seen.push(o.promptText),
+    });
+    await tailer.start();
+    await appendFile(
+      sessionPath,
+      jsonl(
+        { type: "user", message: { role: "user", content: "the prompt" }, sessionId: SESSION_ID },
+        {
+          type: "user",
+          isCompactSummary: true,
+          message: {
+            role: "user",
+            content: "This session is being continued from a previous conversation…",
+          },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "m",
+            content: [{ type: "thinking", thinking: "…" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "m",
+            content: [{ type: "text", text: "ok" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+      ),
+    );
+    for (let i = 0; i < 100 && seen.length < 2; i++) await new Promise((r) => setTimeout(r, 20));
+    expect(seen).toEqual(["the prompt", "the prompt"]);
+  });
+
+  it("a CLI continuation (isMeta, array text, no channel) starts a turn nobody's receipt owns", async () => {
+    writeFileSync(sessionPath, "");
+    const { bus } = createMockBus();
+    const seen: string[] = [];
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => {},
+      onTurnObserved: (o) => seen.push(o.promptText),
+    });
+    await tailer.start();
+    await appendFile(
+      sessionPath,
+      jsonl(
+        { type: "user", message: { role: "user", content: "A" }, sessionId: SESSION_ID },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "mA",
+            content: [{ type: "text", text: "a" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "user",
+          isMeta: true,
+          message: {
+            role: "user",
+            content: [{ type: "text", text: "Continue from where you left off." }],
+          },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "mC",
+            content: [{ type: "text", text: "c" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+        // and a second boundary of yet another message with no prompt at all in between
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "mD",
+            content: [{ type: "text", text: "d" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+      ),
+    );
+    await new Promise((r) => setTimeout(r, 300));
+    expect(seen).toEqual(["A"]); // mC cleared the attribution; mD had no prompt either
+  });
+
+  it("a sub-agent's boundary (sidechain assistant line) owns no receipt and does not consume the parent's prompt", async () => {
+    writeFileSync(sessionPath, "");
+    const { bus } = createMockBus();
+    const seen: Array<{ promptText: string; messageId?: string }> = [];
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => {},
+      onTurnObserved: (o) => seen.push({ promptText: o.promptText, messageId: o.messageId }),
+    });
+    await tailer.start();
+    await appendFile(
+      sessionPath,
+      jsonl(
+        {
+          type: "user",
+          message: { role: "user", content: "parent prompt" },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "user",
+          isSidechain: true,
+          message: { role: "user", content: "sub-agent task" },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "assistant",
+          isSidechain: true,
+          message: {
+            role: "assistant",
+            id: "mSub",
+            content: [{ type: "text", text: "sub done" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "mParent",
+            content: [{ type: "text", text: "parent done" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+      ),
+    );
+    for (let i = 0; i < 100 && seen.length < 1; i++) await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 100));
+    expect(seen).toEqual([{ promptText: "parent prompt", messageId: "mParent" }]);
+  });
+
+  it("a sidechain prompt does not become the prompt the next boundary belongs to", async () => {
+    writeFileSync(sessionPath, "");
+    const { bus } = createMockBus();
+    const seen: string[] = [];
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => {},
+      onTurnObserved: (o) => seen.push(o.promptText),
+    });
+    await tailer.start();
+    await appendFile(
+      sessionPath,
+      jsonl(
+        { type: "user", message: { role: "user", content: "the real one" }, sessionId: SESSION_ID },
+        {
+          type: "user",
+          isSidechain: true,
+          message: { role: "user", content: "sub-agent" },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "m",
+            content: [{ type: "text", text: "ok" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+      ),
+    );
+    for (let i = 0; i < 100 && seen.length < 1; i++) await new Promise((r) => setTimeout(r, 20));
+    expect(seen).toEqual(["the real one"]);
+  });
+
+  it("a boundary with no ingested prompt yet (attached mid-turn) is not reported", async () => {
+    writeFileSync(sessionPath, "");
+    const { bus, events } = createMockBus();
+    const seen: string[] = [];
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => {},
+      onTurnObserved: (o) => seen.push(o.promptText),
+    });
+    await tailer.start();
+    await appendFile(
+      sessionPath,
+      jsonl({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          id: "m",
+          content: [{ type: "text", text: "ok" }],
+          stop_reason: "end_turn",
+        },
+        sessionId: SESSION_ID,
+      }),
+    );
+    await waitFor(events, (e) => e.some((x) => x.topic === "response.turn_end"));
+    expect(seen).toEqual([]);
+  });
+});
