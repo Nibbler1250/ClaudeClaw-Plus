@@ -1020,6 +1020,950 @@ describe("BusCore IPC", () => {
     expect(delivered).toHaveLength(1); // verify torn down → NOT re-delivered
   });
 
+  it("a delivery still deciding at socket close is re-delivered only if it gives up unproven; a late turn-started or a recorded prompt is left alone (#402)", async () => {
+    // ~95 % of socket closes on a live daemon are IPC-only drops with the
+    // process alive: a delivery deciding at that moment usually SUCCEEDS.
+    // Carrying it over unconditionally would re-type it at the next restart.
+    const sockPath = join(tempDir, "bus.sock");
+    const setup = async (): Promise<{
+      delivered: string[];
+      resolve: (v: "unconfirmed-idle" | "turn-started") => void;
+      client: Awaited<ReturnType<typeof connectIpcClient>>;
+    }> => {
+      const delivered: string[] = [];
+      let resolveVerdict: (v: "unconfirmed-idle" | "turn-started") => void = () => {};
+      bus = createBusCore({
+        eventLogAppend: createMockEventLog().append,
+        socketPath: sockPath,
+        flushVerifyMs: 30,
+        onError: () => {},
+        streamPromptHandler: (_a, text) =>
+          new Promise((resolve) => {
+            delivered.push(text);
+            if (delivered.length === 1) resolveVerdict = resolve;
+            else resolve("turn-started");
+          }),
+      });
+      await bus.start();
+      const client = await connectIpcClient(sockPath);
+      client.send({
+        type: "hello",
+        agent_id: "alpha",
+        capabilities: ["claude/channel", "claude/channel/permission"],
+      } as IpcHello);
+      await new Promise((r) => setTimeout(r, 20));
+      bus.ingestSessionEvent({
+        ts: 1,
+        agent_id: "alpha",
+        session_id: "s",
+        topic: "bus.events.replay_done",
+        payload: { generation: 1 },
+      });
+      await bus.sendPrompt({
+        agent_id: "alpha",
+        origin: "telegram",
+        origin_id: "i",
+        user_id: "u",
+        text: "inflight",
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(delivered).toHaveLength(1); // handler still deciding
+      return { delivered, resolve: (v) => resolveVerdict(v), client };
+    };
+    const ready = (gen: number, sid: string) =>
+      bus.ingestSessionEvent({
+        ts: 1,
+        agent_id: "alpha",
+        session_id: sid,
+        topic: "bus.events.replay_done",
+        payload: { generation: gen },
+      });
+
+    // (a) give-up after the close, fresh session not ready yet → carried to its replay_done
+    let t = await setup();
+    t.client.close();
+    await new Promise((r) => setTimeout(r, 30));
+    t.resolve("unconfirmed-idle");
+    await new Promise((r) => setTimeout(r, 120)); // > hold deadline + verify: nothing armed on the dead generation
+    expect(t.delivered).toHaveLength(1);
+    ready(2, "s2");
+    await new Promise((r) => setTimeout(r, 30));
+    expect(t.delivered).toHaveLength(2); // re-delivered once the fresh session is ready
+    expect(t.delivered[1]).toBe(t.delivered[0]);
+    await bus.stop();
+
+    // (b) give-up after the close, fresh session ALREADY ready → delivered through the gate now
+    t = await setup();
+    t.client.close();
+    await new Promise((r) => setTimeout(r, 20));
+    ready(2, "s2");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(t.delivered).toHaveLength(1); // nothing to carry yet: the verdict is still pending
+    t.resolve("unconfirmed-idle");
+    await new Promise((r) => setTimeout(r, 40));
+    expect(t.delivered).toHaveLength(2);
+    await new Promise((r) => setTimeout(r, 120));
+    expect(t.delivered).toHaveLength(2); // and only once
+    await bus.stop();
+
+    // (c) the delivery succeeded after all (turn-started) → never re-delivered
+    t = await setup();
+    t.client.close();
+    await new Promise((r) => setTimeout(r, 20));
+    t.resolve("turn-started");
+    ready(2, "s2");
+    await new Promise((r) => setTimeout(r, 60));
+    expect(t.delivered).toHaveLength(1);
+    await bus.stop();
+
+    // (d) the transcript recorded it (prompt line) after the close, then a give-up verdict → not re-delivered
+    t = await setup();
+    t.client.close();
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "prompt",
+      payload: { text: t.delivered[0] },
+    });
+    t.resolve("unconfirmed-idle");
+    ready(2, "s2");
+    await new Promise((r) => setTimeout(r, 60));
+    expect(t.delivered).toHaveLength(1);
+  });
+  it("a verify whose one re-delivery already happened is not carried over a socket close (no third delivery) (#402)", async () => {
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      flushVerifyMs: 30,
+      onError: () => {},
+      streamPromptHandler: async (_a, text) => {
+        delivered.push(text);
+        return "unconfirmed-idle"; // never confirmed
+      },
+    });
+    await bus.start();
+    const client = await connectIpcClient(sockPath);
+    client.send({
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    } as IpcHello);
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "bus.events.replay_done",
+      payload: { generation: 1 },
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "twice max",
+    });
+    await new Promise((r) => setTimeout(r, 90)); // verify → the one re-delivery
+    expect(delivered).toHaveLength(2);
+    client.close(); // the spent entry must not ride the carry-over
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s2",
+      topic: "bus.events.replay_done",
+      payload: { generation: 2 },
+    });
+    await new Promise((r) => setTimeout(r, 120));
+    expect(delivered).toHaveLength(2);
+  });
+
+  it("a verify pre-armed for a delivery still deciding is not carried over a socket close: the verdict decides (#402)", async () => {
+    // A neighbor turn active at submit pre-arms a verify (#250). If the socket
+    // closes while that delivery is still deciding and the verdict is a late
+    // turn-started, carrying the verify would submit the prompt twice.
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    let resolveVerdict: (v: "turn-started") => void = () => {};
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      flushVerifyMs: 30,
+      onError: () => {},
+      streamPromptHandler: (_a, text) =>
+        new Promise((resolve) => {
+          delivered.push(text);
+          resolveVerdict = resolve;
+        }),
+    });
+    await bus.start();
+    const client = await connectIpcClient(sockPath);
+    client.send({
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    } as IpcHello);
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "bus.events.replay_done",
+      payload: { generation: 1 },
+    });
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "prompt",
+      payload: { text: "<channel>neighbor</channel>" },
+    }); // neighbor turn active → pre-armed verify
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "queued behind neighbor",
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(delivered).toHaveLength(1); // deciding
+    client.close();
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s2",
+      topic: "bus.events.replay_done",
+      payload: { generation: 2 },
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    expect(delivered).toHaveLength(1); // nothing carried: the verdict is pending
+    resolveVerdict("turn-started"); // it had worked
+    await new Promise((r) => setTimeout(r, 120));
+    expect(delivered).toHaveLength(1); // never submitted twice
+  });
+
+  it("a hello that follows a new generation's replay_done does not drain the carry-over a second time (#402)", async () => {
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      deliveryBackstopMs: 5000,
+      onError: () => {},
+      streamPromptHandler: async (_a, text) => {
+        delivered.push(text);
+      },
+    });
+    await bus.start();
+    const hello = {
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    } as IpcHello;
+    const client = await connectIpcClient(sockPath);
+    client.send(hello);
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "session.init",
+      payload: {},
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "carry me",
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(delivered).toHaveLength(0); // held while initialising
+    client.close(); // carried
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s2",
+      topic: "bus.events.replay_done",
+      payload: { generation: 2 },
+    }); // the replacement's tailer
+    await new Promise((r) => setTimeout(r, 20));
+    expect(delivered).toHaveLength(1); // drained once, by the ready marker
+    const again = await connectIpcClient(sockPath);
+    again.send(hello); // the replacement process connects afterwards
+    await new Promise((r) => setTimeout(r, 40));
+    expect(delivered).toHaveLength(1); // not drained again
+    again.close();
+  });
+
+  it("a second socket close merges into the carry-over instead of replacing what an earlier late give-up left there (#402)", async () => {
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    let resolveFirst: (v: "unconfirmed-idle") => void = () => {};
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      flushVerifyMs: 30,
+      deliveryBackstopMs: 5000,
+      onError: () => {},
+      streamPromptHandler: (_a, text) =>
+        new Promise((resolve) => {
+          delivered.push(text);
+          if (delivered.length === 1) resolveFirst = resolve;
+          else resolve("turn-started");
+        }),
+    });
+    await bus.start();
+    const hello = {
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    } as IpcHello;
+    let client = await connectIpcClient(sockPath);
+    client.send(hello);
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "bus.events.replay_done",
+      payload: { generation: 1 },
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "first",
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    client.close(); // first close, "first" still deciding
+    await new Promise((r) => setTimeout(r, 20));
+    resolveFirst("unconfirmed-idle"); // late give-up, no fresh session → queued for the next ready
+    await new Promise((r) => setTimeout(r, 20));
+    // The same process reconnects mid-init and a second prompt is held, then the socket drops again.
+    client = await connectIpcClient(sockPath);
+    client.send(hello); // readySinceClose is false → drains "first" now
+    await new Promise((r) => setTimeout(r, 40));
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]).toBe(delivered[0]);
+    // Now exercise the overwrite directly: queue a late give-up again, then a close with a held prompt.
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s3",
+      topic: "session.init",
+      payload: {},
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "held-two",
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(delivered).toHaveLength(2); // held while initialising
+    client.close(); // carries "held-two"; must not drop anything already waiting
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s3",
+      topic: "bus.events.replay_done",
+      payload: { generation: 3 },
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    expect(delivered).toHaveLength(3);
+    expect(delivered[2]).toContain("held-two");
+  });
+
+  it("a compaction hold survives a socket close: an IPC-only reconnect leaves it to its boundary, a new generation releases it once (#402)", async () => {
+    const sockPath = join(tempDir, "bus.sock");
+    const mk = async (verdicts: Array<"stuck-compaction" | "turn-started">) => {
+      const delivered: string[] = [];
+      bus = createBusCore({
+        eventLogAppend: createMockEventLog().append,
+        socketPath: sockPath,
+        flushVerifyMs: 30,
+        stuckCompactionResolveMs: 100_000,
+        onError: () => {},
+        streamPromptHandler: async (_a, text) => {
+          delivered.push(text);
+          return verdicts[delivered.length - 1] ?? "turn-started";
+        },
+      });
+      await bus.start();
+      const hello = {
+        type: "hello",
+        agent_id: "alpha",
+        capabilities: ["claude/channel", "claude/channel/permission"],
+      } as IpcHello;
+      const client = await connectIpcClient(sockPath);
+      client.send(hello);
+      await new Promise((r) => setTimeout(r, 20));
+      bus.ingestSessionEvent({
+        ts: 1,
+        agent_id: "alpha",
+        session_id: "s",
+        topic: "bus.events.replay_done",
+        payload: { generation: 1 },
+      });
+      await bus.sendPrompt({
+        agent_id: "alpha",
+        origin: "telegram",
+        origin_id: "i",
+        user_id: "u",
+        text: "held",
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(delivered).toHaveLength(1); // held (stuck)
+      client.close();
+      await new Promise((r) => setTimeout(r, 20));
+      return { delivered, hello };
+    };
+
+    // (a) IPC-only drop: the same process reconnects; the hold waits for ITS boundary
+    let t = await mk(["stuck-compaction", "turn-started"]);
+    const again = await connectIpcClient(sockPath);
+    again.send(t.hello);
+    await new Promise((r) => setTimeout(r, 60));
+    expect(t.delivered).toHaveLength(1); // not drained into the running compaction
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "session.compact",
+      payload: { trigger: "auto", generation: 1 },
+    });
+    await new Promise((r) => setTimeout(r, 90));
+    expect(t.delivered).toHaveLength(2); // released by the boundary → verified → re-delivered once
+    again.close();
+    await bus.stop();
+
+    // (b) the process really died: the replacement's newer generation releases the hold, once
+    t = await mk(["stuck-compaction", "stuck-compaction", "stuck-compaction"]);
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s2",
+      topic: "bus.events.replay_done",
+      payload: { generation: 2 },
+    });
+    await new Promise((r) => setTimeout(r, 90)); // released → verify → the one re-delivery (gives up again)
+    expect(t.delivered).toHaveLength(2);
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "s2",
+      topic: "session.compact",
+      payload: { trigger: "auto", generation: 2 },
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    expect(t.delivered).toHaveLength(2); // at-most-once: no third delivery
+  });
+  it("a late unconfirmed give-up after an IPC-only drop is re-delivered when the same process reconnects, without waiting for a replay_done that never comes (#402)", async () => {
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    let resolveOld: (v: "unconfirmed-idle") => void = () => {};
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      flushVerifyMs: 30,
+      stuckCompactionResolveMs: 40,
+      onError: () => {},
+      streamPromptHandler: (_a, text) =>
+        new Promise((resolve) => {
+          delivered.push(text);
+          if (delivered.length === 1) resolveOld = resolve;
+          else resolve("turn-started");
+        }),
+    });
+    await bus.start();
+    const hello = {
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    } as IpcHello;
+    const client = await connectIpcClient(sockPath);
+    client.send(hello);
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "bus.events.replay_done",
+      payload: { generation: 1 },
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "blip",
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    client.close(); // IPC drop, process alive
+    await new Promise((r) => setTimeout(r, 20));
+    resolveOld("unconfirmed-idle"); // give-up, unproven, no readiness since the close → carried
+    await new Promise((r) => setTimeout(r, 60));
+    expect(delivered).toHaveLength(1);
+    const again = await connectIpcClient(sockPath);
+    again.send(hello); // the same process reconnects: no new tailer, no replay_done
+    await new Promise((r) => setTimeout(r, 40));
+    expect(delivered).toHaveLength(2); // drained through the gate on hello
+    await new Promise((r) => setTimeout(r, 120));
+    expect(delivered).toHaveLength(2);
+    again.close();
+  });
+
+  it("a late stuck-compaction verdict after an IPC-only drop stays a hold: not drained on hello, released once by its boundary (#402)", async () => {
+    // The process is the same and may still be compacting; typing the retry
+    // on hello would land it in that buffer. The hold releases on the boundary
+    // (same process) or on a newer generation (replacement) — either way once.
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    let resolveOld: (v: "stuck-compaction") => void = () => {};
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      flushVerifyMs: 30,
+      stuckCompactionResolveMs: 100_000,
+      onError: () => {},
+      streamPromptHandler: (_a, text) =>
+        new Promise((resolve) => {
+          delivered.push(text);
+          if (delivered.length === 1) resolveOld = resolve;
+          else resolve("turn-started");
+        }),
+    });
+    await bus.start();
+    const hello = {
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    } as IpcHello;
+    const client = await connectIpcClient(sockPath);
+    client.send(hello);
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "bus.events.replay_done",
+      payload: { generation: 1 },
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "compacting",
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    client.close();
+    await new Promise((r) => setTimeout(r, 20));
+    resolveOld("stuck-compaction"); // late verdict → a hold, not a retry
+    const again = await connectIpcClient(sockPath);
+    again.send(hello);
+    await new Promise((r) => setTimeout(r, 60));
+    expect(delivered).toHaveLength(1); // not drained into the running compaction
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "session.compact",
+      payload: { trigger: "auto", generation: 1 },
+    });
+    await new Promise((r) => setTimeout(r, 90));
+    expect(delivered).toHaveLength(2); // released by its boundary → verified → once
+    await new Promise((r) => setTimeout(r, 90));
+    expect(delivered).toHaveLength(2);
+    again.close();
+  });
+
+  it("a late stuck-compaction verdict whose generation was replaced while the handler was deciding is verified now, not after the deadline (#402)", async () => {
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    let resolveOld: (v: "stuck-compaction") => void = () => {};
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      flushVerifyMs: 30,
+      stuckCompactionResolveMs: 100_000,
+      onError: () => {},
+      streamPromptHandler: (_a, text) =>
+        new Promise((resolve) => {
+          delivered.push(text);
+          if (delivered.length === 1) resolveOld = resolve;
+          else resolve("turn-started");
+        }),
+    });
+    await bus.start();
+    const client = await connectIpcClient(sockPath);
+    client.send({
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    } as IpcHello);
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "bus.events.replay_done",
+      payload: { generation: 1 },
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "typed into gen 1",
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    client.close(); // the process died while the handler was still deciding
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s2",
+      topic: "bus.events.replay_done",
+      payload: { generation: 2 },
+    }); // replacement ready
+    await new Promise((r) => setTimeout(r, 20));
+    resolveOld("stuck-compaction"); // the late verdict: its compaction died with gen 1
+    await new Promise((r) => setTimeout(r, 90)); // verify window, not the 100 s deadline
+    expect(delivered).toHaveLength(2);
+    await new Promise((r) => setTimeout(r, 90));
+    expect(delivered).toHaveLength(2);
+  });
+
+  it("a carried prompt the transcript then records drops its retry sentinel, so a later prompt with the same text can still verify (#402)", async () => {
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      flushVerifyMs: 30,
+      onError: () => {},
+      streamPromptHandler: async (_a, text) => {
+        delivered.push(text);
+        return "unconfirmed-idle";
+      },
+    });
+    await bus.start();
+    const hello = {
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    } as IpcHello;
+    const client = await connectIpcClient(sockPath);
+    client.send(hello);
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "bus.events.replay_done",
+      payload: { generation: 1 },
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "same words",
+    });
+    await new Promise((r) => setTimeout(r, 10)); // verify armed (unconfirmed), not fired yet
+    client.close(); // verify carried → its sentinel set
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "prompt",
+      payload: { text: delivered[0] },
+    }); // the CLI had it after all
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "response.turn_end",
+      payload: { text: "" },
+    }); // …and ran it
+    const again = await connectIpcClient(sockPath);
+    again.send(hello);
+    await new Promise((r) => setTimeout(r, 60));
+    expect(delivered).toHaveLength(1); // nothing carried: it was recorded
+    // A later prompt with the very same text is a fresh prompt: its own verify must still work.
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "same words",
+    });
+    await new Promise((r) => setTimeout(r, 90)); // unconfirmed → verify → re-delivered once
+    expect(delivered).toHaveLength(3);
+    again.close();
+  });
+
+  it("the first replay_done ever seen for an agent does not release a hold taken before any generation was known (#402)", async () => {
+    // The marker may come from the very tailer that accepted the prompt; a
+    // hold taken before it must wait for its boundary like any other.
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      flushVerifyMs: 30,
+      stuckCompactionResolveMs: 100_000,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+      return delivered.length === 1 ? "stuck-compaction" : "turn-started";
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "before any marker",
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(delivered).toHaveLength(1); // held, generation unknown
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "bus.events.replay_done",
+      payload: { generation: 1 },
+    }); // first marker: not a replacement
+    await new Promise((r) => setTimeout(r, 90));
+    expect(delivered).toHaveLength(1); // still held
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "session.compact",
+      payload: { trigger: "auto", generation: 1 },
+    });
+    await new Promise((r) => setTimeout(r, 90));
+    expect(delivered).toHaveLength(2); // its boundary releases it
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s2",
+      topic: "bus.events.replay_done",
+      payload: { generation: 2 },
+    }); // a real replacement later changes nothing
+    await new Promise((r) => setTimeout(r, 60));
+    expect(delivered).toHaveLength(2);
+  });
+
+  it("a retry held in the init queue is dropped when the transcript proves the prompt, so replay_done does not flush a duplicate (#402)", async () => {
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      flushVerifyMs: 30,
+      deliveryBackstopMs: 5000,
+      onError: () => {},
+      streamPromptHandler: async (_a, text) => {
+        delivered.push(text);
+        return "unconfirmed-idle";
+      },
+    });
+    await bus.start();
+    const hello = {
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    } as IpcHello;
+    const client = await connectIpcClient(sockPath);
+    client.send(hello);
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "bus.events.replay_done",
+      payload: { generation: 1 },
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "queued retry",
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    client.close(); // the pending verify is carried (retry)
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s2",
+      topic: "session.init",
+      payload: {},
+    }); // replacement (re)initialising
+    const again = await connectIpcClient(sockPath);
+    again.send(hello); // hello with no replay_done since the close → the retry goes to the gate → held in the init queue
+    await new Promise((r) => setTimeout(r, 40));
+    expect(delivered).toHaveLength(1);
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "prompt",
+      payload: { text: delivered[0] },
+    }); // the old process had it after all
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s2",
+      topic: "bus.events.replay_done",
+      payload: { generation: 2 },
+    }); // flush the init queue
+    await new Promise((r) => setTimeout(r, 60));
+    expect(delivered).toHaveLength(1); // the proven retry was dropped from the queue
+    again.close();
+  });
+
+  it("a hold released by the old tailer's late boundary after a close waits for the replacement's readiness instead of typing into a booting process (#402)", async () => {
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      flushVerifyMs: 30,
+      stuckCompactionResolveMs: 100_000,
+      onError: () => {},
+      streamPromptHandler: async (_a, text) => {
+        delivered.push(text);
+        return delivered.length === 1 ? "stuck-compaction" : "turn-started";
+      },
+    });
+    await bus.start();
+    const client = await connectIpcClient(sockPath);
+    client.send({
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    } as IpcHello);
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "bus.events.replay_done",
+      payload: { generation: 1 },
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "held under gen 1",
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(delivered).toHaveLength(1); // held
+    client.close(); // the process died; a replacement is being spawned
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "session.compact",
+      payload: { trigger: "auto", generation: 1 },
+    }); // old tailer's last read
+    await new Promise((r) => setTimeout(r, 90)); // verify would fire now…
+    expect(delivered).toHaveLength(1); // …but no readiness since the close: parked
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s2",
+      topic: "bus.events.replay_done",
+      payload: { generation: 2 },
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    expect(delivered).toHaveLength(2); // delivered once the replacement is ready
+  });
+  it("a give-up resolving after the fresh session is ready is delivered once, and its own late cleanup does not disturb that delivery (#402)", async () => {
+    // The late give-up re-delivers the text (a second delivery, same key)
+    // while the old delivery's `finally` has not run yet. The old cleanup
+    // must not tear down the new delivery's entry or in-flight count.
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    let resolveOld: (v: "unconfirmed-idle") => void = () => {};
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      flushVerifyMs: 30,
+      onError: () => {},
+      streamPromptHandler: (_a, text) =>
+        new Promise((resolve) => {
+          delivered.push(text);
+          if (delivered.length === 1) resolveOld = resolve;
+          else resolve("turn-started");
+        }),
+    });
+    await bus.start();
+    const client = await connectIpcClient(sockPath);
+    client.send({
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    } as IpcHello);
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "bus.events.replay_done",
+      payload: { generation: 1 },
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "twice",
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(delivered).toHaveLength(1); // old handler pending
+    client.close();
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s2",
+      topic: "bus.events.replay_done",
+      payload: { generation: 2 },
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(delivered).toHaveLength(1); // nothing carried: the old verdict is still pending
+    resolveOld("unconfirmed-idle"); // the give-up → delivered through the gate now
+    await new Promise((r) => setTimeout(r, 40));
+    expect(delivered).toHaveLength(2);
+    // The new delivery's turn-start proves it; nothing further, ever.
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s2",
+      topic: "prompt",
+      payload: { text: delivered[1] },
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    expect(delivered).toHaveLength(2);
+  });
   it("re-delivers a prompt held at socket close once the fresh session is ready (#252 stack ultra B1)", async () => {
     // A reconciler restart of an alive-but-deaf agent closes the socket while a
     // prompt is still held (or awaiting verify). onClose snapshots it; the fresh
@@ -2258,10 +3202,11 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
       expect(delivered).toHaveLength(2);
     });
 
-    it("arms nothing on turn-started, nothing on stuck-compaction, and nothing when the handler has no verdict", async () => {
+    it("arms nothing on turn-started, holds (does not re-deliver yet) on stuck-compaction, and nothing when the handler has no verdict", async () => {
       // stuck-compaction: the CLI may have buffered the keystrokes through the
-      // compaction and will submit them itself; the bus has no "still
-      // compacting" signal to defer on, so re-typing would double-submit.
+      // compaction and will submit them itself when it ends; re-typing WHILE it
+      // runs would double-submit. The prompt is held for the end signal (#402),
+      // so nothing is re-delivered inside the ordinary verify window.
       const delivered = verdictBus(["turn-started", "stuck-compaction", undefined]);
       await prompt("alpha", "confirmed");
       await prompt("alpha", "buffered by the compaction");
@@ -2269,6 +3214,232 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
       expect(delivered).toHaveLength(3);
       await new Promise((r) => setTimeout(r, 90));
       expect(delivered).toHaveLength(3); // none was re-delivered
+    });
+
+    describe("a prompt lost in a stuck compaction (issue #402)", () => {
+      const compactEvt = (agent: string): BusEvent => ({
+        ts: Date.now(), // the boundary line's timestamp: written after the hold was taken
+        agent_id: agent,
+        session_id: "s",
+        topic: "session.compact",
+        payload: { trigger: "auto" },
+      });
+      const heldBus = (
+        verdicts: Array<"stuck-compaction" | "turn-started">,
+        resolveMs = 100_000,
+      ) => {
+        bus = createBusCore({
+          eventLogAppend: createMockEventLog().append,
+          flushVerifyMs: 30,
+          stuckCompactionResolveMs: resolveMs,
+          onError: () => {},
+        });
+        const delivered: string[] = [];
+        bus.setStreamPromptHandler(async (_a, text) => {
+          delivered.push(text);
+          return verdicts[delivered.length - 1];
+        });
+        return delivered;
+      };
+
+      const replayGen = (agent: string, generation: number): BusEvent => ({
+        ...replayEvt(agent),
+        payload: { generation },
+      });
+      const compactGen = (agent: string, generation: number): BusEvent => ({
+        ...compactEvt(agent),
+        payload: { trigger: "auto", generation },
+      });
+
+      it("re-delivers once when the compaction ends and the transcript never recorded the prompt", async () => {
+        const delivered = heldBus(["stuck-compaction", "turn-started"]);
+        await prompt("alpha", "swallowed for good");
+        expect(delivered).toHaveLength(1);
+        await new Promise((r) => setTimeout(r, 90)); // held: no verify runs while the compaction is on
+        expect(delivered).toHaveLength(1);
+        bus.ingestSessionEvent(compactEvt("alpha")); // compact_boundary: it ended
+        await new Promise((r) => setTimeout(r, 90)); // verify: no prompt line → re-deliver
+        expect(delivered).toHaveLength(2);
+        expect(delivered[1]).toBe(delivered[0]);
+      });
+
+      it("does NOT re-deliver when the CLI submits the buffered keystrokes itself at the end of the compaction", async () => {
+        const delivered = heldBus(["stuck-compaction"]);
+        await prompt("alpha", "buffered, then submitted");
+        bus.ingestSessionEvent(compactEvt("alpha"));
+        bus.ingestSessionEvent(turnEvt("alpha", delivered[0] as string)); // the CLI typed it for us
+        bus.ingestSessionEvent(turnEndEvt("alpha"));
+        await new Promise((r) => setTimeout(r, 120));
+        expect(delivered).toHaveLength(1);
+      });
+
+      it("does NOT re-deliver when the transcript records the held prompt BEFORE any end signal (aborted compaction, or the user line first)", async () => {
+        const delivered = heldBus(["stuck-compaction"], 50);
+        await prompt("alpha", "recorded while held");
+        bus.ingestSessionEvent(turnEvt("alpha", delivered[0] as string)); // proof lands during the hold
+        bus.ingestSessionEvent(turnEndEvt("alpha"));
+        await new Promise((r) => setTimeout(r, 150)); // past the deadline: the hold was cancelled, no verify
+        expect(delivered).toHaveLength(1);
+      });
+
+      it("verifies anyway after the resolve deadline when the compaction never reports its end", async () => {
+        const delivered = heldBus(["stuck-compaction", "turn-started"], 50);
+        await prompt("alpha", "compaction that never ends");
+        await new Promise((r) => setTimeout(r, 30));
+        expect(delivered).toHaveLength(1); // still held
+        await new Promise((r) => setTimeout(r, 120)); // deadline → verify → re-deliver once
+        expect(delivered).toHaveLength(2);
+      });
+
+      it("re-delivers at most once even if the re-delivery hits a stuck compaction again", async () => {
+        const delivered = heldBus(["stuck-compaction", "stuck-compaction", "stuck-compaction"], 40);
+        await prompt("alpha", "twice unlucky");
+        await new Promise((r) => setTimeout(r, 130)); // deadline → re-delivery #1 → stuck again
+        expect(delivered).toHaveLength(2);
+        bus.ingestSessionEvent(compactEvt("alpha")); // even a real end signal must not arm a 2nd re-delivery
+        await new Promise((r) => setTimeout(r, 130));
+        expect(delivered).toHaveLength(2);
+      });
+
+      it("releases the hold on a NEW tailer generation (replay_done), which cannot still be compacting", async () => {
+        const delivered = heldBus(["stuck-compaction", "turn-started"]);
+        bus.ingestSessionEvent(replayGen("alpha", 1)); // live generation at hold time
+        await prompt("alpha", "held across a restart");
+        bus.ingestSessionEvent(replayGen("alpha", 2)); // the replacement tailer
+        await new Promise((r) => setTimeout(r, 90));
+        expect(delivered).toHaveLength(2);
+      });
+      it("does NOT release the hold on a replay_done of the generation it was taken in (re-emitted, or a --resume restart keeping the session id)", async () => {
+        const delivered = heldBus(["stuck-compaction", "turn-started"]);
+        bus.ingestSessionEvent(replayGen("alpha", 1));
+        await prompt("alpha", "held across a same-generation marker");
+        bus.ingestSessionEvent(replayGen("alpha", 1)); // same generation
+        await new Promise((r) => setTimeout(r, 90));
+        expect(delivered).toHaveLength(1); // still held
+      });
+
+      it("does NOT release the hold on the init backstop, which is a readiness fallback and not an end signal", async () => {
+        bus = createBusCore({
+          eventLogAppend: createMockEventLog().append,
+          flushVerifyMs: 30,
+          deliveryBackstopMs: 40,
+          stuckCompactionResolveMs: 100_000,
+          onError: () => {},
+        });
+        const delivered: string[] = [];
+        bus.setStreamPromptHandler(async (_a, text) => {
+          delivered.push(text);
+          return delivered.length === 1 ? "stuck-compaction" : "turn-started";
+        });
+        bus.ingestSessionEvent(replayGen("alpha", 1));
+        await prompt("alpha", "held, then the session re-inits");
+        expect(delivered).toHaveLength(1);
+        bus.ingestSessionEvent({
+          ts: 1,
+          agent_id: "alpha",
+          session_id: "s-next",
+          topic: "session.init",
+          payload: {},
+        });
+        await new Promise((r) => setTimeout(r, 120)); // backstop fired (40) + verify window: nothing
+        expect(delivered).toHaveLength(1);
+        bus.ingestSessionEvent(compactGen("alpha", 1)); // the real end signal
+        await new Promise((r) => setTimeout(r, 90));
+        expect(delivered).toHaveLength(2);
+      });
+      it("does NOT release the hold on an out-of-order replay_done from an OLDER tailer generation", async () => {
+        // gen 1 → gen 2 live, prompt held under gen 2; the replaced tailer's
+        // last read publishes gen 1's marker AFTER gen 2's. The hold must stay.
+        const delivered = heldBus(["stuck-compaction", "turn-started"]);
+        bus.ingestSessionEvent(replayGen("alpha", 1));
+        bus.ingestSessionEvent(replayGen("alpha", 2));
+        await prompt("alpha", "held under gen 2");
+        bus.ingestSessionEvent(replayGen("alpha", 1)); // lagged, older
+        await new Promise((r) => setTimeout(r, 90));
+        expect(delivered).toHaveLength(1); // still held
+        bus.ingestSessionEvent(replayGen("alpha", 3)); // a genuinely new one
+        await new Promise((r) => setTimeout(r, 90));
+        expect(delivered).toHaveLength(2);
+      });
+      it("a stale replay_done is a no-op for the delivery gate too: it does not flush held prompts into the replacement", async () => {
+        // gen 2 is live; the replacement's session.init holds new prompts until
+        // its own replay_done. A late gen 1 marker must not stand in for that.
+        const delivered = heldBus(["turn-started", "turn-started"]);
+        bus.ingestSessionEvent(replayGen("alpha", 1));
+        bus.ingestSessionEvent(replayGen("alpha", 2));
+        bus.ingestSessionEvent({
+          ts: 1,
+          agent_id: "alpha",
+          session_id: "gen-3",
+          topic: "session.init",
+          payload: {},
+        });
+        await prompt("alpha", "held for gen 3");
+        expect(delivered).toHaveLength(0); // held: gen 3 not ready
+        bus.ingestSessionEvent(replayGen("alpha", 1)); // stale
+        await new Promise((r) => setTimeout(r, 20));
+        expect(delivered).toHaveLength(0); // still held
+        bus.ingestSessionEvent({ ...replayGen("alpha", 3), session_id: "gen-3" }); // the real readiness
+        await new Promise((r) => setTimeout(r, 20));
+        expect(delivered).toHaveLength(1);
+      });
+      it("releases on a session.compact of the hold's own generation only", async () => {
+        const delivered = heldBus(["stuck-compaction", "turn-started"]);
+        bus.ingestSessionEvent(replayGen("alpha", 2));
+        await prompt("alpha", "held under gen 2");
+        bus.ingestSessionEvent(compactGen("alpha", 1)); // old transcript's late boundary
+        await new Promise((r) => setTimeout(r, 90));
+        expect(delivered).toHaveLength(1); // not released
+        bus.ingestSessionEvent(compactGen("alpha", 2)); // this generation compacted
+        await new Promise((r) => setTimeout(r, 90));
+        expect(delivered).toHaveLength(2);
+      });
+      it("absorbs a verify sendPrompt pre-armed for the same delivery, so it cannot fire during the compaction", async () => {
+        // A neighbor turn active at submit pre-arms a verify (#250). If that
+        // delivery then gives up on stuck-compaction, the pre-armed verify must
+        // not run on its own clock (it would retype into the compaction): the
+        // hold replaces it, and the prompt is still re-delivered at most once.
+        const delivered = heldBus(["stuck-compaction", "turn-started"], 120);
+        bus.ingestSessionEvent(turnEvt("alpha", "<channel>neighbor</channel>")); // neighbor turn streaming
+        await prompt("alpha", "queued behind a neighbor, then compaction");
+        expect(delivered).toHaveLength(1);
+        bus.ingestSessionEvent(turnEndEvt("alpha")); // neighbor ends: the pre-armed verify would now fire
+        await new Promise((r) => setTimeout(r, 90)); // > verify + grace: nothing, the hold owns it
+        expect(delivered).toHaveLength(1);
+        await new Promise((r) => setTimeout(r, 120)); // hold deadline (120) + verify → once
+        expect(delivered).toHaveLength(2);
+        await new Promise((r) => setTimeout(r, 120));
+        expect(delivered).toHaveLength(2); // and never a third time
+      });
+
+      it("a boundary written before the hold was taken (an earlier compaction, read late) does not release it", async () => {
+        const delivered = heldBus(["stuck-compaction", "turn-started"]);
+        bus.ingestSessionEvent(replayGen("alpha", 1));
+        const before = Date.now() - 10_000; // an earlier compaction's boundary line
+        await prompt("alpha", "held for the second compaction");
+        bus.ingestSessionEvent({ ...compactGen("alpha", 1), ts: before }); // ingested late
+        await new Promise((r) => setTimeout(r, 90));
+        expect(delivered).toHaveLength(1); // still held
+        bus.ingestSessionEvent({ ...compactGen("alpha", 1), ts: Date.now() }); // this prompt's compaction ends
+        await new Promise((r) => setTimeout(r, 90));
+        expect(delivered).toHaveLength(2);
+      });
+
+      it("a hold's deadline releases that hold only, not a later prompt held behind a longer compaction", async () => {
+        const delivered = heldBus(
+          ["stuck-compaction", "stuck-compaction", "turn-started", "turn-started"],
+          60,
+        );
+        await prompt("alpha", "first");
+        await new Promise((r) => setTimeout(r, 35));
+        await prompt("alpha", "second"); // held 35 ms later → its own deadline is 35 ms later
+        await new Promise((r) => setTimeout(r, 80)); // first deadline (60) + verify (30) + grace…
+        expect(delivered).toHaveLength(3); // …only "first" was re-delivered
+        expect(delivered[2]).toBe(delivered[0]);
+        await new Promise((r) => setTimeout(r, 100)); // second deadline (35+60) + verify + grace
+        expect(delivered).toHaveLength(4);
+        expect(delivered[3]).toBe(delivered[1]);
+      });
     });
 
     it("does NOT re-deliver when the transcript records the prompt after all (late user line)", async () => {
