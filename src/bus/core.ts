@@ -278,6 +278,16 @@ export interface BusCore {
   activeTurnAgents(): string[];
   /** #315: agents with a turn in flight OR a prompt the bus still owes the model. */
   busyAgents?(): string[];
+  /**
+   * #412 (item 1): the session manager announces a replacement process's
+   * tailer generation the moment that process becomes the delivery target
+   * (before its collision wait and before its tailer's `replay_done` is
+   * ingested). A delivery typed into the new process in that window is then
+   * tagged with the new generation, so a hold taken on its verdict cannot be
+   * released by a late boundary from the old tailer's last read. Optional:
+   * mocks and other wirings need not implement it.
+   */
+  noteSpawnedGeneration?(agent_id: string, generation: number): void;
   ingestReply(req: IngestReplyRequest): void;
   ingestSessionEvent(e: BusEvent): void;
   ingestPermissionDecision(req: IngestPermissionDecisionRequest): void;
@@ -288,6 +298,13 @@ export interface BusCore {
   start(): Promise<void>;
   /** Stop the IPC server and drain. */
   stop(): Promise<void>;
+}
+
+/** The greater of two optional generations (`undefined` when neither is known). */
+function maxGeneration(a: number | undefined, b: number | undefined): number | undefined {
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  return a > b ? a : b;
 }
 
 export class BusCoreImpl implements BusCore {
@@ -446,6 +463,10 @@ export class BusCoreImpl implements BusCore {
    *  `session_id` cannot play this role: it is the stable Claude UUID and
    *  survives a `--resume` restart. */
   private readonly agentTailerGeneration = new Map<string, number>();
+  /** #412: the generation the session manager has SPAWNED for an agent, which
+   *  may be ahead of the live one (its `replay_done` not ingested yet). A
+   *  delivery is tagged with the greater of the two. */
+  private readonly agentSpawnedGeneration = new Map<string, number>();
   private readonly deliveryBackstopMs: number;
   /**
    * Pending turn-start verification for a BACKSTOP-flushed prompt. The backstop
@@ -837,6 +858,7 @@ export class BusCoreImpl implements BusCore {
       for (const entry of held.values()) clearTimeout(entry.timer);
     this.compactionHeld.clear();
     this.agentTailerGeneration.clear();
+    this.agentSpawnedGeneration.clear();
     this.agentTurnActive.clear();
     this.lastTurnEndMessageId.clear();
     this.originAmbiguous.clear();
@@ -1074,8 +1096,14 @@ export class BusCoreImpl implements BusCore {
     const epoch = this.inFlightEpoch.get(agent_id) ?? 0;
     // The tailer generation this delivery types into: a hold taken on its
     // verdict belongs to THIS generation, not to whatever is live when the
-    // (possibly late) verdict lands.
-    const generationAtStart = this.agentTailerGeneration.get(agent_id);
+    // (possibly late) verdict lands. The process the PTY layer types into is
+    // whichever the session manager has current — a replacement it has
+    // spawned counts from the announce (#412), even before that tailer's
+    // `replay_done` moves the live pointer.
+    const generationAtStart = maxGeneration(
+      this.agentTailerGeneration.get(agent_id),
+      this.agentSpawnedGeneration.get(agent_id),
+    );
     const key = sanitizePtyPromptText(wrapped);
     const token = ++this.deliveryToken;
     let proofs = this.inFlightProof.get(agent_id);
@@ -1236,9 +1264,17 @@ export class BusCoreImpl implements BusCore {
     // rotation storm shows. Ordering is only known when the marker carries a
     // generation (session-manager wiring); without one, behaviour is as before.
     const liveGeneration = this.agentTailerGeneration.get(agent_id);
-    if (generation !== undefined && liveGeneration !== undefined && generation < liveGeneration) {
+    // #412: a marker older than the generation the manager has SPAWNED is stale
+    // too, even before that generation's own `replay_done` moved the live
+    // pointer — the old tailer's last read must not clear the replacement's
+    // init state nor drain the queue into it before its own readiness marker.
+    const knownGeneration = maxGeneration(
+      liveGeneration,
+      this.agentSpawnedGeneration.get(agent_id),
+    );
+    if (generation !== undefined && knownGeneration !== undefined && generation < knownGeneration) {
       console.warn(
-        `[bus] ignoring stale replay_done for agent=${agent_id} (tailer generation ${generation} < live ${liveGeneration})`,
+        `[bus] ignoring stale replay_done for agent=${agent_id} (tailer generation ${generation} < ${liveGeneration !== undefined && generation < liveGeneration ? `live ${liveGeneration}` : `spawned ${knownGeneration}`})`,
       );
       return;
     }
@@ -1669,6 +1705,13 @@ export class BusCoreImpl implements BusCore {
       }
     }
     return [...busy];
+  }
+
+  noteSpawnedGeneration(agent_id: string, generation: number): void {
+    const known = this.agentSpawnedGeneration.get(agent_id);
+    if (known === undefined || generation > known) {
+      this.agentSpawnedGeneration.set(agent_id, generation);
+    }
   }
 
   /* ─────────────────────────────── subscriptions ─────────────────────────────── */
