@@ -28,6 +28,14 @@ Group=claw
 ExecStart=/bin/bash -c 'set -a; source /home/claw/.claudeclaw-env; set +a; exec bun run /opt/claudeclaw/src/index.ts start --web'
 Restart=on-failure
 RestartSec=10
+# Graceful drain (#315): SIGTERM must reach the daemon ONLY, so the `claude`
+# children outlive the signal while the daemon waits (up to
+# settings.shutdown.drainTurnsMs, default 30 s) for in-flight turns. With the
+# default KillMode=control-group every child dies at the same instant and the
+# drain has nothing left to protect. `mixed` SIGKILLs whatever remains at
+# TimeoutStopSec, so keep that above the drain window.
+KillMode=mixed
+TimeoutStopSec=90
 
 # ── Tier 1 hardening ────────────────────────────────────────────────────────
 TasksMax=100
