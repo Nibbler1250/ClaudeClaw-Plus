@@ -1468,6 +1468,167 @@ describe("BusCore IPC", () => {
     await new Promise((r) => setTimeout(r, 150));
     expect(t.delivered).toHaveLength(2); // at-most-once: no third delivery
   });
+  it("a prompt typed into a spawned replacement before its replay_done is tagged with the NEW generation: the old tailer's late boundary cannot release its hold (#412 item 1)", async () => {
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      flushVerifyMs: 30,
+      stuckCompactionResolveMs: 100_000,
+      onError: () => {},
+      streamPromptHandler: async (_a, text) => {
+        delivered.push(text);
+        return "stuck-compaction";
+      },
+    });
+    await bus.start();
+    const client = await connectIpcClient(sockPath);
+    client.send({
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    } as IpcHello);
+    await new Promise((r) => setTimeout(r, 20));
+    // generation 1 is live
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s1",
+      topic: "bus.events.replay_done",
+      payload: { generation: 1 },
+    });
+    // the session manager has spawned the replacement (generation 2); its
+    // tailer's replay_done has NOT been ingested yet
+    bus.noteSpawnedGeneration?.("alpha", 2);
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "typed into the replacement",
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(delivered).toHaveLength(1); // held: stuck in the replacement's compaction
+    // the OLD tailer's last in-flight read: a session.compact of generation 1
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "s1",
+      topic: "session.compact",
+      payload: { trigger: "auto", generation: 1 },
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    expect(delivered).toHaveLength(1); // NOT released — the hold belongs to generation 2
+    // the replacement's own replay_done: a new generation releases OLDER holds only
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "s2",
+      topic: "bus.events.replay_done",
+      payload: { generation: 2 },
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    expect(delivered).toHaveLength(1); // still held: its compaction is in generation 2
+    // the replacement's compaction ends: ITS boundary releases the hold, once
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "s2",
+      topic: "session.compact",
+      payload: { trigger: "auto", generation: 2 },
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    expect(delivered).toHaveLength(2); // released → verified → the one re-delivery
+    client.close();
+  });
+
+  it("a late replay_done of the replaced generation, after the spawn was announced, is stale and drains nothing (#412, Copilot)", async () => {
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      onError: () => {},
+      streamPromptHandler: async (_a, text) => {
+        delivered.push(text);
+        return "turn-started";
+      },
+    });
+    await bus.start();
+    const warnings: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...a: unknown[]) => {
+      warnings.push(a.map(String).join(" "));
+    };
+    try {
+      // generation 1 live; the process is then replaced: the manager announces 2
+      bus.ingestSessionEvent({
+        ts: 1,
+        agent_id: "alpha",
+        session_id: "s1",
+        topic: "bus.events.replay_done",
+        payload: { generation: 1 },
+      });
+      bus.noteSpawnedGeneration?.("alpha", 2);
+      // the replacement is initialising: a prompt is queued behind its readiness
+      bus.ingestSessionEvent({
+        ts: 2,
+        agent_id: "alpha",
+        session_id: "s2",
+        topic: "session.init",
+        payload: {},
+      });
+      await bus.sendPrompt({
+        agent_id: "alpha",
+        origin: "telegram",
+        origin_id: "i",
+        user_id: "u",
+        text: "queued",
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(delivered).toHaveLength(0);
+      // the OLD tailer's last read: its replay_done (generation 1) lands late
+      bus.ingestSessionEvent({
+        ts: 3,
+        agent_id: "alpha",
+        session_id: "s1",
+        topic: "bus.events.replay_done",
+        payload: { generation: 1 },
+      });
+      await new Promise((r) => setTimeout(r, 40));
+      expect(delivered).toHaveLength(0); // NOT drained into a replacement that has not said it is ready
+      expect(warnings.some((w) => w.includes("stale replay_done") && w.includes("spawned 2"))).toBe(
+        true,
+      );
+      // the replacement's own marker drains it
+      bus.ingestSessionEvent({
+        ts: 4,
+        agent_id: "alpha",
+        session_id: "s2",
+        topic: "bus.events.replay_done",
+        payload: { generation: 2 },
+      });
+      await new Promise((r) => setTimeout(r, 40));
+      expect(delivered).toHaveLength(1);
+    } finally {
+      console.warn = origWarn;
+    }
+  });
+
+  it("noteSpawnedGeneration never moves backwards, and a delivery with no spawned generation keeps the live one (#412)", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    const b = bus as unknown as {
+      noteSpawnedGeneration: (a: string, g: number) => void;
+      agentSpawnedGeneration: Map<string, number>;
+    };
+    b.noteSpawnedGeneration("alpha", 3);
+    b.noteSpawnedGeneration("alpha", 2);
+    expect(b.agentSpawnedGeneration.get("alpha")).toBe(3);
+    b.noteSpawnedGeneration("alpha", 4);
+    expect(b.agentSpawnedGeneration.get("alpha")).toBe(4);
+    expect(b.agentSpawnedGeneration.get("beta")).toBeUndefined();
+  });
   it("a late unconfirmed give-up after an IPC-only drop is re-delivered when the same process reconnects, without waiting for a replay_done that never comes (#402)", async () => {
     const sockPath = join(tempDir, "bus.sock");
     const delivered: string[] = [];

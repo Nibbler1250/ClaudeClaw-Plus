@@ -985,6 +985,34 @@ describe("JSONL tailer wiring (issue #215)", () => {
     expect(replies[0].origin).toBe("telegram");
   });
 
+  it("announces the tailer generation to the bus BEFORE the record goes live, with the number the tailer carries (#412 item 1)", async () => {
+    // From `agents.set` on, the bus resolves this proc as the delivery target
+    // and the collision wait takes 2 s on a healthy spawn: the announce must
+    // already have happened, or a prompt typed in that window is tagged with
+    // the generation being replaced.
+    const calls: Array<{ agent: string; generation: number; recordLive: boolean }> = [];
+    const b = bus as unknown as { noteSpawnedGeneration?: (a: string, g: number) => void };
+    const original = b.noteSpawnedGeneration?.bind(bus);
+    b.noteSpawnedGeneration = (a: string, g: number) => {
+      calls.push({ agent: a, generation: g, recordLive: mgr.getAgent(a) !== undefined });
+      original?.(a, g);
+    };
+    try {
+      const agent = mkAgent({ id: "gen-agent", cwd: agentCwd, session_id: SID });
+      await mgr.spawnAgent(agent, "telegram");
+      spawned.push(agent.id);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toEqual({ agent: "gen-agent", generation: 1, recordLive: false });
+      const record = (
+        mgr as unknown as { agents: Map<string, { tailer?: { generation?: number } }> }
+      ).agents.get("gen-agent");
+      // the tailer built for this process carries the announced number
+      expect(record?.tailer?.generation).toBe(1);
+    } finally {
+      if (original) b.noteSpawnedGeneration = original;
+    }
+  });
+
   it("spawns cleanly when no bus is configured (tailer wiring is opt-in)", async () => {
     const noBus = new SessionManager({
       commandOverride: "/bin/cat",

@@ -840,6 +840,21 @@ export class SessionManager {
       mcpConfigCwd,
       spawnedAt: Date.now(),
     };
+    // #402/#412: number this process's tailer generation and announce it to
+    // the bus BEFORE the record goes live — from `agents.set` on, the bus's
+    // PTY handler resolves this proc as the delivery target, and the
+    // collision wait below takes 2 s on a healthy spawn. A prompt typed into
+    // the replacement in that window must be tagged with its generation, not
+    // the one being replaced. The announce is monotonic, so a collided attempt
+    // that never builds its tailer leaves nothing behind; the retry announces
+    // the next number and its tailer carries that one.
+    const tailerGeneration = this.options.bus
+      ? (this.tailerGeneration.get(agent.id) ?? 0) + 1
+      : undefined;
+    if (this.options.bus && tailerGeneration !== undefined) {
+      this.tailerGeneration.set(agent.id, tailerGeneration);
+      this.options.bus.noteSpawnedGeneration?.(agent.id, tailerGeneration);
+    }
     this.agents.set(agent.id, record);
     // The collision detector's verdict for this spawn, once it is armed below.
     // The exit log reads it so that "collision" is said by ONE judge (#326):
@@ -977,9 +992,9 @@ export class SessionManager {
       // it. Both implement `AgentProcess`, so the transcript hooks are reached
       // through it — and a runtime without them stays a no-op via `?.`.
       const confirmable: AgentProcess = proc;
-      // #402: number the tailers per agent so the bus can order their markers.
-      const generation = (this.tailerGeneration.get(agent.id) ?? 0) + 1;
-      this.tailerGeneration.set(agent.id, generation);
+      // #402: the generation numbered (and announced, #412) before the record
+      // went live above, so the bus can order this tailer's markers.
+      const generation = tailerGeneration as number;
       const tailer = new JsonlTailer({
         bus: this.options.bus,
         agent_id: agent.id,
