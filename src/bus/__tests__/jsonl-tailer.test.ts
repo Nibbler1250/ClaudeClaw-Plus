@@ -617,6 +617,68 @@ describe("JsonlTailer — assistant lines", () => {
     expect("generation" in (replay?.payload as object)).toBe(false);
   });
 
+  it("fires onTranscriptLine for every line it reads — ingestion or not, replayed or live — and keeps dispatching when the callback throws (#383)", async () => {
+    // Two replayed lines: an assistant line (not an ingestion) and a user
+    // prompt (an ingestion); then one live-tailed line.
+    writeFileSync(
+      sessionPath,
+      jsonl(
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "msg_A",
+            content: [{ type: "text", text: "hi" }],
+            stop_reason: "end_turn",
+          },
+          timestamp: "2026-06-02T10:00:10.000Z",
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "user",
+          message: { role: "user", content: "a prompt" },
+          timestamp: "2026-06-02T10:00:11.000Z",
+          sessionId: SESSION_ID,
+        },
+      ),
+    );
+    const { bus, events } = createMockBus();
+    let lines = 0;
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => {},
+      onTranscriptLine: () => {
+        lines++;
+        throw new Error("subscriber bug"); // must not stop the tailer
+      },
+    });
+    await tailer.start();
+    expect(lines).toBe(2); // both replayed lines, ingestion or not
+    expect(events.some((e) => e.topic === "response.turn_end")).toBe(true); // dispatch went on past the throw
+    expect(events.some((e) => e.topic === "prompt")).toBe(true);
+
+    await appendFile(
+      sessionPath,
+      `\n{"type":"assistant","truncated":\n${jsonl({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          id: "msg_B",
+          content: [{ type: "text", text: "later" }],
+          stop_reason: "end_turn",
+        },
+        timestamp: "2026-06-02T10:00:12.000Z",
+        sessionId: SESSION_ID,
+      })}`,
+    );
+    await waitFor(events, (e) => e.filter((x) => x.topic === "response.turn_end").length >= 2);
+    expect(lines).toBe(5); // a blank line and a malformed one counted as activity too, then the good one
+  });
+
   it("surfaces api_error fields as system.api_error", async () => {
     writeFileSync(
       sessionPath,
