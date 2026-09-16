@@ -1,21 +1,35 @@
 /**
- * Tests for runner.ts modelOverride wiring (Phase 18 Plan 01).
+ * Tests for runner.ts modelOverride wiring (Phase 18 Plan 01, made real in #330).
  *
- * Strategy: spy on runClaudeOnce to intercept model arg, throw sentinel
- * to short-circuit downstream side effects. Use isolated tmp cwd to
- * contain any session/log writes.
+ * Strategy: inject `execClaude`'s primary exec (`_setPrimaryExecForTests`) to
+ * capture the resolved model and throw a sentinel that short-circuits the
+ * downstream recovery paths. The runs still reach `recordInvocationStart`,
+ * so the usage records they leave under `<cwd>/.claude/claudeclaw/usage/` are
+ * removed in `afterAll` (same wipe the governance tests do in `beforeEach`).
  *
  * Run with: bun test src/__tests__/runner.test.ts
  */
 
-import { describe, it, expect, beforeAll, beforeEach, afterEach, spyOn, test } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  spyOn,
+  test,
+} from "bun:test";
+import { readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import * as runnerMod from "../runner";
 import * as configMod from "../config";
 import { initConfig, loadSettings, getSettings } from "../config";
+import type { RunOptions } from "../runner";
 
 const SENTINEL = "RUNNER_TEST_SENTINEL";
 
-let runOnceSpy: ReturnType<typeof spyOn> | null = null;
 const capturedModels: string[] = [];
 
 beforeAll(async () => {
@@ -29,23 +43,63 @@ beforeAll(async () => {
   await loadSettings();
 });
 
+// #330: `execClaude` never calls `runClaudeOnce` for the primary run (that is
+// `runClaudeStream` / `runOnPty`), and a `spyOn(module, …)` cannot intercept
+// a local binding anyway — so these tests passed for months without asserting
+// anything (and passed an object into a string parameter). The primary-exec
+// seam is the only thing that sees the resolved model.
 beforeEach(() => {
   capturedModels.length = 0;
-  runOnceSpy = spyOn(runnerMod, "runClaudeOnce").mockImplementation((async (
-    _args: string[],
-    model: string,
-  ) => {
+  runnerMod._setPrimaryExecForTests(async ({ model }) => {
     capturedModels.push(model);
     throw new Error(SENTINEL);
-  }) as any);
+  });
 });
 
 afterEach(() => {
-  runOnceSpy?.mockRestore();
-  runOnceSpy = null;
+  runnerMod._setPrimaryExecForTests(null);
 });
 
-async function tryRun(opts?: { modelOverride?: string }): Promise<void> {
+// #330: with the exec seam the runs reach `recordInvocationStart`, which
+// writes a `status: "started"` record (never completed, since the seam throws)
+// plus an index entry per run. Leave none behind — and touch nothing that was
+// there before: the usage directory is durable operator telemetry, so only the
+// files this suite created are removed and the index is put back as found.
+const USAGE_DIR = join(process.cwd(), ".claude", "claudeclaw", "usage");
+// Every file's content before the suite: the per-invocation record is a new
+// file, but the index AND the daily `usage-YYYY-MM-DD.jsonl` log are appended
+// to in place, so both come back byte-for-byte.
+let usageBefore: Map<string, string> | null = null;
+beforeAll(async () => {
+  usageBefore = await snapshotUsageDir();
+});
+afterAll(async () => {
+  if (usageBefore) await restoreUsageDir(usageBefore);
+});
+async function snapshotUsageDir(): Promise<Map<string, string>> {
+  const snap = new Map<string, string>();
+  try {
+    for (const file of await readdir(USAGE_DIR)) {
+      snap.set(file, await readFile(join(USAGE_DIR, file), "utf8"));
+    }
+  } catch {
+    /* directory did not exist */
+  }
+  return snap;
+}
+async function restoreUsageDir(snap: Map<string, string>): Promise<void> {
+  try {
+    for (const file of await readdir(USAGE_DIR)) {
+      const before = snap.get(file);
+      if (before === undefined) await rm(join(USAGE_DIR, file), { recursive: true, force: true });
+      else await writeFile(join(USAGE_DIR, file), before);
+    }
+  } catch {
+    /* directory may not exist */
+  }
+}
+
+async function tryRun(opts?: string | { modelOverride?: string }): Promise<void> {
   try {
     await runnerMod.run("test-job", "hello world", undefined, opts);
   } catch (e) {
@@ -56,10 +110,26 @@ async function tryRun(opts?: { modelOverride?: string }): Promise<void> {
 }
 
 describe("Phase 18: runner modelOverride wiring", () => {
-  it("forwards modelOverride to runClaudeOnce as primaryConfig.model", async () => {
+  it("forwards modelOverride to the primary exec as primaryConfig.model", async () => {
     await tryRun({ modelOverride: "opus" });
     expect(capturedModels.length).toBeGreaterThanOrEqual(1);
     expect(capturedModels[0]).toBe("opus");
+  });
+
+  it("accepts the bare string form production passes (start.ts job tick)", async () => {
+    await tryRun("haiku");
+    expect(capturedModels[0]).toBe("haiku");
+  });
+
+  it("resolveModelOverride: string, object, blank and garbage", () => {
+    expect(runnerMod.resolveModelOverride("opus")).toBe("opus");
+    expect(runnerMod.resolveModelOverride({ modelOverride: "glm" })).toBe("glm");
+    expect(runnerMod.resolveModelOverride("  ")).toBeUndefined();
+    expect(runnerMod.resolveModelOverride({})).toBeUndefined();
+    expect(runnerMod.resolveModelOverride(undefined)).toBeUndefined();
+    expect(
+      runnerMod.resolveModelOverride({ modelOverride: 42 } as unknown as RunOptions),
+    ).toBeUndefined();
   });
 
   it("without options uses settings.model (back-compat)", async () => {
@@ -129,7 +199,7 @@ describe("Phase 18: runner modelOverride wiring", () => {
   // This is verified by inspection of src/runner.ts execClaude: fallbackConfig
   // is built from `fallback?.model` after the override branch, never from
   // options.modelOverride. Documented here rather than asserted because the
-  // runClaudeOnce spy only captures the primary model arg, not fallback.
+  // primary-exec seam only sees the primary model, not the fallback.
 });
 
 // ─── withCleanProcessEnv (issue: bun-pty env leak) ───────────────────────────
