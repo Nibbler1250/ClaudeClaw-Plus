@@ -234,6 +234,13 @@ describe("Phase 18 Plan 02: resolveJobModel cascade to agent defaultModel", () =
 });
 
 describe("Phase 18: loadJobs invalid model rejection", () => {
+  it("keeps an explicit label on a flat-dir job (#409)", async () => {
+    const name = uniq("labelled");
+    await writeFlatJob(name, "schedule: 0 9 * * *\nrecurring: true\nlabel: Nightly sync");
+    const jobs = await loadJobs();
+    expect(jobs.find((j) => j.name === name)?.label).toBe("Nightly sync");
+  });
+
   it("skips a flat-dir job with an invalid model and logs error (#378)", async () => {
     const name = uniq("flatbad");
     await writeFlatJob(name, "schedule: 0 9 * * *\nrecurring: true\nmodel: sonet");
