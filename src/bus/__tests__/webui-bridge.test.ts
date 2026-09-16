@@ -459,3 +459,122 @@ describe("streamBusPrompt — per-agent bookkeeping (#213, split per #218)", () 
     expect(await peekSession("gamma")).toBeNull();
   });
 });
+
+describe("streamBusPrompt — dead IPC is surfaced after the reconnect grace (#390)", () => {
+  let sockDir: string;
+  beforeEach(() => {
+    sockDir = mkdtempSync(join(tmpdir(), "ccplus-bridge-ipc-"));
+  });
+  afterEach(() => {
+    if (existsSync(sockDir)) rmSync(sockDir, { recursive: true, force: true });
+  });
+  const readReceipts = (): ReceiptRecord[] =>
+    existsSync(join(sockDir, "receipts.jsonl"))
+      ? readFileSync(join(sockDir, "receipts.jsonl"), "utf8")
+          .split("\n")
+          .filter(Boolean)
+          .map((l) => JSON.parse(l) as ReceiptRecord)
+      : [];
+
+  it("warns the dashboard inline when the agent still has no MCP connection after the grace", async () => {
+    // A bus WITH an IPC server but no connected agent: `sendPrompt` falls
+    // through to the PTY leg and reports `ipc_sent: false`.
+    const bus = createBusCore({
+      eventLogAppend: mockEventLog(),
+      socketPath: join(sockDir, "b.sock"),
+    });
+    await bus.start();
+    try {
+      const chunks: Array<[number, string]> = [];
+      const t0 = Date.now();
+      const store = createReceiptStore({ path: join(sockDir, "receipts.jsonl") });
+      const result = await streamBusPrompt(bus, "alpha", "hi", {
+        timeoutMs: 400,
+        ipcWarningGraceMs: 50,
+        onChunk: (t) => chunks.push([Date.now() - t0, t]),
+        receiptStore: store,
+      });
+      expect(result.ok).toBe(false);
+      expect(chunks.length).toBe(1);
+      expect(chunks[0][1]).toContain("agent alpha still has no MCP connection");
+      expect(chunks[0][0]).toBeGreaterThanOrEqual(45);
+      // Wait for the receipt close fire-and-forget to flush to disk.
+      for (let i = 0; i < 50 && readReceipts().length === 0; i++) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      const rec = readReceipts().at(-1);
+      expect(rec?.notes?.ipc_sent).toBe(false);
+      expect(rec?.notes?.bus_send_ok).toBe(true);
+    } finally {
+      await bus.stop();
+    }
+  });
+
+  it("stays silent about IPC on a bus that runs without an IPC server", async () => {
+    const bus = createBusCore({ eventLogAppend: mockEventLog() });
+    const chunks: string[] = [];
+    const pending = streamBusPrompt(bus, "alpha", "hi", {
+      timeoutMs: 2000,
+      ipcWarningGraceMs: 10,
+      onChunk: (t) => chunks.push(t),
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    bus.ingestReply({ agent_id: "alpha", text: "ok", intent: "final" });
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(chunks).toEqual(["ok"]);
+  });
+
+  it("does not warn when the reply lands inside the grace (a normal restart window)", async () => {
+    const bus = createBusCore({
+      eventLogAppend: mockEventLog(),
+      socketPath: join(sockDir, "c.sock"),
+    });
+    await bus.start();
+    try {
+      const chunks: string[] = [];
+      const pending = streamBusPrompt(bus, "alpha", "hi", {
+        timeoutMs: 2000,
+        ipcWarningGraceMs: 200,
+        onChunk: (t) => chunks.push(t),
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      // The MCP server said hello in the meantime and the turn replied.
+      bus.ingestReply({ agent_id: "alpha", text: "late but here", intent: "final" });
+      const result = await pending;
+      await new Promise((r) => setTimeout(r, 250));
+      expect(result.ok).toBe(true);
+      expect(result.output).toBe("late but here");
+      expect(chunks).toEqual(["late but here"]);
+    } finally {
+      await bus.stop();
+    }
+  });
+
+  it("does not warn when the connection is back by the time the grace ends", async () => {
+    const bus = createBusCore({
+      eventLogAppend: mockEventLog(),
+      socketPath: join(sockDir, "d.sock"),
+    });
+    await bus.start();
+    try {
+      const chunks: string[] = [];
+      const busAny = bus as unknown as { hasIpcConnection: (a: string) => boolean };
+      const original = busAny.hasIpcConnection;
+      let connected = false;
+      busAny.hasIpcConnection = (a: string) => connected || original.call(bus, a);
+      const pending = streamBusPrompt(bus, "alpha", "hi", {
+        timeoutMs: 300,
+        ipcWarningGraceMs: 40,
+        onChunk: (t) => chunks.push(t),
+      });
+      await new Promise((r) => setTimeout(r, 10));
+      connected = true; // hello arrived inside the grace
+      const result = await pending;
+      expect(result.ok).toBe(false); // no reply in this test, only the timeout
+      expect(chunks).toEqual([]);
+    } finally {
+      await bus.stop();
+    }
+  });
+});

@@ -228,7 +228,21 @@ export interface BusCoreOptions {
 /* ───────────────────────────────────────────────────────────────────── */
 
 export interface BusCore {
-  sendPrompt(req: SendPromptRequest): Promise<{ promise_id: string }>;
+  /**
+   * Resolves once the prompt is published and handed to both delivery legs.
+   * `ipc_sent` reports the IPC leg (#390): `false` means the bus has no MCP
+   * connection for the agent, so the prompt reached the PTY only and the
+   * agent's `reply` tool has no channel back — a caller that awaits the
+   * reply can tell its user now instead of at its own timeout. `undefined`
+   * when the bus runs without an IPC server (in-process / tests).
+   */
+  sendPrompt(req: SendPromptRequest): Promise<{ promise_id: string; ipc_sent?: boolean }>;
+  /**
+   * Whether the bus currently holds an MCP connection for the agent (#390).
+   * Optional: mocks and in-process buses without an IPC server need not
+   * implement it; callers treat `undefined` as "unknown".
+   */
+  hasIpcConnection?(agentId: string): boolean;
   subscribe(filter: SubscriptionFilter, handler: SubscriptionHandler): Subscription;
   invokeSlashCommand(agent_id: string, cmd: string): Promise<void>;
   /**
@@ -834,7 +848,7 @@ export class BusCoreImpl implements BusCore {
 
   /* ─────────────────────────────── prompts ─────────────────────────────── */
 
-  async sendPrompt(req: SendPromptRequest): Promise<{ promise_id: string }> {
+  async sendPrompt(req: SendPromptRequest): Promise<{ promise_id: string; ipc_sent?: boolean }> {
     const promise_id = randomUUID();
     // Emit a `prompt` BusEvent so subscribers see the inbound message and
     // the audit log records it. We do this before forwarding so the event
@@ -1006,7 +1020,7 @@ export class BusCoreImpl implements BusCore {
         this.armFlushVerify(req.agent_id, [wrapped]);
       }
     }
-    return { promise_id };
+    return { promise_id, ipc_sent: this.ipcServer ? !ipcSendFailed : undefined };
   }
 
   /** Deliver a PTY-stdin prompt, or hold it if the agent's session is
@@ -1616,6 +1630,10 @@ export class BusCoreImpl implements BusCore {
    *  no `response.turn_end` yet). Exposed so an external restart/deploy guard can
    *  drain-then-restart instead of killing a turn mid-flight. Aggregate sibling of
    *  {@link isAgentTurnActive}. */
+  hasIpcConnection(agentId: string): boolean {
+    return this.ipcServer?.hasConnection(agentId) ?? false;
+  }
+
   activeTurnAgents(): string[] {
     return [...this.agentTurnActive];
   }

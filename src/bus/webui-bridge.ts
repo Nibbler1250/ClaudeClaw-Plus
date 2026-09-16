@@ -80,6 +80,8 @@ export interface StreamBusPromptOptions {
    * on the same per-agent slot) lands on the fresh PTY.
    */
   rotateAgent?: (agentId: string) => Promise<void>;
+  /** #390: override of the reconnect grace before the no-MCP warning (tests). */
+  ipcWarningGraceMs?: number;
 }
 
 export interface BusPromptResult {
@@ -90,6 +92,15 @@ export interface BusPromptResult {
 }
 
 const DEFAULT_PROMPT_TIMEOUT_MS = 5 * 60 * 1000;
+/**
+ * #390: how long a prompt sent with no MCP connection waits before the
+ * dashboard is told. A fresh spawn, a restart or a #227 rotation delivers the
+ * prompt to the PTY before the MCP server's `hello` lands, and the reply then
+ * comes through the connection that arrived in between — that window is the
+ * reconciler's confirm delay, so the warning re-checks the connection after
+ * the same 5 s instead of crying wolf on every restart.
+ */
+const IPC_WARNING_GRACE_MS = 5_000;
 
 /**
  * Send a prompt through the bus to one agent and resolve with the
@@ -216,6 +227,7 @@ function runPrompt(
   let accumulated = "";
   return new Promise<BusPromptResult>((resolve) => {
     let resolved = false;
+    let ipcWarningTimer: ReturnType<typeof setTimeout> | null = null;
     const finish = (
       r: BusPromptResult,
       finalState: "turn_observed" | "timeout" | "wedged_prompt",
@@ -229,6 +241,7 @@ function runPrompt(
         /* idempotent close — fine */
       }
       clearTimeout(timer);
+      if (ipcWarningTimer) clearTimeout(ipcWarningTimer);
       // Close the receipt before resolving — best-effort, never throws.
       // We don't await here because the caller (e.g. dashboard SSE)
       // shouldn't block on a disk write, but the store appends serially
@@ -280,12 +293,43 @@ function runPrompt(
         user_id: "webui",
         text: message,
       })
-      .then(() => {
+      .then((ack) => {
+        // A fast `final` or the timeout may already have settled the prompt.
+        if (resolved) return;
         // The bus accepted the prompt — the route was resolvable. We
         // don't yet know whether the PTY actually accepted it (that's
         // stamped by `runtime-mount.ts` via prompt_hash lookup), but
         // we can confirm the bus seam is unblocked.
-        receipt.patch({ notes: { ...receipt.record.notes, bus_send_ok: true } });
+        const notes: Record<string, unknown> = { ...receipt.record.notes, bus_send_ok: true };
+        // #390: the bus knew at send time that the agent has no MCP
+        // connection — the prompt went to the PTY only and the agent's
+        // `reply` tool has no way back. Without this the dashboard sat
+        // silent until the 5-minute timeout while the daemon log already
+        // said `[bus-ipc] send-failed`. Note it on the receipt now; tell the
+        // dashboard after the reconnect grace, and only if the connection is
+        // still missing then. Keep waiting either way: the transcript-driven
+        // turn_end path can still deliver.
+        if (ack.ipc_sent === false) {
+          notes.ipc_sent = false;
+          if (opts.onChunk) {
+            const graceMs = opts.ipcWarningGraceMs ?? IPC_WARNING_GRACE_MS;
+            ipcWarningTimer = setTimeout(() => {
+              ipcWarningTimer = null;
+              if (resolved || bus.hasIpcConnection?.(agentId) === true) return;
+              try {
+                opts.onChunk?.(
+                  `\n[chat warning: agent ${agentId} still has no MCP connection ` +
+                    `${graceMs / 1000}s after the prompt — it reached the agent's ` +
+                    `terminal but the reply channel is down (reconcile armed). If no reply ` +
+                    `follows, check the daemon log for [bus-ipc] send-failed and [boot-dialog].]\n`,
+                );
+              } catch {
+                /* chunk callback errors must not break the prompt flow */
+              }
+            }, graceMs);
+          }
+        }
+        receipt.patch({ notes });
       })
       .catch((err) => {
         finish(
