@@ -112,6 +112,9 @@ export type IngestReplyRequest = {
   agent_id: string;
   text: string;
   intent: "final" | "progress" | "tool_status";
+  /** #224: the `origin_id` (chat) this reply answers, as the agent read it in the
+   *  `<channel>` block. Honoured only when that chat has prompted this agent. */
+  in_reply_to?: string;
 };
 
 export type IngestPermissionDecisionRequest = {
@@ -307,6 +310,9 @@ function maxGeneration(a: number | undefined, b: number | undefined): number | u
   return a > b ? a : b;
 }
 
+/** #224: how many distinct chats per agent the bus remembers as valid reply targets. */
+const KNOWN_PROMPT_ORIGINS_MAX = 64;
+
 export class BusCoreImpl implements BusCore {
   private subscribers = new Map<string, SubscriberRecord>();
   private connectedAgents = new Set<string>();
@@ -421,6 +427,20 @@ export class BusCoreImpl implements BusCore {
    * single-prompt state (a `set` onto an empty slot) or is torn down (#284 MEDIUM).
    */
   private readonly originAmbiguous = new Set<string>();
+  /**
+   * #224: every surface/chat that has prompted an agent, most recent last,
+   * bounded. `lastPromptOrigin` is last-write-wins, so when two chats share an
+   * agent and interleave, a reply routed by it reaches the wrong chat. A reply
+   * that names the chat it answers (`in_reply_to`) is routed to that chat —
+   * but only if the chat is in here: an agent must not be able to address a
+   * chat that never spoke to it.
+   */
+  private readonly knownPromptOrigins = new Map<string, Map<string, Set<BusOrigin>>>();
+  private readonly warnedUnknownReplyTarget = new Set<string>();
+  /** #224: the chats a final already answered THIS turn — a second final to
+   *  the same chat is the #217 race loser; to another chat it is a second
+   *  answer. Reset with the other per-turn flags. */
+  private readonly currentTurnFinalOrigins = new Map<string, Set<string>>();
 
   /**
    * Delivery gate. A prompt typed into a PTY-resident agent while its session
@@ -744,6 +764,7 @@ export class BusCoreImpl implements BusCore {
           this.pendingTurns.delete(agentId);
           this.currentTurnReplied.delete(agentId);
           this.currentTurnFinalPublished.delete(agentId);
+          this.currentTurnFinalOrigins.delete(agentId);
           // Reply-tool enforcement (#215/#240): drop nudge state with the rest
           // of the per-turn flags so a dead session can't leave it dangling.
           this.replyNudged.delete(agentId);
@@ -862,6 +883,9 @@ export class BusCoreImpl implements BusCore {
     this.agentTurnActive.clear();
     this.lastTurnEndMessageId.clear();
     this.originAmbiguous.clear();
+    this.knownPromptOrigins.clear();
+    this.warnedUnknownReplyTarget.clear();
+    this.currentTurnFinalOrigins.clear();
     this.currentOperation.clear();
     this.correlationAmbiguous.clear();
     this.pendingTurns.clear();
@@ -931,6 +955,7 @@ export class BusCoreImpl implements BusCore {
     } else {
       this.originAmbiguous.delete(req.agent_id);
     }
+    this.rememberPromptOrigin(req.agent_id, req.origin, req.origin_id);
     this.lastPromptOrigin.set(req.agent_id, {
       origin: req.origin,
       origin_id: req.origin_id,
@@ -1746,6 +1771,64 @@ export class BusCoreImpl implements BusCore {
 
   /* ─────────────────────────────── ingest ─────────────────────────────── */
 
+  private rememberPromptOrigin(agent_id: string, origin: BusOrigin, origin_id: string): void {
+    let known = this.knownPromptOrigins.get(agent_id);
+    if (!known) {
+      known = new Map();
+      this.knownPromptOrigins.set(agent_id, known);
+    }
+    const surfaces = known.get(origin_id) ?? new Set<BusOrigin>();
+    surfaces.add(origin);
+    known.delete(origin_id); // re-insert: most recent last
+    known.set(origin_id, surfaces);
+    if (known.size > KNOWN_PROMPT_ORIGINS_MAX) {
+      const oldest = known.keys().next().value;
+      if (oldest !== undefined) known.delete(oldest);
+    }
+  }
+
+  /**
+   * The origin a reply explicitly names (`in_reply_to`), or undefined when it
+   * names nothing, names a chat that never prompted this agent (warned once
+   * per agent), or names an id two surfaces share and the slot does not
+   * disambiguate — in every undefined case the caller routes by the slot.
+   */
+  private resolveNamedOrigin(
+    agent_id: string,
+    inReplyTo: string | undefined,
+  ): { origin: BusOrigin; origin_id: string } | undefined {
+    if (typeof inReplyTo !== "string" || inReplyTo.length === 0) return undefined;
+    const surfaces = this.knownPromptOrigins.get(agent_id)?.get(inReplyTo);
+    if (surfaces !== undefined && surfaces.size > 0) {
+      if (surfaces.size === 1) return { origin: [...surfaces][0], origin_id: inReplyTo };
+      // The same id on two surfaces (a Telegram chat and a Discord channel
+      // both called "100"): the slot decides if it points at that id, else
+      // the name is ambiguous and the slot routes.
+      const slot = this.lastPromptOrigin.get(agent_id);
+      if (slot && slot.origin_id === inReplyTo && surfaces.has(slot.origin)) {
+        return { origin: slot.origin, origin_id: inReplyTo };
+      }
+      this.warnReplyTarget(
+        agent_id,
+        `names in_reply_to=${JSON.stringify(inReplyTo)}, an id two surfaces share`,
+      );
+      return undefined;
+    }
+    this.warnReplyTarget(
+      agent_id,
+      `names in_reply_to=${JSON.stringify(inReplyTo)}, a chat that never prompted it`,
+    );
+    return undefined;
+  }
+
+  private warnReplyTarget(agent_id: string, what: string): void {
+    if (this.warnedUnknownReplyTarget.has(agent_id)) return;
+    this.warnedUnknownReplyTarget.add(agent_id);
+    console.warn(
+      `[bus] agent=${agent_id} reply ${what} — ignored, routing by the last prompt instead (logged once per agent)`,
+    );
+  }
+
   ingestReply(req: IngestReplyRequest, opts?: { synthetic?: boolean }): void {
     // Cross-transport dedup (#217 finding 2): a final reply can arrive both
     // as the agent's real `reply` IPC AND as the synthesized recovery from
@@ -1755,12 +1838,24 @@ export class BusCoreImpl implements BusCore {
     // turn never delivers two finals. `synthetic` calls (from
     // `handleTurnEnd`) bypass the check — they only run AFTER confirming no
     // final has published yet, and must be allowed to publish the first.
-    if (
-      req.intent === "final" &&
-      !opts?.synthetic &&
-      this.currentTurnFinalPublished.get(req.agent_id) === true
-    ) {
-      return;
+    // #224: a final that NAMES a chat is deduplicated per chat — two chats
+    // answered in one turn are two finals, not a duplicate. Only a final that
+    // repeats a chat already answered this turn (or names none, where the
+    // slot is the implicit target) is the race loser the check exists for.
+    const named = this.resolveNamedOrigin(req.agent_id, req.in_reply_to);
+    // The origin this reply is EFFECTIVELY routed to: the named chat, else the
+    // slot. Dedup and bookkeeping below use it, so an unnamed final answering
+    // the slot's chat and a later final naming that same chat are one answer.
+    const effective = named ?? this.lastPromptOrigin.get(req.agent_id);
+    if (req.intent === "final" && !opts?.synthetic) {
+      const answered = this.currentTurnFinalOrigins.get(req.agent_id);
+      if (
+        effective
+          ? answered?.has(effective.origin_id)
+          : this.currentTurnFinalPublished.get(req.agent_id) === true
+      ) {
+        return;
+      }
     }
     const topic: BusEventTopic =
       req.intent === "tool_status" ? "response.tool_use" : "response.text";
@@ -1769,7 +1864,11 @@ export class BusCoreImpl implements BusCore {
     // is best-effort — if no prompt has been seen yet (e.g. a scheduler-
     // initiated reply), the field stays undefined and the adapter falls
     // back to its configured channel set.
-    const origin = this.lastPromptOrigin.get(req.agent_id);
+    // #224: a reply that names the chat it answers wins over the last-write
+    // slot — when two chats share the agent and interleave, the slot points
+    // at whichever wrote last. Only a chat that has prompted this agent is
+    // honoured; anything else falls back to the slot and is logged once.
+    const origin = effective;
     const event: BusEvent<{
       text: string;
       intent: string;
@@ -1811,8 +1910,23 @@ export class BusCoreImpl implements BusCore {
     //   - `request_human` IPC handler (origin on system.request_human)
     //   - `permission_request` IPC handler (origin on channel.permission_request)
     if (req.intent === "final") {
-      this.lastPromptOrigin.delete(req.agent_id);
-      this.originAmbiguous.delete(req.agent_id);
+      // #224: the slot is the chat still waiting for an answer. A final that
+      // answered a DIFFERENT chat (named it) leaves the slot's chat unanswered,
+      // so the slot stays; a final that named nothing, or named the slot's own
+      // chat, clears it as before.
+      const slot = this.lastPromptOrigin.get(req.agent_id);
+      if (!named || !slot || slot.origin_id === named.origin_id) {
+        this.lastPromptOrigin.delete(req.agent_id);
+        this.originAmbiguous.delete(req.agent_id);
+      }
+      if (effective) {
+        let answered = this.currentTurnFinalOrigins.get(req.agent_id);
+        if (!answered) {
+          answered = new Set();
+          this.currentTurnFinalOrigins.set(req.agent_id, answered);
+        }
+        answered.add(effective.origin_id);
+      }
       // Silent-drop safety net (#215): the agent called `reply` with a final
       // intent → mark this turn as delivered, so the `response.turn_end`
       // handler skips the synthetic-delivery fallback for this turn.
@@ -1854,6 +1968,7 @@ export class BusCoreImpl implements BusCore {
   private openTurn(agentId: string): void {
     this.currentTurnReplied.set(agentId, false);
     this.currentTurnFinalPublished.set(agentId, false);
+    this.currentTurnFinalOrigins.delete(agentId);
   }
 
   /**
@@ -1984,6 +2099,7 @@ export class BusCoreImpl implements BusCore {
       "intent:'final' to send your answer for this turn.";
     this.currentTurnReplied.set(agentId, false);
     this.currentTurnFinalPublished.set(agentId, false);
+    this.currentTurnFinalOrigins.delete(agentId);
     // IPC path (best-effort, no reconciler): reach an MCP-connected agent.
     // Wrapped so a synchronous send() throw can't skip the PTY path below or
     // propagate to the turn-end handler — the send is best-effort, mirroring
@@ -2452,7 +2568,12 @@ export class BusCoreImpl implements BusCore {
   private handleIpcMessage(agentId: string, msg: IpcMessage): void {
     switch (msg.type) {
       case "reply":
-        this.ingestReply({ agent_id: agentId, text: msg.text, intent: msg.intent });
+        this.ingestReply({
+          agent_id: agentId,
+          text: msg.text,
+          intent: msg.intent,
+          ...(msg.in_reply_to ? { in_reply_to: msg.in_reply_to } : {}),
+        });
         break;
       case "edit_message": {
         const origin = this.lastPromptOrigin.get(agentId);
@@ -2505,6 +2626,7 @@ export class BusCoreImpl implements BusCore {
         // tracking flag to keep the map bounded.
         this.currentTurnReplied.delete(agentId);
         this.currentTurnFinalPublished.delete(agentId);
+        this.currentTurnFinalOrigins.delete(agentId);
         // Reply-tool enforcement (#215/#240): no turn_end is coming — drop the
         // nudge state too so it can't leak into a later turn for this agent.
         this.replyNudged.delete(agentId);
@@ -2608,6 +2730,7 @@ export class BusCoreImpl implements BusCore {
         // turn_end either — clear tracking too.
         this.currentTurnReplied.delete(agentId);
         this.currentTurnFinalPublished.delete(agentId);
+        this.currentTurnFinalOrigins.delete(agentId);
         // Reply-tool enforcement (#215/#240): no turn_end is coming — drop the
         // nudge state too so it can't leak into a later turn for this agent.
         this.replyNudged.delete(agentId);

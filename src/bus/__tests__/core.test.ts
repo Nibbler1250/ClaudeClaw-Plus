@@ -245,6 +245,268 @@ describe("BusCore pub/sub", () => {
     expect(payload.origin_id).toBe("dm-channel-42");
   });
 
+  it("a reply that names the chat it answers reaches that chat, not the one that wrote last (#224)", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    const received: BusEvent[] = [];
+    bus.subscribe({ agent_id: "triage", topics: ["response.text"] }, (e) => received.push(e));
+    const prompt = (origin_id: string, text: string) =>
+      bus.sendPrompt({ agent_id: "triage", origin: "telegram", origin_id, user_id: "u", text });
+    await prompt("100", "hello"); // chat A
+    await prompt("200", "hi"); // chat B — the last-write slot now points here
+    // the agent answers A first and says so
+    bus.ingestReply({ agent_id: "triage", text: "hello A", intent: "final", in_reply_to: "100" });
+    // then B — a second final in the same turn, to another chat
+    bus.ingestReply({ agent_id: "triage", text: "hi B", intent: "final", in_reply_to: "200" });
+    const routes = received.map((e) => {
+      const p = e.payload as { text: string; origin?: string; origin_id?: string };
+      return [p.text, p.origin, p.origin_id];
+    });
+    expect(routes).toEqual([
+      ["hello A", "telegram", "100"],
+      ["hi B", "telegram", "200"],
+    ]);
+  });
+
+  it("without in_reply_to the last-write slot still routes (unchanged behaviour, #224)", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    const received: BusEvent[] = [];
+    bus.subscribe({ agent_id: "triage", topics: ["response.text"] }, (e) => received.push(e));
+    await bus.sendPrompt({
+      agent_id: "triage",
+      origin: "telegram",
+      origin_id: "100",
+      user_id: "u",
+      text: "a",
+    });
+    await bus.sendPrompt({
+      agent_id: "triage",
+      origin: "telegram",
+      origin_id: "200",
+      user_id: "u",
+      text: "b",
+    });
+    bus.ingestReply({ agent_id: "triage", text: "?", intent: "final" });
+    expect((received[0]?.payload as { origin_id?: string }).origin_id).toBe("200");
+  });
+
+  it("in_reply_to naming a chat that never prompted the agent is ignored, warned once, and the slot routes (#224)", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    const received: BusEvent[] = [];
+    bus.subscribe({ agent_id: "triage", topics: ["response.text"] }, (e) => received.push(e));
+    const warnings: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...a: unknown[]) => {
+      warnings.push(a.map(String).join(" "));
+    };
+    try {
+      await bus.sendPrompt({
+        agent_id: "triage",
+        origin: "telegram",
+        origin_id: "100",
+        user_id: "u",
+        text: "a",
+      });
+      // another agent's chat must not be addressable either
+      await bus.sendPrompt({
+        agent_id: "other",
+        origin: "telegram",
+        origin_id: "999",
+        user_id: "u",
+        text: "x",
+      });
+      bus.ingestReply({ agent_id: "triage", text: "p1", intent: "progress", in_reply_to: "999" });
+      bus.ingestReply({ agent_id: "triage", text: "p2", intent: "progress", in_reply_to: "31337" });
+    } finally {
+      console.warn = origWarn;
+    }
+    const ids = received.map((e) => (e.payload as { origin_id?: string }).origin_id);
+    expect(ids).toEqual(["100", "100"]);
+    expect(warnings.filter((w) => w.includes("never prompted it"))).toHaveLength(1);
+  });
+
+  it("a chat stays a valid reply target after the turn it prompted ended (bounded memory of 64 per agent, #224)", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    const received: BusEvent[] = [];
+    bus.subscribe({ agent_id: "triage", topics: ["response.text"] }, (e) => received.push(e));
+    await bus.sendPrompt({
+      agent_id: "triage",
+      origin: "discord",
+      origin_id: "dm-1",
+      user_id: "u",
+      text: "a",
+    });
+    bus.ingestReply({ agent_id: "triage", text: "done", intent: "final" }); // clears the slot
+    for (let i = 0; i < 70; i++) {
+      await bus.sendPrompt({
+        agent_id: "triage",
+        origin: "telegram",
+        origin_id: `c${i}`,
+        user_id: "u",
+        text: "x",
+      });
+    }
+    // dm-1 was evicted (oldest of 71); c6..c69 remain
+    bus.ingestReply({ agent_id: "triage", text: "late", intent: "progress", in_reply_to: "c10" });
+    bus.ingestReply({
+      agent_id: "triage",
+      text: "evicted",
+      intent: "progress",
+      in_reply_to: "dm-1",
+    });
+    const routes = received.slice(1).map((e) => {
+      const p = e.payload as { origin?: string; origin_id?: string };
+      return [p.origin, p.origin_id];
+    });
+    expect(routes[0]).toEqual(["telegram", "c10"]);
+    expect(routes[1]).toEqual(["telegram", "c69"]); // fell back to the slot
+  });
+
+  it("two chats answered in ONE turn are two finals, not a duplicate; a repeat to the same chat is dropped (#224)", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    const received: BusEvent[] = [];
+    bus.subscribe({ agent_id: "triage", topics: ["response.text"] }, (e) => received.push(e));
+    await bus.sendPrompt({
+      agent_id: "triage",
+      origin: "telegram",
+      origin_id: "100",
+      user_id: "u",
+      text: "a",
+    });
+    await bus.sendPrompt({
+      agent_id: "triage",
+      origin: "telegram",
+      origin_id: "200",
+      user_id: "u",
+      text: "b",
+    });
+    bus.ingestReply({ agent_id: "triage", text: "for A", intent: "final", in_reply_to: "100" });
+    bus.ingestReply({ agent_id: "triage", text: "for B", intent: "final", in_reply_to: "200" });
+    bus.ingestReply({
+      agent_id: "triage",
+      text: "for A again",
+      intent: "final",
+      in_reply_to: "100",
+    }); // race loser
+    bus.ingestReply({ agent_id: "triage", text: "unnamed", intent: "final" }); // #217 loser: a final was published this turn
+    const routes = received.map((e) => {
+      const p = e.payload as { text: string; origin_id?: string };
+      return [p.text, p.origin_id];
+    });
+    expect(routes).toEqual([
+      ["for A", "100"],
+      ["for B", "200"],
+    ]);
+  });
+
+  it("an unnamed final answers the slot's chat; a later final NAMING that chat is the duplicate, not a second answer (#224)", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    const received: BusEvent[] = [];
+    bus.subscribe({ agent_id: "triage", topics: ["response.text"] }, (e) => received.push(e));
+    await bus.sendPrompt({
+      agent_id: "triage",
+      origin: "telegram",
+      origin_id: "100",
+      user_id: "u",
+      text: "a",
+    });
+    await bus.sendPrompt({
+      agent_id: "triage",
+      origin: "telegram",
+      origin_id: "200",
+      user_id: "u",
+      text: "b",
+    }); // slot = 200
+    bus.ingestReply({ agent_id: "triage", text: "for B (unnamed)", intent: "final" }); // routed to 200 by the slot
+    bus.ingestReply({
+      agent_id: "triage",
+      text: "for B again",
+      intent: "final",
+      in_reply_to: "200",
+    }); // duplicate
+    bus.ingestReply({ agent_id: "triage", text: "for A", intent: "final", in_reply_to: "100" }); // a different chat: delivered
+    const routes = received.map((e) => {
+      const p = e.payload as { text: string; origin_id?: string };
+      return [p.text, p.origin_id];
+    });
+    expect(routes).toEqual([
+      ["for B (unnamed)", "200"],
+      ["for A", "100"],
+    ]);
+  });
+
+  it("a final that answered ANOTHER chat leaves the slot's chat as the default for the next unnamed reply (#224)", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    const received: BusEvent[] = [];
+    bus.subscribe({ agent_id: "triage", topics: ["response.text"] }, (e) => received.push(e));
+    await bus.sendPrompt({
+      agent_id: "triage",
+      origin: "telegram",
+      origin_id: "100",
+      user_id: "u",
+      text: "a",
+    });
+    await bus.sendPrompt({
+      agent_id: "triage",
+      origin: "telegram",
+      origin_id: "200",
+      user_id: "u",
+      text: "b",
+    }); // slot = B
+    bus.ingestReply({ agent_id: "triage", text: "for A", intent: "final", in_reply_to: "100" });
+    // the turn for B opens on its own prompt line; the agent forgets in_reply_to
+    (bus as unknown as { openTurn: (a: string) => void }).openTurn("triage");
+    bus.ingestReply({ agent_id: "triage", text: "for B, unnamed", intent: "final" });
+    const ids = received.map((e) => (e.payload as { origin_id?: string }).origin_id);
+    expect(ids).toEqual(["100", "200"]); // before this change the second would have had no origin at all
+  });
+
+  it("an id two surfaces share is honoured only when the slot disambiguates it (#224)", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    const received: BusEvent[] = [];
+    bus.subscribe({ agent_id: "triage", topics: ["response.text"] }, (e) => received.push(e));
+    const warnings: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...a: unknown[]) => {
+      warnings.push(a.map(String).join(" "));
+    };
+    try {
+      await bus.sendPrompt({
+        agent_id: "triage",
+        origin: "discord",
+        origin_id: "100",
+        user_id: "u",
+        text: "a",
+      });
+      await bus.sendPrompt({
+        agent_id: "triage",
+        origin: "telegram",
+        origin_id: "100",
+        user_id: "u",
+        text: "b",
+      }); // slot = telegram/100
+      bus.ingestReply({ agent_id: "triage", text: "p", intent: "progress", in_reply_to: "100" }); // slot decides: telegram
+      await bus.sendPrompt({
+        agent_id: "triage",
+        origin: "telegram",
+        origin_id: "300",
+        user_id: "u",
+        text: "c",
+      }); // slot = 300
+      bus.ingestReply({ agent_id: "triage", text: "q", intent: "progress", in_reply_to: "100" }); // ambiguous → slot, warned
+    } finally {
+      console.warn = origWarn;
+    }
+    const routes = received.map((e) => {
+      const p = e.payload as { origin?: string; origin_id?: string };
+      return [p.origin, p.origin_id];
+    });
+    expect(routes).toEqual([
+      ["telegram", "100"],
+      ["telegram", "300"],
+    ]);
+    expect(warnings.filter((w) => w.includes("two surfaces share"))).toHaveLength(1);
+  });
+
   it("XML-escapes the channel wrap so user text can't inject sibling markup (#140 review)", async () => {
     bus = createBusCore({ eventLogAppend: createMockEventLog().append });
     let wrapped = "";
@@ -1629,6 +1891,46 @@ describe("BusCore IPC", () => {
     expect(b.agentSpawnedGeneration.get("alpha")).toBe(4);
     expect(b.agentSpawnedGeneration.get("beta")).toBeUndefined();
   });
+  it("`reply` over IPC carries in_reply_to to the routed event (#224)", async () => {
+    const sockPath = join(tempDir, "bus.sock");
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, socketPath: sockPath });
+    await bus.start();
+    const received: BusEvent[] = [];
+    bus.subscribe({ agent_id: "triage", topics: ["response.text"] }, (e) => received.push(e));
+    const client = await connectIpcClient(sockPath);
+    client.send({
+      type: "hello",
+      agent_id: "triage",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    } as IpcHello);
+    await new Promise((r) => setTimeout(r, 20));
+    await bus.sendPrompt({
+      agent_id: "triage",
+      origin: "telegram",
+      origin_id: "100",
+      user_id: "u",
+      text: "a",
+    });
+    await bus.sendPrompt({
+      agent_id: "triage",
+      origin: "telegram",
+      origin_id: "200",
+      user_id: "u",
+      text: "b",
+    });
+    client.send({
+      type: "reply",
+      agent_id: "triage",
+      text: "for A",
+      intent: "final",
+      in_reply_to: "100",
+    } as IpcMessage);
+    for (let i = 0; i < 50 && received.length === 0; i++)
+      await new Promise((r) => setTimeout(r, 10));
+    expect((received[0]?.payload as { origin_id?: string }).origin_id).toBe("100");
+    client.close();
+  });
+
   it("a late unconfirmed give-up after an IPC-only drop is re-delivered when the same process reconnects, without waiting for a replay_done that never comes (#402)", async () => {
     const sockPath = join(tempDir, "bus.sock");
     const delivered: string[] = [];

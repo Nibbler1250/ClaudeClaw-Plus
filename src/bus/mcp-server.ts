@@ -265,6 +265,12 @@ const ReplyArgsSchema = z.object({
   metadata: z
     .object({
       intent: z.enum(["final", "progress", "tool_status"]).optional(),
+      // #224: the chat_id of the <channel> block this reply answers.
+      in_reply_to: z
+        .union([z.string(), z.number()])
+        .transform(String)
+        .pipe(z.string().max(200))
+        .optional(),
     })
     .optional(),
 });
@@ -677,6 +683,7 @@ export class BusMcpServer {
       agent_id: this.agentId,
       text: args.message,
       intent: args.metadata?.intent ?? "progress",
+      ...(args.metadata?.in_reply_to ? { in_reply_to: args.metadata.in_reply_to } : {}),
     };
     this.ipc.send(ipcMsg);
     return {
