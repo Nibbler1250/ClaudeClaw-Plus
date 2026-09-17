@@ -149,8 +149,31 @@ export async function recordClaudeSessionId(
     return;
   }
 
+  // #376: recorded on every successful turn, so an unchanged id is a no-op.
+  // The mapping keeps the FIRST id it recorded (the documented contract —
+  // `attachClaudeSessionId` refuses to overwrite without `force`); when the
+  // runner has since replaced the session (auto-rotate, corruption reset,
+  // stale recovery) that contract leaves a dead id here. Nothing consumes
+  // the mapping's id yet, so this only says so, once per conversation —
+  // whether the mapping should follow the rotation is an open question on
+  // the issue.
+  const existing = await get(channelId, threadId);
+  if (existing?.claudeSessionId === claudeSessionId) return;
+  if (existing?.claudeSessionId) {
+    const key = `${channelId}\u0000${threadId}`;
+    if (!warnedRotation.has(key)) {
+      warnedRotation.add(key);
+      console.warn(
+        `[resume] channel=${channelId} thread=${threadId}: the runner now reports session ${claudeSessionId} but the mapping keeps ${existing.claudeSessionId} (first id recorded; see #376)`,
+      );
+    }
+    return;
+  }
   await sessionMapAttachClaudeSessionId(channelId, threadId, claudeSessionId);
 }
+
+/** #376: conversations already warned about a rotated session the mapping does not follow. */
+const warnedRotation = new Set<string>();
 
 /**
  * Update session metadata after successful processing.
