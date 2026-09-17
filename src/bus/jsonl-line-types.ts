@@ -272,9 +272,14 @@ export function encodeCwdForProjectsDir(
   cwd: string,
   _platform: NodeJS.Platform = process.platform,
 ): string {
-  const encoded = cwd.replace(/[^a-zA-Z0-9]/g, "-");
+  const encoded = substituteProjectsDirChars(cwd);
   if (encoded.length <= PROJECTS_DIR_MAX_LEN) return encoded;
   return `${encoded.slice(0, PROJECTS_DIR_MAX_LEN)}-${hashCwdForProjectsDir(cwd)}`;
+}
+
+/** The CLI's character rule, in one place (#416): every non-alphanumeric → `-`. */
+function substituteProjectsDirChars(cwd: string): string {
+  return cwd.replace(/[^a-zA-Z0-9]/g, "-");
 }
 
 /**
@@ -286,7 +291,7 @@ export function encodeCwdForProjectsDir(
  * prefix of all of them (#368, Copilot on the PR).
  */
 export function encodeCwdForProjectsDirPrefix(root: string): string {
-  return root.replace(/[^a-zA-Z0-9]/g, "-").slice(0, PROJECTS_DIR_MAX_LEN);
+  return substituteProjectsDirChars(root).slice(0, PROJECTS_DIR_MAX_LEN);
 }
 
 /**

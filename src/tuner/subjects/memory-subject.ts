@@ -220,7 +220,10 @@ interface MemoryEntry {
  * MemorySubject — wisecron-managed MEMORY.md index tuner (LOW).
  *
  * What it tunes: MEMORY.md (auto-memory index) at
- * `~/.claude/projects/-home-<user>/memory/MEMORY.md`. Detects:
+ * `~/.claude/projects/<encoded home dir>/memory/MEMORY.md` — the directory
+ * name is the home directory run through the CLI's own rule
+ * (`encodeCwdForProjectsDir`, #368), e.g. `-home-simon` or `-Users-simon`.
+ * Detects:
  *  - duplicate entries (same slug or near-duplicate description)
  *  - dead entries (referenced .md file no longer exists)
  *  - stale ordering (most-referenced entries should be on top)
