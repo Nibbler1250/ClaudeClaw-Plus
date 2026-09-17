@@ -1878,6 +1878,78 @@ describe("BusCore IPC", () => {
     }
   });
 
+  it("an un-numbered marker next to numbered tailers is called out once per agent and keeps the pre-#402 semantics (#412 item 3)", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    const warnings: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...a: unknown[]) => {
+      warnings.push(a.map(String).join(" "));
+    };
+    try {
+      // no numbered tailer yet: an un-numbered marker is the normal pre-#402 world, nothing to say
+      bus.ingestSessionEvent({
+        ts: 1,
+        agent_id: "alpha",
+        session_id: "s",
+        topic: "bus.events.replay_done",
+        payload: {},
+      });
+      expect(warnings).toHaveLength(0);
+      // the manager numbers this agent's tailers
+      bus.ingestSessionEvent({
+        ts: 2,
+        agent_id: "alpha",
+        session_id: "s",
+        topic: "bus.events.replay_done",
+        payload: { generation: 1 },
+      });
+      // a second, un-numbered wiring speaks up
+      bus.ingestSessionEvent({
+        ts: 3,
+        agent_id: "alpha",
+        session_id: "s",
+        topic: "bus.events.replay_done",
+        payload: {},
+      });
+      bus.ingestSessionEvent({
+        ts: 4,
+        agent_id: "alpha",
+        session_id: "s",
+        topic: "session.compact",
+        payload: { trigger: "auto" },
+      });
+      const w = warnings.filter((x) => x.includes("without a tailer generation"));
+      expect(w).toHaveLength(1);
+      expect(w[0]).toContain("agent=alpha");
+      // another agent, numbered too, gets its own line — through the session.compact branch this time
+      bus.ingestSessionEvent({
+        ts: 5,
+        agent_id: "beta",
+        session_id: "t",
+        topic: "bus.events.replay_done",
+        payload: { generation: 3 },
+      });
+      bus.ingestSessionEvent({
+        ts: 6,
+        agent_id: "beta",
+        session_id: "t",
+        topic: "session.compact",
+        payload: { trigger: "auto" },
+      });
+      const w2 = warnings.filter((x) => x.includes("without a tailer generation"));
+      expect(w2).toHaveLength(2);
+      expect(w2[1]).toContain("agent=beta");
+      expect(w2[1]).toContain("session.compact");
+      // the delivery backstop reports readiness with no marker at all: not a tailer, nothing said
+      (
+        bus as unknown as { markAgentReady: (a: string, s?: string, b?: boolean) => void }
+      ).markAgentReady("beta", undefined, true);
+      expect(warnings.filter((x) => x.includes("without a tailer generation"))).toHaveLength(2);
+    } finally {
+      console.warn = origWarn;
+    }
+  });
+
   it("noteSpawnedGeneration never moves backwards, and a delivery with no spawned generation keeps the live one (#412)", async () => {
     bus = createBusCore({ eventLogAppend: createMockEventLog().append });
     const b = bus as unknown as {
