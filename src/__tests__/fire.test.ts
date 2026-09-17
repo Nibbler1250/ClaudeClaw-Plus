@@ -4,7 +4,17 @@
  * Run with: bun test src/__tests__/fire.test.ts
  */
 
-import { describe, it, expect, afterEach } from "bun:test";
+import { describe, it, expect, afterEach, mock } from "bun:test";
+
+// #344: pin the exact `run()` call the default runner makes — the seam tests
+// below only see the injectable side of it.
+const runCalls: unknown[][] = [];
+mock.module("../runner", () => ({
+  run: async (...args: unknown[]) => {
+    runCalls.push(args);
+    return { exitCode: 0, stdout: "mocked", stderr: "" };
+  },
+}));
 import { rm, mkdir, writeFile } from "fs/promises";
 import { join } from "path";
 import { fireJob, runFireCommand, parseFireArgs } from "../commands/fire";
@@ -39,12 +49,26 @@ afterEach(async () => {
 });
 
 // A fake runner/prompt resolver keeps tests hermetic (no real `claude` exec).
-function fakeRunner(calls: Array<{ name: string; prompt: string; agent?: string }>, exitCode = 0) {
-  return async (name: string, prompt: string, agent?: string) => {
-    calls.push({ name, prompt, agent });
+type RunCall = {
+  name: string;
+  prompt: string;
+  agent?: string;
+  extras?: { timeoutMs?: number; modelOverride?: string };
+};
+function fakeRunner(calls: RunCall[], exitCode = 0) {
+  return async (
+    name: string,
+    prompt: string,
+    agent?: string,
+    extras?: { timeoutMs?: number; modelOverride?: string },
+  ) => {
+    calls.push({ name, prompt, agent, extras });
     return { exitCode, stdout: `ran:${name}`, stderr: "" };
   };
 }
+// #344: the fired prompt carries the scheduled path's clock prefix; the body is its last line.
+const bodyOf = (prompt: string) => prompt.split("\n").at(-1);
+const CLOCK_LINE = /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC[+-]\d+(?::\d{2})?\]$/;
 
 const passthroughResolver = async (p: string) => p;
 
@@ -83,7 +107,7 @@ describe("fireJob", () => {
       "research briefing",
     );
 
-    const calls: Array<{ name: string; prompt: string; agent?: string }> = [];
+    const calls: RunCall[] = [];
     const result = await fireJob(agent, "daily-research", {
       runner: fakeRunner(calls),
       promptResolver: passthroughResolver,
@@ -93,8 +117,13 @@ describe("fireJob", () => {
     expect(result.exitCode).toBe(0);
     expect(calls).toHaveLength(1);
     expect(calls[0].agent).toBe(agent);
-    expect(calls[0].prompt).toBe("research briefing");
+    expect(bodyOf(calls[0].prompt)).toBe("research briefing");
+    const lines = calls[0].prompt.split("\n");
+    expect(lines).toHaveLength(2); // clock line + body, like the cron loop
+    expect(lines[0]).toMatch(CLOCK_LINE);
     expect(calls[0].name).toBe(`${agent}/daily-research`);
+    // no timeout/model in the frontmatter → none passed, the runner falls back to its defaults
+    expect(calls[0].extras?.timeoutMs).toBeUndefined();
   });
 
   it("errors clearly when agent directory does not exist", async () => {
@@ -122,6 +151,71 @@ describe("fireJob", () => {
     expect(result.error).toContain("not found");
   });
 
+  it("passes the job's own timeout and model to the runner, as the scheduled path does (#344)", async () => {
+    const agent = uniq("fire-extras");
+    await writeAgentJob(
+      agent,
+      "long-research",
+      "schedule: 0 9 * * *\nrecurring: true\ntimeout: 1200\nmodel: opus",
+      "deep research",
+    );
+    const calls: RunCall[] = [];
+    const result = await fireJob(agent, "long-research", {
+      runner: fakeRunner(calls),
+      promptResolver: passthroughResolver,
+    });
+    expect(result.success).toBe(true);
+    expect(calls[0].extras).toEqual({ timeoutMs: 1_200_000, modelOverride: "opus" });
+  });
+
+  it('the default runner calls run() exactly as the cron loop does: agent:<name> thread, model, timeout, agent, "job" (#344)', async () => {
+    const agent = uniq("fire-default");
+    await writeAgentJob(
+      agent,
+      "nightly",
+      "schedule: 0 2 * * *\nrecurring: true\ntimeout: 900\nmodel: haiku",
+      "tidy up",
+    );
+    runCalls.length = 0;
+    const result = await fireJob(agent, "nightly", { promptResolver: passthroughResolver });
+    expect(result.success).toBe(true);
+    expect(runCalls).toHaveLength(1);
+    const [name, prompt, threadId, modelOverride, timeoutMs, agentName, category] = runCalls[0] as [
+      string,
+      string,
+      string,
+      string | undefined,
+      number | undefined,
+      string | undefined,
+      string | undefined,
+    ];
+    expect(name).toBe(`${agent}/nightly`);
+    expect(bodyOf(prompt)).toBe("tidy up");
+    expect(threadId).toBe(`agent:${agent}`);
+    expect(modelOverride).toBe("haiku");
+    expect(timeoutMs).toBe(900_000);
+    expect(agentName).toBe(agent);
+    expect(category).toBe("job");
+  });
+
+  it("refuses a job whose model: is invalid, as the cron loader does (#344)", async () => {
+    const agent = uniq("fire-badmodel");
+    await writeAgentJob(
+      agent,
+      "typo",
+      "schedule: 0 2 * * *\nrecurring: true\nmodel: opus-4.5",
+      "x",
+    );
+    const calls: RunCall[] = [];
+    const result = await fireJob(agent, "typo", {
+      runner: fakeRunner(calls),
+      promptResolver: passthroughResolver,
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("Invalid model");
+    expect(calls).toHaveLength(0);
+  });
+
   it("can fire a disabled job (bypasses enabled filter)", async () => {
     const agent = uniq("disabled");
     await writeAgentJob(
@@ -131,14 +225,14 @@ describe("fireJob", () => {
       "disabled prompt",
     );
 
-    const calls: Array<{ name: string; prompt: string; agent?: string }> = [];
+    const calls: RunCall[] = [];
     const result = await fireJob(agent, "off-job", {
       runner: fakeRunner(calls),
       promptResolver: passthroughResolver,
     });
     expect(result.success).toBe(true);
     expect(calls).toHaveLength(1);
-    expect(calls[0].prompt).toBe("disabled prompt");
+    expect(bodyOf(calls[0].prompt)).toBe("disabled prompt");
   });
 
   it("propagates runner exitCode on failure", async () => {
