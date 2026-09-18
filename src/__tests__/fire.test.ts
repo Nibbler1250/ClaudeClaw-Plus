@@ -4,21 +4,14 @@
  * Run with: bun test src/__tests__/fire.test.ts
  */
 
-import { describe, it, expect, afterEach, mock } from "bun:test";
-
-// #344: pin the exact `run()` call the default runner makes — the seam tests
-// below only see the injectable side of it.
-const runCalls: unknown[][] = [];
-mock.module("../runner", () => ({
-  run: async (...args: unknown[]) => {
-    runCalls.push(args);
-    return { exitCode: 0, stdout: "mocked", stderr: "" };
-  },
-}));
-import { rm, mkdir, writeFile } from "fs/promises";
+import { describe, it, expect, afterEach } from "bun:test";
+import { readdir, readFile, rm, mkdir, writeFile } from "fs/promises";
 import { join } from "path";
 import { fireJob, runFireCommand, parseFireArgs } from "../commands/fire";
 import type { Job } from "../jobs";
+import { initConfig, loadSettings } from "../config";
+import * as runnerMod from "../runner";
+import { createThreadSession, removeThreadSession } from "../sessionManager";
 
 const PROJECT = process.cwd();
 const AGENTS_DIR = join(PROJECT, "agents");
@@ -168,7 +161,15 @@ describe("fireJob", () => {
     expect(calls[0].extras).toEqual({ timeoutMs: 1_200_000, modelOverride: "opus" });
   });
 
-  it('the default runner calls run() exactly as the cron loop does: agent:<name> thread, model, timeout, agent, "job" (#344)', async () => {
+  // #344: the default runner is observed end to end through the primary-exec
+  // seam (`_setPrimaryExecForTests`), not a `mock.module("../runner")` — bun
+  // module mocks are process-wide and would leak into runner.test.ts. The seam
+  // sees the resolved model, the timeout, the agent cwd and the argv; a seeded
+  // `agent:<name>` thread session shows up as `--resume`, which is the point of
+  // the issue: a manual fire lands in the scheduled turn's session.
+  it("the default runner reaches the exec exactly as the cron loop does: agent:<name> session, model, timeout, agent cwd (#344)", async () => {
+    await initConfig();
+    await loadSettings();
     const agent = uniq("fire-default");
     await writeAgentJob(
       agent,
@@ -176,26 +177,52 @@ describe("fireJob", () => {
       "schedule: 0 2 * * *\nrecurring: true\ntimeout: 900\nmodel: haiku",
       "tidy up",
     );
-    runCalls.length = 0;
-    const result = await fireJob(agent, "nightly", { promptResolver: passthroughResolver });
-    expect(result.success).toBe(true);
-    expect(runCalls).toHaveLength(1);
-    const [name, prompt, threadId, modelOverride, timeoutMs, agentName, category] = runCalls[0] as [
-      string,
-      string,
-      string,
-      string | undefined,
-      number | undefined,
-      string | undefined,
-      string | undefined,
-    ];
-    expect(name).toBe(`${agent}/nightly`);
+    const threadId = `agent:${agent}`;
+    const SESSION = "sess-344-fire-e2e";
+    const SENTINEL = "FIRE_344_E2E_SENTINEL";
+    await createThreadSession(threadId, SESSION);
+    // The run reaches `recordInvocationStart` before the seam throws: put the
+    // usage directory back byte-for-byte afterwards (see model-override.test.ts).
+    const usageDir = join(process.cwd(), ".claude", "claudeclaw", "usage");
+    const usageBefore = new Map<string, string>();
+    for (const f of await readdir(usageDir).catch(() => [] as string[])) {
+      usageBefore.set(f, await readFile(join(usageDir, f), "utf8"));
+    }
+    const seen: { name: string; args: string[]; model: string; cwd?: string; timeoutMs: number }[] =
+      [];
+    runnerMod._setPrimaryExecForTests(async ({ name, args, model, cwd, timeoutMs }) => {
+      seen.push({ name, args, model, cwd, timeoutMs });
+      throw new Error(SENTINEL);
+    });
+    try {
+      await expect(
+        fireJob(agent, "nightly", { promptResolver: passthroughResolver }),
+      ).rejects.toThrow(SENTINEL);
+    } finally {
+      runnerMod._setPrimaryExecForTests(null);
+      await removeThreadSession(threadId);
+      try {
+        for (const f of await readdir(usageDir)) {
+          const before = usageBefore.get(f);
+          if (before === undefined) await rm(join(usageDir, f), { recursive: true, force: true });
+          else await writeFile(join(usageDir, f), before);
+        }
+      } catch {
+        /* directory may not exist */
+      }
+    }
+    expect(seen).toHaveLength(1);
+    const call = seen[0];
+    expect(call.name).toBe(`${agent}/nightly`);
+    expect(call.model).toBe("haiku");
+    expect(call.timeoutMs).toBe(900_000);
+    expect(call.cwd).toBe(join(AGENTS_DIR, agent));
+    const prompt = call.args[call.args.indexOf("-p") + 1];
     expect(bodyOf(prompt)).toBe("tidy up");
-    expect(threadId).toBe(`agent:${agent}`);
-    expect(modelOverride).toBe("haiku");
-    expect(timeoutMs).toBe(900_000);
-    expect(agentName).toBe(agent);
-    expect(category).toBe("job");
+    expect(prompt.split("\n")[0]).toMatch(CLOCK_LINE);
+    const resumeAt = call.args.indexOf("--resume");
+    expect(resumeAt).toBeGreaterThan(-1);
+    expect(call.args[resumeAt + 1]).toBe(SESSION);
   });
 
   it("refuses a job whose model: is invalid, as the cron loader does (#344)", async () => {
