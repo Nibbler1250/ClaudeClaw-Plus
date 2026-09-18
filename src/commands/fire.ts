@@ -6,15 +6,38 @@
  *   claudeclaw fire <agent> <label>
  *
  * Fires a single agent job immediately via the same `run()` code path as the
- * cron loop. Disabled jobs (enabled: false) CAN be fired manually — the
- * enabled flag only gates cron scheduling.
+ * cron loop (legacy and PTY runtimes). Disabled jobs (enabled: false) CAN be
+ * fired manually — the enabled flag only gates cron scheduling.
+ *
+ * Two things worth knowing (#344):
+ * - the fired turn runs AS the agent, on the agent's own session
+ *   (`agent:<name>`, the same one its scheduled runs use). A `claudeclaw fire`
+ *   from a second process therefore resumes the same session as the daemon's
+ *   cron tick — do not fire a job at the minute it is due.
+ * - under `runtime: "bus"` the scheduled turn is the raw `job.prompt` handed to
+ *   the bus scheduler (no clock, no timeout, the agent's own model); a fire
+ *   through the web UI's bus runner sends the clock-prefixed prompt and bounds
+ *   its wait with the job's timeout — the model stays the agent's.
  *
  * Closes GAP-17-05: no more waiting on cron to smoke-test a new job.
  */
 
-import { loadAgentJobsUnfiltered, agentDirExists, type Job } from "../jobs";
-import { run as defaultRun } from "../runner";
-import { resolvePrompt as defaultResolvePrompt, initConfig, loadSettings } from "../config";
+import {
+  loadAgentJobsUnfiltered,
+  agentDirExists,
+  resolveJobModel,
+  snapshotJobFrontmatter,
+  validateModelString,
+  type Job,
+} from "../jobs";
+import { run } from "../runner";
+import {
+  resolvePrompt as defaultResolvePrompt,
+  getSettings,
+  initConfig,
+  loadSettings,
+} from "../config";
+import { buildClockPromptPrefix } from "../timezone";
 
 export interface FireResult {
   success: boolean;
@@ -26,12 +49,26 @@ export interface FireResult {
   label?: string;
 }
 
+/**
+ * What the scheduled path (`runJob` in start.ts) derives from the job before it
+ * calls `run()`, so a manual fire is the same turn (#344): the job's own
+ * `timeout:` frontmatter (seconds → ms), its resolved model, and the `"job"`
+ * timeout category. Before #344 a fire passed none of these — it ran on the
+ * default 5-minute cap and on a different session key — which is how a job
+ * that legitimately runs 20 minutes "timed out" only when fired by hand.
+ */
+export interface FireRunExtras {
+  timeoutMs?: number;
+  modelOverride?: string;
+}
+
 export interface FireJobOptions {
-  /** Injectable runner for tests. Defaults to runner.run. */
+  /** Injectable runner for tests. Defaults to the scheduled path's `run()` call. */
   runner?: (
     name: string,
     prompt: string,
     agent?: string,
+    extras?: FireRunExtras,
   ) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
   /** Injectable prompt resolver for tests. Defaults to config.resolvePrompt. */
   promptResolver?: (prompt: string) => Promise<string>;
@@ -42,9 +79,32 @@ export interface FireJobOptions {
 }
 
 /**
+ * The scheduled path's `run()` call, exactly (`runJob` in start.ts): the
+ * session key `agent:<name>`, the job's model and timeout, the `"job"` timeout
+ * category, the agent name for its memory/identity.
+ */
+async function defaultRun(
+  name: string,
+  prompt: string,
+  agent?: string,
+  extras: FireRunExtras = {},
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  return run(
+    name,
+    prompt,
+    agent ? `agent:${agent}` : name,
+    extras.modelOverride,
+    extras.timeoutMs,
+    agent,
+    "job",
+  );
+}
+
+/**
  * Fire a single agent job once, bypassing the cron loop and the enabled
- * filter. Uses the same `run()` signature as the scheduled path to guarantee
- * storage/exec format parity.
+ * filter. Derives the same arguments as the scheduled path (`runJob` in
+ * start.ts) — clock prefix, model, timeout, session key — so the fired turn is
+ * the scheduled turn, storage and exec included.
  */
 export async function fireJob(
   agent: string,
@@ -86,9 +146,41 @@ export async function fireJob(
     };
   }
 
-  // Mirror cron-loop pattern: resolvePrompt then run(name, prompt, agent)
+  // The cron loop's loader skips a job whose `model:` is invalid (#378); the
+  // unfiltered loader used here does not. Since a fire now honours `model:`,
+  // refuse the same way instead of handing claude a bad `--model`.
+  try {
+    validateModelString(job.model, `job '${agent}:${label}'`);
+  } catch (err) {
+    return {
+      success: false,
+      exitCode: 1,
+      error: err instanceof Error ? err.message : String(err),
+      agent,
+      label,
+    };
+  }
+
+  // Mirror the cron loop (`runJob`): clock prefix, resolved prompt, the job's
+  // own model and timeout, and the frontmatter snapshot — the agent's cwd is
+  // its own directory, and a turn that rewrites its job file must not drop
+  // `schedule:`. Settings may not be loaded (tests): the clock then carries
+  // no offset.
+  const restoreFrontmatter = await snapshotJobFrontmatter(job.name);
   const resolved = await promptResolver(job.prompt);
-  const result = await runner(job.name, resolved, job.agent);
+  let tzOffset = 0;
+  try {
+    tzOffset = getSettings().timezoneOffsetMinutes;
+  } catch {
+    /* settings not loaded */
+  }
+  const prompt = `${buildClockPromptPrefix(new Date(), tzOffset)}\n${resolved}`;
+  const extras: FireRunExtras = {
+    timeoutMs: job.timeoutSeconds ? job.timeoutSeconds * 1000 : undefined,
+    modelOverride: await resolveJobModel(job),
+  };
+  const result = await runner(job.name, prompt, job.agent, extras);
+  if (await restoreFrontmatter()) console.log(`Restored frontmatter for job: ${job.name}`);
   return {
     success: result.exitCode === 0,
     exitCode: result.exitCode,
