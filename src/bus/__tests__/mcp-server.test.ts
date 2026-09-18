@@ -324,6 +324,16 @@ describe("BusMcpServer — outbound tools", () => {
     expect(reply.in_reply_to).toBe("100");
   });
 
+  it("`reply` tool lets metadata.in_reply_to win when both forms are given", async () => {
+    await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", in_reply_to: 1, metadata: { in_reply_to: 2 } },
+    });
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.in_reply_to).toBe("2");
+  });
+
   it("`reply` tool lets metadata.intent win when both forms are given", async () => {
     await h.client.callTool({
       name: "reply",
