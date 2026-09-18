@@ -3,7 +3,8 @@ import { join } from "path";
 import { homedir } from "os";
 import {
   getPidPath,
-  cleanupPidFile,
+  cleanupPidFileIf,
+  isPidAlive,
   waitForPidExit,
   stopGraceMs,
   readConfiguredDrainMs,
@@ -116,11 +117,26 @@ export async function stop() {
         process.exit(1);
       }
     }
-  } catch {
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EPERM") {
+      // #420: alive, not ours — say so and leave its file alone.
+      console.log(
+        `Daemon (PID ${pid}) belongs to another user — cannot signal it; PID file left in place.`,
+      );
+      await teardownStatusline();
+      process.exit(1);
+    }
     console.log(`Daemon process ${pid} already dead.`);
   }
 
-  await cleanupPidFile();
+  // #420: only if the file still names the daemon we stopped — a `start` that
+  // raced us may already own it. "absent" is the normal graceful case: the
+  // daemon removes its own file when it exits.
+  if ((await cleanupPidFileIf(Number(pid))) === "foreign") {
+    console.log(
+      `PID file no longer names ${pid} (another daemon started meanwhile) — left in place.`,
+    );
+  }
   await teardownStatusline();
 
   try {
@@ -143,6 +159,7 @@ export async function stopAll() {
   }
 
   let found = 0;
+  let survivors = 0;
   for (const dir of dirs) {
     const projectPath = "/" + dir.slice(1).replace(/-/g, "/");
     const pidFile = join(projectPath, ".claude", "claudeclaw", "daemon.pid");
@@ -150,11 +167,10 @@ export async function stopAll() {
     let pid: string;
     try {
       pid = (await readFile(pidFile, "utf-8")).trim();
-      process.kill(Number(pid), 0);
     } catch {
       continue;
     }
-
+    if (!isPidAlive(Number(pid))) continue;
     found++;
     try {
       process.kill(Number(pid), "SIGTERM");
@@ -177,12 +193,27 @@ export async function stopAll() {
         );
       }
       if (gone) {
-        try {
-          await unlink(pidFile);
-        } catch {}
+        // #420: compare-and-unlink — the file may already belong to a
+        // replacement started meanwhile.
+        await cleanupPidFileIf(Number(pid), pidFile);
+      } else {
+        survivors++;
       }
-    } catch {
-      console.log(`\x1b[31m✗ Failed to stop\x1b[0m PID ${pid} — ${projectPath}`);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EPERM") {
+        // alive, another user's: cannot be signalled from here
+        console.log(
+          `\x1b[31m✗ Cannot signal\x1b[0m PID ${pid} — ${projectPath} (another user's daemon)`,
+        );
+        survivors++;
+      } else if (!isPidAlive(Number(pid))) {
+        // it exited on its own between the probe and the signal
+        console.log(`\x1b[33m■ Stopped\x1b[0m PID ${pid} — ${projectPath} (exited on its own)`);
+        await cleanupPidFileIf(Number(pid), pidFile);
+      } else {
+        console.log(`\x1b[31m✗ Failed to stop\x1b[0m PID ${pid} — ${projectPath}`);
+        survivors++;
+      }
     }
   }
 
@@ -190,5 +221,7 @@ export async function stopAll() {
     console.log("No running daemons found.");
   }
 
-  process.exit(0);
+  // #420: a daemon that survived SIGKILL (or could not be signalled) still owns
+  // its socket and agents — say so with the exit code, not only in the log.
+  process.exit(survivors > 0 ? 1 : 0);
 }

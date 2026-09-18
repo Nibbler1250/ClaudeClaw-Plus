@@ -31,6 +31,7 @@ import { ensureUserSymlinks } from "../install";
 import {
   writePidFile,
   cleanupPidFile,
+  cleanupPidFileIf,
   checkExistingDaemon,
   waitForPidExit,
   stopGraceMs,
@@ -396,7 +397,8 @@ export async function start(args: string[] = []) {
       }
     }
 
-    await cleanupPidFile();
+    // #420: remove the file only if it still names the daemon we replaced.
+    await cleanupPidFileIf(existingPid);
   }
 
   await initConfig();
@@ -722,7 +724,8 @@ export async function start(args: string[] = []) {
       }
     }
     await teardownStatusline();
-    await cleanupPidFile();
+    // #420: only our own file — a replacement that already wrote its PID keeps it.
+    await cleanupPidFileIf(process.pid);
     process.exit(0);
   }
   process.on("SIGTERM", shutdown);
