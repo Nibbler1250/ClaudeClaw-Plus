@@ -346,6 +346,17 @@ describe("BusMcpServer — outbound tools", () => {
     expect("in_reply_to" in reply).toBe(false);
   });
 
+  it("`reply` tool: a null metadata.intent does not shadow a top-level intent", async () => {
+    const result = await h.client.callTool({
+      name: "reply",
+      arguments: { message: "done", intent: "final", metadata: { intent: null } },
+    });
+    expect(result.isError).toBeFalsy();
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.intent).toBe("final");
+  });
+
   it("`reply` tool rejects an unknown key inside metadata too", async () => {
     const result = await h.client.callTool({
       name: "reply",
