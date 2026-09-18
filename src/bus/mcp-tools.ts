@@ -14,30 +14,41 @@ export const BUS_MCP_TOOLS = [
     name: "reply",
     description:
       "Send a reply to the originating surface (Discord/Telegram/Slack/Web UI). " +
-      "Use `intent: 'final'` for the turn-final message, `'progress'` for streaming " +
-      "updates, `'tool_status'` for tool-execution notes. " +
-      "When several chats talk to you, set `metadata.in_reply_to` to the `chat_id` " +
+      "Call it as { message, intent } — `intent: 'final'` for the turn-final message, " +
+      "`'progress'` for streaming updates, `'tool_status'` for tool-execution notes; " +
+      "omitted, it is `'progress'`. " +
+      "When several chats talk to you, set `in_reply_to` to the `chat_id` " +
       "(or `origin_id`) attribute of the <channel …> block you are answering, so the " +
       "reply reaches that chat and not whichever one wrote last. One `final` per chat " +
-      "you answer; a second `final` to the same chat in one turn is dropped.",
+      "you answer; a second `final` to the same chat in one turn is dropped. " +
+      "The same two fields are also accepted under `metadata`; any other key is refused.",
     inputSchema: {
       type: "object" as const,
       properties: {
         message: { type: "string" },
+        intent: {
+          type: "string",
+          enum: ["final", "progress", "tool_status"],
+          description: "'final' ends the turn and notifies the user; default 'progress'.",
+        },
+        in_reply_to: {
+          type: ["string", "number"],
+          description:
+            "The chat_id (or origin_id) attribute of the <channel …> block this reply answers. " +
+            "Only chats that actually prompted you are honoured.",
+        },
         metadata: {
           type: "object",
+          description: "Alternative placement of the same `intent` / `in_reply_to` fields.",
           properties: {
             intent: { type: "string", enum: ["final", "progress", "tool_status"] },
-            in_reply_to: {
-              type: ["string", "number"],
-              description:
-                "The chat_id (or origin_id) attribute of the <channel …> block this reply answers. " +
-                "Only chats that actually prompted you are honoured.",
-            },
+            in_reply_to: { type: ["string", "number"] },
           },
+          additionalProperties: false,
         },
       },
       required: ["message"],
+      additionalProperties: false,
     },
   },
   {
