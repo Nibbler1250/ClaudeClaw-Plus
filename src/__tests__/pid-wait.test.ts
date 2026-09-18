@@ -4,10 +4,17 @@
  * primitive they wait on.
  */
 import { describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { readConfiguredDrainMs, stopGraceMs, waitForPidExit } from "../pid";
+import { dirname, join } from "node:path";
+import {
+  cleanupPidFileIf,
+  getPidPath,
+  isPidAlive,
+  readConfiguredDrainMs,
+  stopGraceMs,
+  waitForPidExit,
+} from "../pid";
 
 describe("waitForPidExit (#315)", () => {
   it("resolves true at once for a pid that does not exist", async () => {
@@ -46,6 +53,34 @@ describe("waitForPidExit (#315)", () => {
       expect(await readConfiguredDrainMs(dir)).toBeUndefined();
       writeFileSync(f, JSON.stringify({}));
       expect(await readConfiguredDrainMs(dir)).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("isPidAlive: EPERM means alive (a process that is not ours), ESRCH means gone (#420)", () => {
+    // PID 1 exists and is not ours: kill(1, 0) throws EPERM for an unprivileged user.
+    if (process.getuid?.() !== 0) expect(isPidAlive(1)).toBe(true);
+    expect(isPidAlive(2 ** 22 - 7)).toBe(false);
+    expect(isPidAlive(process.pid)).toBe(true);
+  });
+
+  it("cleanupPidFileIf removes the file only when it still names the expected pid (#420)", async () => {
+    // A temp file, never the project's real daemon.pid (CodeRabbit): a daemon
+    // command running alongside the tests must not read a test value.
+    const dir = mkdtempSync(join(tmpdir(), "ccplus-pidfile-"));
+    const file = join(dir, "daemon.pid");
+    try {
+      writeFileSync(file, "4242\n");
+      expect(await cleanupPidFileIf(9999, file)).toBe("foreign"); // another daemon owns it now
+      expect(existsSync(file)).toBe(true);
+      expect(await cleanupPidFileIf(4242, file)).toBe("removed");
+      expect(existsSync(file)).toBe(false);
+      expect(await cleanupPidFileIf(4242, file)).toBe("absent"); // the daemon removed its own file: normal
+      writeFileSync(file, "garbage\n");
+      expect(await cleanupPidFileIf(4242, file)).toBe("removed"); // a corrupt file names nobody
+      expect(existsSync(file)).toBe(false);
+      expect(getPidPath()).toContain("daemon.pid"); // the default path is the project's
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

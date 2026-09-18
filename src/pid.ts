@@ -26,14 +26,12 @@ export async function checkExistingDaemon(): Promise<number | null> {
     return null;
   }
 
-  try {
-    process.kill(pid, 0); // signal 0 = just check if alive
-    return pid;
-  } catch {
-    // process is dead, clean up stale pid file
-    await cleanupPidFile();
-    return null;
-  }
+  // #420: EPERM means alive-but-not-ours — never treat it as stale, or a
+  // `start` by another user removes a live daemon's file and starts over it.
+  if (isPidAlive(pid)) return pid;
+  // process is dead, clean up stale pid file
+  await cleanupPidFile();
+  return null;
 }
 
 export async function writePidFile(): Promise<void> {
@@ -50,14 +48,59 @@ export async function writePidFile(): Promise<void> {
 export async function waitForPidExit(pid: number, maxMs: number, pollMs = 100): Promise<boolean> {
   const deadline = Date.now() + maxMs;
   for (;;) {
-    try {
-      process.kill(pid, 0);
-    } catch {
-      return true;
-    }
+    if (!isPidAlive(pid)) return true;
     if (Date.now() >= deadline) return false;
     await Bun.sleep(Math.min(pollMs, Math.max(1, deadline - Date.now())));
   }
+}
+
+/**
+ * `kill(pid, 0)` throws for two different reasons: `ESRCH` (no such process —
+ * gone) and `EPERM` (it exists but is not ours). Only the first means gone
+ * (#420); treating a foreign live PID as exited would let `stop` /
+ * `--replace-existing` remove its file and start another daemon over it.
+ */
+export function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Remove `daemon.pid` only if it still names `expectedPid` (#420). Between
+ * "the old daemon exited" and this unlink, a concurrent `start` may have
+ * written its own PID into the file; unlinking unconditionally would drop
+ * that daemon's file and let a later `start` launch a duplicate. Returns
+ * whether the file was removed.
+ */
+export type PidFileCleanup = "removed" | "absent" | "foreign";
+export async function cleanupPidFileIf(
+  expectedPid: number,
+  pidFile: string = PID_FILE,
+): Promise<PidFileCleanup> {
+  let raw: string;
+  try {
+    raw = (await readFile(pidFile, "utf-8")).trim();
+  } catch {
+    // The daemon removes its own file on a clean exit; "absent" is the
+    // normal outcome of a graceful stop, not a sign of anything.
+    return "absent";
+  }
+  // A corrupt file (non-numeric) names nobody: remove it, as `checkExistingDaemon` does.
+  const current = Number(raw);
+  if (!Number.isInteger(current) || current <= 0) {
+    await unlink(pidFile).catch(() => undefined);
+    return "removed";
+  }
+  if (current !== expectedPid) return "foreign";
+  // TOCTOU between this read and the unlink is one syscall wide and accepted:
+  // POSIX has no compare-and-unlink without a lock file, and the window used
+  // to be the whole drain.
+  await unlink(pidFile).catch(() => undefined);
+  return "removed";
 }
 
 /**

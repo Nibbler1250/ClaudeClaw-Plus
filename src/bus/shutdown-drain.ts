@@ -95,12 +95,49 @@ export async function drainActiveTurns(maxMs: number, deps: DrainDeps): Promise<
       waitedMs: now() - startedAt,
     };
   };
-  if (busyAtStart.length === 0) return done([], false);
+  if (maxMs <= 0 && busyAtStart.length === 0) return done([], false);
+  // Subscribe before any waiting: a turn that starts AND ends between two
+  // polls is never seen in the busy set, only through its `turn_end`
+  // (CodeRabbit on the PR). Its reply then gets the settle grace from that
+  // moment, not from the signal.
+  let lastTurnEndAt: number | null = null;
+  const unsubscribe = deps.onTurnEnd?.((agentId) => {
+    finished.add(agentId);
+    lastTurnEndAt = now();
+  });
+  if (busyAtStart.length === 0) {
+    // #420: adapters stay live until the teardown that follows, so a prompt
+    // accepted right after SIGTERM can enter the busy set a few ms from now.
+    // Give it the settle grace before concluding there is nothing to wait for;
+    // if something shows up, drain it like any other.
+    const hardStop = startedAt + maxMs;
+    let settleUntil = Math.min(now() + settleMs, hardStop);
+    let late: string[] = [];
+    while (now() < settleUntil && late.length === 0) {
+      if (deps.shouldAbort?.()) {
+        unsubscribe?.();
+        return done([], true);
+      }
+      await sleep(Math.min(POLL_MS, Math.max(1, settleUntil - now())));
+      late = deps.busyAgents();
+      // a turn ended while we were not looking: its reply is still on its way out
+      if (lastTurnEndAt !== null) settleUntil = Math.min(lastTurnEndAt + settleMs, hardStop);
+    }
+    if (late.length === 0) {
+      unsubscribe?.();
+      return done([], false);
+    }
+    log(
+      `[shutdown] ${late.length} agent(s) became busy right after the signal (${late.join(", ")}) — draining them`,
+    );
+    busyAtStart.push(...late);
+  }
   if (maxMs <= 0) {
     log(
       `[shutdown] ${busyAtStart.length} agent(s) still busy (${busyAtStart.join(", ")}) — ` +
         "drain disabled (settings.shutdown.drainTurnsMs = 0); stopping now, their replies are lost",
     );
+    unsubscribe?.();
     return done(busyAtStart, false);
   }
   log(
@@ -108,9 +145,6 @@ export async function drainActiveTurns(maxMs: number, deps: DrainDeps): Promise<
       `draining for up to ${secs(maxMs)} before stopping (settings.shutdown.drainTurnsMs); ` +
       "a second SIGTERM/SIGINT stops the wait",
   );
-  const unsubscribe = deps.onTurnEnd?.((agentId) => {
-    finished.add(agentId);
-  });
   let busy = busyAtStart;
   let aborted = false;
   try {
