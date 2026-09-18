@@ -303,6 +303,47 @@ describe("BusMcpServer — outbound tools", () => {
     expect(reply.intent).toBe("progress");
   });
 
+  it("`reply` tool honours a top-level `intent` (the form its description shows)", async () => {
+    const result = await h.client.callTool({
+      name: "reply",
+      arguments: { message: "done", intent: "final" },
+    });
+    expect(result.isError).toBeFalsy();
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.intent).toBe("final");
+  });
+
+  it("`reply` tool honours a top-level `in_reply_to` like metadata.in_reply_to", async () => {
+    await h.client.callTool({
+      name: "reply",
+      arguments: { message: "for chat A", intent: "final", in_reply_to: 100 },
+    });
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.in_reply_to).toBe("100");
+  });
+
+  it("`reply` tool lets metadata.intent win when both forms are given", async () => {
+    await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", intent: "progress", metadata: { intent: "final" } },
+    });
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.intent).toBe("final");
+  });
+
+  it("`reply` tool rejects an unknown argument instead of delivering it as progress", async () => {
+    const result = await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", intnet: "final" },
+    });
+    expect(result.isError).toBe(true);
+    expect(String((result.content as Array<{ text?: string }>)[0]?.text)).toContain("intnet");
+    expect(h.ipc.sent.length).toBe(0);
+  });
+
   it("`reply` tool forwards metadata.in_reply_to on the IpcReply (#224)", async () => {
     await h.client.callTool({
       name: "reply",
