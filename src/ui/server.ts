@@ -577,12 +577,19 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
           let busRunnerError: string | undefined;
           const fireOpts = opts.bus
             ? {
-                runner: async (name: string, prompt: string, jobAgent?: string) => {
+                runner: async (
+                  name: string,
+                  prompt: string,
+                  jobAgent?: string,
+                  extras?: { timeoutMs?: number },
+                ) => {
                   const target = jobAgent ?? agent;
+                  // #344: the job's own `timeout:` bounds the bridge WAIT (the
+                  // agent's turn itself is not cancelled by the bridge).
                   const out = await (opts.bus as NonNullable<typeof opts.bus>).sendPromptAndAwait(
                     target,
                     prompt,
-                    { origin: "webui", originId: `job:${name}` },
+                    { origin: "webui", originId: `job:${name}`, timeoutMs: extras?.timeoutMs },
                   );
                   if (!out.ok && out.error) busRunnerError = out.error;
                   return {
