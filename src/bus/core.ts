@@ -487,6 +487,16 @@ export class BusCoreImpl implements BusCore {
    *  may be ahead of the live one (its `replay_done` not ingested yet). A
    *  delivery is tagged with the greater of the two. */
   private readonly agentSpawnedGeneration = new Map<string, number>();
+  /** #412 item 3: once per agent — an un-numbered marker next to numbered ones. */
+  private readonly warnedUnnumberedMarker = new Set<string>();
+  private warnUnnumberedMarker(agent_id: string, topic: string): void {
+    if (this.warnedUnnumberedMarker.has(agent_id)) return;
+    this.warnedUnnumberedMarker.add(agent_id);
+    console.warn(
+      `[bus] agent=${agent_id}: a ${topic} marker without a tailer generation arrived while this agent's tailers are numbered — a second tailer wiring? Its markers are not ordered against the numbered ones and release every hold (pre-#402 semantics); logged once per agent`,
+    );
+  }
+
   private readonly deliveryBackstopMs: number;
   /**
    * Pending turn-start verification for a BACKSTOP-flushed prompt. The backstop
@@ -880,6 +890,7 @@ export class BusCoreImpl implements BusCore {
     this.compactionHeld.clear();
     this.agentTailerGeneration.clear();
     this.agentSpawnedGeneration.clear();
+    this.warnedUnnumberedMarker.clear();
     this.agentTurnActive.clear();
     this.lastTurnEndMessageId.clear();
     this.originAmbiguous.clear();
@@ -1302,6 +1313,16 @@ export class BusCoreImpl implements BusCore {
         `[bus] ignoring stale replay_done for agent=${agent_id} (tailer generation ${generation} < ${liveGeneration !== undefined && generation < liveGeneration ? `live ${liveGeneration}` : `spawned ${knownGeneration}`})`,
       );
       return;
+    }
+    // #412 item 3: a marker WITHOUT a generation for an agent whose tailers are
+    // numbered means a second tailer wiring exists next to the session
+    // manager's. Its markers get the pre-#402 semantics (they order nothing
+    // and release every hold); nothing changes here, but say so once — the
+    // day that wiring appears, this line is how the two are told apart.
+    // The delivery backstop calls in with no marker at all (`viaBackstop`) —
+    // that is not a tailer speaking, so it says nothing here.
+    if (generation === undefined && !viaBackstop && knownGeneration !== undefined) {
+      this.warnUnnumberedMarker(agent_id, "replay_done");
     }
     // A replacement is a numeric generation ADVANCING. The first marker ever
     // seen for an agent is not one: it may be the very tailer that accepted a
@@ -2153,6 +2174,15 @@ export class BusCoreImpl implements BusCore {
         // boundary the tailer being replaced publishes late belongs to the old
         // transcript and says nothing about a compaction in the replacement.
         const gen = (e.payload as { generation?: unknown } | undefined)?.generation;
+        if (
+          typeof gen !== "number" &&
+          maxGeneration(
+            this.agentTailerGeneration.get(e.agent_id),
+            this.agentSpawnedGeneration.get(e.agent_id),
+          ) !== undefined
+        ) {
+          this.warnUnnumberedMarker(e.agent_id, "session.compact");
+        }
         this.releaseCompactionHold(e.agent_id, {
           ...(typeof gen === "number" ? { generation: gen } : {}),
           boundaryAt: e.ts,
