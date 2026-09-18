@@ -21,7 +21,8 @@ export const BUS_MCP_TOOLS = [
       "(or `origin_id`) attribute of the <channel …> block you are answering, so the " +
       "reply reaches that chat and not whichever one wrote last. One `final` per chat " +
       "you answer; a second `final` to the same chat in one turn is dropped. " +
-      "The same two fields are also accepted under `metadata`; any other key is refused.",
+      "The same two fields are also accepted under `metadata` (which wins if both are set); " +
+      "any other key is refused.",
     inputSchema: {
       type: "object" as const,
       properties: {
