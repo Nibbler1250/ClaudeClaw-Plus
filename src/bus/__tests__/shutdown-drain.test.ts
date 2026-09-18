@@ -45,17 +45,82 @@ function scriptedBus(
 }
 
 describe("drainActiveTurns (#315)", () => {
-  it("returns at once when nothing is busy, without logging", async () => {
+  it("with nothing busy it waits only the settle grace (a prompt may land right after the signal), without logging", async () => {
     const c = clock();
     const lines: string[] = [];
     const out = await drainActiveTurns(30_000, {
       busyAgents: () => [],
       log: (l) => lines.push(l),
+      settleMs: 1000,
       ...c,
     });
     expect(out.busyAtStart).toEqual([]);
-    expect(out.waitedMs).toBe(0);
+    expect(out.waitedMs).toBe(1000);
     expect(lines).toEqual([]);
+  });
+
+  it("drainTurnsMs = 0 with nothing busy returns at once", async () => {
+    const c = clock();
+    const out = await drainActiveTurns(0, { busyAgents: () => [], ...c });
+    expect(out.waitedMs).toBe(0);
+  });
+
+  it("a prompt accepted right after the signal enters the busy set during the grace and is drained (#420)", async () => {
+    const c = clock();
+    const lines: string[] = [];
+    // nothing busy at t=0; at 300ms a prompt lands and its turn runs until 900ms
+    const bus = scriptedBus(c, { greg: { until: 900, turnEnd: true } });
+    const busyAgents = () => (c.at() < 300 ? [] : bus.busyAgents());
+    const out = await drainActiveTurns(30_000, {
+      busyAgents,
+      onTurnEnd: bus.onTurnEnd,
+      log: (l) => lines.push(l),
+      settleMs: 1000,
+      ...c,
+    });
+    expect(out.busyAtStart).toEqual(["greg"]);
+    expect(out.finished).toEqual(["greg"]);
+    expect(lines[0]).toContain("became busy right after the signal (greg)");
+    expect(lines.at(-1)).toContain("drain complete");
+  });
+
+  it("a turn that starts and ends between two polls is seen through its turn_end and gets the settle grace from then (#420)", async () => {
+    const c = clock();
+    const handlers: Array<(a: string) => void> = [];
+    let fired = false;
+    // never busy at any poll: the turn lives between the 250ms and 500ms samples
+    const out = await drainActiveTurns(30_000, {
+      busyAgents: () => [],
+      onTurnEnd: (h) => {
+        handlers.push(h);
+        return () => undefined;
+      },
+      settleMs: 1000,
+      ...c,
+      sleep: async (ms) => {
+        await c.sleep(ms);
+        if (!fired && c.at() >= 480) {
+          fired = true;
+          for (const h of handlers) h("greg"); // turn_end lands at ~500ms
+        }
+      },
+    });
+    expect(out.finished).toEqual(["greg"]);
+    // grace re-based on the turn_end (~500ms) → ends ~1500ms, not at the original 1000ms
+    expect(out.waitedMs).toBeGreaterThanOrEqual(1500);
+    expect(out.waitedMs).toBeLessThan(1500 + 250);
+  });
+
+  it("a second signal during the empty-snapshot grace aborts it", async () => {
+    const c = clock();
+    const out = await drainActiveTurns(30_000, {
+      busyAgents: () => [],
+      shouldAbort: () => c.at() >= 250,
+      settleMs: 1000,
+      ...c,
+    });
+    expect(out.aborted).toBe(true);
+    expect(out.waitedMs).toBeLessThan(1000);
   });
 
   it("waits for the turns to end, settles, and reports them as finished", async () => {
