@@ -27,23 +27,30 @@ export const BUS_MCP_TOOLS = [
       type: "object" as const,
       properties: {
         message: { type: "string" },
+        // `null` on any optional reads as "not set" (the parser in mcp-server.ts
+        // agrees) — a model routinely writes null for a field it does not use.
         intent: {
-          type: "string",
-          enum: ["final", "progress", "tool_status"],
+          anyOf: [{ type: "string", enum: ["final", "progress", "tool_status"] }, { type: "null" }],
           description: "'final' ends the turn and notifies the user; default 'progress'.",
         },
         in_reply_to: {
-          type: ["string", "number"],
+          type: ["string", "number", "null"],
+          minLength: 1,
           description:
             "The chat_id (or origin_id) attribute of the <channel …> block this reply answers. " +
             "Only chats that actually prompted you are honoured.",
         },
         metadata: {
-          type: "object",
+          type: ["object", "null"],
           description: "Alternative placement of the same `intent` / `in_reply_to` fields.",
           properties: {
-            intent: { type: "string", enum: ["final", "progress", "tool_status"] },
-            in_reply_to: { type: ["string", "number"] },
+            intent: {
+              anyOf: [
+                { type: "string", enum: ["final", "progress", "tool_status"] },
+                { type: "null" },
+              ],
+            },
+            in_reply_to: { type: ["string", "number", "null"], minLength: 1 },
           },
           additionalProperties: false,
         },

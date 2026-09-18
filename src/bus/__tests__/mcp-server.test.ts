@@ -334,6 +334,15 @@ describe("BusMcpServer — outbound tools", () => {
     expect(reply.in_reply_to).toBe("2");
   });
 
+  it("`reply` tool refuses an empty `in_reply_to` instead of routing it as unnamed", async () => {
+    const result = await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", intent: "final", in_reply_to: "" },
+    });
+    expect(result.isError).toBe(true);
+    expect(h.ipc.sent).toHaveLength(0);
+  });
+
   it("`reply` tool lets metadata.intent win when both forms are given", async () => {
     await h.client.callTool({
       name: "reply",
