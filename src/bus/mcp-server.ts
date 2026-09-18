@@ -265,7 +265,9 @@ const ReplyIntentSchema = z.enum(["final", "progress", "tool_status"]);
 const ReplyInReplyToSchema = z
   .union([z.string(), z.number()])
   .transform(String)
-  .pipe(z.string().max(200));
+  // An empty string would be dropped as "unnamed" further down and the reply
+  // would fall back to whichever chat wrote last — refuse it here instead.
+  .pipe(z.string().min(1).max(200));
 
 // `intent` / `in_reply_to` are accepted at the top level AND under `metadata`
 // (the historical form). Both objects are strict: an unknown key — a typo, or a
