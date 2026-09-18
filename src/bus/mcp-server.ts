@@ -269,7 +269,8 @@ const ReplyInReplyToSchema = z
 
 // `intent` / `in_reply_to` are accepted at the top level AND under `metadata`
 // (the historical form). Both objects are strict: an unknown key — a typo, or a
-// field placed at the wrong level — is refused with a message naming it. Before
+// field placed at the wrong level — is refused with a message naming it. `null`
+// on any optional means "not set", as a model routinely writes it. Before
 // this, a top-level `intent: "final"` (the form the tool description itself
 // showed) was dropped by the non-strict parse and the reply went out as
 // `progress`: the surface kept editing one live message in place, no final ever
@@ -277,15 +278,15 @@ const ReplyInReplyToSchema = z
 const ReplyArgsSchema = z
   .object({
     message: z.string(),
-    intent: ReplyIntentSchema.optional(),
-    in_reply_to: ReplyInReplyToSchema.optional(),
+    intent: ReplyIntentSchema.nullish(),
+    in_reply_to: ReplyInReplyToSchema.nullish(),
     metadata: z
       .object({
-        intent: ReplyIntentSchema.optional(),
-        in_reply_to: ReplyInReplyToSchema.optional(),
+        intent: ReplyIntentSchema.nullish(),
+        in_reply_to: ReplyInReplyToSchema.nullish(),
       })
       .strict()
-      .optional(),
+      .nullish(),
   })
   .strict();
 

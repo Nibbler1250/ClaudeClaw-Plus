@@ -334,6 +334,28 @@ describe("BusMcpServer — outbound tools", () => {
     expect(reply.intent).toBe("final");
   });
 
+  it("`reply` tool treats null optionals as unset (models write null for 'not applicable')", async () => {
+    const result = await h.client.callTool({
+      name: "reply",
+      arguments: { message: "done", intent: "final", in_reply_to: null, metadata: null },
+    });
+    expect(result.isError).toBeFalsy();
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.intent).toBe("final");
+    expect("in_reply_to" in reply).toBe(false);
+  });
+
+  it("`reply` tool rejects an unknown key inside metadata too", async () => {
+    const result = await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", metadata: { intent: "final", chat_id: "100" } },
+    });
+    expect(result.isError).toBe(true);
+    expect(String((result.content as Array<{ text?: string }>)[0]?.text)).toContain("chat_id");
+    expect(h.ipc.sent.length).toBe(0);
+  });
+
   it("`reply` tool rejects an unknown argument instead of delivering it as progress", async () => {
     const result = await h.client.callTool({
       name: "reply",
