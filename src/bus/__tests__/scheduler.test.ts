@@ -523,6 +523,42 @@ describe("BusScheduler.scheduleCron (cronExpr)", () => {
     expect(calls).toHaveLength(1);
   });
 
+  // Issue #437: `nextCronMatch` used to give up after 48 hours and return
+  // the scan-end date, so a Tue/Thu schedule armed on a Thursday fired on
+  // Saturday (armed + 48h + 1min) instead of the next Tuesday.
+  it("arms the real next match when it is more than 48 hours away", () => {
+    const { bus, calls } = createFakeBus();
+    // Thursday 2026-09-17 07:00 (+2) == 05:00Z.
+    const start = Date.UTC(2026, 8, 17, 5, 0, 0);
+    const clock = makeFakeClock(start);
+    scheduler = createBusScheduler({ bus, clock, timezoneOffsetMinutes: 120 });
+
+    scheduler.scheduleCron({ agent_id: "alpha", cronExpr: "0 7 * * 2,4", prompt: "brief" });
+
+    // Nothing at the old bogus time (48h + 1min)…
+    clock.advance(48 * 60 * 60_000 + 60_000);
+    expect(calls).toHaveLength(0);
+    // …and the fire lands on Tuesday 2026-09-22 07:00 (+2), 5 days after arming.
+    const tuesday = Date.UTC(2026, 8, 22, 5, 0, 0);
+    clock.advance(tuesday - clock.now() - 1);
+    expect(calls).toHaveLength(0);
+    clock.advance(1);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].metadata?.fire_at).toBe(tuesday);
+
+    // Re-arm: Thursday 2026-09-24 07:00 (+2).
+    clock.advance(2 * 24 * 60 * 60_000);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("rejects a well-formed cron expression that never matches", () => {
+    const { bus } = createFakeBus();
+    scheduler = createBusScheduler({ bus });
+    expect(() =>
+      scheduler.scheduleCron({ agent_id: "a", cronExpr: "0 0 31 2 *", prompt: "p" }),
+    ).toThrow(/never matches/);
+  });
+
   // Codex P2 fix on PR #117: malformed cron expressions used to be
   // silently accepted (probe via nextCronMatch didn't throw on garbage).
   // Now eager validation rejects fast on operator typos.

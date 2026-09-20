@@ -327,6 +327,17 @@ class BusSchedulerImpl implements BusScheduler {
       if (!rec || this.stopped) return;
       const now = this.clock.now();
       const nextDate = nextCronMatch(cronExpr, new Date(now), this.timezoneOffsetMinutes);
+      if (!nextDate) {
+        // No upcoming match inside the scan window. Arming a made-up time
+        // would fire the job on an unrelated day (issue #437) — drop the
+        // trigger and surface it instead.
+        this.timers.delete(id);
+        this.onError(
+          new Error(`scheduleCron: no upcoming match for "${cronExpr}"; trigger ${id} not armed`),
+          { ctx: "scheduler-arm", scheduler_trigger_id: id, cron: cronExpr },
+        );
+        return;
+      }
       const delay = Math.max(0, nextDate.getTime() - now);
       rec.handle = this.clock.setTimeout(() => {
         // Re-fetch the record — `cancel`/`stop` may have purged it
@@ -425,6 +436,12 @@ export function validateCronExpression(cronExpr: string): void {
     const field = fields[i];
     const [min, max] = CRON_FIELD_RANGES[i];
     validateCronField(field, min, max, cronExpr, i);
+  }
+  // Well-formed but impossible dates (`0 0 31 2 *`) pass the per-field
+  // range check yet never fire. Reject them here so `schedule_task` fails
+  // at creation time instead of silently producing a job that never runs.
+  if (nextCronMatch(cronExpr, new Date()) === null) {
+    throw new Error(`scheduleCron: invalid cron expression "${cronExpr}": it never matches`);
   }
 }
 
