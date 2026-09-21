@@ -810,7 +810,10 @@ describe("one active turn per agent (#239)", () => {
       bus.ingestSessionEvent(tailer("a", "prompt", { text: delivered[0] }));
       await sleep(70); // released, nothing queued
       turnEnd(bus, "a"); // A ends normally
-      await send(bus, "a", "from B", "telegram", "chat-B");
+      const b = await send(bus, "a", "from B", "telegram", "chat-B");
+      // Nothing to overlap: B's prompt event is not flagged (CodeRabbit, minor).
+      const bPrompt = events.find((e) => e.topic === "prompt" && e.promise_id === b.promise_id);
+      expect((bPrompt as { correlation_ambiguous?: true })?.correlation_ambiguous).toBeUndefined();
       bus.ingestReply({ agent_id: "a", text: "answer for B", intent: "final" }); // before B's line
       expect(events.filter((e) => e.topic === "response.text").at(-1)?.payload).toMatchObject({
         origin_id: "chat-B",
