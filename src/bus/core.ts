@@ -1953,6 +1953,7 @@ export class BusCoreImpl implements BusCore {
       // there (the #138 rule the close-time clear exists for).
       const awaited = this.awaitOwnPromptLine.get(agent_id);
       this.awaitOwnPromptLine.delete(agent_id);
+      this.earlyReleased.delete(agent_id); // the released turn cannot outlive its generation
       const rerun =
         awaited === undefined ||
         awaited === null ||
@@ -2966,6 +2967,10 @@ export class BusCoreImpl implements BusCore {
       // the tailer just proved it over.
       this.gateParked.delete(e.agent_id);
       this.redeliveredSinceClose.delete(e.agent_id);
+      // This terminator proves the released turn is over: a prompt admitted
+      // later cannot land in it, so it must not wait for its own line nor
+      // defer its origin (CodeRabbit on the PR).
+      if (!staleTerminator) this.earlyReleased.delete(e.agent_id);
       if (id && this.lastTurnEndMessageId.get(e.agent_id) === id) {
         releaseSlot = false; // another line of the message that already released
       } else {

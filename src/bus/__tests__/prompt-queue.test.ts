@@ -800,6 +800,26 @@ describe("one active turn per agent (#239)", () => {
       });
     });
 
+    it("a released turn that then ends normally leaves nothing behind: the next prompt is a clean admission", async () => {
+      // CodeRabbit on the PR: the early-release flag is consumed by the next
+      // admission; with nothing queued at the release it must be cleared by
+      // the terminator, else a prompt hours later waits for its own line and
+      // its IPC final — arriving before that line — routes by a stale slot.
+      const { bus, events, delivered } = makeBus({ turnDeadlineMs: 40 });
+      await send(bus, "a", "from A", "telegram", "chat-A");
+      bus.ingestSessionEvent(tailer("a", "prompt", { text: delivered[0] }));
+      await sleep(70); // released, nothing queued
+      turnEnd(bus, "a"); // A ends normally
+      await send(bus, "a", "from B", "telegram", "chat-B");
+      bus.ingestReply({ agent_id: "a", text: "answer for B", intent: "final" }); // before B's line
+      expect(events.filter((e) => e.topic === "response.text").at(-1)?.payload).toMatchObject({
+        origin_id: "chat-B",
+      });
+      turnEnd(bus, "a"); // B's end counts as B's without a line
+      await send(bus, "a", "from C", "telegram", "chat-C");
+      expect(texts(delivered)).toEqual(["from A", "from B", "from C"]);
+    });
+
     describe("an IPC socket close", () => {
       async function ipcBus() {
         const { mkdtempSync } = await import("node:fs");
