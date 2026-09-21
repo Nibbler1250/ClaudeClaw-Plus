@@ -2981,6 +2981,13 @@ export class BusCoreImpl implements BusCore {
           `[bus] late boundary line for agent=${e.agent_id}: its turn was released and a ` +
             "new prompt admitted since — not synthesizing (it would reach the next chat). See #239/#405.",
         );
+        // Nothing else of this path is that line's to run: the streaming flag,
+        // the parking, the release and the admission all belong to the
+        // newcomer's turn now (CodeRabbit on the PR). It is published for the
+        // record, uncorrelated — stamping it with the newcomer's operation id
+        // would assert the very attribution it does not have.
+        this.publishUncorrelated(e);
+        return;
       } else if (staleTerminator) {
         this.handleStaleTurnEnd(e.agent_id, payload?.text ?? "");
       } else {
@@ -3172,7 +3179,17 @@ export class BusCoreImpl implements BusCore {
     // deadline starts over. A turn that publishes nothing for `turnDeadlineMs`
     // is the only one it ever releases.
     if (event.agent_id) this.touchTurn(event.agent_id);
+    this.dispatch(event);
+  }
 
+  /** #239: a line of a message whose turn was released before the next
+   *  prompt was admitted is nobody's now — published for the record, flagged,
+   *  and NOT stamped with the operation that happens to own the slot. */
+  private publishUncorrelated(event: BusEvent): void {
+    this.dispatch({ ...event, correlation_ambiguous: true });
+  }
+
+  private dispatch(event: BusEvent): void {
     // 1. Audit log. Fire-and-forget on the promise — durability is the
     //    event-log's job. We swallow errors into onError so a transient
     //    disk failure doesn't take the bus down.

@@ -692,11 +692,22 @@ describe("one active turn per agent (#239)", () => {
         bus.ingestSessionEvent(tailer("a", "response.turn_end", { text: "", message_id: mid }));
         await sleep(50); // settle passed: B admitted
         expect(texts(delivered)).toEqual(["from A", "from B"]);
+        // B's turn is streaming by now; the late line must leave it alone.
+        bus.ingestSessionEvent(tailer("a", "prompt", { text: delivered[1] }));
+        await send(bus, "a", "from C", "telegram", "chat-C");
+        const before = events.length;
         bus.ingestSessionEvent(
           tailer("a", "response.turn_end", { text: "A's text", message_id: mid }),
         );
         expect(events.filter((e) => e.topic === "response.text")).toEqual([]);
-        expect(bus.isAgentTurnActive("a")).toBe(false);
+        expect(bus.isAgentTurnActive("a")).toBe(true); // B still streaming
+        expect(texts(delivered)).toEqual(["from A", "from B"]); // C not admitted into B's turn
+        await sleep(40); // > settle: still not
+        expect(texts(delivered)).toEqual(["from A", "from B"]);
+        // Published for the record, flagged, and not stamped as B's.
+        const late = events.slice(before).find((e) => e.topic === "response.turn_end");
+        expect(late?.correlation_ambiguous).toBe(true);
+        expect(late?.promise_id).toBeUndefined();
       });
 
       it("a new generation un-parks the gate; a backstop or same-generation marker does not", async () => {
@@ -1046,7 +1057,8 @@ describe("one active turn per agent (#239)", () => {
           bus.ingestSessionEvent(tailer("a", "prompt", { text: delivered[0] }));
           await send(bus, "a", "from B", "telegram", "chat-B");
           await send(bus, "a", "from C", "telegram", "chat-C");
-          await sleep(100); // deadline (80): B typed into A's live turn
+          // deadline (80): B typed into A's live turn
+          for (let i = 0; i < 40 && texts(delivered).length < 2; i++) await sleep(10);
           expect(texts(delivered)).toEqual(["from A", "from B"]);
           client.destroy(); // blip
           for (let i = 0; i < 50 && bus.hasIpcConnection?.("a") === true; i++) await sleep(10);
