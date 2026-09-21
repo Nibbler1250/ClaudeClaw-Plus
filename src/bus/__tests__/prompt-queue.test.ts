@@ -307,17 +307,17 @@ describe("one active turn per agent (#239)", () => {
     });
 
     it("is idle-based: a turn that keeps publishing is never released", async () => {
-      const { bus, errors, delivered } = makeBus({ turnDeadlineMs: 40 });
+      const { bus, errors, delivered } = makeBus({ turnDeadlineMs: 80 });
       await send(bus, "a", "long");
       await send(bus, "a", "next");
-      for (let i = 0; i < 6; i++) {
+      for (let i = 0; i < 8; i++) {
         await sleep(20);
         bus.ingestSessionEvent(tailer("a", "tool_result", { i }));
       }
-      // 120 ms > 40 ms, but never 40 ms of silence.
+      // 160 ms > 80 ms, but never 80 ms of silence (20 ms beats, 60 ms of margin).
       expect(errors.filter((e) => e.ctx?.ctx === "turn-deadline")).toEqual([]);
       expect(texts(delivered)).toEqual(["long"]);
-      await sleep(70); // now silent → released
+      for (let i = 0; i < 30 && texts(delivered).length < 2; i++) await sleep(10); // now silent → released
       expect(texts(delivered)).toEqual(["long", "next"]);
     });
 
@@ -330,19 +330,24 @@ describe("one active turn per agent (#239)", () => {
         eventLogAppend: mockAppend,
         turnEndSettleMs: 0,
         onError: (_e, ctx) => errors.push({ ctx }),
-        turnDeadlineMs: 60,
+        turnDeadlineMs: 120,
         stuckCompactionResolveMs: 100_000,
         flushVerifyMs: 30,
         streamPromptHandler: async (_a, text) => {
           delivered.push(text);
-          await sleep(50); // the PTY layer's own compaction budget, scaled down
+          await sleep(60); // the PTY layer's own compaction budget, scaled down
           return "stuck-compaction";
         },
       });
-      await send(bus, "a", "held"); // t=0: deadline at 60
-      await sleep(80); // t=50: the hold was taken → re-armed to 110
+      await send(bus, "a", "held"); // t=0: deadline at 120
+      await sleep(150); // t≈60: the hold was taken → re-armed to ≈180; t=150 is past the first deadline
       expect(errors.filter((e) => e.ctx?.ctx === "turn-deadline")).toEqual([]);
-      await sleep(60); // t=140: silent since the hold → released
+      for (
+        let i = 0;
+        i < 40 && errors.filter((e) => e.ctx?.ctx === "turn-deadline").length === 0;
+        i++
+      )
+        await sleep(10); // silent since the hold → released
       expect(errors.filter((e) => e.ctx?.ctx === "turn-deadline")).toHaveLength(1);
     });
 
@@ -846,6 +851,50 @@ describe("one active turn per agent (#239)", () => {
       bus.ingestSessionEvent(tailer("a", "prompt", { text: delivered[1] })); // B's own line
       turnEnd(bus, "a"); // B's end
       expect(texts(delivered)).toEqual(["from A", "from B", "from C"]);
+    });
+
+    describe("the early-release window belongs to the released turn (CodeRabbit)", () => {
+      it("an unanswered released turn ending with text is synthesised to its chat — no nudge into the newcomer's REPL, newcomer's flags untouched", async () => {
+        const { bus, events, delivered } = makeBus({ turnDeadlineMs: 40, replyNudge: true });
+        await send(bus, "a", "from A", "telegram", "chat-A");
+        bus.ingestSessionEvent(tailer("a", "prompt", { text: delivered[0] }));
+        await send(bus, "a", "from B", "telegram", "chat-B");
+        await sleep(70); // B typed into A's live turn
+        turnEnd(bus, "a", "A's unsent text"); // A ends, never called reply
+        const replies = () =>
+          events
+            .filter((e) => e.topic === "response.text")
+            .map((e) => e.payload as { text: string; origin_id?: string });
+        expect(replies()).toEqual([
+          expect.objectContaining({ text: "A's unsent text", origin_id: "chat-A" }),
+        ]);
+        expect(delivered.filter((w) => w.includes("system-reminder"))).toEqual([]); // no nudge
+        bus.ingestSessionEvent(tailer("a", "prompt", { text: delivered[1] })); // B's own line
+        turnEnd(bus, "a", "B's unsent text"); // B ends silently too: ITS net runs — flags were clean
+        expect(delivered.filter((w) => w.includes("system-reminder"))).toHaveLength(1); // B's own nudge
+        bus.ingestReply({ agent_id: "a", text: "answer for B", intent: "final" });
+        expect(replies().at(-1)).toEqual(
+          expect.objectContaining({ text: "answer for B", origin_id: "chat-B" }),
+        );
+      });
+
+      it("a final in the window is the released turn's: routed to its chat, deduplicated on its state, and the newcomer's own final still goes out", async () => {
+        const { bus, events, delivered } = makeBus({ turnDeadlineMs: 40, replyNudge: false });
+        await send(bus, "a", "from A", "telegram", "chat-A");
+        bus.ingestSessionEvent(tailer("a", "prompt", { text: delivered[0] }));
+        await send(bus, "a", "from B", "telegram", "chat-B");
+        await sleep(70);
+        bus.ingestReply({ agent_id: "a", text: "answer for A", intent: "final" });
+        bus.ingestReply({ agent_id: "a", text: "answer for A again", intent: "final" }); // race loser
+        turnEnd(bus, "a", "answer for A"); // A's stale end: already answered → nothing synthesised
+        bus.ingestSessionEvent(tailer("a", "prompt", { text: delivered[1] }));
+        bus.ingestReply({ agent_id: "a", text: "answer for B", intent: "final" });
+        const routes = events
+          .filter((e) => e.topic === "response.text")
+          .map((e) => e.payload as { text: string; origin_id?: string })
+          .map((p) => `${p.text} -> ${p.origin_id}`);
+        expect(routes).toEqual(["answer for A -> chat-A", "answer for B -> chat-B"]);
+      });
     });
 
     describe("an IPC socket close", () => {

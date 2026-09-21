@@ -2639,6 +2639,29 @@ export class BusCoreImpl implements BusCore {
   }
 
   /**
+   * #239: the silent-drop net for a RELEASED turn's terminator, run while the
+   * newcomer's own line is still awaited. The shared per-turn flags were
+   * reset for the newcomer at its admission, so they say nothing about the
+   * released turn — and a nudge would be typed into the newcomer's REPL. The
+   * one signal that survives the admission is the routing slot: the released
+   * turn's own final cleared it (answered — nothing to do), else it still
+   * names that turn's chat and the text goes straight there. The flags are
+   * then handed back to the newcomer clean.
+   */
+  private handleStaleTurnEnd(agentId: string, text: string): void {
+    if (text.trim().length === 0) return;
+    const origin = this.lastPromptOrigin.get(agentId);
+    if (!origin || !CHANNEL_DRIVEN_ORIGINS.has(origin.origin)) return;
+    console.warn(
+      `[bus] silent-drop recovered for agent=${agentId} (origin=${origin.origin}, ` +
+        `chars=${text.length}): a released turn ended with text but no reply — ` +
+        "synthesizing ingestReply to deliver (no nudge: its REPL now belongs to the next prompt). See #239.",
+    );
+    this.ingestReply({ agent_id: agentId, text, intent: "final" }, { synthetic: true });
+    this.openTurn(agentId);
+  }
+
+  /**
    * A new turn starts undelivered (#392): clear the two per-turn delivery
    * flags. Called from `sendPrompt` (ahead of delivery) and from the tailer
    * `prompt` event — the turn start the bus observes for EVERY turn, whoever
@@ -2958,6 +2981,8 @@ export class BusCoreImpl implements BusCore {
           `[bus] late boundary line for agent=${e.agent_id}: its turn was released and a ` +
             "new prompt admitted since — not synthesizing (it would reach the next chat). See #239/#405.",
         );
+      } else if (staleTerminator) {
+        this.handleStaleTurnEnd(e.agent_id, payload?.text ?? "");
       } else {
         this.handleTurnEnd(e.agent_id, payload?.text ?? "");
       }
