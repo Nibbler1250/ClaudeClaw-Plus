@@ -380,7 +380,14 @@ interface BusCore {
     user_id: string;         // allow-list checked here
     text: string;
     metadata?: Record<string, any>;
-  }): Promise<{ promise_id: string }>;
+  }): Promise<{ promise_id: string; ipc_sent?: boolean; queued?: true }>;
+  // One active turn per agent: a prompt arriving while the agent still owes a
+  // terminator for an earlier one is queued (fair: FIFO per origin, round-robin
+  // across origins, capped per origin) and delivered — same promise_id — once
+  // that turn ends. The ack says `queued: true`; `PromptQueueFullError` rejects
+  // the newest prompt of an origin past the cap. An admitted turn that shows no
+  // sign of life for `turnDeadlineMs` (default 15 min) is released, loudly.
+  queuedPrompts(agent_id: string): ReadonlyArray<{ promise_id: string; origin: string; origin_id: string }>;
 
   // surface ← Bus  (pub/sub)
   subscribe(filter: {

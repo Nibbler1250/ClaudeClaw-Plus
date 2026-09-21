@@ -108,6 +108,51 @@ export type SendPromptRequest = {
   metadata?: Record<string, unknown>;
 };
 
+export type SendPromptAck = {
+  promise_id: string;
+  ipc_sent?: boolean;
+  /** #239: the prompt is waiting behind the agent's active turn. It keeps its
+   *  `promise_id`; `ipc_sent` is unknown until it is admitted. */
+  queued?: true;
+};
+
+type QueuedPrompt = { req: SendPromptRequest; promise_id: string; queuedAt: number };
+
+/** #239: the shape a delivered prompt and its transcript line agree on. The
+ *  PTY is fed `sanitizePtyPromptText` output (a TAB survives it) while the CLI
+ *  records what its input box parsed (a pasted TAB becomes spaces, a typed one
+ *  is a completion key and vanishes) — the same disagreement the PTY layer's
+ *  own matcher drops whitespace for (issue #362). */
+function promptLineKey(text: string): string {
+  return sanitizePtyPromptText(text).replace(/\s+/g, "");
+}
+
+/** #239: thrown by `sendPrompt` when an origin already has `promptQueueCapPerOrigin`
+ *  prompts waiting on the agent. The newest is refused, never a queued one. */
+export class PromptQueueFullError extends Error {
+  readonly agent_id: string;
+  readonly origin: BusOrigin;
+  readonly origin_id: string;
+  constructor(
+    agent_id: string,
+    origin: BusOrigin,
+    origin_id: string,
+    cap: number,
+    scope: "origin" | "agent",
+  ) {
+    // The chat id stays out of the message (it reaches logs); it is on the
+    // error object for callers that need it.
+    super(
+      `prompt queue full for agent=${agent_id} origin=${origin} ` +
+        `(${scope} cap ${cap}) — the agent's current turn has not ended`,
+    );
+    this.name = "PromptQueueFullError";
+    this.agent_id = agent_id;
+    this.origin = origin;
+    this.origin_id = origin_id;
+  }
+}
+
 export type IngestReplyRequest = {
   agent_id: string;
   text: string;
@@ -184,6 +229,36 @@ export interface BusCoreOptions {
    *  before the same verify-then-re-deliver rule is applied anyway. Defaults to
    *  600000 (10 min, ≫ the PTY layer's own compaction budget). Lowered in tests. */
   stuckCompactionResolveMs?: number;
+  /** #239: how long an admitted turn may go without ANY sign of life — no
+   *  event for the agent, no delivery-layer transition — before the bus stops
+   *  waiting for its terminator, releases the operation slot and admits the
+   *  next queued prompt. Without it a turn that never terminates would leave
+   *  the agent deaf to every origin (the #372 leak, turned from a mis-stamp
+   *  into a stall by serialization). Defaults to 900000 (15 min: above the
+   *  10-min compaction hold and the CLI's longest tool call). It is also the
+   *  bound for an agent no transcript feeds (IPC-only, no tailer), whose turns
+   *  never produce the `response.turn_end` that frees the slot. Lowered in
+   *  tests. */
+  turnDeadlineMs?: number;
+  /** #239: cap on prompts one origin (surface + chat) may have waiting behind
+   *  an active turn; the newest is refused past it. Defaults to 32. */
+  promptQueueCapPerOrigin?: number;
+  /** #239: cap on prompts waiting on one agent across every origin, so the
+   *  number of origins cannot grow the queue without bound either. Defaults
+   *  to 256. */
+  promptQueueCapPerAgent?: number;
+  /** #239 / #405: how long after a `response.turn_end` the next queued prompt
+   *  is admitted. The CLI writes one line per content block and repeats the
+   *  terminal stop_reason on each, so a thinking+text message ends in TWO
+   *  boundary lines for one turn; admitting on the first would run the
+   *  silent-drop net for the second against the newcomer's state (its origin,
+   *  its reply flags) — the very misroute #239 closes. The CLI writes both
+   *  lines together at message end; the settle lets them both land, with
+   *  margin for a stalled event loop splitting the read. Defaults to 1000.
+   *  `0` admits on the first line synchronously (tests, or a transcript whose
+   *  terminal message is known to be one line). A line that still arrives
+   *  after an admission is dropped rather than routed to the newcomer. */
+  turnEndSettleMs?: number;
   /** Slash-command delegate (Agent C wires this). */
   slashCommandHandler?: SlashCommandHandler;
   /** REPL prompt delegate for PTY-stdin agents. Wired by the Session Manager. */
@@ -238,8 +313,21 @@ export interface BusCore {
    * agent's `reply` tool has no channel back — a caller that awaits the
    * reply can tell its user now instead of at its own timeout. `undefined`
    * when the bus runs without an IPC server (in-process / tests).
+   *
+   * #239: one active turn per agent. A prompt arriving while the agent still
+   * owes a terminator for an earlier one is QUEUED — the ack then carries
+   * `queued: true` and no `ipc_sent`, and the prompt is delivered (with the
+   * same `promise_id`) once the running turn ends or the turn deadline
+   * releases it. Rejects with `PromptQueueFullError` past the per-origin cap.
    */
-  sendPrompt(req: SendPromptRequest): Promise<{ promise_id: string; ipc_sent?: boolean }>;
+  sendPrompt(req: SendPromptRequest): Promise<SendPromptAck>;
+  /** #239: prompts waiting behind an active turn on this agent, admission order. */
+  queuedPrompts(
+    agentId: string,
+  ): ReadonlyArray<{ promise_id: string; origin: BusOrigin; origin_id: string }>;
+  /** #239: drop a prompt still waiting (a caller that gave up on its reply);
+   *  `false` once it was admitted. Optional: mocks need not implement it. */
+  withdrawQueuedPrompt?(agentId: string, promise_id: string): boolean;
   /**
    * Whether the bus currently holds an MCP connection for the agent (#390).
    * Optional: mocks and in-process buses without an IPC server need not
@@ -335,10 +423,10 @@ export class BusCoreImpl implements BusCore {
    * Tracks the origin (surface + channel id) of the most recent prompt
    * per agent. Adapters use this on outbound `response.text` events to
    * route the reply back to the originating channel/DM rather than
-   * fanning out to every channel the agent owns. Last-write-wins —
-   * acceptable because Discord/Telegram bots wait for a reply before
-   * sending another prompt; interleaved prompts on the same agent
-   * fall back to broadcast behaviour at the adapter level.
+   * fanning out to every channel the agent owns. Single-slot: since #239 the
+   * bus admits one prompt per agent at a time (`promptQueue`), so the slot is
+   * the chat whose turn is running, and a prompt from another chat waits
+   * rather than overwriting it mid-turn.
    */
   private readonly lastPromptOrigin = new Map<
     string,
@@ -364,13 +452,12 @@ export class BusCoreImpl implements BusCore {
    * events a client most needs correlated, so the operation slot survives the
    * final reply and is released on `response.turn_end`.
    *
-   * And the same limitation, which is WIDER than concurrency: a second prompt
-   * while one is in flight overwrites the slot (what `originAmbiguous`
-   * records), but the tailer's asynchronous `response.turn_end` means even
-   * sequential turns can cross — see the residual-race note in
-   * `handleTurnEnd` (#217 finding 3, deferred #239). Correlation from this
-   * slot is advisory; exact correlation needs turn identity carried through
-   * the tailer.
+   * #239: a second prompt no longer overwrites an occupied slot — it waits in
+   * `promptQueue` until this one is released, so for bus-opened turns the id
+   * is exact. It stays ADVISORY for the two cases counting cannot see: a turn
+   * the bus did not open (the operator's own keyboard, a task notification)
+   * ends a live operation early, and a slot the turn deadline freed may
+   * belong to a turn that was merely slow (`deadlineReleased`).
    */
   private readonly currentOperation = new Map<string, string>();
 
@@ -397,6 +484,9 @@ export class BusCoreImpl implements BusCore {
    * Keyed on the operation slot instead, both cases collapse into one
    * condition — a prompt arriving while a slot is still occupied — and the
    * taint lives and dies with the id it qualifies.
+   *
+   * #239: admission now waits for a free slot, so that condition is reached
+   * on one path only — a slot the turn deadline freed (`deadlineReleased`).
    */
   private readonly correlationAmbiguous = new Set<string>();
 
@@ -415,6 +505,106 @@ export class BusCoreImpl implements BusCore {
    * correlation really is uncertain for its whole life.
    */
   private readonly pendingTurns = new Map<string, number>();
+
+  /**
+   * #239: one active turn per agent. Every per-turn structure above is a
+   * single slot keyed by agent (`lastPromptOrigin`, the reply flags, the
+   * operation slot), and two prompts interleaving on one agent clobber each
+   * other's — the second `sendPrompt` rewrites the origin mid-turn and the
+   * first turn's reply, or the reply the silent-drop net synthesises for it,
+   * is routed to the wrong chat. Keying each slot by origin was the other
+   * option; it preserves a concurrency model inside one transcript that no
+   * comparable runtime runs, so the bus serializes instead: a prompt arriving
+   * while the agent still owes a terminator waits here and is admitted when
+   * the slot frees (`admitNext`). Fair across origins — FIFO per lane (surface
+   * + chat), round-robin across lanes — so one chatty surface cannot starve
+   * another, and capped per lane so a runaway origin cannot grow it without
+   * bound. #224's named replies stay the routing layer on top.
+   *
+   * What a queued prompt is NOT: held by the delivery layer. `deliveryQueue`,
+   * `compactionHeld`, `pendingRedelivery` and `flushVerify` hold prompts the
+   * bus has ALREADY admitted (the slot is theirs) while the PTY is not ready
+   * for them. The distinction is what makes `turnDeadline` honest (#372): a
+   * prompt waiting here holds no slot, so the deadline only ever runs against
+   * a turn the bus actually opened.
+   */
+  private readonly promptQueue = new Map<
+    string,
+    { lanes: Map<string, QueuedPrompt[]>; order: string[] }
+  >();
+  private readonly promptQueueCapPerOrigin: number;
+  private readonly promptQueueCapPerAgent: number;
+  /**
+   * #239 / #372: the release the serializing structure needs. A counted turn
+   * that never produces its terminator — a prompt the CLI swallowed, a turn
+   * interrupted at a session-generation boundary, an agent that died without
+   * closing its socket — would otherwise hold the slot forever, and under
+   * serialization that is no longer a mis-stamped `promise_id` but an agent
+   * deaf to every origin. So the admission gate itself is given a deadline —
+   * whatever holds it: a counted turn, a reply nudge whose turn never ends, a
+   * streaming flag stuck by a turn the bus did not open — and the deadline is
+   * IDLE-based, not total: it is re-armed by every sign of life for the agent
+   * (any event published for it — the tailer's transcript lines, replies,
+   * asks — and every delivery-layer transition: a hold taken, a verify armed,
+   * a re-delivery). A long tool call or a subagent that writes nothing to the
+   * transcript for longer than `turnDeadlineMs` is the known false positive;
+   * the release is loud (`onError` + `[bus]` log) so it is tuned on evidence,
+   * and its cost is bounded to the pre-#239 behaviour (one interleaved turn,
+   * flagged `correlation_ambiguous`).
+   */
+  private readonly turnDeadline = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly turnDeadlineMs: number;
+  /**
+   * #239: agents whose slot was freed by the deadline rather than a terminator.
+   * The next admitted prompt may then interleave with a turn that is merely
+   * slow, so it is flagged `correlation_ambiguous` on admission — the one path
+   * left on which a bus-opened turn can overlap another.
+   */
+  private readonly deadlineReleased = new Set<string>();
+  /**
+   * #239: agents whose gate was released EARLY — by the deadline, or by a
+   * `cancel` / `error` from the process — while the CLI turn may still be
+   * running. The next prompt admitted is typed into that turn, and the turn's
+   * real `response.turn_end` then arrives AFTER the admission: taken as the
+   * newcomer's terminator it would free the newcomer's count and admit the
+   * prompt after it into the newcomer's turn, and so on down the queue — the
+   * whole queue shifted by one. So a prompt admitted after an early release
+   * waits for its OWN transcript line (`awaitOwnPromptLine`): a terminator
+   * that lands before it belongs to the released turn and frees nothing.
+   */
+  private readonly earlyReleased = new Set<string>();
+  /** #239: admitted prompts (their PTY text) whose `prompt` line has not been
+   *  tailed yet, for agents whose previous turn was released early. */
+  private readonly awaitOwnPromptLine = new Map<string, string | null>();
+  /** #239: the origin of a prompt admitted after an early release, applied to
+   *  the routing slot only once its own line is tailed — until then the slot
+   *  still belongs to the released turn, whose late reply must reach ITS chat,
+   *  not the newcomer's. */
+  private readonly pendingOrigin = new Map<
+    string,
+    { origin: BusOrigin; origin_id: string; userId?: string; skillName?: string }
+  >();
+  /**
+   * #239: agents whose IPC socket closed while a turn was live. The code's own
+   * accounting (#402) says most closes are IPC-only drops with the process —
+   * and the turn — alive, so the queue must NOT be admitted on the close: the
+   * newcomer would be typed into the live turn. It waits for proof the turn
+   * is over — the tailer's `response.turn_end`, a new session generation — or
+   * the deadline.
+   */
+  private readonly gateParked = new Set<string>();
+  /** #239: prompts the bus re-delivered since the agent's last socket close
+   *  (the #402 carry-over, drained on `hello` or on `replay_done`). They hold
+   *  no slot — the close freed it — yet each is a bus-owned prompt about to
+   *  run; the gate stays parked on them until a `turn_end`, and one of them
+   *  is the prompt whose `pendingOrigin` may still be applied. Cleared with
+   *  the park. */
+  private readonly redeliveredSinceClose = new Map<string, string[]>();
+  /** #239 / #405: the pending admission after a `response.turn_end`, so every
+   *  boundary line of the terminal message is processed before the next
+   *  prompt goes. Held by `slotFree` for its duration. */
+  private readonly admitSettle = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly turnEndSettleMs: number;
 
   /**
    * Agents whose `lastPromptOrigin` is currently AMBIGUOUS for security
@@ -654,16 +844,12 @@ export class BusCoreImpl implements BusCore {
    * agent ended the turn without delivering — we synthesize an
    * `ingestReply` so the user actually receives the response.
    *
-   * Single-slot per agent, last-write-wins — the same limitation
-   * `lastPromptOrigin` carries above (and this map depends on
-   * `lastPromptOrigin` for routing the synthesized reply). Interleaving two
-   * in-flight prompts on one agent would let the second `sendPrompt` reset
-   * the flag mid-turn for the first; the webui-bridge mutex serialising
-   * prompt→reply per agent is the workaround for the path that would
-   * otherwise violate the one-turn-at-a-time assumption. The residual
-   * cross-channel stale/misroute race this leaves open (a lagged turn_end
-   * synthesizing the wrong prompt's text to the wrong surface) is tracked
-   * as deferred follow-up #239 — see the note in `handleTurnEnd`.
+   * Single-slot per agent, like `lastPromptOrigin` (which routes the
+   * synthesized reply). Interleaving two in-flight prompts on one agent would
+   * let the second `sendPrompt` reset the flag mid-turn for the first — the
+   * cross-channel misroute of #239. Since #239 the bus admits one prompt per
+   * agent at a time (`promptQueue`), so the one-turn-at-a-time assumption
+   * these flags rest on is enforced rather than hoped for.
    */
   private readonly currentTurnReplied = new Map<string, boolean>();
 
@@ -702,6 +888,10 @@ export class BusCoreImpl implements BusCore {
     this.deliveryBackstopMs = opts.deliveryBackstopMs ?? 4000;
     this.flushVerifyMs = opts.flushVerifyMs ?? 8000;
     this.stuckCompactionResolveMs = opts.stuckCompactionResolveMs ?? 600_000;
+    this.turnDeadlineMs = opts.turnDeadlineMs ?? 900_000;
+    this.promptQueueCapPerOrigin = opts.promptQueueCapPerOrigin ?? 32;
+    this.promptQueueCapPerAgent = opts.promptQueueCapPerAgent ?? 256;
+    this.turnEndSettleMs = opts.turnEndSettleMs ?? 1000;
     this.flushVerifyGraceMs =
       opts.flushVerifyGraceMs ?? Math.min(1500, Math.ceil(this.flushVerifyMs / 4));
     this.eventLogAppend = opts.eventLogAppend ?? eventLogAppend;
@@ -744,7 +934,10 @@ export class BusCoreImpl implements BusCore {
         this.helloEpoch.set(agentId, this.inFlightEpoch.get(agentId) ?? 0);
         if (carried && !readySinceClose) {
           this.pendingRedelivery.delete(agentId);
-          for (const wrapped of carried) this.deliverOrQueuePrompt(agentId, wrapped);
+          for (const wrapped of carried) {
+            this.noteRedelivered(agentId, wrapped);
+            this.deliverOrQueuePrompt(agentId, wrapped);
+          }
         }
         this.logIpc("hello", {
           agent: agentId,
@@ -763,6 +956,7 @@ export class BusCoreImpl implements BusCore {
           // Without this, a subsequent scheduler/cron event for this
           // agent (after a reconnect) would inherit the dead session's
           // origin and misroute (5-agent review on PR #138, A1 finding).
+          const turnCounted = this.currentOperation.has(agentId);
           this.lastPromptOrigin.delete(agentId);
           this.originAmbiguous.delete(agentId);
           // Same lifecycle: no `response.turn_end` is coming either, so the
@@ -779,6 +973,13 @@ export class BusCoreImpl implements BusCore {
           // of the per-turn flags so a dead session can't leave it dangling.
           this.replyNudged.delete(agentId);
           this.pendingNudgeText.delete(agentId);
+          // #239: the slot is free; its deadline goes with it. The prompts
+          // queued behind it are NOT dropped — like the carried re-deliveries
+          // below they belong to the agent that comes back — and the next one
+          // is admitted at the same point a direct prompt would have been
+          // delivered before the queue existed (below, once the delivery-gate
+          // state is reset; `markAgentReady` admits again after the flush).
+          this.deadlineReleased.delete(agentId);
           // The subprocess is gone -- tear down this agent's delivery-gate
           // state too, so a held prompt plus an armed backstop timer can never
           // flush a stale keystroke into a restart that reuses this agent_id.
@@ -847,12 +1048,26 @@ export class BusCoreImpl implements BusCore {
           // into the fresh session (#252 HIGH).
           this.clearFlushVerify(agentId);
           this.inFlightDeliveries.delete(agentId);
+          const turnWasLive = this.agentTurnActive.has(agentId) || turnCounted;
           this.agentTurnActive.delete(agentId);
           this.logIpc("close", {
             agent: agentId,
             connections: this.ipcServer?.connectionCount() ?? 0,
             registered: this.connectedAgents.size,
           });
+          // #239: a close with a turn live is, most of the time, an IPC-only
+          // drop with the process and its turn alive — the queue is PARKED
+          // until the turn is proven over (its `turn_end`, a new generation)
+          // or the deadline, never admitted into it. A close with the agent
+          // idle admits as a direct prompt would have been delivered.
+          if (turnWasLive) this.gateParked.add(agentId);
+          this.redeliveredSinceClose.delete(agentId); // a new carry-over starts here
+          // `awaitOwnPromptLine` / `pendingOrigin` survive the close: an
+          // IPC-only blip leaves the released turn running, and its late
+          // terminator must still count for nobody. A real replacement clears
+          // them on its new generation.
+          this.touchTurn(agentId);
+          if (!turnWasLive) this.admitNext(agentId);
         } else {
           this.logIpc("close", { agent: null, note: "pre-handshake socket closed" });
         }
@@ -903,12 +1118,309 @@ export class BusCoreImpl implements BusCore {
     this.pendingRedelivery.clear();
     this.replyNudged.clear();
     this.pendingNudgeText.clear();
+    for (const timer of this.turnDeadline.values()) clearTimeout(timer);
+    this.turnDeadline.clear();
+    this.deadlineReleased.clear();
+    this.earlyReleased.clear();
+    this.awaitOwnPromptLine.clear();
+    this.pendingOrigin.clear();
+    this.gateParked.clear();
+    this.redeliveredSinceClose.clear();
+    for (const timer of this.admitSettle.values()) clearTimeout(timer);
+    this.admitSettle.clear();
+    this.promptQueue.clear();
   }
 
   /* ─────────────────────────────── prompts ─────────────────────────────── */
 
-  async sendPrompt(req: SendPromptRequest): Promise<{ promise_id: string; ipc_sent?: boolean }> {
+  sendPrompt(req: SendPromptRequest): Promise<SendPromptAck> {
     const promise_id = randomUUID();
+    // #239: one active turn per agent. The slot is free when the agent owes no
+    // terminator for a bus-opened turn, no turn is streaming in its transcript
+    // (a turn the bus did not open — typed into the TUI, a task notification —
+    // still occupies the REPL and its reply slot), and no reply nudge is
+    // outstanding (the nudged turn answers the PREVIOUS prompt; admitting the
+    // next one now would rewrite the origin that answer routes by — the very
+    // misroute this queue exists to close).
+    if (!this.slotFree(req.agent_id) || this.promptQueue.has(req.agent_id)) {
+      // Behind an active turn, or behind prompts already waiting (a free slot
+      // with a non-empty queue is a release whose `admitNext` has not run yet
+      // — never let a newcomer jump it).
+      try {
+        this.enqueuePrompt(req, promise_id);
+      } catch (err) {
+        return Promise.reject(err);
+      }
+      // A gate parked by a socket close whose agent has not come back: the
+      // process may be dead, and the only automatic restart (#222) is woken by
+      // a failed IPC send — which a queued prompt no longer attempts. Wake it
+      // from here, as the pre-queue delivery of this prompt would have.
+      if (
+        this.gateParked.has(req.agent_id) &&
+        this.ipcServer &&
+        !this.ipcServer.hasConnection(req.agent_id)
+      ) {
+        this.logIpc("send-failed", {
+          agent: req.agent_id,
+          ctx: "sendPrompt:parked",
+          registeredKnown: this.connectedAgents.has(req.agent_id),
+          connections: this.ipcServer.connectionCount(),
+        });
+        this.onMcpSendFailed(req.agent_id, { reason: "sendPrompt:parked-no-mcp-connection" });
+      }
+      this.admitNext(req.agent_id);
+      return Promise.resolve({ promise_id, queued: true });
+    }
+    // Not wrapped in an async function of its own: `admitPrompt` is the body
+    // `sendPrompt` had before #239, and callers that race its ack against a
+    // fast `final` (the webui bridge's receipt notes) rely on its tick count.
+    return this.admitPrompt(req, promise_id);
+  }
+
+  /** #239: no bus-opened turn in flight, no turn streaming, no nudge pending. */
+  private slotFree(agent_id: string): boolean {
+    return (
+      !this.currentOperation.has(agent_id) &&
+      !this.agentTurnActive.has(agent_id) &&
+      this.replyNudged.get(agent_id) !== true &&
+      !this.gateParked.has(agent_id) &&
+      !this.admitSettle.has(agent_id)
+    );
+  }
+
+  /** #239 / #405: admit after a `response.turn_end`, once the terminal
+   *  message's other boundary lines have had `turnEndSettleMs` to land. A
+   *  further line within the window restarts it. */
+  private scheduleAdmit(agent_id: string): void {
+    const prev = this.admitSettle.get(agent_id);
+    if (prev) clearTimeout(prev);
+    if (this.turnEndSettleMs <= 0) {
+      this.admitSettle.delete(agent_id);
+      this.touchTurn(agent_id);
+      this.admitNext(agent_id);
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.admitSettle.delete(agent_id);
+      this.touchTurn(agent_id);
+      this.admitNext(agent_id);
+    }, this.turnEndSettleMs);
+    (timer as { unref?: () => void }).unref?.();
+    this.admitSettle.set(agent_id, timer);
+    this.touchTurn(agent_id);
+  }
+
+  private enqueuePrompt(req: SendPromptRequest, promise_id: string): void {
+    let q = this.promptQueue.get(req.agent_id);
+    if (!q) {
+      q = { lanes: new Map(), order: [] };
+      this.promptQueue.set(req.agent_id, q);
+    }
+    const laneKey = `${req.origin}:${req.origin_id}`;
+    let lane = q.lanes.get(laneKey);
+    if (!lane) {
+      lane = [];
+      q.lanes.set(laneKey, lane);
+      q.order.push(laneKey);
+    }
+    if (lane.length >= this.promptQueueCapPerOrigin) {
+      if (lane.length === 0) this.dropLane(q, req.agent_id, laneKey);
+      throw new PromptQueueFullError(
+        req.agent_id,
+        req.origin,
+        req.origin_id,
+        this.promptQueueCapPerOrigin,
+        "origin",
+      );
+    }
+    let total = 0;
+    for (const l of q.lanes.values()) total += l.length;
+    if (total >= this.promptQueueCapPerAgent) {
+      if (lane.length === 0) this.dropLane(q, req.agent_id, laneKey);
+      throw new PromptQueueFullError(
+        req.agent_id,
+        req.origin,
+        req.origin_id,
+        this.promptQueueCapPerAgent,
+        "agent",
+      );
+    }
+    lane.push({ req, promise_id, queuedAt: Date.now() });
+    // Surface only, like the other `[bus]` lines: a chat id is not log material.
+    console.warn(
+      `[bus] prompt queued for agent=${req.agent_id} (origin=${req.origin}, ` +
+        `lane depth=${lane.length}, lanes=${q.lanes.size}): a turn is still in flight. See #239.`,
+    );
+  }
+
+  /** A lane created for a prompt that was then refused must not linger as an
+   *  empty entry in the rotation (nor keep the agent's queue "non-empty"). */
+  private dropLane(
+    q: { lanes: Map<string, QueuedPrompt[]>; order: string[] },
+    agent_id: string,
+    laneKey: string,
+  ): void {
+    q.lanes.delete(laneKey);
+    const i = q.order.indexOf(laneKey);
+    if (i >= 0) q.order.splice(i, 1);
+    if (q.lanes.size === 0) this.promptQueue.delete(agent_id);
+  }
+
+  /** #239: pop the next prompt in fair order — the first non-empty lane in
+   *  rotation, which then moves to the back — or nothing. */
+  private dequeuePrompt(agent_id: string): QueuedPrompt | undefined {
+    const q = this.promptQueue.get(agent_id);
+    if (!q) return undefined;
+    for (let i = 0; i < q.order.length; i++) {
+      const laneKey = q.order.shift() as string;
+      const lane = q.lanes.get(laneKey);
+      if (!lane || lane.length === 0) {
+        q.lanes.delete(laneKey);
+        continue;
+      }
+      const next = lane.shift() as QueuedPrompt;
+      if (lane.length === 0) q.lanes.delete(laneKey);
+      else q.order.push(laneKey);
+      if (q.lanes.size === 0) this.promptQueue.delete(agent_id);
+      return next;
+    }
+    this.promptQueue.delete(agent_id);
+    return undefined;
+  }
+
+  withdrawQueuedPrompt(agentId: string, promise_id: string): boolean {
+    const q = this.promptQueue.get(agentId);
+    if (!q) return false;
+    for (const [laneKey, lane] of q.lanes) {
+      const i = lane.findIndex((e) => e.promise_id === promise_id);
+      if (i < 0) continue;
+      lane.splice(i, 1);
+      if (lane.length === 0) this.dropLane(q, agentId, laneKey);
+      return true;
+    }
+    return false;
+  }
+
+  queuedPrompts(
+    agentId: string,
+  ): ReadonlyArray<{ promise_id: string; origin: BusOrigin; origin_id: string }> {
+    const q = this.promptQueue.get(agentId);
+    if (!q) return [];
+    // Admission order: walk the rotation round by round.
+    const out: { promise_id: string; origin: BusOrigin; origin_id: string }[] = [];
+    const cursors = new Map<string, number>();
+    let progressed = true;
+    while (progressed) {
+      progressed = false;
+      for (const laneKey of q.order) {
+        const lane = q.lanes.get(laneKey) ?? [];
+        const i = cursors.get(laneKey) ?? 0;
+        if (i >= lane.length) continue;
+        const entry = lane[i] as QueuedPrompt;
+        out.push({
+          promise_id: entry.promise_id,
+          origin: entry.req.origin,
+          origin_id: entry.req.origin_id,
+        });
+        cursors.set(laneKey, i + 1);
+        progressed = true;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * #239: the slot may have just freed — a terminator landed, an abnormal
+   * release ran, the deadline fired. Admit the next queued prompt if so. Every
+   * release site calls this; it is a no-op while the slot is still occupied
+   * or nothing waits, so calling it too often costs nothing and missing a
+   * call is the only way to strand a prompt.
+   */
+  private admitNext(agent_id: string): void {
+    if (!this.slotFree(agent_id)) return;
+    const next = this.dequeuePrompt(agent_id);
+    if (!next) return;
+    console.warn(
+      `[bus] admitting queued prompt for agent=${agent_id} ` +
+        `(origin=${next.req.origin}, waited ${Date.now() - next.queuedAt}ms).`,
+    );
+    // The ack of a queued prompt has no reader (its caller was answered at
+    // enqueue time); a delivery failure surfaces through onError as it would
+    // for a direct send.
+    void this.admitPrompt(next.req, next.promise_id).catch((err) =>
+      this.onError(err, { ctx: "admitNext", agent_id }),
+    );
+  }
+
+  /** #239 / #372: bring the idle deadline in line with the admission gate —
+   *  (re)armed while anything holds it (a counted turn, a nudge outstanding,
+   *  a streaming flag), cleared once it is free. Called on admission, on every
+   *  sign of life, and at every release site. */
+  private touchTurn(agent_id: string): void {
+    const prev = this.turnDeadline.get(agent_id);
+    if (prev) clearTimeout(prev);
+    if (this.slotFree(agent_id)) {
+      this.turnDeadline.delete(agent_id);
+      return;
+    }
+    const timer = setTimeout(() => this.onTurnDeadline(agent_id), this.turnDeadlineMs);
+    (timer as { unref?: () => void }).unref?.();
+    this.turnDeadline.set(agent_id, timer);
+  }
+
+  /**
+   * #239 / #372: the admitted turn showed no sign of life for `turnDeadlineMs`.
+   * Its terminator is not coming — or is coming from a turn too slow to tell
+   * apart from a dead one. Either way the queue behind it must move: release
+   * every per-turn slot exactly as the abnormal terminators (cancel / error /
+   * disconnect) do, say so loudly, and admit the next prompt flagged as
+   * possibly overlapping.
+   */
+  private onTurnDeadline(agent_id: string): void {
+    this.turnDeadline.delete(agent_id);
+    if (this.slotFree(agent_id)) return;
+    const operation = this.currentOperation.get(agent_id);
+    const held = [
+      operation ? `operation=${operation}` : null,
+      this.replyNudged.get(agent_id) === true ? "reply-nudge outstanding" : null,
+      this.agentTurnActive.has(agent_id) ? "turn streaming" : null,
+      this.gateParked.has(agent_id) ? "parked (IPC close or re-delivery)" : null,
+    ]
+      .filter(Boolean)
+      .join(", ");
+    const waiting = this.queuedPrompts(agent_id).length;
+    const msg =
+      `turn deadline: agent=${agent_id} (${held}) showed no sign of life for ` +
+      `${this.turnDeadlineMs}ms — releasing the turn (${waiting} prompt(s) queued). ` +
+      "A turn that was merely slow may now overlap the next one; its events are flagged " +
+      "correlation_ambiguous. See #239 / #372.";
+    console.error(`[bus] ${msg}`);
+    this.onError(new Error(msg), { ctx: "turn-deadline", agent_id, operation, held, waiting });
+    // Only what HOLDS the gate is cleared. The origin and the reply flags stay:
+    // the turn may merely be slow, and its late reply (or the text the net
+    // synthesises for it) must still find its chat — deleting the origin here
+    // turned a slow single-chat turn into a dropped answer (adversarial
+    // finding). If a prompt is admitted next, its own admission overwrites the
+    // origin and marks it ambiguous for the security gate, as before #239.
+    this.currentOperation.delete(agent_id);
+    this.correlationAmbiguous.delete(agent_id);
+    this.pendingTurns.delete(agent_id);
+    this.replyNudged.delete(agent_id);
+    this.pendingNudgeText.delete(agent_id);
+    this.agentTurnActive.delete(agent_id);
+    this.gateParked.delete(agent_id);
+    this.redeliveredSinceClose.delete(agent_id);
+    this.awaitOwnPromptLine.delete(agent_id); // the next admission sets its own
+    this.pendingOrigin.delete(agent_id);
+    const settle = this.admitSettle.get(agent_id);
+    if (settle) clearTimeout(settle);
+    this.admitSettle.delete(agent_id);
+    this.deadlineReleased.add(agent_id);
+    this.earlyReleased.add(agent_id);
+    this.admitNext(agent_id);
+  }
+
+  private async admitPrompt(req: SendPromptRequest, promise_id: string): Promise<SendPromptAck> {
     // Emit a `prompt` BusEvent so subscribers see the inbound message and
     // the audit log records it. We do this before forwarding so the event
     // is durable even if the IPC send fails.
@@ -945,13 +1457,25 @@ export class BusCoreImpl implements BusCore {
     // terminator, so events from here on cannot be attributed to one operation
     // with confidence. Say so on the envelope rather than letting a client
     // correlate confidently and wrongly.
-    if (this.currentOperation.has(req.agent_id)) {
+    //
+    // #239: admission waits for a free slot, so an occupied one is no longer
+    // reachable here. The one overlap left is a slot the DEADLINE freed: the
+    // turn it belonged to may still be running, and this prompt's events may
+    // then be its. Flag it for the same reason.
+    if (this.currentOperation.has(req.agent_id) || this.deadlineReleased.has(req.agent_id)) {
       this.correlationAmbiguous.add(req.agent_id);
     } else {
       this.correlationAmbiguous.delete(req.agent_id);
     }
+    this.deadlineReleased.delete(req.agent_id);
+    // Admitted while the released turn may still run (see `earlyReleased`):
+    // a terminator that lands before this prompt's own transcript line is
+    // that turn's, not ours. The PTY text is filled in below once wrapped;
+    // `null` (no PTY leg) accepts the next `prompt` line whatever its text.
+    if (this.earlyReleased.delete(req.agent_id)) this.awaitOwnPromptLine.set(req.agent_id, null);
     this.currentOperation.set(req.agent_id, promise_id);
     this.pendingTurns.set(req.agent_id, (this.pendingTurns.get(req.agent_id) ?? 0) + 1);
+    this.touchTurn(req.agent_id);
     this.publish(promptEvent);
     // Remember the origin so `ingestReply` can attach it to the
     // outbound `response.text` event for surface-aware routing.
@@ -961,13 +1485,7 @@ export class BusCoreImpl implements BusCore {
     // security gate — mark the agent so the permission gate won't attribute a
     // deny to the wrong user/skill. A `set` onto an empty slot is a clean,
     // unambiguous single prompt, so clear any prior taint.
-    if (this.lastPromptOrigin.has(req.agent_id)) {
-      this.originAmbiguous.add(req.agent_id);
-    } else {
-      this.originAmbiguous.delete(req.agent_id);
-    }
-    this.rememberPromptOrigin(req.agent_id, req.origin, req.origin_id);
-    this.lastPromptOrigin.set(req.agent_id, {
+    const originRecord = {
       origin: req.origin,
       origin_id: req.origin_id,
       // #258 item 3 slice 2: carry the inbound identity so the per-tool
@@ -978,7 +1496,16 @@ export class BusCoreImpl implements BusCore {
         typeof req.metadata?.command === "string"
           ? req.metadata.command.replace(/^\//, "")
           : undefined,
-    });
+    };
+    if (this.awaitOwnPromptLine.has(req.agent_id)) {
+      // #239: admitted onto a turn that may still be running. Its late reply
+      // — or the text the net synthesises for it — routes by the slot, so the
+      // slot keeps that turn's chat until THIS prompt's own line proves the
+      // REPL moved on (`applyPendingOrigin`).
+      this.pendingOrigin.set(req.agent_id, originRecord);
+    } else {
+      this.applyOrigin(req.agent_id, originRecord);
+    }
     // Silent-drop safety net (#215): new prompt → reset the "did this
     // turn call reply?" flag. If the agent ends the turn (response.turn_end)
     // without ever setting this to true, we'll synthesize delivery.
@@ -1059,6 +1586,9 @@ export class BusCoreImpl implements BusCore {
         }
       }
       const wrapped = `<channel ${attrs.join(" ")}>${escapeXmlText(req.text)}</channel>`;
+      if (this.awaitOwnPromptLine.has(req.agent_id)) {
+        this.awaitOwnPromptLine.set(req.agent_id, promptLineKey(wrapped));
+      }
       // If the agent's session is (re)initialising the prompt is HELD and the
       // backstop flush-verify path already covers it. The uncovered case is an
       // IMMEDIATE delivery whose IPC send just failed: the MCP/IPC socket
@@ -1068,17 +1598,37 @@ export class BusCoreImpl implements BusCore {
       // checking a turn started (dossier 20260614T034258). Verify turn-start for
       // that prompt and re-deliver once if none lands.
       // Arm a turn-start verify when the PTY confirm-loop can't be trusted to
-      // attribute the turn to THIS prompt: (a) the IPC send just failed (socket
-      // blip), or (b) a neighbor turn is already streaming, so this keystroke is
-      // queued in the REPL box and the confirm-loop may read the neighbor's
-      // stream as this prompt's turn-start (#250 HIGH). The verify defers while a
-      // turn stays active and re-delivers only if no turn ever starts.
+      // attribute the turn to THIS prompt: the IPC send just failed (socket
+      // blip). The verify defers while a turn stays active and re-delivers
+      // only if no turn ever starts.
+      //
+      // #239: the other reason this used to arm — a neighbor turn already
+      // streaming, so the keystroke sat in the REPL box and the confirm-loop
+      // could read the neighbor's stream as this prompt's start (#250 HIGH) —
+      // cannot hold here any more: admission waits for the REPL to be free.
+      // The deferral in the verify timer stays, for the re-deliveries that do
+      // not pass through admission (a backstop flush, a #361 give-up).
       const deliveredImmediately = !this.agentInitializing.has(req.agent_id);
-      const neighborTurnActive = this.agentTurnActive.has(req.agent_id);
+      // #239: admitted after an early release, the prompt may be typed into a
+      // turn that is still running — the one case left where the REPL box can
+      // swallow it (#250). Verify its own turn starts; re-deliver once if not.
+      const intoLiveTurn = this.awaitOwnPromptLine.has(req.agent_id);
       this.deliverOrQueuePrompt(req.agent_id, wrapped);
-      if ((ipcSendFailed || neighborTurnActive) && deliveredImmediately) {
+      if ((ipcSendFailed || intoLiveTurn) && deliveredImmediately) {
         this.armFlushVerify(req.agent_id, [wrapped]);
       }
+    } else if (ipcSendFailed) {
+      // #372 source A: neither leg took the prompt — no PTY handler, and the
+      // IPC send failed. No turn will start and no terminator is coming, so
+      // the slot counted above would be held until the deadline, and under
+      // #239 that is the agent deaf to every origin for `turnDeadlineMs`.
+      // Release it now: a prompt that never reached the agent never held a
+      // slot. (A bus with no IPC server at all is the in-process / test
+      // configuration; its prompts are observed on the bus itself, so the
+      // slot stays.)
+      this.logIpc("undeliverable", { agent: req.agent_id, ctx: "sendPrompt", promise_id });
+      this.releaseTurn(req.agent_id);
+      this.admitNext(req.agent_id);
     }
     return { promise_id, ipc_sent: this.ipcServer ? !ipcSendFailed : undefined };
   }
@@ -1114,6 +1664,7 @@ export class BusCoreImpl implements BusCore {
 
   private deliverOrQueuePrompt(agent_id: string, wrapped: string): void {
     if (!this.streamPromptHandler) return;
+    this.touchTurn(agent_id); // #239: a delivery-layer transition is a sign of life
     if (this.agentInitializing.has(agent_id)) {
       const q = this.deliveryQueue.get(agent_id) ?? [];
       q.push(wrapped);
@@ -1356,19 +1907,74 @@ export class BusCoreImpl implements BusCore {
     // push them through the gate. Independent of the held-queue below, and done
     // first so they keep their original order ahead of anything newly held.
     const carried = this.pendingRedelivery.get(agent_id);
+    const flushed: string[] = [];
     if (carried) {
       this.pendingRedelivery.delete(agent_id);
-      for (const wrapped of carried) this.deliverOrQueuePrompt(agent_id, wrapped);
+      for (const wrapped of carried) {
+        flushed.push(wrapped);
+        this.noteRedelivered(agent_id, wrapped);
+        this.deliverOrQueuePrompt(agent_id, wrapped);
+      }
     }
     const q = this.deliveryQueue.get(agent_id);
-    if (!q || q.length === 0) return;
-    this.deliveryQueue.delete(agent_id);
-    for (const wrapped of q) this.streamDeliver(agent_id, wrapped);
-    // A backstop flush is timer-driven (no `replay_done`), so the session may
-    // still be mid-(re)init and swallow the keystroke; verify a turn actually
-    // starts and re-deliver once if not. The real `replay_done` path is
-    // known-ready and needs no verification.
-    if (viaBackstop) this.armFlushVerify(agent_id, q);
+    if (q && q.length > 0) {
+      this.deliveryQueue.delete(agent_id);
+      for (const wrapped of q) {
+        flushed.push(wrapped);
+        this.noteRedelivered(agent_id, wrapped);
+        this.streamDeliver(agent_id, wrapped);
+      }
+      // A backstop flush is timer-driven (no `replay_done`), so the session may
+      // still be mid-(re)init and swallow the keystroke; verify a turn actually
+      // starts and re-deliver once if not. The real `replay_done` path is
+      // known-ready and needs no verification.
+      if (viaBackstop) this.armFlushVerify(agent_id, q);
+    }
+    // #239: the streaming flag was cleared above; if the slot is free too
+    // (its turn ended, or was released abnormally) a prompt queued behind it
+    // goes now — AFTER the carried and held prompts, which were admitted first.
+    // The slot of a turn this boundary interrupted is deliberately NOT freed
+    // here (#372: the held prompts just flushed were counted on it); the
+    // deadline bounds that case. A gate parked by an IPC close is released:
+    // a new generation cannot still be running the turn that was live then.
+    // Only a generation known to be NEW — or, when generations are not
+    // numbered, a real `replay_done` — says so; a re-emitted marker for the
+    // live generation could still be mid-turn.
+    const redelivered = this.redeliveredSinceClose.get(agent_id) ?? [];
+    if (generation === undefined ? !viaBackstop : newGeneration) {
+      // A new generation cannot still be running the turn that was live at
+      // the close — unless the bus has since re-delivered a prompt into this
+      // agent (on `hello`, or just above): that one is running, or about to.
+      if (redelivered.length === 0) this.gateParked.delete(agent_id);
+      // The interrupted turn's line will never be tailed by this generation.
+      // The prompt admitted after it runs here only if it was re-delivered;
+      // its chat takes the slot then, and only then — a slot pointing at a
+      // chat whose turn is not coming would route an ambient turn's text
+      // there (the #138 rule the close-time clear exists for).
+      const awaited = this.awaitOwnPromptLine.get(agent_id);
+      this.awaitOwnPromptLine.delete(agent_id);
+      const rerun =
+        awaited === undefined ||
+        awaited === null ||
+        redelivered.some((w) => promptLineKey(w) === awaited);
+      if (rerun) this.applyPendingOrigin(agent_id);
+      else this.pendingOrigin.delete(agent_id);
+    }
+    // #239: a re-delivery holds no slot (the close freed it), yet it is a
+    // bus-owned prompt about to run in this REPL. Admitting the queue behind
+    // it would put two bus prompts in one turn — the invariant this queue
+    // exists for. `noteRedelivered` parked the gate on it; its `turn_end`
+    // un-parks, so nothing is admitted here.
+    this.touchTurn(agent_id);
+    if (flushed.length === 0) this.admitNext(agent_id);
+  }
+
+  /** #239: a carried prompt went back out — see `redeliveredSinceClose`. */
+  private noteRedelivered(agent_id: string, wrapped: string): void {
+    const list = this.redeliveredSinceClose.get(agent_id) ?? [];
+    list.push(wrapped);
+    this.redeliveredSinceClose.set(agent_id, list);
+    this.gateParked.add(agent_id);
   }
 
   /** Arm per-prompt turn-start verification after a backstop flush — or after
@@ -1428,6 +2034,7 @@ export class BusCoreImpl implements BusCore {
       this.compactionHeld.set(agent_id, held);
     }
     if (held.has(key)) return;
+    this.touchTurn(agent_id); // #239: the hold is a transition, not silence
     held.set(key, {
       wrapped,
       // The tailer generation this hold belongs to: only its own generation's
@@ -1486,6 +2093,7 @@ export class BusCoreImpl implements BusCore {
   }
 
   private armFlushVerify(agent_id: string, prompts: string[]): void {
+    this.touchTurn(agent_id); // #239: a verify armed is a sign of life
     let pending = this.flushVerify.get(agent_id);
     if (!pending) {
       pending = new Map();
@@ -1574,11 +2182,42 @@ export class BusCoreImpl implements BusCore {
    *  re-delivery (#252). The absorption records (#389) are the other proof —
    *  same text, same exact-match lookup: the prompt reached the model inside
    *  the running turn instead of opening its own. */
+  /** The exact key when one of the agent's pending entries carries it;
+   *  otherwise the pending key whose whitespace-stripped form matches; else
+   *  the exact key unchanged (no entry — the callers' lookups then miss). */
+  private matchPromptKey(agent_id: string, key: string): string {
+    const has = (m: Map<string, unknown> | undefined) => m?.has(key) === true;
+    if (
+      has(this.flushVerify.get(agent_id)) ||
+      has(this.inFlightProof.get(agent_id)) ||
+      has(this.compactionHeld.get(agent_id)) ||
+      this.spentRetry.get(agent_id)?.has(key)
+    ) {
+      return key;
+    }
+    const stripped = key.replace(/\s+/g, "");
+    for (const m of [
+      this.flushVerify.get(agent_id),
+      this.inFlightProof.get(agent_id),
+      this.compactionHeld.get(agent_id),
+    ]) {
+      if (!m) continue;
+      for (const k of m.keys()) if (k.replace(/\s+/g, "") === stripped) return k;
+    }
+    const sentinels = this.spentRetry.get(agent_id);
+    if (sentinels) for (const k of sentinels) if (k.replace(/\s+/g, "") === stripped) return k;
+    return key;
+  }
+
   private noteFlushTurnStart(agent_id: string, ingestedText: string): boolean {
     // ingestedText is the line claude recorded (already PTY-sanitized) and the
     // map keys are sanitized too; sanitize again — it is idempotent — to be
     // robust against any residual normalization before the exact-match lookup.
-    const key = sanitizePtyPromptText(ingestedText);
+    // #239: the CLI records whitespace differently from what was typed (a
+    // pasted TAB becomes spaces), so an exact miss falls back to the
+    // whitespace-agnostic shape both surfaces agree on — else a verify for a
+    // prompt the CLI already ran would re-deliver it after the next turn.
+    const key = this.matchPromptKey(agent_id, sanitizePtyPromptText(ingestedText));
     // Proof for a delivery whose handler is still deciding (#361): remember
     // it, so a later give-up verdict for that same prompt arms nothing.
     const proofs = this.inFlightProof.get(agent_id);
@@ -1641,6 +2280,13 @@ export class BusCoreImpl implements BusCore {
    *  verify was pending is counted: that is the one `sendPrompt` incremented
    *  for and the tailer never opened a turn for. */
   private noteAbsorbedPrompt(agent_id: string, text: string): void {
+    // #239: a prompt folded into the running turn will never get a line of
+    // its own; the running turn's terminator is the one to wait for now.
+    const awaited = this.awaitOwnPromptLine.get(agent_id);
+    if (awaited !== undefined && (awaited === null || promptLineKey(text) === awaited)) {
+      this.awaitOwnPromptLine.delete(agent_id);
+      this.applyPendingOrigin(agent_id);
+    }
     if (!this.noteFlushTurnStart(agent_id, text)) return;
     this.releaseTurn(agent_id);
   }
@@ -1658,6 +2304,7 @@ export class BusCoreImpl implements BusCore {
       this.pendingTurns.delete(agent_id);
       this.currentOperation.delete(agent_id);
       this.correlationAmbiguous.delete(agent_id);
+      this.touchTurn(agent_id); // #239: cleared, or re-armed for a nudge still outstanding
     }
   }
 
@@ -1738,6 +2385,8 @@ export class BusCoreImpl implements BusCore {
     // transcript nor ended: the window between the PTY delivery settling and
     // the JSONL `prompt` line being ingested (Copilot on the PR).
     for (const [agent, n] of this.pendingTurns) if (n > 0) busy.add(agent);
+    // #239: a prompt waiting behind an active turn is owed to the model too.
+    for (const [agent, q] of this.promptQueue) if (q.lanes.size > 0) busy.add(agent);
     for (const [agent, n] of this.inFlightDeliveries) if (n > 0) busy.add(agent);
     for (const [agent, q] of this.deliveryQueue) if (q.length > 0) busy.add(agent);
     for (const [agent, held] of this.compactionHeld) if (held.size > 0) busy.add(agent);
@@ -1791,6 +2440,30 @@ export class BusCoreImpl implements BusCore {
   }
 
   /* ─────────────────────────────── ingest ─────────────────────────────── */
+
+  /** Take the routing slot for a prompt (#284: an occupied slot makes the
+   *  cached identity ambiguous for the security gate). */
+  private applyOrigin(
+    agent_id: string,
+    record: { origin: BusOrigin; origin_id: string; userId?: string; skillName?: string },
+  ): void {
+    if (this.lastPromptOrigin.has(agent_id)) {
+      this.originAmbiguous.add(agent_id);
+    } else {
+      this.originAmbiguous.delete(agent_id);
+    }
+    this.rememberPromptOrigin(agent_id, record.origin, record.origin_id);
+    this.lastPromptOrigin.set(agent_id, record);
+  }
+
+  /** #239: the prompt admitted after an early release has its own turn now —
+   *  its chat takes the slot. */
+  private applyPendingOrigin(agent_id: string): void {
+    const record = this.pendingOrigin.get(agent_id);
+    if (!record) return;
+    this.pendingOrigin.delete(agent_id);
+    this.applyOrigin(agent_id, record);
+  }
 
   private rememberPromptOrigin(agent_id: string, origin: BusOrigin, origin_id: string): void {
     let known = this.knownPromptOrigins.get(agent_id);
@@ -2014,19 +2687,14 @@ export class BusCoreImpl implements BusCore {
     const ownText = text && text.trim().length > 0 ? text : "";
     const deliverText = ownText || (nudged ? (this.pendingNudgeText.get(agentId) ?? "") : "");
     if (deliverText.trim().length === 0) return;
-    // RESIDUAL RACE (#217 finding 3 → deferred #239): `lastPromptOrigin` and
-    // the per-turn flags are single-slot, keyed by agent_id only, with no
-    // prompt/turn identity. The JSONL tailer's `response.turn_end` is
-    // delivered asynchronously (fs.watch + drain), so on a cross-channel
-    // interleave — P1(telegram) ends → reply → P2(webui) arrives (resets the
-    // flag, rewrites origin=webui) → P1's lagged turn_end lands here — this
-    // can route P1's text to P2's origin (webui). The flag-reset path is
-    // largely covered by the webui-bridge mutex serialising prompt→reply per
-    // agent, but cross-surface interleave is NOT fully closed. A complete fix
-    // threads the originating prompt_id onto the turn_end event and matches
-    // it to the in-flight prompt before synthesizing; that requires the
-    // tailer to carry prompt identity and is tracked as deferred follow-up
-    // #239 to avoid destabilizing this safety-net PR.
+    // #239 (was the residual race of #217 finding 3): `lastPromptOrigin` and
+    // the per-turn flags are single-slot, keyed by agent_id only. The JSONL
+    // tailer's `response.turn_end` is delivered asynchronously, so a
+    // cross-channel interleave — P1(telegram) ends → reply → P2(webui)
+    // arrives (resets the flag, rewrites origin=webui) → P1's lagged turn_end
+    // lands here — used to route P1's text to P2's chat. P2 is now held in
+    // `promptQueue` until this very terminator has been processed, so the
+    // origin read here is P1's own.
     const origin = this.lastPromptOrigin.get(agentId);
     if (!origin) {
       // No origin to route to (cron tick / unprompted ambient turn).
@@ -2202,6 +2870,16 @@ export class BusCoreImpl implements BusCore {
         // agent as having an active turn so a LATER prompt delivered during it
         // arms — and defers — its own verify.
         if (typeof text === "string") this.noteFlushTurnStart(e.agent_id, text);
+        // #239: the prompt admitted after an early release has now started its
+        // own turn — the next terminator is legitimately its own.
+        const awaited = this.awaitOwnPromptLine.get(e.agent_id);
+        if (
+          awaited !== undefined &&
+          (awaited === null || (typeof text === "string" && promptLineKey(text) === awaited))
+        ) {
+          this.awaitOwnPromptLine.delete(e.agent_id);
+          this.applyPendingOrigin(e.agent_id);
+        }
         this.agentTurnActive.add(e.agent_id);
         // #392: a turn is starting, whoever opened it (a bus prompt, a task
         // notification, a re-delivery, a prompt that waited behind an active
@@ -2252,17 +2930,46 @@ export class BusCoreImpl implements BusCore {
     // second release for the same message id would free the slot of a prompt
     // counted in between and stamp its events with no `promise_id`.
     let releaseSlot = false;
+    let staleTerminator = false;
     if (e.topic === "response.turn_end" && e.agent_id) {
       const payload = e.payload as { text?: string; message_id?: string };
-      this.handleTurnEnd(e.agent_id, payload?.text ?? "");
+      // #239: after an early release the admitted prompt's own line has not
+      // been tailed yet — this terminator is the RELEASED turn's, arriving
+      // late. The net still runs (that turn's text still needs its chat), the
+      // REPL is free, but nothing the bus counted for the newcomer ends here.
+      staleTerminator = this.awaitOwnPromptLine.has(e.agent_id);
+      const id = payload?.message_id;
+      // #405 beyond the settle: a further line of a message whose turn was
+      // already released AND followed by an admission — the state the net
+      // would read is the newcomer's. Routing that text would land it in the
+      // newcomer's chat (the #239 misroute); it is dropped, loudly.
+      // On the stale path the slot is still the released turn's own chat
+      // (`pendingOrigin` unapplied), so its text routes correctly there.
+      if (
+        id &&
+        !staleTerminator &&
+        this.lastTurnEndMessageId.get(e.agent_id) === id &&
+        !this.admitSettle.has(e.agent_id) &&
+        this.currentOperation.has(e.agent_id)
+      ) {
+        console.warn(
+          `[bus] late boundary line for agent=${e.agent_id}: its turn was released and a ` +
+            "new prompt admitted since — not synthesizing (it would reach the next chat). See #239/#405.",
+        );
+      } else {
+        this.handleTurnEnd(e.agent_id, payload?.text ?? "");
+      }
       // The turn ended → the REPL is free, so a prompt queued behind it can now
       // start; stop deferring its flush-verify (see agentTurnActive).
       this.agentTurnActive.delete(e.agent_id);
-      const id = payload?.message_id;
+      // #239: an IPC close (or a re-delivery) parked the gate on this turn;
+      // the tailer just proved it over.
+      this.gateParked.delete(e.agent_id);
+      this.redeliveredSinceClose.delete(e.agent_id);
       if (id && this.lastTurnEndMessageId.get(e.agent_id) === id) {
         releaseSlot = false; // another line of the message that already released
       } else {
-        releaseSlot = true;
+        releaseSlot = !staleTerminator;
         if (id) this.lastTurnEndMessageId.set(e.agent_id, id);
       }
     }
@@ -2271,6 +2978,17 @@ export class BusCoreImpl implements BusCore {
     // published: that event is the one a client most needs correlated, and
     // clearing alongside `agentTurnActive` above would strip it.
     if (releaseSlot && e.agent_id) this.releaseTurn(e.agent_id);
+    // #239: the REPL is free and (unless a nudge just went out) so is the
+    // slot — the next queued prompt goes once the terminal message's other
+    // boundary lines have landed (`scheduleAdmit`, #405). Also after a
+    // turn_end the bus did not count (a nudged turn's own end): its
+    // `releaseTurn` above found nothing to free, but the nudge state it
+    // cleared was what held admission. A stale terminator admits nothing: the
+    // newcomer's turn is about to start in that same REPL.
+    if (e.topic === "response.turn_end" && e.agent_id) {
+      if (staleTerminator) this.touchTurn(e.agent_id);
+      else this.scheduleAdmit(e.agent_id);
+    }
   }
 
   /**
@@ -2411,6 +3129,11 @@ export class BusCoreImpl implements BusCore {
     //    that already carries an id, or belongs to no operation, is passed
     //    through untouched — no copy, no allocation.
     const event = this.stampOperation(incoming);
+    // #239 / #372: any event for an agent is a sign of life for its admitted
+    // turn — the tailer's transcript lines, a reply, an ask — so the idle
+    // deadline starts over. A turn that publishes nothing for `turnDeadlineMs`
+    // is the only one it ever releases.
+    if (event.agent_id) this.touchTurn(event.agent_id);
 
     // 1. Audit log. Fire-and-forget on the promise — durability is the
     //    event-log's job. We swallow errors into onError so a transient
@@ -2665,6 +3388,14 @@ export class BusCoreImpl implements BusCore {
         // neighbor-turn flag would never clear via the tailer — drop it here
         // too, else flush-verify defers forever for this agent (#252 stack ultra).
         this.agentTurnActive.delete(agentId);
+        // #239: the process spoke, so the gate parked by a close is moot; but
+        // the CLI turn itself may still be running (`cancel` is a tool the
+        // agent calls mid-turn) — the next admission waits for its own line.
+        this.gateParked.delete(agentId);
+        this.redeliveredSinceClose.delete(agentId);
+        this.earlyReleased.add(agentId);
+        this.touchTurn(agentId); // the deadline goes with the slot
+        this.admitNext(agentId);
         break;
       case "request_human": {
         // Forward the correlation id along with the question. Without
@@ -2769,6 +3500,14 @@ export class BusCoreImpl implements BusCore {
         // neighbor-turn flag would never clear via the tailer — drop it here
         // too, else flush-verify defers forever for this agent (#252 stack ultra).
         this.agentTurnActive.delete(agentId);
+        // #239: the process spoke, so the gate parked by a close is moot; but
+        // the CLI turn itself may still be running (`cancel` is a tool the
+        // agent calls mid-turn) — the next admission waits for its own line.
+        this.gateParked.delete(agentId);
+        this.redeliveredSinceClose.delete(agentId);
+        this.earlyReleased.add(agentId);
+        this.touchTurn(agentId); // the deadline goes with the slot
+        this.admitNext(agentId);
         break;
       // hello already handled in the IPC layer; outbound types (prompt,
       // permission_response, ask_answer) shouldn't arrive from MCP.

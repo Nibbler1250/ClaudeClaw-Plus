@@ -72,7 +72,7 @@ function mockEventLog() {
 }
 
 function makeBus(): BusCore {
-  return createBusCore({ eventLogAppend: mockEventLog() });
+  return createBusCore({ eventLogAppend: mockEventLog(), turnEndSettleMs: 0 });
 }
 
 describe("streamBusPrompt", () => {
@@ -204,6 +204,84 @@ describe("streamBusPrompt", () => {
     expect(bus.state().subscriberCount).toBe(0);
   });
 
+  it("ignores a final routed to ANOTHER chat while this prompt waits behind that chat's turn (#239)", async () => {
+    // The bus queues the webui prompt behind a telegram turn; that turn's
+    // final lands on this agent-wide subscription first. It is not ours.
+    const bus = makeBus();
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "chat-A",
+      user_id: "u",
+      text: "from A",
+    });
+    const pending = streamBusPrompt(bus, "alpha", "from webui", {
+      timeoutMs: 2000,
+      originId: "dash",
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    bus.ingestReply({ agent_id: "alpha", text: "answer for A", intent: "final" }); // routed to chat-A
+    let settled = false;
+    void pending.then(() => {
+      settled = true;
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(settled).toBe(false);
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "response.turn_end",
+      payload: { text: "" },
+    }); // A's turn ends → the webui prompt is admitted
+    bus.ingestReply({ agent_id: "alpha", text: "answer for webui", intent: "final" });
+    const result = await pending;
+    expect(result.output).toBe("answer for webui");
+  });
+
+  it("a final the agent names for ANOTHER chat inside our own turn still resolves, as on main (#224, #239)", async () => {
+    const bus = makeBus();
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "chat-A",
+      user_id: "u",
+      text: "earlier",
+    });
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "response.turn_end",
+      payload: { text: "" },
+    });
+    const pending = streamBusPrompt(bus, "alpha", "digest", { timeoutMs: 300, originId: "job:1" });
+    await Promise.resolve();
+    await Promise.resolve();
+    bus.ingestReply({ agent_id: "alpha", text: "for A", intent: "final", in_reply_to: "chat-A" });
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(result.output).toBe("for A");
+  });
+
+  it("a caller that times out while still queued withdraws its prompt: no orphan turn later (#239)", async () => {
+    const bus = makeBus();
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "chat-A",
+      user_id: "u",
+      text: "long",
+    });
+    const result = await streamBusPrompt(bus, "alpha", "from dash", {
+      timeoutMs: 50,
+      originId: "dash",
+    });
+    expect(result.ok).toBe(false);
+    expect(bus.queuedPrompts("alpha")).toEqual([]);
+  });
+
   it("serializes concurrent prompts to the same agent (Codex P1 on #136)", async () => {
     // The bridge subscribes by agent_id only; without serialization a
     // second prompt's `final` could resolve the first caller. We assert
@@ -234,6 +312,16 @@ describe("streamBusPrompt", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(bus.state().subscriberCount).toBe(1);
+    // #239: the bus itself holds the second prompt until the first TURN ends
+    // (its final reply is not the terminator — `response.turn_end` is). The
+    // tailer supplies that in the daemon; here we do.
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "response.turn_end",
+      payload: { text: "" },
+    });
     bus.ingestReply({ agent_id: "alpha", text: "second-reply", intent: "final" });
     const secondResult = await secondPending;
     expect(secondResult.output).toBe("second-reply");
@@ -511,7 +599,7 @@ describe("streamBusPrompt — dead IPC is surfaced after the reconnect grace (#3
   });
 
   it("stays silent about IPC on a bus that runs without an IPC server", async () => {
-    const bus = createBusCore({ eventLogAppend: mockEventLog() });
+    const bus = createBusCore({ eventLogAppend: mockEventLog(), turnEndSettleMs: 0 });
     const chunks: string[] = [];
     const pending = streamBusPrompt(bus, "alpha", "hi", {
       timeoutMs: 2000,
