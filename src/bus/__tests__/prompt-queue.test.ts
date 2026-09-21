@@ -823,6 +823,31 @@ describe("one active turn per agent (#239)", () => {
       expect(texts(delivered)).toEqual(["from A", "from B", "from C"]);
     });
 
+    it("the released turn's late terminator does not un-park a re-delivery still outstanding", async () => {
+      // CodeRabbit on the PR: B, admitted after a deadline, is carried over an
+      // IPC-only close and re-delivered on the reconnect (parked, still
+      // awaiting its own line). A's late end must not free the gate for C —
+      // B's turn is the one the park is for.
+      const { bus, delivered } = makeBus({ turnDeadlineMs: 40 });
+      await send(bus, "a", "from A", "telegram", "chat-A");
+      bus.ingestSessionEvent(tailer("a", "prompt", { text: delivered[0] }));
+      await send(bus, "a", "from B", "telegram", "chat-B");
+      await sleep(70); // B typed into A's live turn, awaiting its own line
+      const b = bus as unknown as {
+        currentOperation: Map<string, string>;
+        noteRedelivered(agent: string, wrapped: string): void;
+      };
+      b.currentOperation.delete("a"); // the close freed B's slot...
+      b.noteRedelivered("a", delivered[1] as string); // ...and the reconnect re-delivered B
+      await send(bus, "a", "from C", "telegram", "chat-C");
+      turnEnd(bus, "a"); // A's late end: stale
+      await send(bus, "a", "from D", "telegram", "chat-D"); // a newcomer would admit C if the gate were free
+      expect(texts(delivered)).toEqual(["from A", "from B"]); // C still waits
+      bus.ingestSessionEvent(tailer("a", "prompt", { text: delivered[1] })); // B's own line
+      turnEnd(bus, "a"); // B's end
+      expect(texts(delivered)).toEqual(["from A", "from B", "from C"]);
+    });
+
     describe("an IPC socket close", () => {
       async function ipcBus() {
         const { mkdtempSync } = await import("node:fs");

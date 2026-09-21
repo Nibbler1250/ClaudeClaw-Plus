@@ -2965,9 +2965,13 @@ export class BusCoreImpl implements BusCore {
       // start; stop deferring its flush-verify (see agentTurnActive).
       this.agentTurnActive.delete(e.agent_id);
       // #239: an IPC close (or a re-delivery) parked the gate on this turn;
-      // the tailer just proved it over.
-      this.gateParked.delete(e.agent_id);
-      this.redeliveredSinceClose.delete(e.agent_id);
+      // the tailer just proved it over — unless this is the RELEASED turn's
+      // late terminator while a re-delivered prompt is still outstanding: that
+      // prompt's turn is the one the park is for (CodeRabbit on the PR).
+      if (!staleTerminator || !this.redeliveredSinceClose.has(e.agent_id)) {
+        this.gateParked.delete(e.agent_id);
+        this.redeliveredSinceClose.delete(e.agent_id);
+      }
       // This terminator proves the released turn is over: a prompt admitted
       // later cannot land in it, so it must not wait for its own line nor
       // defer its origin (CodeRabbit on the PR).
