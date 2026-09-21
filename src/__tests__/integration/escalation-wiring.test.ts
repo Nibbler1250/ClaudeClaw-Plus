@@ -11,7 +11,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "bun:test";
 import { randomUUID } from "crypto";
-import { rm, mkdir } from "node:fs/promises";
+import { rm, mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -20,6 +20,7 @@ import { join } from "node:path";
 // =============================================================================
 
 const ESCALATION_DIR = join(process.cwd(), ".claude", "claudeclaw");
+const POLICY_DIR = join(process.cwd(), ".claude", "claudeclaw");
 const PAUSE_STATE_FILE = join(ESCALATION_DIR, "paused.json");
 const PAUSE_ACTIONS_FILE = join(ESCALATION_DIR, "pause-actions.jsonl");
 const WORKFLOW_DIR = join(process.cwd(), ".claude", "claudeclaw", "workflows");
@@ -179,6 +180,7 @@ import {
 } from "../../orchestrator/executor";
 
 import type { NormalizedEvent } from "../../gateway/normalizer";
+import { loadRules, clearCache } from "../../policy/engine";
 
 // Import pause controller for test setup
 import {
@@ -326,7 +328,37 @@ describe("Gateway Escalation Wiring", () => {
     it("should accept events when system is not paused", async () => {
       // Ensure system is not paused
       await resume({});
+      // #304: the gateway also evaluates the inbound event against the policy
+      // engine, whose in-memory rules are whatever the LAST `loadRules()` in
+      // this process saw — empty here, and empty means default deny. The test
+      // passed only when another file had left an allow rule loaded. Load
+      // one of our own, and put the file back afterwards.
+      const policyFile = join(POLICY_DIR, "policies.json");
+      const hadPolicyFile = existsSync(policyFile);
+      const previousPolicy = hadPolicyFile ? await readFile(policyFile, "utf8") : null;
+      await mkdir(POLICY_DIR, { recursive: true });
+      await writeFile(
+        policyFile,
+        JSON.stringify({
+          version: 1,
+          rules: [{ id: "test-allow-inbound", tool: "InboundMessage", action: "allow" }],
+          cache: { enabled: false, maxEntries: 1000, ttlMs: 60000 },
+          updatedAt: new Date().toISOString(),
+        }),
+        "utf8",
+      );
+      await loadRules();
+      try {
+        await acceptWhenNotPaused();
+      } finally {
+        clearCache();
+        if (previousPolicy !== null) await writeFile(policyFile, previousPolicy, "utf8");
+        else await rm(policyFile, { force: true });
+        await loadRules().catch(() => undefined);
+      }
+    });
 
+    async function acceptWhenNotPaused(): Promise<void> {
       const mockDeps: GatewayDependencies = {
         eventLog: {
           append: vi.fn().mockResolvedValue({
@@ -381,7 +413,7 @@ describe("Gateway Escalation Wiring", () => {
       const result = await gateway.processInboundEvent(event);
 
       expect(result.success).toBe(true);
-    });
+    }
 
     it("should check pause state in standalone processInboundEvent function", async () => {
       // Pause the system

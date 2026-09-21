@@ -1,0 +1,44 @@
+name: Integration (nightly)
+
+# #304: the tests that need a real `claude` and credentials. They are NOT in
+# the PR job — a test that skips when its infra is missing reports green and
+# proves nothing — so they run here, un-gated, every night and on demand, and
+# a failure is red and visible. A red nightly is information; a skipped PR
+# check is not.
+#
+# Needs the CLAUDE_CODE_OAUTH_TOKEN repository secret (a long-lived token from
+# `claude setup-token`). Without it the run fails at the auth check below,
+# which is the intended signal, not a skip.
+
+on:
+  schedule:
+    - cron: "17 6 * * *" # 06:17 UTC daily
+  workflow_dispatch:
+
+jobs:
+  integration:
+    name: Real-claude integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install Claude Code
+        run: bun install -g @anthropic-ai/claude-code
+
+      - name: Check claude is usable
+        run: |
+          test -n "$CLAUDE_CODE_OAUTH_TOKEN" || { echo "CLAUDE_CODE_OAUTH_TOKEN secret is not set — the integration tests cannot run"; exit 1; }
+          claude --version
+
+      - name: Run integration tests
+        run: bun test tests/integration

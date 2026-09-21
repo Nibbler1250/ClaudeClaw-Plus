@@ -11,8 +11,7 @@
  *     to a temp dir and passed as `claudeBin`.
  *   - `homeOverride` confines `~/.claude/projects/` writes to a temp dir
  *     so the suite leaves the host's claude state untouched.
- *   - One integration test is `skipIf(!process.env.SCHEMA_PROBE_INTEGRATION)`
- *     for the real-claude smoke run.
+ *   - The real-claude smoke run lives in tests/integration/ (nightly job, #304).
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
@@ -41,8 +40,6 @@ import {
 import { encodeCwdForProjectsDirPrefix } from "../jsonl-line-types";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
-
-const IS_UNIX = process.platform !== "win32";
 
 /* ───────────────────────────────────────────────────────────────────── */
 /* Test harness — temp home + version stub + canned JSONL writer         */
@@ -794,28 +791,6 @@ describe("captureClaudeVersion — win32 shell-true branch is platform-injectabl
 });
 
 /* ───────────────────────────────────────────────────────────────────── */
-/* Integration — opt-in via env. Spawns real `claude`.                   */
+/* Integration against the real `claude`: tests/integration/               */
+/* schema-probe-real-claude.test.ts (nightly job, #304) — no env gate here. */
 /* ───────────────────────────────────────────────────────────────────── */
-
-const skipIntegration = !process.env.SCHEMA_PROBE_INTEGRATION || !IS_UNIX;
-describe.skipIf(skipIntegration)("SchemaProbe integration (SCHEMA_PROBE_INTEGRATION=1)", () => {
-  it("passes against the installed claude binary", async () => {
-    const h = makeHarness();
-    try {
-      const probe = new SchemaProbe({
-        mode: "warn-only",
-        cacheFile: h.cacheFile,
-        homeOverride: h.homeDir,
-        timeoutMs: 30_000,
-      });
-      const res = await probe.run();
-      // Either passes outright, or surfaces specific assertions for triage.
-      if (res.status !== "passed") {
-        console.error("integration probe assertions:", res.failedAssertions);
-      }
-      expect(["passed", "failed"]).toContain(res.status);
-    } finally {
-      h.cleanup();
-    }
-  });
-});
