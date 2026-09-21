@@ -429,8 +429,13 @@ const ADAPTER_CAPABILITIES = [
    *
    * So a present id is ADVISORY, not authoritative: it is trustworthy only
    * where the client has out-of-band evidence that no turn ran on that agent
-   * other than the ones it submitted. Threading identity from the submitting
-   * side is the complete fix, tracked as #239.
+   * other than the ones it submitted.
+   *
+   * #239 narrowed the overlapping-submit case to one path: the bus admits one
+   * prompt per agent at a time, so a submit can only land on an occupied slot
+   * when the turn deadline freed it — and that admission is flagged. The
+   * ambient-turn case above is unchanged; session-per-conversation (#376) is
+   * where the remaining identity work goes.
    */
   "events.correlation_ambiguity",
   /** `/health` reports `instance_id` and `started_at`, which change on restart. */

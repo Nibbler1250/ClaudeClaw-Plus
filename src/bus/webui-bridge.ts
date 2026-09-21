@@ -249,31 +249,56 @@ function runPrompt(
       void receipt.close(finalState, notes);
       resolve(r);
     };
-    const sub = bus.subscribe({ agent_id: agentId, topics: ["response.text"] }, (event) => {
-      const payload = event.payload as { text?: string; intent?: string };
-      if (typeof payload.text === "string" && payload.text.length > 0) {
-        accumulated += payload.text;
-        if (opts.onChunk) {
-          try {
-            opts.onChunk(payload.text);
-          } catch {
-            /* chunk callback errors must not break the prompt flow */
+    // #239: the bus may queue this prompt behind another chat's running turn,
+    // so that turn's final reliably lands on this agent-wide subscription
+    // before our own turn has even started. Nothing before our own `prompt`
+    // event (published on admission, carrying our origin and text) is ours.
+    // Within our turn the first `final` resolves as before — including one
+    // the agent names for another chat (#224).
+    let promiseId: string | null = null;
+    let admitted = false;
+    const sub = bus.subscribe(
+      { agent_id: agentId, topics: ["prompt", "response.text"] },
+      (event) => {
+        if (event.topic === "prompt") {
+          const p = event.payload as { origin?: string; origin_id?: string; text?: string };
+          if (
+            (promiseId !== null && event.promise_id === promiseId) ||
+            (p.origin === origin && p.origin_id === originId && p.text === message)
+          ) {
+            admitted = true;
+          }
+          return;
+        }
+        if (!admitted) return;
+        const payload = event.payload as { text?: string; intent?: string };
+        if (typeof payload.text === "string" && payload.text.length > 0) {
+          accumulated += payload.text;
+          if (opts.onChunk) {
+            try {
+              opts.onChunk(payload.text);
+            } catch {
+              /* chunk callback errors must not break the prompt flow */
+            }
           }
         }
-      }
-      if (payload.intent === "final") {
-        finish(
-          {
-            ok: true,
-            output: accumulated || (payload.text ?? ""),
-            exitCode: 0,
-          },
-          "turn_observed",
-          { output_chars: accumulated.length },
-        );
-      }
-    });
+        if (payload.intent === "final") {
+          finish(
+            {
+              ok: true,
+              output: accumulated || (payload.text ?? ""),
+              exitCode: 0,
+            },
+            "turn_observed",
+            { output_chars: accumulated.length },
+          );
+        }
+      },
+    );
     const timer = setTimeout(() => {
+      // #239: a prompt still waiting in the bus queue when its caller gives up
+      // would run later with no listener — its reply lost, the turn wasted.
+      if (promiseId !== null && !admitted) bus.withdrawQueuedPrompt?.(agentId, promiseId);
       finish(
         {
           ok: false,
@@ -294,6 +319,8 @@ function runPrompt(
         text: message,
       })
       .then((ack) => {
+        promiseId = ack.promise_id;
+        if (!ack.queued) admitted = true; // admitted directly (its prompt event already passed)
         // A fast `final` or the timeout may already have settled the prompt.
         if (resolved) return;
         // The bus accepted the prompt — the route was resolvable. We

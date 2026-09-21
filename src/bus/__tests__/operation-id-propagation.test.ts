@@ -25,7 +25,7 @@ function makeBus(): { bus: BusCore; events: BusEvent[] } {
   const events: BusEvent[] = [];
   // Swallow the error the `error` IPC path reports by design — the test
   // asserts the slot is released, not that the bus stays quiet.
-  const bus = createBusCore({ eventLogAppend: mockAppend, onError: () => {} });
+  const bus = createBusCore({ eventLogAppend: mockAppend, onError: () => {}, turnEndSettleMs: 0 });
   bus.subscribe({}, (e) => events.push(e));
   return { bus, events };
 }
@@ -244,26 +244,22 @@ describe("operation id propagation", () => {
     });
   });
 
-  it("documents the limit: a second prompt takes the slot, so correlation is advisory", async () => {
-    // The boundary a control client must design against, asserted rather than
-    // left to be discovered: the slot is per AGENT, not per operation.
-    //
-    // Overlapping prompts are the OBVIOUS case, shown here. The non-obvious
-    // one is that sequential turns are not safe either — the tailer delivers
-    // `response.turn_end` asynchronously, so a lagged turn_end can land after
-    // the next prompt has taken the slot (#217 finding 3, deferred #239).
-    // That is why the guarantee is ADVISORY and not "exact for sequential
-    // turns": a client cannot detect the lag, so it cannot know which case
-    // it is in.
+  it("a second prompt waits for the slot, so the running turn's events keep its id (#239)", async () => {
+    // Before #239 the slot was per AGENT and last-write-wins: a second prompt
+    // took it mid-turn and the first turn's remaining events were stamped
+    // with the second's id — the reason the guarantee is documented as
+    // ADVISORY on `/health`. The second prompt now waits for the first's
+    // terminator; until then every event on the agent is the first's.
     const { bus, events } = makeBus();
     const first = await prompt(bus, "alpha", "one");
     const second = await prompt(bus, "alpha", "two");
+    expect(second.queued).toBe(true);
 
     bus.ingestSessionEvent(tailerEvent("alpha", "response.text", { text: "whose?" }));
 
     const text = events.filter((e) => e.topic === "response.text");
     expect(text).toHaveLength(1);
-    expect(text[0].promise_id).toBe(second.promise_id);
-    expect(text[0].promise_id).not.toBe(first.promise_id);
+    expect(text[0].promise_id).toBe(first.promise_id);
+    expect(text[0].promise_id).not.toBe(second.promise_id);
   });
 });

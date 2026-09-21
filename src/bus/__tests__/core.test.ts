@@ -194,7 +194,7 @@ describe("BusCore pub/sub", () => {
   });
 
   it("state() reports subscriber count and connected agents", () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     const s1 = bus.subscribe({}, () => {});
     const s2 = bus.subscribe({}, () => {});
     expect(bus.state().subscriberCount).toBe(2);
@@ -207,6 +207,7 @@ describe("BusCore pub/sub", () => {
     const calls: Array<[string, string]> = [];
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       slashCommandHandler: async (agent_id, cmd) => {
         calls.push([agent_id, cmd]);
       },
@@ -216,7 +217,7 @@ describe("BusCore pub/sub", () => {
   });
 
   it("invokeSlashCommand throws if no handler is wired", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     await expect(bus.invokeSlashCommand("alpha", "/compact")).rejects.toThrow(
       /slashCommandHandler/,
     );
@@ -225,7 +226,7 @@ describe("BusCore pub/sub", () => {
   /* ── origin propagation: see PR #133 + Codex P1 follow-up ──────────── */
 
   it("ingestReply stamps the originating origin/origin_id from the most recent prompt", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     const received: BusEvent[] = [];
     bus.subscribe({ agent_id: "alpha", topics: ["response.text"] }, (e) => received.push(e));
 
@@ -246,13 +247,14 @@ describe("BusCore pub/sub", () => {
   });
 
   it("a reply that names the chat it answers reaches that chat, not the one that wrote last (#224)", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     const received: BusEvent[] = [];
     bus.subscribe({ agent_id: "triage", topics: ["response.text"] }, (e) => received.push(e));
     const prompt = (origin_id: string, text: string) =>
       bus.sendPrompt({ agent_id: "triage", origin: "telegram", origin_id, user_id: "u", text });
     await prompt("100", "hello"); // chat A
-    await prompt("200", "hi"); // chat B — the last-write slot now points here
+    endTurn(bus, "triage"); // #239: A's turn ends before B's starts
+    await prompt("200", "hi"); // chat B — the slot now points here
     // the agent answers A first and says so
     bus.ingestReply({ agent_id: "triage", text: "hello A", intent: "final", in_reply_to: "100" });
     // then B — a second final in the same turn, to another chat
@@ -267,8 +269,8 @@ describe("BusCore pub/sub", () => {
     ]);
   });
 
-  it("without in_reply_to the last-write slot still routes (unchanged behaviour, #224)", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+  it("without in_reply_to the slot routes — and under #239 the slot is the chat whose turn is running, not the last to write", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     const received: BusEvent[] = [];
     bus.subscribe({ agent_id: "triage", topics: ["response.text"] }, (e) => received.push(e));
     await bus.sendPrompt({
@@ -278,19 +280,26 @@ describe("BusCore pub/sub", () => {
       user_id: "u",
       text: "a",
     });
-    await bus.sendPrompt({
+    const second = await bus.sendPrompt({
       agent_id: "triage",
       origin: "telegram",
       origin_id: "200",
       user_id: "u",
       text: "b",
     });
+    // Before #239 the second prompt overwrote the slot mid-turn and this
+    // unnamed final — the answer to "a" — landed in chat 200.
+    expect(second.queued).toBe(true);
     bus.ingestReply({ agent_id: "triage", text: "?", intent: "final" });
-    expect((received[0]?.payload as { origin_id?: string }).origin_id).toBe("200");
+    expect((received[0]?.payload as { origin_id?: string }).origin_id).toBe("100");
+    // Chat 200's turn starts once 100's ends; its unnamed final routes to 200.
+    endTurn(bus, "triage");
+    bus.ingestReply({ agent_id: "triage", text: "!", intent: "final" });
+    expect((received[1]?.payload as { origin_id?: string }).origin_id).toBe("200");
   });
 
   it("in_reply_to naming a chat that never prompted the agent is ignored, warned once, and the slot routes (#224)", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     const received: BusEvent[] = [];
     bus.subscribe({ agent_id: "triage", topics: ["response.text"] }, (e) => received.push(e));
     const warnings: string[] = [];
@@ -325,7 +334,7 @@ describe("BusCore pub/sub", () => {
   });
 
   it("a chat stays a valid reply target after the turn it prompted ended (bounded memory of 64 per agent, #224)", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     const received: BusEvent[] = [];
     bus.subscribe({ agent_id: "triage", topics: ["response.text"] }, (e) => received.push(e));
     await bus.sendPrompt({
@@ -336,6 +345,7 @@ describe("BusCore pub/sub", () => {
       text: "a",
     });
     bus.ingestReply({ agent_id: "triage", text: "done", intent: "final" }); // clears the slot
+    endTurn(bus, "triage");
     for (let i = 0; i < 70; i++) {
       await bus.sendPrompt({
         agent_id: "triage",
@@ -344,6 +354,9 @@ describe("BusCore pub/sub", () => {
         user_id: "u",
         text: "x",
       });
+      // #239: one turn at a time — end each so the next chat is admitted
+      // (and remembered). The last one's turn stays open: it holds the slot.
+      if (i < 69) endTurn(bus, "triage");
     }
     // dm-1 was evicted (oldest of 71); c6..c69 remain
     bus.ingestReply({ agent_id: "triage", text: "late", intent: "progress", in_reply_to: "c10" });
@@ -362,9 +375,11 @@ describe("BusCore pub/sub", () => {
   });
 
   it("two chats answered in ONE turn are two finals, not a duplicate; a repeat to the same chat is dropped (#224)", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     const received: BusEvent[] = [];
     bus.subscribe({ agent_id: "triage", topics: ["response.text"] }, (e) => received.push(e));
+    // #239: chat 100 spoke in an earlier turn (so it is a known reply target);
+    // the turn now running is chat 200's.
     await bus.sendPrompt({
       agent_id: "triage",
       origin: "telegram",
@@ -372,6 +387,7 @@ describe("BusCore pub/sub", () => {
       user_id: "u",
       text: "a",
     });
+    endTurn(bus, "triage");
     await bus.sendPrompt({
       agent_id: "triage",
       origin: "telegram",
@@ -399,7 +415,7 @@ describe("BusCore pub/sub", () => {
   });
 
   it("an unnamed final answers the slot's chat; a later final NAMING that chat is the duplicate, not a second answer (#224)", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     const received: BusEvent[] = [];
     bus.subscribe({ agent_id: "triage", topics: ["response.text"] }, (e) => received.push(e));
     await bus.sendPrompt({
@@ -409,6 +425,7 @@ describe("BusCore pub/sub", () => {
       user_id: "u",
       text: "a",
     });
+    endTurn(bus, "triage"); // #239: 100 spoke earlier; 200's turn is the one running
     await bus.sendPrompt({
       agent_id: "triage",
       origin: "telegram",
@@ -435,7 +452,7 @@ describe("BusCore pub/sub", () => {
   });
 
   it("a final that answered ANOTHER chat leaves the slot's chat as the default for the next unnamed reply (#224)", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     const received: BusEvent[] = [];
     bus.subscribe({ agent_id: "triage", topics: ["response.text"] }, (e) => received.push(e));
     await bus.sendPrompt({
@@ -445,6 +462,7 @@ describe("BusCore pub/sub", () => {
       user_id: "u",
       text: "a",
     });
+    endTurn(bus, "triage"); // #239: 100 spoke earlier; 200's turn is the one running
     await bus.sendPrompt({
       agent_id: "triage",
       origin: "telegram",
@@ -461,7 +479,7 @@ describe("BusCore pub/sub", () => {
   });
 
   it("an id two surfaces share is honoured only when the slot disambiguates it (#224)", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     const received: BusEvent[] = [];
     bus.subscribe({ agent_id: "triage", topics: ["response.text"] }, (e) => received.push(e));
     const warnings: string[] = [];
@@ -477,6 +495,7 @@ describe("BusCore pub/sub", () => {
         user_id: "u",
         text: "a",
       });
+      endTurn(bus, "triage"); // #239: one turn at a time
       await bus.sendPrompt({
         agent_id: "triage",
         origin: "telegram",
@@ -485,6 +504,7 @@ describe("BusCore pub/sub", () => {
         text: "b",
       }); // slot = telegram/100
       bus.ingestReply({ agent_id: "triage", text: "p", intent: "progress", in_reply_to: "100" }); // slot decides: telegram
+      endTurn(bus, "triage");
       await bus.sendPrompt({
         agent_id: "triage",
         origin: "telegram",
@@ -508,7 +528,7 @@ describe("BusCore pub/sub", () => {
   });
 
   it("XML-escapes the channel wrap so user text can't inject sibling markup (#140 review)", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     let wrapped = "";
     bus.setStreamPromptHandler(async (_agent, text) => {
       wrapped = text;
@@ -533,7 +553,7 @@ describe("BusCore pub/sub", () => {
   });
 
   it("clears the cached origin after a 'final' reply so scheduler/cron events don't inherit it (Codex P1 on #133)", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     const received: BusEvent[] = [];
     bus.subscribe({ agent_id: "alpha", topics: ["response.text"] }, (e) => received.push(e));
 
@@ -561,7 +581,7 @@ describe("BusCore pub/sub", () => {
   });
 
   it("keeps the origin across progress + tool_status events until the final reply", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     const received: BusEvent[] = [];
     bus.subscribe({ agent_id: "alpha", topics: ["response.text", "response.tool_use"] }, (e) =>
       received.push(e),
@@ -605,6 +625,7 @@ describe("UDS path validation", () => {
     const longPath = `${tempDir}/${"x".repeat(120)}.sock`;
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: longPath,
     });
     await expect(bus.start()).rejects.toThrow(/96-byte/);
@@ -684,6 +705,20 @@ describe("FrameDecoder", () => {
 /* ───────────────────────────────────────────────────────────────────── */
 
 /** Connect to a UDS as a Bun client and return helpers for the test. */
+/** #239: end the agent's current turn the way the JSONL tailer does. One
+ *  active turn per agent — a prompt sent while a turn is in flight waits for
+ *  this before it is delivered, so tests that stage several prompts on one
+ *  agent end each turn explicitly. */
+function endTurn(bus: BusCore, agent_id: string, text = ""): void {
+  bus.ingestSessionEvent({
+    ts: Date.now(),
+    agent_id,
+    session_id: "sess-1",
+    topic: "response.turn_end",
+    payload: { text, message_id: randomUUID() },
+  });
+}
+
 async function connectIpcClient(socketPath: string) {
   const inbound: IpcMessage[] = [];
   const errors: Error[] = [];
@@ -741,6 +776,7 @@ describe("BusCore IPC", () => {
     const sockPath = join(tempDir, "bus.sock");
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
       // Silence the expected "missing capability" log — this test is the
       // negative path and the error is the assertion target.
@@ -769,6 +805,7 @@ describe("BusCore IPC", () => {
     const sockPath = join(tempDir, "bus.sock");
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
     });
     await bus.start();
@@ -794,6 +831,7 @@ describe("BusCore IPC", () => {
     const sockPath = join(tempDir, "bus.sock");
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
       deliveryBackstopMs: 100,
       onError: () => {},
@@ -841,6 +879,7 @@ describe("BusCore IPC", () => {
     const sockPath = join(tempDir, "bus.sock");
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
     });
     await bus.start();
@@ -875,6 +914,7 @@ describe("BusCore IPC", () => {
     const sockPath = join(tempDir, "bus.sock");
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
     });
     await bus.start();
@@ -912,6 +952,7 @@ describe("BusCore IPC", () => {
     const sockPath = join(tempDir, "bus.sock");
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
     });
     await bus.start();
@@ -958,6 +999,7 @@ describe("BusCore IPC", () => {
     const sockPath = join(tempDir, "bus.sock");
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
     });
     await bus.start();
@@ -1020,6 +1062,7 @@ describe("BusCore IPC", () => {
     const sockPath = join(tempDir, "bus.sock");
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
     });
     await bus.start();
@@ -1058,6 +1101,7 @@ describe("BusCore IPC", () => {
     const sockPath = join(tempDir, "bus.sock");
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
       onError: () => undefined, // suppress test-noise — we expect one error
     });
@@ -1098,6 +1142,7 @@ describe("BusCore IPC", () => {
     const sockPath = join(tempDir, "bus.sock");
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
     });
     await bus.start();
@@ -1139,6 +1184,7 @@ describe("BusCore IPC", () => {
     const sockPath = join(tempDir, "bus.sock");
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
     });
     await bus.start();
@@ -1176,6 +1222,7 @@ describe("BusCore IPC", () => {
     const sockPath = join(tempDir, "bus.sock");
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
     });
     await bus.start();
@@ -1212,6 +1259,7 @@ describe("BusCore IPC", () => {
     const delivered: string[] = [];
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
       flushVerifyMs: 30,
       streamPromptHandler: async (_a, text) => {
@@ -1244,6 +1292,7 @@ describe("BusCore IPC", () => {
     const delivered: string[] = [];
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
       deliveryBackstopMs: 20,
       flushVerifyMs: 80,
@@ -1296,6 +1345,7 @@ describe("BusCore IPC", () => {
       let resolveVerdict: (v: "unconfirmed-idle" | "turn-started") => void = () => {};
       bus = createBusCore({
         eventLogAppend: createMockEventLog().append,
+        turnEndSettleMs: 0,
         socketPath: sockPath,
         flushVerifyMs: 30,
         onError: () => {},
@@ -1399,6 +1449,7 @@ describe("BusCore IPC", () => {
     const delivered: string[] = [];
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
       flushVerifyMs: 30,
       onError: () => {},
@@ -1444,15 +1495,18 @@ describe("BusCore IPC", () => {
     expect(delivered).toHaveLength(2);
   });
 
-  it("a verify pre-armed for a delivery still deciding is not carried over a socket close: the verdict decides (#402)", async () => {
-    // A neighbor turn active at submit pre-arms a verify (#250). If the socket
-    // closes while that delivery is still deciding and the verdict is a late
-    // turn-started, carrying the verify would submit the prompt twice.
+  it("a delivery still deciding is not carried over a socket close: the verdict decides (#402)", async () => {
+    // If the socket closes while a delivery is still deciding and the verdict
+    // is a late turn-started, carrying it would submit the prompt twice.
+    // (#239: this used to start from a verify pre-armed by a neighbor turn
+    // active at submit; a prompt now waits for the neighbor's turn to end
+    // before it is delivered, so the deciding delivery is the prompt's own.)
     const sockPath = join(tempDir, "bus.sock");
     const delivered: string[] = [];
     let resolveVerdict: (v: "turn-started") => void = () => {};
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
       flushVerifyMs: 30,
       onError: () => {},
@@ -1483,14 +1537,17 @@ describe("BusCore IPC", () => {
       session_id: "s",
       topic: "prompt",
       payload: { text: "<channel>neighbor</channel>" },
-    }); // neighbor turn active → pre-armed verify
-    await bus.sendPrompt({
+    }); // neighbor turn active → the prompt waits (#239)
+    const ack = await bus.sendPrompt({
       agent_id: "alpha",
       origin: "telegram",
       origin_id: "i",
       user_id: "u",
       text: "queued behind neighbor",
     });
+    expect(ack.queued).toBe(true);
+    expect(delivered).toHaveLength(0);
+    endTurn(bus, "alpha"); // neighbor ends → admitted → delivered, deciding
     await new Promise((r) => setTimeout(r, 20));
     expect(delivered).toHaveLength(1); // deciding
     client.close();
@@ -1514,6 +1571,7 @@ describe("BusCore IPC", () => {
     const delivered: string[] = [];
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
       deliveryBackstopMs: 5000,
       onError: () => {},
@@ -1570,6 +1628,7 @@ describe("BusCore IPC", () => {
     let resolveFirst: (v: "unconfirmed-idle") => void = () => {};
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
       flushVerifyMs: 30,
       deliveryBackstopMs: 5000,
@@ -1615,6 +1674,10 @@ describe("BusCore IPC", () => {
     await new Promise((r) => setTimeout(r, 40));
     expect(delivered).toHaveLength(2);
     expect(delivered[1]).toBe(delivered[0]);
+    // #239: the first close parked the gate on "first"'s live turn; the
+    // re-delivered "first" ran and ended — its turn_end un-parks it, so the
+    // next prompt is admitted (and held) rather than queued.
+    endTurn(bus, "alpha");
     // Now exercise the overwrite directly: queue a late give-up again, then a close with a held prompt.
     bus.ingestSessionEvent({
       ts: 1,
@@ -1652,6 +1715,7 @@ describe("BusCore IPC", () => {
       const delivered: string[] = [];
       bus = createBusCore({
         eventLogAppend: createMockEventLog().append,
+        turnEndSettleMs: 0,
         socketPath: sockPath,
         flushVerifyMs: 30,
         stuckCompactionResolveMs: 100_000,
@@ -1735,6 +1799,7 @@ describe("BusCore IPC", () => {
     const delivered: string[] = [];
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
       flushVerifyMs: 30,
       stuckCompactionResolveMs: 100_000,
@@ -1810,6 +1875,7 @@ describe("BusCore IPC", () => {
     const delivered: string[] = [];
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
       onError: () => {},
       streamPromptHandler: async (_a, text) => {
@@ -1879,7 +1945,7 @@ describe("BusCore IPC", () => {
   });
 
   it("an un-numbered marker next to numbered tailers is called out once per agent and keeps the pre-#402 semantics (#412 item 3)", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     const warnings: string[] = [];
     const origWarn = console.warn;
     console.warn = (...a: unknown[]) => {
@@ -1951,7 +2017,7 @@ describe("BusCore IPC", () => {
   });
 
   it("noteSpawnedGeneration never moves backwards, and a delivery with no spawned generation keeps the live one (#412)", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     const b = bus as unknown as {
       noteSpawnedGeneration: (a: string, g: number) => void;
       agentSpawnedGeneration: Map<string, number>;
@@ -1965,7 +2031,11 @@ describe("BusCore IPC", () => {
   });
   it("`reply` over IPC carries in_reply_to to the routed event (#224)", async () => {
     const sockPath = join(tempDir, "bus.sock");
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append, socketPath: sockPath });
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
+      socketPath: sockPath,
+    });
     await bus.start();
     const received: BusEvent[] = [];
     bus.subscribe({ agent_id: "triage", topics: ["response.text"] }, (e) => received.push(e));
@@ -2009,6 +2079,7 @@ describe("BusCore IPC", () => {
     let resolveOld: (v: "unconfirmed-idle") => void = () => {};
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
       flushVerifyMs: 30,
       stuckCompactionResolveMs: 40,
@@ -2067,6 +2138,7 @@ describe("BusCore IPC", () => {
     let resolveOld: (v: "stuck-compaction") => void = () => {};
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
       flushVerifyMs: 30,
       stuckCompactionResolveMs: 100_000,
@@ -2129,6 +2201,7 @@ describe("BusCore IPC", () => {
     let resolveOld: (v: "stuck-compaction") => void = () => {};
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
       flushVerifyMs: 30,
       stuckCompactionResolveMs: 100_000,
@@ -2185,6 +2258,7 @@ describe("BusCore IPC", () => {
     const delivered: string[] = [];
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
       flushVerifyMs: 30,
       onError: () => {},
@@ -2255,6 +2329,7 @@ describe("BusCore IPC", () => {
     // hold taken before it must wait for its boundary like any other.
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       flushVerifyMs: 30,
       stuckCompactionResolveMs: 100_000,
       onError: () => {},
@@ -2307,6 +2382,7 @@ describe("BusCore IPC", () => {
     const delivered: string[] = [];
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
       flushVerifyMs: 30,
       deliveryBackstopMs: 5000,
@@ -2377,6 +2453,7 @@ describe("BusCore IPC", () => {
     const delivered: string[] = [];
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
       flushVerifyMs: 30,
       stuckCompactionResolveMs: 100_000,
@@ -2440,6 +2517,7 @@ describe("BusCore IPC", () => {
     let resolveOld: (v: "unconfirmed-idle") => void = () => {};
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
       flushVerifyMs: 30,
       onError: () => {},
@@ -2508,6 +2586,7 @@ describe("BusCore IPC", () => {
     const delivered: string[] = [];
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       socketPath: sockPath,
       deliveryBackstopMs: 5000, // large: the prompt stays HELD (not backstop-flushed) until close
       onError: () => {},
@@ -2560,6 +2639,7 @@ describe("BusCore IPC", () => {
     function makeBus(opts?: { replyNudge?: boolean; nudges?: string[] }): BusCore {
       return createBusCore({
         eventLogAppend: createMockEventLog().append,
+        turnEndSettleMs: 0,
         replyNudge: opts?.replyNudge,
         // Capture PTY-stdin deliveries so nudge tests can assert the reminder
         // was injected (no real REPL in tests).
@@ -3048,6 +3128,7 @@ describe("BusCore IPC", () => {
     function makeBus(): BusCore {
       return createBusCore({
         eventLogAppend: createMockEventLog().append,
+        turnEndSettleMs: 0,
         replyNudge: false,
         streamPromptHandler: async () => {},
       });
@@ -3239,7 +3320,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     bus.sendPrompt({ agent_id: agent, origin: "webui", origin_id: "i", user_id: "u", text });
 
   it("holds a PTY prompt that arrives while the session is (re)initialising", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     const delivered: string[] = [];
     bus.setStreamPromptHandler(async (_a, text) => {
       delivered.push(text);
@@ -3249,30 +3330,34 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     expect(delivered).toHaveLength(0); // held, not swallowed by a not-yet-ready TUI
   });
 
-  it("flushes held prompts in FIFO order on replay_done", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+  it("flushes the held prompt on replay_done; a prompt behind it waits for its turn (#239)", async () => {
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     const delivered: string[] = [];
     bus.setStreamPromptHandler(async (_a, text) => {
       delivered.push(text);
     });
     bus.ingestSessionEvent(initEvt("alpha"));
-    await prompt("alpha", "one");
-    await prompt("alpha", "two");
+    await prompt("alpha", "one"); // admitted → held by the init gate
+    const two = await prompt("alpha", "two"); // #239: queued behind "one"
+    expect(two.queued).toBe(true);
     expect(delivered).toHaveLength(0);
     bus.ingestSessionEvent(replayEvt("alpha"));
-    expect(delivered).toHaveLength(2);
+    expect(delivered).toHaveLength(1);
     expect(delivered[0]).toContain("one");
+    endTurn(bus, "alpha"); // "one" ends → "two" is admitted and, the session live, delivered
+    expect(delivered).toHaveLength(2);
     expect(delivered[1]).toContain("two");
   });
 
   it("delivers immediately when the session is not initialising", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     const delivered: string[] = [];
     bus.setStreamPromptHandler(async (_a, text) => {
       delivered.push(text);
     });
     await prompt("alpha", "now");
     expect(delivered).toHaveLength(1);
+    endTurn(bus, "alpha"); // #239: one turn at a time
     // after a full init->replay cycle, back to immediate delivery
     bus.ingestSessionEvent(initEvt("alpha"));
     bus.ingestSessionEvent(replayEvt("alpha"));
@@ -3283,6 +3368,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
   it("backstop flushes held prompts if replay_done never arrives (never strands)", async () => {
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       deliveryBackstopMs: 20,
       onError: () => {},
     });
@@ -3298,7 +3384,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
   });
 
   it("gates per-agent: one agent initialising doesn't hold another", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     const delivered: Array<[string, string]> = [];
     bus.setStreamPromptHandler(async (a, text) => {
       delivered.push([a, text]);
@@ -3317,6 +3403,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
   it("delivers immediately on the real producer order (replay_done then session.init)", async () => {
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       deliveryBackstopMs: 1000, // long: a backstop-driven flush would be a bug here
     });
     const delivered: string[] = [];
@@ -3336,6 +3423,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
   it("a late session.init for the live generation does not re-arm the hold", async () => {
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       deliveryBackstopMs: 1000,
     });
     const delivered: string[] = [];
@@ -3345,6 +3433,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     bus.ingestSessionEvent(replayEvt("alpha")); // session live (generation "s")
     await prompt("alpha", "p1");
     expect(delivered).toHaveLength(1);
+    endTurn(bus, "alpha"); // #239: one turn at a time
     bus.ingestSessionEvent(initEvt("alpha")); // late init for SAME generation "s"
     await prompt("alpha", "p2");
     expect(delivered).toHaveLength(2); // p2 not held
@@ -3354,7 +3443,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
   // start of the new tailer) must still arm the hold even though a PRIOR
   // generation was already live.
   it("a new generation's session.init (init before replay) still arms the hold", async () => {
-    bus = createBusCore({ eventLogAppend: createMockEventLog().append });
+    bus = createBusCore({ eventLogAppend: createMockEventLog().append, turnEndSettleMs: 0 });
     const delivered: string[] = [];
     bus.setStreamPromptHandler(async (_a, text) => {
       delivered.push(text);
@@ -3402,6 +3491,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
   it("re-delivers ONCE when a backstop-flushed prompt never starts a turn (idle-REPL wedge)", async () => {
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       deliveryBackstopMs: 20,
       flushVerifyMs: 30,
       onError: () => {},
@@ -3425,6 +3515,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
   it("does NOT re-deliver a backstop-flushed prompt that starts a turn", async () => {
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       deliveryBackstopMs: 20,
       flushVerifyMs: 30,
       onError: () => {},
@@ -3450,6 +3541,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     // text fixes it — a non-matching `prompt` event must NOT cancel.
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       deliveryBackstopMs: 20,
       flushVerifyMs: 30,
       onError: () => {},
@@ -3486,6 +3578,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     // (double-submit). This test fails on the raw-key implementation.
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       deliveryBackstopMs: 20,
       flushVerifyMs: 30,
       onError: () => {},
@@ -3514,6 +3607,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     // defers re-delivery until the handler settles.
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       deliveryBackstopMs: 20,
       flushVerifyMs: 30,
       onError: () => {},
@@ -3547,6 +3641,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     // a later armFlushVerify for the same key is a no-op.
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       deliveryBackstopMs: 50,
       flushVerifyMs: 60,
       onError: () => {},
@@ -3575,15 +3670,15 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     payload: { text: "" }, // empty → the #215 synthesizer is a no-op
   });
 
-  it("re-delivers a prompt queued behind a neighbor turn if it never starts its own (bus-level #250 HIGH)", async () => {
-    // A prompt delivered while a neighbor turn is STREAMING is only a queued
-    // keystroke in the REPL box; the PTY confirm-loop can misread the neighbor's
-    // stream as this prompt's turn-start. The bus arms a verify (reliable
-    // tailer attribution), DEFERS it while the neighbor turn is active (the
-    // prompt legitimately waits behind it — re-delivering sooner double-submits),
-    // and re-delivers only if no turn ever starts for it.
+  it("a prompt arriving during a neighbor turn waits in the bus, not in the REPL box (#239, was bus-level #250 HIGH)", async () => {
+    // Before #239 the prompt was typed into the box while the neighbor turn
+    // streamed, and a verify (deferred behind the live turn) re-delivered it
+    // if no turn ever started for it. Now the bus does not deliver at all
+    // while the REPL is busy: the prompt is queued and delivered ONCE when the
+    // neighbor's turn ends — nothing to verify, nothing to re-deliver.
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       flushVerifyMs: 40,
       onError: () => {},
     });
@@ -3592,19 +3687,24 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
       delivered.push(text);
     });
     bus.ingestSessionEvent(turnEvt("alpha", "<channel>neighbor</channel>")); // neighbor turn active
-    await prompt("alpha", "queued");
-    expect(delivered).toHaveLength(1); // delivered immediately (queued in the box)
-    await new Promise((r) => setTimeout(r, 100)); // > flushVerify, but neighbor still active
-    expect(delivered).toHaveLength(1); // DEFERRED — not re-delivered behind the live turn
-    bus.ingestSessionEvent(turnEndEvt("alpha")); // neighbor turn ends → REPL free
-    await new Promise((r) => setTimeout(r, 100)); // > flushVerify + grace, no turn for "queued"
-    expect(delivered).toHaveLength(2); // now re-delivered exactly once
-    expect(delivered[1]).toContain("queued");
+    const ack = await prompt("alpha", "queued");
+    expect(ack.queued).toBe(true);
+    expect(bus.queuedPrompts("alpha").map((q) => q.promise_id)).toEqual([ack.promise_id]);
+    expect(delivered).toHaveLength(0); // not typed into a busy REPL
+    await new Promise((r) => setTimeout(r, 100)); // > flushVerify: still nothing, neighbor still active
+    expect(delivered).toHaveLength(0);
+    bus.ingestSessionEvent(turnEndEvt("alpha")); // neighbor turn ends → REPL free → admitted
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toContain("queued");
+    expect(bus.queuedPrompts("alpha")).toEqual([]);
+    await new Promise((r) => setTimeout(r, 100)); // > flushVerify + grace: no verify was armed
+    expect(delivered).toHaveLength(1); // delivered exactly once
   });
 
-  it("does NOT re-deliver a queued prompt that starts its own turn after the neighbor ends (#252)", async () => {
+  it("a queued prompt admitted after the neighbor ends starts its own turn and is not re-delivered (#252, #239)", async () => {
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       flushVerifyMs: 40,
       onError: () => {},
     });
@@ -3614,11 +3714,13 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     });
     bus.ingestSessionEvent(turnEvt("alpha", "<channel>neighbor</channel>")); // neighbor turn active
     await prompt("alpha", "queued");
+    expect(delivered).toHaveLength(0); // #239: waits
+    bus.ingestSessionEvent(turnEndEvt("alpha")); // neighbor ends → admitted
     expect(delivered).toHaveLength(1);
-    bus.ingestSessionEvent(turnEndEvt("alpha")); // neighbor ends
-    bus.ingestSessionEvent(turnEvt("alpha", delivered[0])); // "queued" starts its OWN turn → cancel
+    bus.ingestSessionEvent(turnEvt("alpha", delivered[0])); // "queued" starts its OWN turn
+    expect(bus.isAgentTurnActive("alpha")).toBe(true);
     await new Promise((r) => setTimeout(r, 100)); // > flushVerify + grace
-    expect(delivered).toHaveLength(1); // attributed → not re-delivered
+    expect(delivered).toHaveLength(1); // not re-delivered
   });
 
   it("recovers a stuck neighbor-turn flag on replay_done so flush-verify is not disabled forever (#252 stack ultra HIGH)", async () => {
@@ -3628,6 +3730,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     // generation (replay_done) must clear it so the safety net comes back.
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       flushVerifyMs: 40,
       onError: () => {},
     });
@@ -3636,14 +3739,15 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
       delivered.push(text);
     });
     bus.ingestSessionEvent(turnEvt("alpha", "<channel>orphan</channel>")); // turn starts, NO turn_end ever
-    await prompt("alpha", "p1"); // immediate delivery during the (stuck) active turn → arms a verify
+    await prompt("alpha", "p1"); // #239: waits behind the (stuck) active turn
+    expect(delivered).toHaveLength(0);
+    await new Promise((r) => setTimeout(r, 70)); // > flushVerify: still waiting, the flag is stuck true
+    expect(delivered).toHaveLength(0);
+    bus.ingestSessionEvent(replayEvt("alpha")); // a new generation clears the stuck flag → admitted
     expect(delivered).toHaveLength(1);
-    await new Promise((r) => setTimeout(r, 70)); // > flushVerify: deferred while agentTurnActive stuck true
-    expect(delivered).toHaveLength(1); // not re-delivered — verify is (correctly) deferred...
-    bus.ingestSessionEvent(replayEvt("alpha")); // ...until a new generation clears the stuck flag
-    await new Promise((r) => setTimeout(r, 70)); // verify now fires → re-deliver "p1"
-    expect(delivered).toHaveLength(2);
-    expect(delivered[1]).toContain("p1");
+    expect(delivered[0]).toContain("p1");
+    await new Promise((r) => setTimeout(r, 70));
+    expect(delivered).toHaveLength(1); // delivered once, no verify to fire
   });
 
   it("clears the neighbor-turn flag on a turn_end whatever its stop_reason — contract pin for #401 (the tailer now emits max_tokens/stop_sequence)", async () => {
@@ -3655,6 +3759,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     // after the next clean one.
     bus = createBusCore({
       eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
       flushVerifyMs: 40,
       onError: () => {},
     });
@@ -3663,19 +3768,18 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
       delivered.push(text);
     });
     bus.ingestSessionEvent(turnEvt("alpha", "<channel>neighbor</channel>")); // neighbor turn active
-    await prompt("alpha", "p1"); // delivered during the active turn → arms a verify
-    expect(delivered).toHaveLength(1);
+    await prompt("alpha", "p1"); // #239: waits behind the active turn
+    expect(delivered).toHaveLength(0);
     expect(bus.isAgentTurnActive("alpha")).toBe(true);
-    await new Promise((r) => setTimeout(r, 70)); // > flushVerify: deferred while the turn is active
-    expect(delivered).toHaveLength(1);
+    await new Promise((r) => setTimeout(r, 70)); // > flushVerify: still waiting
+    expect(delivered).toHaveLength(0);
     bus.ingestSessionEvent({
       ...turnEndEvt("alpha"),
       payload: { stop_reason: "max_tokens", text: "" }, // empty → the #215 synthesizer is a no-op
     }); // the neighbor stops on max_tokens — the turn is over
     expect(bus.isAgentTurnActive("alpha")).toBe(false);
-    await new Promise((r) => setTimeout(r, 70)); // verify now fires → re-deliver "p1"
-    expect(delivered).toHaveLength(2);
-    expect(delivered[1]).toContain("p1");
+    expect(delivered).toHaveLength(1); // admitted on that terminator like on `end_turn`
+    expect(delivered[0]).toContain("p1");
   });
 
   describe("delivery verdict from the PTY layer (issue #361)", () => {
@@ -3708,6 +3812,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     ) => {
       bus = createBusCore({
         eventLogAppend: createMockEventLog().append,
+        turnEndSettleMs: 0,
         flushVerifyMs: 30,
         onError: () => {},
       });
@@ -3744,7 +3849,9 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
       // so nothing is re-delivered inside the ordinary verify window.
       const delivered = verdictBus(["turn-started", "stuck-compaction", undefined]);
       await prompt("alpha", "confirmed");
+      endTurn(bus, "alpha"); // #239: one turn at a time
       await prompt("alpha", "buffered by the compaction");
+      endTurn(bus, "alpha");
       await prompt("alpha", "legacy handler");
       expect(delivered).toHaveLength(3);
       await new Promise((r) => setTimeout(r, 90));
@@ -3765,6 +3872,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
       ) => {
         bus = createBusCore({
           eventLogAppend: createMockEventLog().append,
+          turnEndSettleMs: 0,
           flushVerifyMs: 30,
           stuckCompactionResolveMs: resolveMs,
           onError: () => {},
@@ -3856,6 +3964,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
       it("does NOT release the hold on the init backstop, which is a readiness fallback and not an end signal", async () => {
         bus = createBusCore({
           eventLogAppend: createMockEventLog().append,
+          turnEndSettleMs: 0,
           flushVerifyMs: 30,
           deliveryBackstopMs: 40,
           stuckCompactionResolveMs: 100_000,
@@ -3929,16 +4038,17 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
         await new Promise((r) => setTimeout(r, 90));
         expect(delivered).toHaveLength(2);
       });
-      it("absorbs a verify sendPrompt pre-armed for the same delivery, so it cannot fire during the compaction", async () => {
-        // A neighbor turn active at submit pre-arms a verify (#250). If that
-        // delivery then gives up on stuck-compaction, the pre-armed verify must
-        // not run on its own clock (it would retype into the compaction): the
-        // hold replaces it, and the prompt is still re-delivered at most once.
+      it("a prompt admitted after a neighbor turn, then lost in a compaction, is held and re-delivered at most once", async () => {
+        // Before #239 a neighbor turn active at submit pre-armed a verify
+        // (#250) that the hold had to absorb. The prompt now waits for the
+        // neighbor's turn to end before it is delivered at all; only the hold
+        // is armed, and the at-most-once rule is unchanged.
         const delivered = heldBus(["stuck-compaction", "turn-started"], 120);
         bus.ingestSessionEvent(turnEvt("alpha", "<channel>neighbor</channel>")); // neighbor turn streaming
         await prompt("alpha", "queued behind a neighbor, then compaction");
+        expect(delivered).toHaveLength(0); // #239: waits
+        bus.ingestSessionEvent(turnEndEvt("alpha")); // neighbor ends → delivered → gives up: held
         expect(delivered).toHaveLength(1);
-        bus.ingestSessionEvent(turnEndEvt("alpha")); // neighbor ends: the pre-armed verify would now fire
         await new Promise((r) => setTimeout(r, 90)); // > verify + grace: nothing, the hold owns it
         expect(delivered).toHaveLength(1);
         await new Promise((r) => setTimeout(r, 120)); // hold deadline (120) + verify → once
@@ -3960,20 +4070,25 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
         expect(delivered).toHaveLength(2);
       });
 
-      it("a hold's deadline releases that hold only, not a later prompt held behind a longer compaction", async () => {
-        const delivered = heldBus(
-          ["stuck-compaction", "stuck-compaction", "turn-started", "turn-started"],
-          60,
-        );
+      it("a hold's deadline re-delivers that prompt only; a prompt sent meanwhile waits in the bus for its turn (#239)", async () => {
+        // Before #239 two prompts could be held behind two compactions, each
+        // with its own deadline. Now the second is not delivered while the
+        // first still owes its turn: it waits in the admission queue, and the
+        // first's re-delivery does not touch it.
+        const delivered = heldBus(["stuck-compaction", "turn-started", "turn-started"], 60);
         await prompt("alpha", "first");
         await new Promise((r) => setTimeout(r, 35));
-        await prompt("alpha", "second"); // held 35 ms later → its own deadline is 35 ms later
+        const second = await prompt("alpha", "second");
+        expect(second.queued).toBe(true);
+        expect(delivered).toHaveLength(1);
         await new Promise((r) => setTimeout(r, 80)); // first deadline (60) + verify (30) + grace…
-        expect(delivered).toHaveLength(3); // …only "first" was re-delivered
-        expect(delivered[2]).toBe(delivered[0]);
-        await new Promise((r) => setTimeout(r, 100)); // second deadline (35+60) + verify + grace
-        expect(delivered).toHaveLength(4);
-        expect(delivered[3]).toBe(delivered[1]);
+        expect(delivered).toHaveLength(2); // …only "first" was re-delivered
+        expect(delivered[1]).toBe(delivered[0]);
+        await new Promise((r) => setTimeout(r, 100));
+        expect(delivered).toHaveLength(2); // "second" still waits: no turn_end yet
+        endTurn(bus, "alpha"); // first's turn ends → second admitted
+        expect(delivered).toHaveLength(3);
+        expect(delivered[2]).toContain("second");
       });
     });
 
@@ -4002,6 +4117,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
       let resolveHandler: (v: "unconfirmed-live") => void = () => {};
       bus = createBusCore({
         eventLogAppend: createMockEventLog().append,
+        turnEndSettleMs: 0,
         flushVerifyMs: 30,
         onError: () => {},
       });
@@ -4026,6 +4142,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
       let resolveHandler: (v: "unconfirmed-idle") => void = () => {};
       bus = createBusCore({
         eventLogAppend: createMockEventLog().append,
+        turnEndSettleMs: 0,
         flushVerifyMs: 30,
         onError: () => {},
       });
@@ -4096,22 +4213,31 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
       topic: "attachment.queued_command",
       payload: { type: "queued_command", prompt, commandMode: "prompt", origin: { kind: "human" } },
     });
-    // Neighbor turn active → deliver "queued" (arms a deferred verify) → the
-    // caller injects the absorption proof → neighbor ends → wait past verify +
-    // grace. Returns what the PTY handler received.
+    // #239: the bus no longer delivers while a turn streams, so the only way a
+    // delivered prompt meets a running turn is the race the tailer cannot
+    // close — the REPL looked idle at admission, the CLI had just started a
+    // turn the bus did not open (a task notification, the operator's own
+    // keyboard) and its `prompt` line is ingested after ours was typed. The
+    // PTY layer, seeing the neighbor's stream, cannot prove our turn and gives
+    // up `unconfirmed-live`, which arms the verify the absorption must cancel.
+    // Deliver "queued" → the neighbor's line lands → the caller injects the
+    // absorption proof → neighbor ends → wait past verify + grace. Returns
+    // what the PTY handler received.
     const absorbedScenario = async (proof: (delivered: string) => BusEvent[]) => {
       bus = createBusCore({
         eventLogAppend: createMockEventLog().append,
+        turnEndSettleMs: 0,
         flushVerifyMs: 40,
         onError: () => {},
       });
       const delivered: string[] = [];
       bus.setStreamPromptHandler(async (_a, text) => {
         delivered.push(text);
+        return delivered.length === 1 ? "unconfirmed-live" : "turn-started";
       });
-      bus.ingestSessionEvent(turnEvt("alpha", "<channel>neighbor</channel>"));
       await prompt("alpha", "queued");
       expect(delivered).toHaveLength(1);
+      bus.ingestSessionEvent(turnEvt("alpha", "<channel>neighbor</channel>")); // ingested late
       for (const e of proof(delivered[0])) bus.ingestSessionEvent(e);
       bus.ingestSessionEvent(turnEndEvt("alpha"));
       await new Promise((r) => setTimeout(r, 100)); // > flushVerify + grace
@@ -4151,51 +4277,65 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
       // and `correlation_ambiguous`, until some turn the bus did not open ends.
       bus = createBusCore({
         eventLogAppend: createMockEventLog().append,
+        turnEndSettleMs: 0,
         flushVerifyMs: 40,
         onError: () => {},
       });
       const delivered: string[] = [];
       bus.setStreamPromptHandler(async (_a, text) => {
         delivered.push(text);
+        return "unconfirmed-live";
       });
-      const a = await prompt("alpha", "A"); // counted
-      bus.ingestSessionEvent(turnEvt("alpha", delivered[0] as string)); // A's turn starts
-      const b = await prompt("alpha", "absorbed"); // counted, delivered behind A
-      bus.ingestSessionEvent(absorbedEvt("alpha", delivered[1] as string));
-      bus.ingestSessionEvent(turnEndEvt("alpha")); // A ends; nothing is in flight
-      await new Promise((r) => setTimeout(r, 100)); // > flushVerify + grace
-      expect(delivered).toHaveLength(2); // not re-delivered
+      // #239: the running turn is one the bus did not open (a bus prompt would
+      // have held the slot and kept B in the queue). B is admitted while the
+      // REPL looks idle; the foreign turn's line lands after B was typed.
+      const b = await prompt("alpha", "absorbed"); // counted
+      bus.ingestSessionEvent(turnEvt("alpha", "<channel>foreign</channel>")); // the absorbing turn
+      bus.ingestSessionEvent(absorbedEvt("alpha", delivered[0] as string));
+      // The absorption released B's count: the slot is free even before the
+      // foreign turn ends (its end frees nothing the bus counted).
       expect(stampOf(bus)).toEqual({ promise_id: undefined, ambiguous: undefined });
-      expect(a.promise_id).not.toBe(b.promise_id);
+      bus.ingestSessionEvent(turnEndEvt("alpha"));
+      await new Promise((r) => setTimeout(r, 100)); // > flushVerify + grace
+      expect(delivered).toHaveLength(1); // not re-delivered
+      expect(stampOf(bus)).toEqual({ promise_id: undefined, ambiguous: undefined });
+      expect(b.promise_id).toBeDefined();
     });
 
-    it("both records for the same prompt (the real file order) release it once, not twice", async () => {
-      // A running, B absorbed (both records), C delivered and waiting behind A.
-      // Counted turns: A, B, C. The absorption releases B only; A's end then
-      // leaves C's turn owning the slot. A second release on the second record
-      // would free the slot under C.
+    it("both records for the same prompt (the real file order) release it once; a prompt waiting in the bus takes the slot only when the turn ends", async () => {
+      // B absorbed into a foreign turn (both records), C sent meanwhile.
+      // #239: C waits in the admission queue — the absorption frees B's slot
+      // but the REPL is still streaming, so C is admitted on the turn's end
+      // and then owns the slot. A second release on the second record has
+      // nothing left to free and must not disturb that.
       bus = createBusCore({
         eventLogAppend: createMockEventLog().append,
+        turnEndSettleMs: 0,
         flushVerifyMs: 40,
         onError: () => {},
       });
       const delivered: string[] = [];
       bus.setStreamPromptHandler(async (_a, text) => {
         delivered.push(text);
+        return delivered.length === 1 ? "unconfirmed-live" : "turn-started";
       });
-      bus.ingestSessionEvent(turnEvt("alpha", "<channel>neighbor</channel>"));
-      await prompt("alpha", "A");
       await prompt("alpha", "absorbed");
+      bus.ingestSessionEvent(turnEvt("alpha", "<channel>foreign</channel>")); // ingested late
       const c = await prompt("alpha", "waiting");
-      const b = delivered[1] as string;
+      expect(c.queued).toBe(true);
+      const b = delivered[0] as string;
       for (const e of [
         queueEvt("alpha", { operation: "enqueue", content: b }),
         absorbedEvt("alpha", b),
         queuedCommandEvt("alpha", b),
       ])
         bus.ingestSessionEvent(e);
-      bus.ingestSessionEvent(turnEndEvt("alpha")); // A ends → C's turn owns the slot
+      expect(delivered).toHaveLength(1); // C not admitted into the streaming turn
+      bus.ingestSessionEvent(turnEndEvt("alpha")); // the foreign turn ends → C admitted, owns the slot
+      expect(delivered).toHaveLength(2);
       expect(stampOf(bus).promise_id).toBe(c.promise_id);
+      await new Promise((r) => setTimeout(r, 100)); // > flushVerify + grace
+      expect(delivered).toHaveLength(2); // B never re-delivered
     });
 
     it("an absorption record for ANOTHER prompt does not silence this one's verify (#252 attribution)", async () => {
@@ -4224,6 +4364,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
       // no `sendPrompt` (which opens a turn by design) is involved.
       bus = createBusCore({
         eventLogAppend: createMockEventLog().append,
+        turnEndSettleMs: 0,
         replyNudge: false,
         onError: () => {},
       });
@@ -4246,7 +4387,10 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
 
 describe("busyAgents (#315)", () => {
   it("is empty on a fresh bus and reports an agent whose turn is active", async () => {
-    const bus = createBusCore({ eventLogAppend: createMockEventLog().append }) as unknown as {
+    const bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
+    }) as unknown as {
       busyAgents: () => string[];
       activeTurnAgents: () => string[];
       ingestReply: (r: { agent_id: string; text: string; intent: string }) => void;
@@ -4255,7 +4399,10 @@ describe("busyAgents (#315)", () => {
   });
 
   it("covers the delivery states a turn-active flag does not: in-flight, queued, held, carried, verifying", () => {
-    const bus = createBusCore({ eventLogAppend: createMockEventLog().append }) as unknown as {
+    const bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      turnEndSettleMs: 0,
+    }) as unknown as {
       busyAgents: () => string[];
       activeTurnAgents: () => string[];
       inFlightDeliveries: Map<string, number>;
