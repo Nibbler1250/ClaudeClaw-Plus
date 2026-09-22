@@ -1,6 +1,7 @@
 /**
  * #376: `recordClaudeSessionId` runs on every successful turn — it must be
- * quiet when the id is unchanged and must follow a rotation.
+ * quiet when the id is unchanged and must follow the runner when it replaces
+ * the conversation's session (the map mirrors `sessions.ts`, it decides nothing).
  *
  * The session map has no path seam; like `session-map.test.ts` this uses the
  * cwd file, but puts back whatever was there before instead of deleting it.
@@ -42,7 +43,7 @@ afterEach(() => {
 });
 
 describe("recordClaudeSessionId (#376)", () => {
-  it("two turns recording at once cannot race: same id → one record, no chatter; different ids → first wins, one warning", async () => {
+  it("two turns recording at once cannot race: same id → one record, no chatter; different ids → one of them, one replacement line", async () => {
     await getOrCreateSessionMapping("telegram:2", "default");
     await Promise.all([
       recordClaudeSessionId("telegram:2", "default", "sess-x"),
@@ -51,6 +52,7 @@ describe("recordClaudeSessionId (#376)", () => {
     ]);
     expect((await get("telegram:2", "default"))?.claudeSessionId).toBe("sess-x");
     expect(warnings).toHaveLength(0);
+    expect(logs.filter((l) => l.includes("the map follows"))).toHaveLength(0);
     await getOrCreateSessionMapping("telegram:3", "default");
     await Promise.all([
       recordClaudeSessionId("telegram:3", "default", "sess-p"),
@@ -59,21 +61,23 @@ describe("recordClaudeSessionId (#376)", () => {
     const kept = (await get("telegram:3", "default"))?.claudeSessionId;
     expect(["sess-p", "sess-q"]).toContain(kept);
     expect(warnings.filter((w) => w.includes("Not overwriting"))).toHaveLength(0);
-    expect(warnings.filter((w) => w.includes("mapping keeps"))).toHaveLength(1);
+    // serialized: the second write is a replacement of the first, said once
+    expect(logs.filter((l) => l.includes("the map follows"))).toHaveLength(1);
   });
 
-  it("records once, stays quiet on the same id, keeps the first id on a rotation and says so once", async () => {
+  it("records once, stays quiet on the same id, follows a rotation and says so once per replacement", async () => {
     await getOrCreateSessionMapping("telegram:1", "default");
     await recordClaudeSessionId("telegram:1", "default", "sess-a");
     expect((await get("telegram:1", "default"))?.claudeSessionId).toBe("sess-a");
     await recordClaudeSessionId("telegram:1", "default", "sess-a");
     await recordClaudeSessionId("telegram:1", "default", "sess-a");
     expect(warnings).toHaveLength(0); // no "Not overwriting" chatter on the steady state
+    expect(logs.filter((l) => l.includes("the map follows"))).toHaveLength(0);
     await recordClaudeSessionId("telegram:1", "default", "sess-b"); // the runner rotated
     await recordClaudeSessionId("telegram:1", "default", "sess-b");
-    expect((await get("telegram:1", "default"))?.claudeSessionId).toBe("sess-a"); // documented contract: first id wins
-    const w = warnings.filter((x) => x.includes("mapping keeps sess-a"));
-    expect(w).toHaveLength(1);
-    expect(logs.filter((l) => l.includes("Not overwriting"))).toHaveLength(0);
+    expect((await get("telegram:1", "default"))?.claudeSessionId).toBe("sess-b"); // the map mirrors the runner
+    const l = logs.filter((x) => x.includes("sess-a → sess-b"));
+    expect(l).toHaveLength(1);
+    expect(warnings).toHaveLength(0);
   });
 });

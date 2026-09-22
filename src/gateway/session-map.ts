@@ -263,25 +263,33 @@ export async function incrementTurnCount(channelId: string, threadId: string): P
 /**
  * #376: record the id a turn reported, atomically with the lookup. Runs as one
  * queued write so two turns finishing together cannot both see an empty
- * mapping and race their attaches. Keeps the first id recorded (the documented
- * contract); reports what happened so the caller can log once.
+ * mapping and race their attaches. The map mirrors the runner: when the runner
+ * has replaced the conversation's session (auto-rotate, corruption reset,
+ * stale recovery) the new id overwrites the old one and the old one is
+ * returned so the caller can say so. (`attachClaudeSessionId` below keeps its
+ * first-wins contract for callers that want it.)
  */
 export async function recordClaudeSessionIdAtomic(
   channelId: string,
   threadId: string,
   claudeSessionId: string,
-): Promise<"recorded" | "unchanged" | "kept-first" | "no-mapping"> {
+): Promise<
+  | { outcome: "recorded" }
+  | { outcome: "unchanged" }
+  | { outcome: "replaced"; previous: string }
+  | { outcome: "no-mapping" }
+> {
   await initSessionMap();
   return enqueueWrite(async () => {
     const existing = sessionMap?.[channelId]?.[threadId] ?? null;
-    if (!existing) return "no-mapping";
-    if (existing.claudeSessionId === claudeSessionId) return "unchanged";
-    if (existing.claudeSessionId !== null) return "kept-first";
+    if (!existing) return { outcome: "no-mapping" };
+    if (existing.claudeSessionId === claudeSessionId) return { outcome: "unchanged" };
+    const previous = existing.claudeSessionId;
     existing.claudeSessionId = claudeSessionId;
     existing.status = "active";
     existing.updatedAt = new Date().toISOString();
     await saveMap(sessionMap!);
-    return "recorded";
+    return previous === null ? { outcome: "recorded" } : { outcome: "replaced", previous };
   });
 }
 

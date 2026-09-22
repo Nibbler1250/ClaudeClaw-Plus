@@ -20,10 +20,8 @@ import type { ProcessingResult } from "../event-processor";
 import type { NormalizedEvent } from "./normalizer";
 import {
   getOrCreateSessionMapping,
-  getResumeArgsForEvent,
   updateSessionAfterProcessing,
   recordClaudeSessionId,
-  type ResumeArgs,
 } from "./resume";
 import { shouldBlockAdmission, handlePolicyDenial } from "../escalation";
 import { evaluate, type ToolRequestContext, type PolicyDecision } from "../policy/engine";
@@ -53,7 +51,6 @@ export interface GatewayDependencies {
   /** Resume module functions */
   resume: {
     getOrCreateSessionMapping: typeof getOrCreateSessionMapping;
-    getResumeArgsForEvent: typeof getResumeArgsForEvent;
     updateSessionAfterProcessing: typeof updateSessionAfterProcessing;
     recordClaudeSessionId?: typeof recordClaudeSessionId;
   };
@@ -83,7 +80,6 @@ function createDefaultDependencies(): GatewayDependencies {
     },
     resume: {
       getOrCreateSessionMapping,
-      getResumeArgsForEvent,
       updateSessionAfterProcessing,
       recordClaudeSessionId,
     },
@@ -203,15 +199,14 @@ export class Gateway {
    * 3. Append event to event log (event log assigns sequence number)
    * 4. Trigger processor on persisted event record
    * 5. Update mapping metadata after success
-   * 6. Record real Claude session ID if available
+   * 6. Record the Claude session id the runner reported
    *
    * @param event - NormalizedEvent from adapter/normalizer
-   * @returns Processing result with event record and session info
+   * @returns Processing result with the event record
    */
   async processInboundEvent(event: NormalizedEvent): Promise<{
     success: boolean;
     eventRecord?: EventRecord;
-    resumeArgs?: ResumeArgs;
     error?: string;
   }> {
     if (!this.running) {
@@ -318,13 +313,12 @@ export class Gateway {
       // Step 6: Record the real Claude session id the processor surfaced
       // (#376: the runner reads it off the CLI's `system/init` / `result`
       // events and it travels `RunResult` → `ProcessingResult`). Before #376
-      // nothing populated it, so every mapping stayed `claudeSessionId: null`
-      // and `resumeArgs` was always empty. Note what this does NOT change: the
-      // runner resumes by its own session store (`sessions.ts`, keyed by the
-      // `threadId` the processor passes — none today, so the global session),
-      // and `resumeArgs` has no consumer yet; the mapping is now truthful, the
-      // spawn is unchanged. Say so, once per conversation, when a successful
-      // turn brings no id.
+      // nothing populated it, so every mapping stayed `claudeSessionId: null`.
+      // The map only records; which session a conversation resumes is the
+      // runner's own store (`sessions.ts`, keyed by the thread id the
+      // processor passes — per conversation under `session.gatewayScope:
+      // "conversation"`, the global session otherwise). Say so, once per
+      // conversation, when a successful turn brings no id.
       if (processorResult.success && processorResult.claudeSessionId) {
         if (this.deps.resume.recordClaudeSessionId) {
           await this.deps.resume.recordClaudeSessionId(
@@ -344,13 +338,9 @@ export class Gateway {
         }
       }
 
-      // Get resume args for response
-      const resumeArgs = await this.deps.resume.getResumeArgsForEvent(event);
-
       return {
         success: processorResult.success,
         eventRecord,
-        resumeArgs,
         error: processorResult.error,
       };
     } catch (err) {
@@ -406,7 +396,6 @@ export function setGateway(gateway: Gateway): void {
 export async function processInboundEvent(event: NormalizedEvent): Promise<{
   success: boolean;
   eventRecord?: EventRecord;
-  resumeArgs?: ResumeArgs;
   error?: string;
 }> {
   // Check if system is paused before creating gateway
@@ -512,7 +501,6 @@ export async function processEventWithFallback(
   success: boolean;
   source: "gateway" | "legacy";
   eventRecord?: EventRecord;
-  resumeArgs?: ResumeArgs;
   error?: string;
   legacyResult?: LegacyResult;
 }> {
@@ -541,7 +529,6 @@ export async function processEventWithFallback(
       success: result.success,
       source: "gateway",
       eventRecord: result.eventRecord,
-      resumeArgs: result.resumeArgs,
       error: result.error,
     };
   } else {

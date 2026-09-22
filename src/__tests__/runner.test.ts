@@ -26,7 +26,8 @@ import { join } from "node:path";
 import * as runnerMod from "../runner";
 import * as configMod from "../config";
 import { initConfig, loadSettings, getSettings } from "../config";
-import type { RunOptions } from "../runner";
+import type { PrimaryExecCall, RunOptions } from "../runner";
+import { createThreadSession, removeThreadSession } from "../sessionManager";
 
 const SENTINEL = "RUNNER_TEST_SENTINEL";
 
@@ -657,5 +658,68 @@ describe("killActive reaches a PTY session that is still booting (#394)", () => 
       snapshot.mockRestore();
       kill.mockRestore();
     }
+  });
+});
+
+// #376: `--resume` restores the conversation, not the flags — `--mcp-config`,
+// `--settings`, `--plugin-dir`, `--add-dir`, `--append-system-prompt`, the
+// permission flags and `--model` must be passed again on every resumed turn.
+// The `claude -p` runner path passes the security flags, the appended system
+// prompt and the model (it uses none of the other four; the job path adds
+// `--mcp-config` in `buildJobArgs`, pinned by its own test). This pins that a
+// resumed turn's argv is the fresh turn's argv plus `--resume <id>`, and that
+// the resolved model is the same — so a refactor that builds the resume argv
+// on a shorter path cannot drop a flag silently.
+describe("#376: a resumed turn re-passes what --resume does not restore", () => {
+  const calls: PrimaryExecCall[] = [];
+  const threads: string[] = [];
+
+  beforeEach(() => {
+    calls.length = 0;
+    runnerMod._setPrimaryExecForTests(async (call) => {
+      calls.push(call);
+      throw new Error(SENTINEL);
+    });
+  });
+
+  afterEach(async () => {
+    runnerMod._setPrimaryExecForTests(null);
+    for (const t of threads.splice(0)) await removeThreadSession(t);
+  });
+
+  async function runThread(threadId: string): Promise<PrimaryExecCall> {
+    threads.push(threadId);
+    const before = calls.length;
+    try {
+      await runnerMod.run("test-job", "hello world", threadId);
+    } catch (e) {
+      if (!(e as Error).message?.includes(SENTINEL)) throw e;
+    }
+    expect(calls.length).toBe(before + 1);
+    return calls[before];
+  }
+
+  it("resumed argv = fresh argv + `--resume <id>`; same model", async () => {
+    const stamp = `${Date.now()}-${process.pid}`;
+    const fresh = await runThread(`376-fresh-${stamp}`);
+    expect(fresh.args).not.toContain("--resume");
+
+    const resumedThread = `376-resumed-${stamp}`;
+    await createThreadSession(resumedThread, "sess-376-resume-me");
+    const resumed = await runThread(resumedThread);
+
+    const at = resumed.args.indexOf("--resume");
+    expect(at).toBeGreaterThan(-1);
+    expect(resumed.args[at + 1]).toBe("sess-376-resume-me");
+    const withoutResume = [...resumed.args.slice(0, at), ...resumed.args.slice(at + 2)];
+    expect(withoutResume).toEqual(fresh.args);
+    expect(resumed.model).toBe(fresh.model);
+
+    // The flags that do not survive `--resume` are present on the resumed turn.
+    expect(resumed.args).toContain("--append-system-prompt");
+    const permission = resumed.args.some(
+      (a) => a === "--dangerously-skip-permissions" || a === "--permission-mode",
+    );
+    expect(permission).toBe(true);
   });
 });

@@ -13,6 +13,9 @@ import {
   processNext,
   processPending,
   processPersistedEvent,
+  conversationSessionKey,
+  gatewaySessionThreadId,
+  type GatewayTurnContext,
   initGatewayProcessor,
   getPendingCount,
   getLastProcessedSeq,
@@ -203,6 +206,36 @@ describe("Event Processor", () => {
     const result = await processPersistedEvent(rec.id);
     expect(result.success).toBe(true);
     expect(result.claudeSessionId).toBe("sess-42");
+  });
+
+  it("initGatewayProcessor hands the process function the conversation the record came from (#376)", async () => {
+    const seen: GatewayTurnContext[] = [];
+    await initGatewayProcessor(async (_source, _prompt, ctx) => {
+      seen.push(ctx);
+      return { exitCode: 0, stdout: "ok", stderr: "" };
+    });
+    const topic = await append(
+      createTestEntry({
+        channelId: "telegram:-100777",
+        threadId: "42",
+        payload: { normalizedEvent: { channel: "telegram", text: "hi", metadata: {} } },
+        dedupeKey: "",
+      }),
+    );
+    await processPersistedEvent(topic.id);
+    const plain = await append(
+      createTestEntry({
+        channelId: "discord:123",
+        threadId: "default",
+        payload: { normalizedEvent: { channel: "discord", text: "hi", metadata: {} } },
+        dedupeKey: "",
+      }),
+    );
+    await processPersistedEvent(plain.id);
+    expect(seen).toEqual([
+      { channelId: "telegram:-100777", threadId: "42", conversationKey: "telegram:-100777:42" },
+      { channelId: "discord:123", threadId: "default", conversationKey: "discord:123:default" },
+    ]);
   });
 
   it("initGatewayProcessor leaves claudeSessionId absent when the runner surfaced none (#376)", async () => {
@@ -396,5 +429,24 @@ describe("Event Processor - Edge Cases", () => {
     await processPending();
 
     expect(types).toEqual(["type-a", "type-b", "type-c"]);
+  });
+});
+
+// #376: which runner session a gateway turn resumes.
+describe("gateway session scope (#376)", () => {
+  it("conversationSessionKey: channel:thread, the session map's own pair; an empty thread reads as default", () => {
+    expect(conversationSessionKey("telegram:-100777", "default")).toBe("telegram:-100777:default");
+    expect(conversationSessionKey("telegram:-100777", "")).toBe("telegram:-100777:default");
+    expect(conversationSessionKey("telegram:-100777", "42")).toBe("telegram:-100777:42");
+    // the Discord normalizer repeats the channel id as the thread id
+    expect(conversationSessionKey("discord:guild:1:2", "2")).toBe("discord:guild:1:2:2");
+  });
+
+  it('gatewaySessionThreadId: the global session unless session.gatewayScope is "conversation"', () => {
+    const ctx = { conversationKey: "telegram:-100777:42" };
+    expect(gatewaySessionThreadId(ctx, { gatewayScope: "global" })).toBeUndefined();
+    expect(gatewaySessionThreadId(ctx, { gatewayScope: "conversation" })).toBe(
+      "telegram:-100777:42",
+    );
   });
 });

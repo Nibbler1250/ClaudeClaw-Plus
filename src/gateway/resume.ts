@@ -27,14 +27,6 @@ import type { NormalizedEvent } from "./normalizer";
 
 // --- Core types ---
 
-export interface ResumeArgs {
-  mappingId: string;
-  claudeSessionId: string | null;
-  args: string[];
-  isNewMapping: boolean;
-  canResume: boolean;
-}
-
 export interface UpdateSessionOptions {
   turnCountIncrement?: number;
   status?: SessionStatus;
@@ -75,57 +67,12 @@ export async function getOrCreateSessionMapping(
   return sessionMapGetOrCreate(channelId, threadId);
 }
 
-/**
- * Get resume arguments for a channel+thread combination.
- *
- * @param channelId - The channel identifier
- * @param threadId - The thread/conversation identifier (defaults to "default")
- * @returns ResumeArgs object containing:
- *   - mappingId: The session mapping identifier
- *   - claudeSessionId: Real Claude session ID or null
- *   - args: CLI arguments (--resume with session ID if canResume)
- *   - isNewMapping: Whether this was a newly created mapping
- *   - canResume: Whether this session can be resumed (has real Claude session ID)
- */
-export async function getResumeArgs(
-  channelId: string,
-  threadId: string = "default",
-): Promise<ResumeArgs> {
-  const entry = await get(channelId, threadId);
-
-  if (!entry) {
-    // No mapping exists - create one
-    const newEntry = await getOrCreateSessionMapping(channelId, threadId);
-    return {
-      mappingId: newEntry.mappingId,
-      claudeSessionId: null,
-      args: [],
-      isNewMapping: true,
-      canResume: false,
-    };
-  }
-
-  const canResume = entry.claudeSessionId !== null;
-
-  return {
-    mappingId: entry.mappingId,
-    claudeSessionId: entry.claudeSessionId,
-    args: canResume ? ["--resume", entry.claudeSessionId] : [],
-    isNewMapping: false,
-    canResume,
-  };
-}
-
-/**
- * Get resume arguments from a normalized event.
- * Convenience wrapper around getResumeArgs using event's channelId and threadId.
- *
- * @param event - A NormalizedEvent
- * @returns ResumeArgs for the event's channel+thread
- */
-export async function getResumeArgsForEvent(event: NormalizedEvent): Promise<ResumeArgs> {
-  return getResumeArgs(event.channelId, event.threadId);
-}
+// #376: `getResumeArgs` / `getResumeArgsForEvent` (the `--resume` argv built
+// from this map) are gone. Nothing that spawned claude ever consumed them —
+// the runner resumes from its own store (`sessions.ts`, keyed by the thread id
+// the gateway passes) — and keeping two sources of truth for "which session
+// does this conversation resume" is how the map drifted to `null` everywhere.
+// The map still records the id the runner reports, for status and forensics.
 
 // --- Task 2: Post-processing metadata updates ---
 
@@ -151,29 +98,19 @@ export async function recordClaudeSessionId(
   }
 
   // #376: recorded on every successful turn, so an unchanged id is a no-op.
-  // The mapping keeps the FIRST id it recorded (the documented contract —
-  // `attachClaudeSessionId` refuses to overwrite without `force`); when the
-  // runner has since replaced the session (auto-rotate, corruption reset,
-  // stale recovery) that contract leaves a dead id here. Nothing consumes
-  // the mapping's id yet, so this only says so, once per conversation —
-  // whether the mapping should follow the rotation is an open question on
-  // the issue.
-  // One queued operation: lookup, duplicate check and attach together, so two
-  // turns finishing at once cannot both see an empty mapping (CodeRabbit).
-  const outcome = await sessionMapRecordAtomic(channelId, threadId, claudeSessionId);
-  if (outcome !== "kept-first") return;
-  const key = `${channelId}\u0000${threadId}`;
-  if (!warnedRotation.has(key)) {
-    warnedRotation.add(key);
-    const kept = (await get(channelId, threadId))?.claudeSessionId;
-    console.warn(
-      `[resume] channel=${channelId} thread=${threadId}: the runner now reports session ${claudeSessionId} but the mapping keeps ${kept} (first id recorded; see #376)`,
+  // The map mirrors the runner's store (`sessions.ts`), which is the only
+  // thing that decides what a conversation resumes: when the runner has
+  // replaced the session (auto-rotate, corruption reset, stale recovery) the
+  // map follows and says so once per replacement, instead of keeping a dead
+  // first id. One queued operation: lookup, duplicate check and write
+  // together, so two turns finishing at once cannot race (CodeRabbit).
+  const result = await sessionMapRecordAtomic(channelId, threadId, claudeSessionId);
+  if (result.outcome === "replaced") {
+    console.log(
+      `[resume] channel=${channelId} thread=${threadId}: session ${result.previous.slice(0, 8)} → ${claudeSessionId.slice(0, 8)} (the runner replaced the conversation's session; the map follows, #376)`,
     );
   }
 }
-
-/** #376: conversations already warned about a rotated session the mapping does not follow. */
-const warnedRotation = new Set<string>();
 
 /**
  * Update session metadata after successful processing.

@@ -497,6 +497,46 @@ export function hasDedupeKey(key: string): boolean {
 let gatewayProcessFn: ((eventId: string) => Promise<ProcessingResult>) | null = null;
 
 /**
+ * #376: where a gateway turn came from, handed to the process function next
+ * to the prompt so the runner can be told which session to resume.
+ */
+export interface GatewayTurnContext {
+  /** The adapter's channel id (`telegram:123`, a Discord channel or thread id). */
+  channelId: string;
+  /** The adapter's thread id — `"default"` when the channel has no threads/topics. */
+  threadId: string;
+  /** The conversation this turn belongs to; see `conversationSessionKey`. */
+  conversationKey: string;
+}
+
+/**
+ * The runner session key for one gateway conversation: `channelId:threadId`,
+ * the pair the gateway's own session map is keyed by (`telegram:123:default`,
+ * `telegram:123:42` for a topic, `discord:guild:G:C:C` — the Discord
+ * normalizer repeats the channel id as the thread id). Opaque to the runner;
+ * it only has to be stable and distinct per conversation. It is not the key
+ * the legacy Discord path uses for a guild channel (the bare channel id), so
+ * a deployment that turns the gateway on starts each conversation's session
+ * fresh — once.
+ */
+export function conversationSessionKey(channelId: string, threadId: string): string {
+  return `${channelId}:${threadId || "default"}`;
+}
+
+/**
+ * The `threadId` a gateway turn passes to the runner, or `undefined` for the
+ * global session. `session.gatewayScope: "conversation"` gives every
+ * conversation its own session; the default (`"global"`) keeps the one shared
+ * session every gateway turn resumed until #376.
+ */
+export function gatewaySessionThreadId(
+  ctx: Pick<GatewayTurnContext, "conversationKey">,
+  session: { gatewayScope: "global" | "conversation" },
+): string | undefined {
+  return session.gatewayScope === "conversation" ? ctx.conversationKey : undefined;
+}
+
+/**
  * Initialize the event processor for use with the gateway.
  * This must be called before processing Discord/Telegram events through the gateway.
  *
@@ -507,6 +547,7 @@ export async function initGatewayProcessor(
   processFn: (
     source: string,
     prompt: string,
+    ctx: GatewayTurnContext,
   ) => Promise<{ exitCode: number; stdout: string; stderr: string; sessionId?: string }>,
 ): Promise<void> {
   await initProcessor({
@@ -525,7 +566,15 @@ export async function initGatewayProcessor(
         }
 
         const source = event.source || normalizedEvent.channel;
-        const result = await processFn(source, prompt);
+        // #376: the persisted record carries the conversation; the caller
+        // decides (by `session.gatewayScope`) whether the runner sees it.
+        const channelId: string = event.channelId ?? normalizedEvent.channelId ?? "";
+        const threadId: string = event.threadId ?? normalizedEvent.threadId ?? "default";
+        const result = await processFn(source, prompt, {
+          channelId,
+          threadId,
+          conversationKey: conversationSessionKey(channelId, threadId),
+        });
 
         // Dispatch outbound delivery for this source. See the block comment above
         // gatewayDeliveryHooks for queue-ordering and no-retry rationale.

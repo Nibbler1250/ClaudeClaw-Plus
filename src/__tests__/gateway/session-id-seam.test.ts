@@ -51,13 +51,6 @@ function makeDeps(
         createdAt: now,
         updatedAt: now,
       }),
-      getResumeArgsForEvent: async () => ({
-        mappingId: "mapping-1",
-        claudeSessionId: null,
-        args: [],
-        isNewMapping: true,
-        canResume: false,
-      }),
       updateSessionAfterProcessing: async () => undefined,
       recordClaudeSessionId: async (channelId: string, threadId: string, id: string) => {
         recorded.push([channelId, threadId, id]);
