@@ -3934,6 +3934,56 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
         expect(delivered).toHaveLength(2);
       });
 
+      // #412: the deadline exit is the measurement that would reopen the issue,
+      // so it has to be visible on a live daemon and say what was measured.
+      it("says so loudly when it takes the deadline exit: stderr + onError, with the agent and how long it actually waited", async () => {
+        const errors: Array<{ message: string; ctx: Record<string, unknown> }> = [];
+        const lines: string[] = [];
+        const realError = console.error;
+        console.error = (...a: unknown[]) => {
+          lines.push(a.map(String).join(" "));
+        };
+        try {
+          bus = createBusCore({
+            eventLogAppend: createMockEventLog().append,
+            turnEndSettleMs: 0,
+            flushVerifyMs: 30,
+            stuckCompactionResolveMs: 50,
+            onError: (e, ctx) => {
+              errors.push({
+                message: e instanceof Error ? e.message : String(e),
+                ctx: (ctx ?? {}) as Record<string, unknown>,
+              });
+            },
+          });
+          const delivered: string[] = [];
+          bus.setStreamPromptHandler(async (_a, text) => {
+            delivered.push(text);
+            return delivered.length === 1 ? "stuck-compaction" : "turn-started";
+          });
+          bus.ingestSessionEvent(replayGen("alpha", 7));
+          await prompt("alpha", "a compaction that never ends");
+          await new Promise((r) => setTimeout(r, 140));
+          expect(delivered).toHaveLength(2); // it still recovers the prompt
+
+          const deadline = errors.filter((e) => e.ctx.ctx === "compactionHold");
+          expect(deadline).toHaveLength(1);
+          expect(deadline[0]!.ctx.agent_id).toBe("alpha");
+          expect(deadline[0]!.ctx.limit).toBe(50);
+          expect(deadline[0]!.ctx.generation).toBe(7);
+          // the wall clock, not the configured limit
+          expect(deadline[0]!.ctx.waited).toBeGreaterThanOrEqual(50);
+          const loud = lines.filter((l) => l.includes("compaction hold deadline"));
+          expect(loud).toHaveLength(1);
+          expect(loud[0]).toStartWith("[bus] ");
+          expect(loud[0]).toContain("agent=alpha");
+          expect(loud[0]).toContain("limit 50ms");
+          expect(loud[0]).toContain("#412");
+        } finally {
+          console.error = realError;
+        }
+      });
+
       it("re-delivers at most once even if the re-delivery hits a stuck compaction again", async () => {
         const delivered = heldBus(["stuck-compaction", "stuck-compaction", "stuck-compaction"], 40);
         await prompt("alpha", "twice unlucky");
