@@ -61,14 +61,16 @@ export function cronMatches(expr: string, date: Date, timezoneOffsetMinutes = 0)
 
 /**
  * Upper bound on the forward scan, in days. A valid expression can
- * legitimately have a multi-year gap between matches (`0 0 29 2 *` fires
- * every four years; Feb 29 on a given weekday recurs every 28 years — 40
- * across a century boundary that is not a leap year, 2072→2112, which this
- * bound does not reach), so the bound has to cover that; beyond it the
- * expression is treated as never matching and `null` is returned. Only date fields are checked
- * on skipped days, so a full scan is ~10k cheap comparisons.
+ * legitimately have a multi-year gap between matches: `0 0 29 2 *` fires
+ * every four years, and Feb 29 on a given weekday recurs every 28 years —
+ * 40 across a century year that is not leap (2072 → 2112, the longest gap
+ * the Gregorian calendar produces). The bound covers that gap from any
+ * start; beyond it the expression is treated as never matching and `null`
+ * is returned. Only date fields are checked on skipped days, and a time
+ * field that can never match is refused before the scan, so a full scan is
+ * ~15k cheap comparisons.
  */
-const MAX_SCAN_DAYS = 366 * 29;
+const MAX_SCAN_DAYS = 366 * 41;
 
 /**
  * Next instant strictly after `after` that matches `expr`, or `null` when

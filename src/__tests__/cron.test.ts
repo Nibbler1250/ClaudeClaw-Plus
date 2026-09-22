@@ -100,6 +100,11 @@ describe("nextCronMatch — adversarial follow-ups on #437", () => {
     }
   });
 
+  it("covers the 40-year Feb-29 weekday gap across 2100 (2072 → 2112)", () => {
+    const r = nextCronMatch("0 0 29 2 1", new Date("2072-03-01T00:00:00Z"), 0);
+    expect(r?.toISOString()).toBe("2112-02-29T00:00:00.000Z");
+  });
+
   it("day-of-week 7 is Sunday, like 0", () => {
     const seven = nextCronMatch("0 9 * * 7", after, -240);
     const zero = nextCronMatch("0 9 * * 0", after, -240);

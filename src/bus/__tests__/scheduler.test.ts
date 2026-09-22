@@ -795,3 +795,15 @@ describe("createBusScheduler factory", () => {
     expect(scheduler).toBeDefined();
   });
 });
+
+describe("BusScheduler — one-shot with an invalid date (CodeRabbit on #438)", () => {
+  it("rejects a NaN fire time instead of hopping forever", () => {
+    const { bus } = createFakeBus();
+    const clock = makeFakeClock();
+    scheduler = createBusScheduler({ bus, clock, onError: () => {} });
+    expect(() =>
+      scheduler?.scheduleCron({ agent_id: "a", at: new Date("invalid"), prompt: "p" }),
+    ).toThrow(/invalid one-shot time/);
+    expect(clock.pending().length).toBe(0);
+  });
+});

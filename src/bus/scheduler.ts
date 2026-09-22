@@ -294,6 +294,11 @@ class BusSchedulerImpl implements BusScheduler {
 
   private scheduleCronOneShot(id: string, at: Date, req: ScheduleCronRequest): ScheduledTrigger {
     const fireAt = at.getTime();
+    // An invalid date gives NaN: `remaining` would never fit a timer and
+    // `armAt` would re-hop at maximum length forever (CodeRabbit on the PR).
+    if (!Number.isFinite(fireAt)) {
+      throw new Error(`scheduleCron: invalid one-shot time for trigger ${id}: ${String(at)}`);
+    }
 
     const fire = () => {
       this.timers.delete(id);
