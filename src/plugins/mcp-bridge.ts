@@ -47,9 +47,15 @@ export class PluginMcpBridge {
   private auditPath: string;
 
   constructor(auditPath?: string) {
+    // #304: `PLUS_PLUGIN_AUDIT_PATH` overrides the default journal location
+    // — an operator who keeps state elsewhere, and the test preload, which
+    // points every default bridge of a `bun test` run at a temp file so the
+    // suites stop appending to the operator's live journal.
     this.auditPath = auditPath
       ? resolve(auditPath)
-      : resolve(homedir(), ".config", "plus", "plugin-audit.jsonl");
+      : process.env.PLUS_PLUGIN_AUDIT_PATH
+        ? resolve(process.env.PLUS_PLUGIN_AUDIT_PATH)
+        : resolve(homedir(), ".config", "plus", "plugin-audit.jsonl");
 
     // Ensure audit directory exists
     const auditDir = this.auditPath.substring(0, this.auditPath.lastIndexOf("/"));

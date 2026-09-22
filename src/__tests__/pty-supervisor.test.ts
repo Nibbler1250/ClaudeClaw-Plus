@@ -36,7 +36,11 @@ import {
   __isSupervisorInitialisedForTests,
 } from "../runner/pty-supervisor";
 import { getSession, resetSession } from "../sessions";
-import { getThreadSession } from "../sessionManager";
+import {
+  getThreadSession,
+  _resetThreadSessionsForTests,
+  removeThreadSession,
+} from "../sessionManager";
 import {
   PtyClosedError,
   PtyTurnTimeoutError,
@@ -1378,6 +1382,10 @@ describe("pty-supervisor fresh-session persistence (Codex Phase D #2)", () => {
   });
 
   it("thread: with no stored session, spawn pre-allocates --session-id and persists to disk", async () => {
+    // #304: a true cold start — neither the module's in-memory cache (never
+    // reset by the disk cleanup other tests do) nor a stale `t-fresh` entry.
+    _resetThreadSessionsForTests();
+    await removeThreadSession("t-fresh").catch(() => undefined);
     let captured: PtyProcessOptions | null = null;
     const { spawn } = makeSpawnTracker((opts) => {
       captured = opts;
