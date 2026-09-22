@@ -11,8 +11,23 @@
  * - Concurrent inbound events behave consistently
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import { randomUUID } from "crypto";
+
+// #304: `vi.mock` is bun's `mock.module` — process-global, and it outlives
+// this file. Every test file bun loads after this one would see the fakes
+// below in place of `src/escalation`, `src/policy/engine` and
+// `src/governance/client` (the escalation suites failed 38 tests in the
+// pack and 0 alone). Keep the real exports so `afterAll` can put them back.
+const realEscalation = { ...(await import("../../escalation")) };
+const realPolicyEngine = { ...(await import("../../policy/engine")) };
+const realGovernanceClient = { ...(await import("../../governance/client")) };
+
+afterAll(() => {
+  vi.mock("../../escalation", () => realEscalation);
+  vi.mock("../../policy/engine", () => realPolicyEngine);
+  vi.mock("../../governance/client", () => realGovernanceClient);
+});
 
 // Mock modules before importing gateway
 vi.mock("../event-log", () => {

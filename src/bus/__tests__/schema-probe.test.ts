@@ -11,8 +11,7 @@
  *     to a temp dir and passed as `claudeBin`.
  *   - `homeOverride` confines `~/.claude/projects/` writes to a temp dir
  *     so the suite leaves the host's claude state untouched.
- *   - One integration test is `skipIf(!process.env.SCHEMA_PROBE_INTEGRATION)`
- *     for the real-claude smoke run.
+ *   - The real-claude smoke run was removed in #304 (see the note at the end).
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
@@ -41,8 +40,6 @@ import {
 import { encodeCwdForProjectsDirPrefix } from "../jsonl-line-types";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
-
-const IS_UNIX = process.platform !== "win32";
 
 /* ───────────────────────────────────────────────────────────────────── */
 /* Test harness — temp home + version stub + canned JSONL writer         */
@@ -794,28 +791,16 @@ describe("captureClaudeVersion — win32 shell-true branch is platform-injectabl
 });
 
 /* ───────────────────────────────────────────────────────────────────── */
-/* Integration — opt-in via env. Spawns real `claude`.                   */
+/* The env-gated smoke run against the real `claude` that used to sit here */
+/* was removed in #304. Un-gated it cannot pass on a current CLI, and the   */
+/* fault is the probe's own runner (schema-probe-runner.ts), not the CLI:   */
+/* it spawns an interactive REPL in a fresh temp cwd without pre-accepting  */
+/* the trust dialog (its "\r" answers "No, exit" → exit 1), a second       */
+/* dialog (`--dangerously-load-development-channels` confirmation) eats the */
+/* first prompt when trust IS seeded, and it paces on fixed timeout/20 steps */
+/* rather than on JSONL events. The old test also passed `homeOverride` to  */
+/* a temp dir the child never used (`HOME` is inherited), so it looked for  */
+/* the JSONL where claude never writes it — it only reported green by       */
+/* accepting "failed". Tracked as a follow-up issue; a real-claude run       */
+/* belongs in tests/integration/ once the runner holds against the CLI.     */
 /* ───────────────────────────────────────────────────────────────────── */
-
-const skipIntegration = !process.env.SCHEMA_PROBE_INTEGRATION || !IS_UNIX;
-describe.skipIf(skipIntegration)("SchemaProbe integration (SCHEMA_PROBE_INTEGRATION=1)", () => {
-  it("passes against the installed claude binary", async () => {
-    const h = makeHarness();
-    try {
-      const probe = new SchemaProbe({
-        mode: "warn-only",
-        cacheFile: h.cacheFile,
-        homeOverride: h.homeDir,
-        timeoutMs: 30_000,
-      });
-      const res = await probe.run();
-      // Either passes outright, or surfaces specific assertions for triage.
-      if (res.status !== "passed") {
-        console.error("integration probe assertions:", res.failedAssertions);
-      }
-      expect(["passed", "failed"]).toContain(res.status);
-    } finally {
-      h.cleanup();
-    }
-  });
-});

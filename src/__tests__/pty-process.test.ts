@@ -459,7 +459,16 @@ describe("PtyProcess — runTurn sentinel max-wait fallback", () => {
     const proc = await spawnPty(
       baseOpts({
         _commandOverride: "/bin/sh",
-        _argsOverride: ["-c", "stty -echo; printf '\\xe2\\x9c\\xbb shift+tab to cycle'; sleep 5"],
+        // #304: two reasons this used to time out. The output must arrive
+        // DURING the turn — the parser's quiet gate ignores bytes seen before
+        // `runTurn` (#87) — so the shell waits for our prompt line (`read`)
+        // before painting. And `/bin/sh` is dash on Debian/Ubuntu (CI too),
+        // whose `printf` has no `\xHH` escapes — the spinner glyph the
+        // activity gate looks for never appeared; octal is portable.
+        _argsOverride: [
+          "-c",
+          "stty -echo; read _; printf '\\342\\234\\273 shift+tab to cycle'; sleep 5",
+        ],
         quietWindowMs: 50,
         sentinelMaxWaitMs: 250,
       }),
@@ -492,7 +501,7 @@ describe("PtyProcess — runTurn sentinel max-wait fallback", () => {
         _commandOverride: "/bin/sh",
         _argsOverride: [
           "-c",
-          "echo BANNER_BANNER_BANNER_PRETURN; stty -echo; printf '\\xe2\\x9c\\xbb response-bytes-during-turn shift+tab to cycle'; sleep 5",
+          "echo BANNER_BANNER_BANNER_PRETURN; stty -echo; read _; printf '\\342\\234\\273 response-bytes-during-turn shift+tab to cycle'; sleep 5",
         ],
         quietWindowMs: 100,
         sentinelMaxWaitMs: 400,
