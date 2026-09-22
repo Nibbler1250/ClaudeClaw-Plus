@@ -88,3 +88,24 @@ describe("nextCronMatch", () => {
     expect(after.getTime()).toBe(copy);
   });
 });
+
+describe("nextCronMatch — adversarial follow-ups on #437", () => {
+  const after = new Date("2026-09-22T03:10:00Z");
+
+  it("a time field that can never match returns null at once, not after a full-window minute walk", () => {
+    for (const expr of ["0 24 * * *", "60 * * * *", "30-20 * * * *", "61 5 * * *"]) {
+      const t0 = performance.now();
+      expect(nextCronMatch(expr, after, -240)).toBeNull();
+      expect(performance.now() - t0).toBeLessThan(50);
+    }
+  });
+
+  it("day-of-week 7 is Sunday, like 0", () => {
+    const seven = nextCronMatch("0 9 * * 7", after, -240);
+    const zero = nextCronMatch("0 9 * * 0", after, -240);
+    expect(seven).not.toBeNull();
+    expect(seven?.getTime()).toBe(zero?.getTime());
+    expect(cronMatches("0 9 * * 7", new Date("2026-09-27T13:00:00Z"), -240)).toBe(true); // a Sunday
+    expect(cronMatches("0 9 * * 7", new Date("2026-09-28T13:00:00Z"), -240)).toBe(false); // Monday
+  });
+});
