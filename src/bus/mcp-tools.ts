@@ -36,9 +36,13 @@ export const BUS_MCP_TOOLS = [
         in_reply_to: {
           type: ["string", "number", "null"],
           minLength: 1,
+          // A number must be a safe integer (a snowflake as a JSON number has
+          // already lost precision) — pass ids as strings.
+          minimum: -9007199254740991,
+          maximum: 9007199254740991,
           description:
-            "The chat_id (or origin_id) attribute of the <channel …> block this reply answers. " +
-            "Only chats that actually prompted you are honoured.",
+            "The chat_id (or origin_id) attribute of the <channel …> block this reply answers, " +
+            "as a string. Only chats that actually prompted you are honoured.",
         },
         metadata: {
           type: ["object", "null"],
@@ -50,7 +54,12 @@ export const BUS_MCP_TOOLS = [
                 { type: "null" },
               ],
             },
-            in_reply_to: { type: ["string", "number", "null"], minLength: 1 },
+            in_reply_to: {
+              type: ["string", "number", "null"],
+              minLength: 1,
+              minimum: -9007199254740991,
+              maximum: 9007199254740991,
+            },
           },
           additionalProperties: false,
         },

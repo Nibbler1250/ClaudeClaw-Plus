@@ -345,6 +345,25 @@ describe("BusMcpServer — outbound tools", () => {
     expect(h.ipc.sent).toHaveLength(0);
   });
 
+  it("`reply` tool refuses a fractional or unsafe numeric `in_reply_to` instead of routing a mangled id", async () => {
+    for (const bad of [1.5, 2 ** 53, -(2 ** 53) - 2, 1234567890123456789]) {
+      const result = await h.client.callTool({
+        name: "reply",
+        arguments: { message: "x", intent: "final", in_reply_to: bad },
+      });
+      expect(result.isError).toBe(true);
+    }
+    expect(h.ipc.sent).toHaveLength(0);
+    // a safe integer still passes, as a string
+    await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", intent: "final", in_reply_to: 8664000000 },
+    });
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.in_reply_to).toBe("8664000000");
+  });
+
   it("`reply` tool trims a padded `in_reply_to` so it names the chat it meant", async () => {
     await h.client.callTool({
       name: "reply",

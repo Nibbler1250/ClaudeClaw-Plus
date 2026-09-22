@@ -262,8 +262,11 @@ const PermissionRequestNotificationSchema = NotificationSchema.extend({
 
 const ReplyIntentSchema = z.enum(["final", "progress", "tool_status"]);
 // #224: the chat_id of the <channel> block this reply answers.
+// A numeric id must be a safe integer: a fraction is no chat id, and a
+// Discord snowflake written as a JSON number has already lost precision by
+// the time it is parsed (ids belong in strings) — refuse, do not misroute.
 const ReplyInReplyToSchema = z
-  .union([z.string(), z.number()])
+  .union([z.string(), z.number().int()])
   .transform(String)
   // An empty (or blank) string would be dropped as "unnamed" further down and
   // the reply would fall back to whichever chat wrote last — refuse it here.
