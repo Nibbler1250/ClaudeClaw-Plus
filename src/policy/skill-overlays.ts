@@ -67,6 +67,10 @@ export function parseSkillMetadata(skillContent: string, skillName: string): Ski
   let preferredTools: string[] | undefined;
   let deniedTools: string[] | undefined;
 
+  // A quoted entry (`- "Bash"`) used to parse as `"Bash"` with the quotes and
+  // then match nothing — a deny that silently does nothing (adversarial pass).
+  const stripQuotes = (v: string): string => v.replace(/^["']|["']$/g, "").trim();
+
   // Helper to parse array fields (handles both multiline and inline formats)
   function parseArrayField(fieldName: string): string[] | undefined {
     // Match multiline format:
@@ -77,7 +81,7 @@ export function parseSkillMetadata(skillContent: string, skillName: string): Ski
     if (multilineMatch) {
       return multilineMatch[1]
         .split("\n")
-        .map((line) => line.replace(/^\s*-\s*/, "").trim())
+        .map((line) => stripQuotes(line.replace(/^\s*-\s*/, "").trim()))
         .filter(Boolean);
     }
 
@@ -92,7 +96,7 @@ export function parseSkillMetadata(skillContent: string, skillName: string): Ski
     if (inlineMatch) {
       return inlineMatch[1]
         .split(",")
-        .map((item) => item.trim())
+        .map((item) => stripQuotes(item.trim()))
         .filter(Boolean);
     }
 
@@ -220,7 +224,6 @@ export function overlayToRules(overlay: SkillOverlay, basePriority: number = 100
  * (oldest evicted first) so it can't grow unbounded.
  */
 interface CachedOverlay {
-  rules: PolicyRule[];
   /** The tools this skill refuses — the ceiling the engine applies (#258). */
   deniedTools: string[];
   /** The skill's own reason, shown when the ceiling refuses a tool. */
@@ -256,7 +259,6 @@ export function cacheSkillOverlayFromContent(skillName: string, content: string)
   // slot, keeping the size-based eviction order meaningful.
   overlayRulesCache.delete(skillName);
   overlayRulesCache.set(skillName, {
-    rules: overlay ? overlayToRules(overlay) : [],
     deniedTools: overlay?.deniedTools ?? [],
     ...(overlay?.reason ? { reason: overlay.reason } : {}),
     cachedAt: now,
@@ -264,7 +266,12 @@ export function cacheSkillOverlayFromContent(skillName: string, content: string)
   pruneOverlayCache(now);
 }
 
-/** Synchronously get cached overlay deny rules for a skill (empty if none/expired). */
+/**
+ * The cached overlay rendered as policy-shaped rules (empty if none/expired).
+ * The engine does NOT consult these — it applies `skillDeniesTool` as a ceiling
+ * (#258); this is for surfaces that display an overlay next to real rules.
+ * Derived on demand rather than precomputed, so nothing pays for it.
+ */
 export function getCachedSkillOverlayRules(skillName?: string): PolicyRule[] {
   if (!skillName) return [];
   const entry = overlayRulesCache.get(skillName);
@@ -273,7 +280,12 @@ export function getCachedSkillOverlayRules(skillName?: string): PolicyRule[] {
     overlayRulesCache.delete(skillName);
     return [];
   }
-  return entry.rules;
+  if (entry.deniedTools.length === 0) return [];
+  return overlayToRules({
+    skillName,
+    deniedTools: entry.deniedTools,
+    ...(entry.reason ? { reason: entry.reason } : {}),
+  });
 }
 
 /**
@@ -313,7 +325,12 @@ export function skillDeniesTool(
     overlayRulesCache.delete(skillName);
     return null;
   }
-  if (!entry.deniedTools.includes(toolName)) return null;
+  // `*` denies every tool for this skill — the most restrictive thing a SKILL.md
+  // can say ("I am read-only, deny me everything"), and the shape the old rule
+  // form honoured through the engine's `matchesTool`. An exact-match-only
+  // ceiling would have turned it into a silent no-op (adversarial pass).
+  const denied = entry.deniedTools.includes("*") || entry.deniedTools.includes(toolName);
+  if (!denied) return null;
   return {
     // Reads as what it is — a ceiling, not a rule in the ladder.
     id: `skill-overlay-ceiling:${skillName}:${toolName}`,
@@ -335,6 +352,11 @@ export function clearSkillOverlayRulesCache(): void {
 /**
  * Evaluate a tool request in the context of skill policy.
  * Checks if the requested tool is allowed given the skill's policy overlay.
+ *
+ * @deprecated #258: `allowed: true` here means "this skill's overlay does not
+ * refuse it", NOT "permitted" — the user policy still decides, and an explicit
+ * user deny is absolute. Do not treat this as a grant; the engine's `evaluate`
+ * is the only thing that decides. No production caller consults it.
  */
 export function evaluateSkillPolicy(overlay: SkillOverlay, toolName: string): SkillPolicyResult {
   // Check if tool is explicitly denied

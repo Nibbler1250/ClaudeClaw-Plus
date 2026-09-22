@@ -167,27 +167,24 @@ export function evaluate(request: ToolRequestContext): PolicyDecision {
     };
   }
 
-  // Check cache first if enabled
-  if (cacheConfig.enabled) {
-    const cached = getCachedDecision(request);
-    if (cached) {
-      return {
-        ...cached,
-        requestId, // Fresh request ID even for cached decisions
-        evaluatedAt, // Fresh evaluation timestamp
-      };
-    }
-  }
-
   // #258: the skill overlay first, as a ceiling on the tool set — not as a
   // rule in the ladder. Terry's decision on the issue: skills are third-party
   // and an overlay that could widen would let a skill grant itself what the
   // user's policy denied, so an overlay only ever removes, and it removes
   // before anything can allow. The engine's own semantics are untouched below:
   // priority wins, deny first within a tier, allow-exceptions keep working.
+  //
+  // ABOVE the decision cache on purpose (adversarial pass): overlays are
+  // populated lazily, when a slash command resolves the SKILL.md, so a request
+  // evaluated before that arrives caches an ALLOW under this very key and it is
+  // served for the rest of its TTL — re-admitting a tool the skill now refuses.
+  // A ceiling that sits below the cache is not a ceiling. The lookup is a Map
+  // hit. The refusal itself is NOT cached either, so an edited SKILL.md that
+  // stops denying a tool takes effect when the overlay is refreshed rather than
+  // a decision-TTL later.
   const ceiling = skillDeniesTool(request.skillName, request.toolName);
   if (ceiling) {
-    const decision: PolicyDecision = {
+    return {
       requestId,
       action: "deny",
       // Not a rule id: the ceiling is not a rule. It is still an EXPLICIT
@@ -198,12 +195,20 @@ export function evaluate(request: ToolRequestContext): PolicyDecision {
       matchedRuleId: ceiling.id,
       reason: ceiling.reason,
       evaluatedAt,
-      // Keyed by skillName + toolName like every other decision (getRequestKey),
-      // so one skill's ceiling is never served to another's request.
-      cacheable: true,
+      cacheable: false,
     };
-    if (cacheConfig.enabled) cacheDecision(request, decision);
-    return decision;
+  }
+
+  // Check cache first if enabled
+  if (cacheConfig.enabled) {
+    const cached = getCachedDecision(request);
+    if (cached) {
+      return {
+        ...cached,
+        requestId, // Fresh request ID even for cached decisions
+        evaluatedAt, // Fresh evaluation timestamp
+      };
+    }
   }
 
   // Get all applicable rules sorted by priority

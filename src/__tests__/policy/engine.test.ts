@@ -699,6 +699,65 @@ describe("Policy Engine - Skill Overlay engine participation (#258 item 2)", () 
     expect(decision.action).toBe("allow");
   });
 
+  // The three below came out of the adversarial pass on this change.
+  it("honours `deniedTools: [*]` — the most restrictive thing a SKILL.md can say", () => {
+    // As rules this worked (the engine's matchesTool treats `*` as every tool);
+    // an exact-match ceiling would have turned the strictest overlay into a
+    // silent no-op — a fail-open in the one direction this change hardens.
+    cacheSkillOverlayFromContent(
+      "read-only",
+      ["---", "name: read-only", "deniedTools: [*]", "---", "Read only."].join("\n"),
+    );
+    for (const tool of ["Bash", "Write", "AnythingElse"]) {
+      const decision = evaluate(createRequest({ skillName: "read-only", toolName: tool }));
+      expect(decision.action).toBe("deny");
+      expect(decision.matchedRuleId).toBe(`skill-overlay-ceiling:read-only:${tool}`);
+    }
+  });
+
+  it("a quoted entry denies what it says, instead of matching nothing", () => {
+    cacheSkillOverlayFromContent(
+      "quoted",
+      ["---", "name: quoted", "deniedTools:", '  - "Bash"', "---", "Quoted."].join("\n"),
+    );
+    expect(evaluate(createRequest({ skillName: "quoted", toolName: "Bash" })).action).toBe("deny");
+  });
+
+  it("an allow cached before the overlay was resolved does not survive it", async () => {
+    // Overlays are populated lazily, when a slash command resolves the
+    // SKILL.md. With the ceiling below the decision cache, the allow evaluated
+    // a moment earlier was served for the rest of its TTL and re-admitted the
+    // tool the skill refuses. A ceiling under a cache is not a ceiling.
+    await writePolicyFile(
+      [
+        {
+          id: "allow-telegram",
+          priority: 100,
+          scope: { source: "telegram" },
+          tool: "*",
+          action: "allow",
+          reason: "Allow all tools on telegram",
+        },
+      ],
+      { enabled: true, ttlMs: 60_000, maxEntries: 100 },
+    );
+    await loadRules();
+    clearCache();
+    const before = evaluate(createRequest({ skillName: "quant", toolName: "Bash" }));
+    expect(before.action).toBe("allow"); // no overlay resolved yet — cached
+    cacheSkillOverlayFromContent("quant", SKILL_MD);
+    const after = evaluate(createRequest({ skillName: "quant", toolName: "Bash" }));
+    expect(after.action).toBe("deny");
+    expect(after.matchedRuleId).toBe("skill-overlay-ceiling:quant:Bash");
+    // and the refusal is not cached either: an overlay that stops denying it
+    // takes effect on the next evaluation, not a TTL later
+    cacheSkillOverlayFromContent(
+      "quant",
+      ["---", "name: quant", "deniedTools: []", "---", "No longer strict."].join("\n"),
+    );
+    expect(evaluate(createRequest({ skillName: "quant", toolName: "Bash" })).action).toBe("allow");
+  });
+
   it("does not apply one skill's overlay to a different skill", () => {
     cacheSkillOverlayFromContent("quant", SKILL_MD);
     const decision = evaluate(createRequest({ skillName: "other-skill", toolName: "Bash" }));
