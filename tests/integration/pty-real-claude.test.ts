@@ -45,7 +45,9 @@ const TEST_PROJECT_DIR = join("/tmp", `claudeclaw-pty-live-${process.pid}`);
 // the developer's working settings.json.
 const SETTINGS_DIR = join(process.cwd(), ".claude", "claudeclaw");
 const SETTINGS_FILE = join(SETTINGS_DIR, "settings.json");
-const BACKUP_FILE = join(SETTINGS_DIR, "settings.json.pty-it-backup");
+// Unique per run, so a backup left by an interrupted run is never mistaken
+// for ours (and ours never overwrites it).
+const BACKUP_FILE = join(SETTINGS_DIR, `settings.json.pty-live-backup-${process.pid}`);
 
 async function writeRawSettings(obj: unknown): Promise<void> {
   await mkdir(SETTINGS_DIR, { recursive: true });
@@ -54,19 +56,26 @@ async function writeRawSettings(obj: unknown): Promise<void> {
 
 let backedUp = false;
 
+let hadSettingsFile = false;
+
 async function backupSettings(): Promise<void> {
   await mkdir(SETTINGS_DIR, { recursive: true });
-  if (existsSync(SETTINGS_FILE) && !existsSync(BACKUP_FILE)) {
+  hadSettingsFile = existsSync(SETTINGS_FILE);
+  if (hadSettingsFile) {
     await copyFile(SETTINGS_FILE, BACKUP_FILE);
     backedUp = true;
   }
 }
 
+/** Put the settings file back exactly as found: restored from the backup,
+ *  or removed when there was none. */
 async function restoreSettings(): Promise<void> {
   if (backedUp && existsSync(BACKUP_FILE)) {
     await copyFile(BACKUP_FILE, SETTINGS_FILE);
     await unlink(BACKUP_FILE);
     backedUp = false;
+  } else if (!hadSettingsFile) {
+    await rm(SETTINGS_FILE, { force: true }).catch(() => undefined);
   }
 }
 
@@ -74,24 +83,43 @@ async function restoreSettings(): Promise<void> {
 // screens — theme picker first — and the PTY supervisor answers only the
 // trust dialog. Mark onboarding done, touching nothing else in the file and
 // leaving it alone when it already says so (a developer's own machine).
+let seededOnboarding = false;
+
+function readClaudeConfig(path: string): Record<string, unknown> | null {
+  if (!existsSync(path)) return {};
+  try {
+    return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+  } catch {
+    return null; // malformed: not ours to rewrite
+  }
+}
+
+// Write-then-rename: claude rewrites this file itself (atomically, with
+// backups); a partial write must never be what it reads.
+function writeClaudeConfig(path: string, cfg: Record<string, unknown>): void {
+  const tmp = `${path}.pty-it-${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(cfg, null, 2)}\n`, { mode: 0o600 });
+  renameSync(tmp, path);
+}
+
 function seedClaudeOnboarding(): void {
   const path = join(homedir(), ".claude.json");
-  let cfg: Record<string, unknown> = {};
-  if (existsSync(path)) {
-    try {
-      cfg = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-    } catch {
-      return; // malformed: not ours to rewrite
-    }
-  }
-  if (cfg.hasCompletedOnboarding === true) return;
-  // Write-then-rename: claude rewrites this file itself (atomically, with
-  // backups); a partial write must never be what it reads.
-  const tmp = `${path}.pty-it-${process.pid}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify({ ...cfg, hasCompletedOnboarding: true }, null, 2)}\n`, {
-    mode: 0o600,
-  });
-  renameSync(tmp, path);
+  const cfg = readClaudeConfig(path);
+  if (cfg === null || cfg.hasCompletedOnboarding === true) return;
+  writeClaudeConfig(path, { ...cfg, hasCompletedOnboarding: true });
+  seededOnboarding = true;
+}
+
+/** Undo the seed on the machine it was made on — a developer who had not
+ *  onboarded gets their onboarding back; the runner's HOME is discarded. */
+function unseedClaudeOnboarding(): void {
+  if (!seededOnboarding) return;
+  const path = join(homedir(), ".claude.json");
+  const cfg = readClaudeConfig(path);
+  if (cfg === null) return;
+  const { hasCompletedOnboarding: _seeded, ...rest } = cfg;
+  writeClaudeConfig(path, rest);
+  seededOnboarding = false;
 }
 
 beforeAll(async () => {
@@ -157,6 +185,7 @@ afterEach(async () => {
 
 afterAll(async () => {
   await restoreSettings();
+  unseedClaudeOnboarding();
   try {
     await rm(TEST_PROJECT_DIR, { recursive: true, force: true });
   } catch {

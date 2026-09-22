@@ -361,9 +361,16 @@ describe("Gateway Escalation Wiring", () => {
         await acceptWhenNotPaused();
       } finally {
         clearCache();
-        if (previousPolicy !== null) await writeFile(policyFile, previousPolicy, "utf8");
-        else await rm(policyFile, { force: true });
-        await loadRules().catch(() => undefined);
+        if (previousPolicy !== null) {
+          await writeFile(policyFile, previousPolicy, "utf8");
+          await loadRules().catch(() => undefined);
+        } else {
+          // `loadRules()` recreates a default file; reload the empty rules
+          // through it, then leave the file as absent as it was found.
+          await rm(policyFile, { force: true });
+          await loadRules().catch(() => undefined);
+          await rm(policyFile, { force: true });
+        }
       }
     });
 
