@@ -34,7 +34,7 @@ export const BUS_MCP_TOOLS = [
           description: "'final' ends the turn and notifies the user; default 'progress'.",
         },
         in_reply_to: {
-          type: ["string", "number", "null"],
+          type: ["string", "integer", "null"],
           minLength: 1,
           // A number must be a safe integer (a snowflake as a JSON number has
           // already lost precision) — pass ids as strings.
@@ -55,7 +55,7 @@ export const BUS_MCP_TOOLS = [
               ],
             },
             in_reply_to: {
-              type: ["string", "number", "null"],
+              type: ["string", "integer", "null"],
               minLength: 1,
               minimum: -9007199254740991,
               maximum: 9007199254740991,
