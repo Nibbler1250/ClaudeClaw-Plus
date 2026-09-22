@@ -296,7 +296,6 @@ describe("Gateway Escalation Wiring", () => {
         processor: { processPersistedEvent: vi.fn() },
         resume: {
           getOrCreateSessionMapping: vi.fn(),
-          getResumeArgsForEvent: vi.fn(),
           updateSessionAfterProcessing: vi.fn(),
         },
       };
@@ -320,7 +319,6 @@ describe("Gateway Escalation Wiring", () => {
         processor: { processPersistedEvent: vi.fn() },
         resume: {
           getOrCreateSessionMapping: vi.fn(),
-          getResumeArgsForEvent: vi.fn(),
           updateSessionAfterProcessing: vi.fn(),
         },
       };
@@ -411,13 +409,6 @@ describe("Gateway Escalation Wiring", () => {
             lastActiveAt: new Date().toISOString(),
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
-          }),
-          getResumeArgsForEvent: vi.fn().mockResolvedValue({
-            mappingId: "mapping-1",
-            claudeSessionId: null,
-            args: [],
-            isNewMapping: true,
-            canResume: false,
           }),
           updateSessionAfterProcessing: vi.fn(),
         },
