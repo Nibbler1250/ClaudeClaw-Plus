@@ -314,9 +314,12 @@ describe("process-stream-json supervision", () => {
 
   it("propagates CCAW_AGENT_ID and CCAW_BUS_SOCK to child env", async () => {
     // Use `/usr/bin/env` (no args) to introspect the child env.
+    // #304: `env` alone exits before `onData` below is attached, so on a
+    // loaded 2-core runner the dump was already gone (flaky in CI). A short
+    // sleep first keeps the child alive until the listener is on.
     const localMgr = new SessionManager({
-      commandOverride: "/usr/bin/env",
-      argsOverride: [],
+      commandOverride: "/bin/sh",
+      argsOverride: ["-c", "sleep 0.3; /usr/bin/env"],
       busSocketPath: "/tmp/test-bus-env.sock",
     });
     const agent = mkAgent({ id: "psj-env-prop" });

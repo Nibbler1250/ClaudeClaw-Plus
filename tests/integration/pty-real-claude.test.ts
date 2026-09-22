@@ -16,7 +16,7 @@
 import { describe, test, expect, beforeAll, beforeEach, afterAll, afterEach } from "bun:test";
 import { join } from "path";
 import { mkdir, copyFile, unlink, rm, readdir } from "fs/promises";
-import { existsSync } from "fs";
+import { existsSync, readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
 
 import { initConfig, loadSettings, reloadSettings } from "../../src/config";
@@ -70,8 +70,26 @@ async function restoreSettings(): Promise<void> {
   }
 }
 
+// On a fresh HOME (the nightly runner) claude boots into its onboarding
+// screens — theme picker first — and the PTY supervisor answers only the
+// trust dialog. Mark onboarding done, touching nothing else in the file and
+// leaving it alone when it already says so (a developer's own machine).
+function seedClaudeOnboarding(): void {
+  const path = join(homedir(), ".claude.json");
+  let cfg: Record<string, unknown> = {};
+  if (existsSync(path)) {
+    try {
+      cfg = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    } catch {
+      return; // malformed: not ours to rewrite
+    }
+  }
+  if (cfg.hasCompletedOnboarding === true) return;
+  writeFileSync(path, `${JSON.stringify({ ...cfg, hasCompletedOnboarding: true }, null, 2)}\n`);
+}
 
 beforeAll(async () => {
+  seedClaudeOnboarding();
   await backupSettings();
   await mkdir(TEST_PROJECT_DIR, { recursive: true });
 });
@@ -140,7 +158,6 @@ afterAll(async () => {
   }
 });
 
-
 // Slugify the cwd the same way Claude Code does for its JSONL directory —
 // through the one encoder production uses (#368), so this helper cannot pass
 // while production resolves to a directory that does not exist.
@@ -166,7 +183,6 @@ async function discoverLatestClaudeSession(cwd: string): Promise<string | null> 
   }
   return latest ? latest.name.replace(/\.jsonl$/, "") : null;
 }
-
 
 describe("PTY integration — real Claude happy path", () => {
   test(
@@ -202,7 +218,6 @@ describe("PTY integration — real Claude happy path", () => {
     TEST_TIMEOUT_MS,
   );
 });
-
 
 describe("PTY integration — real Claude resume smoke", () => {
   test(
@@ -249,7 +264,6 @@ describe("PTY integration — real Claude resume smoke", () => {
   );
 });
 
-
 describe("PTY integration — concurrent isolation", () => {
   test(
     "three concurrent runOnPty calls produce isolated, non-interleaved responses",
@@ -293,7 +307,6 @@ describe("PTY integration — concurrent isolation", () => {
     TEST_TIMEOUT_MS,
   );
 });
-
 
 describe("PTY integration — sentinel-echo turn detection (real claude)", () => {
   test(
@@ -347,4 +360,3 @@ describe("PTY integration — sentinel-echo turn detection (real claude)", () =>
     TEST_TIMEOUT_MS,
   );
 });
-

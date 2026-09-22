@@ -40,5 +40,9 @@ jobs:
           test -n "$CLAUDE_CODE_OAUTH_TOKEN" || { echo "CLAUDE_CODE_OAUTH_TOKEN secret is not set — the integration tests cannot run"; exit 1; }
           claude --version
 
+      # Run from the directory: the repo's bunfig.toml scopes `bun test` to
+      # `src` (so a plain `bun test` never spawns a real claude), and bun
+      # applies that root even to an explicit path argument.
       - name: Run integration tests
-        run: bun test tests/integration
+        working-directory: tests/integration
+        run: bun test

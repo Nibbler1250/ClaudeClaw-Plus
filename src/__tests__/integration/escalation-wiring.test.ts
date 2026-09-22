@@ -9,7 +9,7 @@
  * Run with: bun test src/__tests__/integration/escalation-wiring.test.ts
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, vi, afterAll } from "bun:test";
 import { randomUUID } from "crypto";
 import { rm, mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -24,6 +24,15 @@ const POLICY_DIR = join(process.cwd(), ".claude", "claudeclaw");
 const PAUSE_STATE_FILE = join(ESCALATION_DIR, "paused.json");
 const PAUSE_ACTIONS_FILE = join(ESCALATION_DIR, "pause-actions.jsonl");
 const WORKFLOW_DIR = join(process.cwd(), ".claude", "claudeclaw", "workflows");
+const HANDOFFS_DIR = join(ESCALATION_DIR, "handoffs");
+
+// #304: the policy-denial and escalation triggers exercised here create real
+// handoff files under the checkout's `.claude/claudeclaw/handoffs/`; left
+// behind, escalation/handoff.test.ts ("initialize with empty handoff index")
+// counts them. This file cleans up what it created.
+afterAll(async () => {
+  await rm(HANDOFFS_DIR, { recursive: true, force: true }).catch(() => undefined);
+});
 
 // =============================================================================
 // Mock External Dependencies

@@ -1,0 +1,11 @@
+# #304 — test discovery.
+#
+# `bun test` with no arguments scans the whole tree, which would include
+# tests/integration/ — the suites that spawn a REAL `claude` and need
+# credentials. Scoping the root to `src` keeps a plain `bun test` (and the
+# PR job's `bun test src`) free of them; bun applies this root even to an
+# explicit path argument, so those suites run from their own directory:
+# `cd tests/integration && bun test` (what integration.yml does).
+[test]
+root = "src"
+preload = ["./scripts/test-preload.ts"]

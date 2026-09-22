@@ -11,7 +11,7 @@
  *     to a temp dir and passed as `claudeBin`.
  *   - `homeOverride` confines `~/.claude/projects/` writes to a temp dir
  *     so the suite leaves the host's claude state untouched.
- *   - The real-claude smoke run lives in tests/integration/ (nightly job, #304).
+ *   - The real-claude smoke run was removed in #304 (see the note at the end).
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
@@ -791,6 +791,10 @@ describe("captureClaudeVersion — win32 shell-true branch is platform-injectabl
 });
 
 /* ───────────────────────────────────────────────────────────────────── */
-/* Integration against the real `claude`: tests/integration/               */
-/* schema-probe-real-claude.test.ts (nightly job, #304) — no env gate here. */
+/* The env-gated smoke run against the real `claude` that used to sit here */
+/* was removed in #304: un-gated it does not pass (the probe sees no JSONL  */
+/* from `claude -p` within its budget on a current CLI, while a manual      */
+/* `claude -p` writes one) and it only ever reported green by accepting    */
+/* "failed". Tracked as a follow-up issue; a real-claude run belongs in     */
+/* tests/integration/ once the probe holds against the installed CLI.       */
 /* ───────────────────────────────────────────────────────────────────── */
