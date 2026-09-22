@@ -334,13 +334,25 @@ describe("BusMcpServer — outbound tools", () => {
     expect(reply.in_reply_to).toBe("2");
   });
 
-  it("`reply` tool refuses an empty `in_reply_to` instead of routing it as unnamed", async () => {
-    const result = await h.client.callTool({
-      name: "reply",
-      arguments: { message: "x", intent: "final", in_reply_to: "" },
-    });
-    expect(result.isError).toBe(true);
+  it("`reply` tool refuses an empty or blank `in_reply_to` instead of routing it as unnamed", async () => {
+    for (const bad of ["", "   "]) {
+      const result = await h.client.callTool({
+        name: "reply",
+        arguments: { message: "x", intent: "final", in_reply_to: bad },
+      });
+      expect(result.isError).toBe(true);
+    }
     expect(h.ipc.sent).toHaveLength(0);
+  });
+
+  it("`reply` tool trims a padded `in_reply_to` so it names the chat it meant", async () => {
+    await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", intent: "final", in_reply_to: " 12345 " },
+    });
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.in_reply_to).toBe("12345");
   });
 
   it("`reply` tool lets metadata.intent win when both forms are given", async () => {
