@@ -458,7 +458,10 @@ describe("sessions — agent-scoped paths", () => {
     );
     expect(runnerSrc).toContain("getFallbackSession(agentName, threadId)");
     expect(runnerSrc).toContain("createFallbackSession(exec.sessionId, agentName, threadId)");
-    expect(discordSrc).toContain("resetFallbackSession(undefined, interaction.channel_id!)");
+    // #376: the Discord /reset scopes the fallback reset by the same key the
+    // conversation resumes (interactionSessionKey), not the raw channel id.
+    expect(discordSrc).toContain("const key = interactionSessionKey(interaction);");
+    expect(discordSrc).toContain("resetFallbackSession(undefined, key);");
   });
 });
 
