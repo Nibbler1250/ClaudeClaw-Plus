@@ -5,11 +5,21 @@
  * Skill overlays are translated into policy-relevant constraints.
  *
  * IMPORTANT: Skill overlays must not become a privilege-escalation path.
- * - "preferredTools" influences recommendation, not security overrides
- * - "requiredTools" surfaces actionable policy errors when unavailable
- * - "deniedTools" become deny rules at priority 150 (basePriority + 50): they
- *   restrict tools a broader rule allows, but the deny is NOT absolute — a
- *   higher-priority (or equal-priority, more-specific) allow still outranks it.
+ * Skills are increasingly third-party and the registries are large, so an
+ * overlay that could widen access would be an escalation primitive: a skill
+ * granting itself what the user's policy denied (#258).
+ *
+ * **An overlay is a ceiling filter applied BEFORE evaluation, not a set of
+ * rules merged into the priority ladder.** It narrows the tool set the engine
+ * is allowed to consider; the engine then evaluates that narrowed set with its
+ * documented semantics unchanged — priority wins, deny first within a tier,
+ * allow-exceptions keep working. Two mechanisms, no conflict:
+ *
+ * - "deniedTools" → the ceiling. A denied tool never reaches the ladder, so no
+ *   rule of any priority can re-allow it for that skill. It can only remove.
+ * - "requiredTools" surfaces actionable errors when a tool is unavailable; it
+ *   never grants anything (an explicit user deny stays absolute).
+ * - "preferredTools" influences recommendation, not security.
  */
 
 import type { PolicyRule, ToolRequestContext } from "./engine";
@@ -160,6 +170,13 @@ export function getSkillOverlayFromContent(
  * - requiredTools → no direct rules, tracked for validation
  * - preferredTools → informational only (not security-critical)
  */
+/**
+ * @deprecated #258: overlay denies are a ceiling applied before evaluation
+ * (`skillDeniesTool`), not rules in the priority ladder — as rules they could be
+ * outranked by a higher-priority allow, which is the escalation this must not
+ * permit. Kept for callers that render an overlay as policy-shaped data; the
+ * engine does not consult these.
+ */
 export function overlayToRules(overlay: SkillOverlay, basePriority: number = 100): PolicyRule[] {
   const rules: PolicyRule[] = [];
 
@@ -204,6 +221,10 @@ export function overlayToRules(overlay: SkillOverlay, basePriority: number = 100
  */
 interface CachedOverlay {
   rules: PolicyRule[];
+  /** The tools this skill refuses — the ceiling the engine applies (#258). */
+  deniedTools: string[];
+  /** The skill's own reason, shown when the ceiling refuses a tool. */
+  reason?: string;
   cachedAt: number;
 }
 const overlayRulesCache = new Map<string, CachedOverlay>();
@@ -236,6 +257,8 @@ export function cacheSkillOverlayFromContent(skillName: string, content: string)
   overlayRulesCache.delete(skillName);
   overlayRulesCache.set(skillName, {
     rules: overlay ? overlayToRules(overlay) : [],
+    deniedTools: overlay?.deniedTools ?? [],
+    ...(overlay?.reason ? { reason: overlay.reason } : {}),
     cachedAt: now,
   });
   pruneOverlayCache(now);
@@ -268,6 +291,36 @@ export function hasCachedSkillOverlay(skillName?: string): boolean {
     return false;
   }
   return true;
+}
+
+/**
+ * #258: the ceiling. `null` when this skill lets the request through — because
+ * it declared no overlay, or none that names this tool — and a reason when it
+ * refuses. The engine calls this BEFORE it evaluates any rule, so a refusal
+ * cannot be outranked by an allow of any priority: an overlay only ever
+ * removes from the set the engine considers. An overlay that was never
+ * resolved in this process caches nothing and is reported by
+ * `hasCachedSkillOverlay`, which the engine surfaces once per skill.
+ */
+export function skillDeniesTool(
+  skillName: string | undefined,
+  toolName: string,
+): { id: string; reason: string } | null {
+  if (!skillName) return null;
+  const entry = overlayRulesCache.get(skillName);
+  if (!entry) return null;
+  if (Date.now() - entry.cachedAt > OVERLAY_CACHE_TTL_MS) {
+    overlayRulesCache.delete(skillName);
+    return null;
+  }
+  if (!entry.deniedTools.includes(toolName)) return null;
+  return {
+    // Reads as what it is — a ceiling, not a rule in the ladder.
+    id: `skill-overlay-ceiling:${skillName}:${toolName}`,
+    reason:
+      entry.reason ??
+      `Tool ${toolName} is denied by skill ${skillName} (skill overlay; skills can only narrow)`,
+  };
 }
 
 /** Clear the overlay rules cache (tests / skill reload). */

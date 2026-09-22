@@ -610,11 +610,81 @@ describe("Policy Engine - Skill Overlay engine participation (#258 item 2)", () 
     }
   });
 
-  it("denies a tool the active skill's overlay forbids (overlay outranks base allow)", () => {
+  // #258: the overlay is a CEILING applied before evaluation, not a rule in the
+  // ladder. Terry's decision on the issue: skills are third-party, so an
+  // overlay may only narrow, and it narrows before anything can allow.
+  it("denies a tool the active skill's overlay forbids, before any rule is considered", () => {
     cacheSkillOverlayFromContent("quant", SKILL_MD);
     const decision = evaluate(createRequest({ skillName: "quant", toolName: "Bash" }));
     expect(decision.action).toBe("deny");
-    expect(decision.matchedRuleId).toBe("skill-quant-deny-Bash");
+    // an explicit refusal (callers tell it from the no-match default deny),
+    // named as the mechanism it is rather than as a rule
+    expect(decision.matchedRuleId).toBe("skill-overlay-ceiling:quant:Bash");
+    expect(decision.reason).toContain("quant");
+  });
+
+  it("no allow can outrank the ceiling — not even one above the overlay's old rule priority", async () => {
+    // The previous design turned deniedTools into rules at priority 150, so an
+    // allow at 200 outranked the skill's own refusal: a skill could be talked
+    // out of its ceiling by the policy file. It cannot any more.
+    await writePolicyFile([
+      {
+        id: "allow-telegram",
+        priority: 100,
+        scope: { source: "telegram" },
+        tool: "*",
+        action: "allow",
+        reason: "Allow all tools on telegram",
+      },
+      {
+        id: "allow-bash-loudly",
+        priority: 900,
+        scope: { source: "telegram" },
+        tool: "Bash",
+        action: "allow",
+        reason: "An allow above everything",
+      },
+    ]);
+    await loadRules();
+    clearCache();
+    cacheSkillOverlayFromContent("quant", SKILL_MD);
+    const decision = evaluate(createRequest({ skillName: "quant", toolName: "Bash" }));
+    expect(decision.action).toBe("deny");
+    expect(decision.matchedRuleId).toBe("skill-overlay-ceiling:quant:Bash");
+  });
+
+  it("a skill cannot re-allow what the user policy denies: requiredTools grants nothing", async () => {
+    // The other half of the decision — an explicit deny is absolute over any
+    // skill metadata. `requiredTools` is actionable information, never a grant.
+    await writePolicyFile([
+      {
+        id: "allow-telegram",
+        priority: 100,
+        scope: { source: "telegram" },
+        tool: "*",
+        action: "allow",
+        reason: "Allow all tools on telegram",
+      },
+      {
+        id: "deny-bash-for-user",
+        priority: 200,
+        scope: { source: "telegram", userId: "u1" },
+        tool: "Bash",
+        action: "deny",
+        reason: "This user may not run Bash",
+      },
+    ]);
+    await loadRules();
+    clearCache();
+    cacheSkillOverlayFromContent(
+      "needs-bash",
+      ["---", "name: needs-bash", "requiredTools:", "  - Bash", "---", "Needs Bash."].join("\n"),
+    );
+    const decision = evaluate(
+      createRequest({ skillName: "needs-bash", toolName: "Bash", userId: "u1" }),
+    );
+    expect(decision.action).toBe("deny");
+    expect(decision.matchedRuleId).toBe("deny-bash-for-user");
   });
 
   it("still allows tools the overlay does not deny", () => {
