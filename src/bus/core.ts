@@ -2037,19 +2037,38 @@ export class BusCoreImpl implements BusCore {
     }
     if (held.has(key)) return;
     this.touchTurn(agent_id); // #239: the hold is a transition, not silence
+    const heldAt = Date.now();
     held.set(key, {
       wrapped,
       // The tailer generation this hold belongs to: only its own generation's
       // `session.compact`, or a NEWER generation's `replay_done`, releases it.
       generation,
-      heldAt: Date.now(),
+      heldAt,
       timer: setTimeout(() => {
-        this.onError(
-          new Error(
-            `compaction never reported its end within ${this.stuckCompactionResolveMs}ms; verifying the held prompt anyway for agent_id=${agent_id}`,
-          ),
-          { ctx: "compactionHold", agent_id },
-        );
+        // #412: this exit is a measurement, not a routine event. Terry's
+        // condition for closing #412 was that it be visible on a live daemon:
+        // the remaining hazard there (a compaction outliving the hold) has
+        // never been observed, and this line is what would reopen it with
+        // evidence. Same shape as the #239 turn deadline, `[bus]` on stderr,
+        // naming the agent and how long the prompt actually waited (the wall
+        // clock, not the configured limit — a blocked event loop stretches it).
+        const waited = Date.now() - heldAt;
+        const others = (this.compactionHeld.get(agent_id)?.size ?? 1) - 1;
+        const msg =
+          `compaction hold deadline: agent=${agent_id} waited ${waited}ms ` +
+          `(limit ${this.stuckCompactionResolveMs}ms, generation ${generation ?? "unknown"}` +
+          `${others > 0 ? `, ${others} other prompt(s) still held` : ""}) — ` +
+          "the compaction never reported its end; verifying the held prompt anyway. " +
+          "If you are reading this on a live daemon, #412 wants to hear about it.";
+        console.error(`[bus] ${msg}`);
+        this.onError(new Error(msg), {
+          ctx: "compactionHold",
+          agent_id,
+          waited,
+          limit: this.stuckCompactionResolveMs,
+          generation,
+          others,
+        });
         // Only THIS entry: a later prompt held behind a longer compaction keeps
         // its own deadline instead of being verified on the first one's clock.
         this.releaseCompactionHold(agent_id, { key });
