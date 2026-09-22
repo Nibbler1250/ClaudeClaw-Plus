@@ -73,9 +73,12 @@ let lastProcessedSeq = 0;
 
 // Gateway outbound delivery.
 //
-// The gateway path serializes inbound platform messages against a single persistent
-// session — in-order processing with dedup via the durable event log, opposed to the
-// legacy fork-per-message path that races concurrent messages from the same user.
+// The gateway path orders inbound platform messages through the durable event log
+// (dedup, in-order processing), opposed to the legacy fork-per-message path that
+// races concurrent messages from the same user. Which runner session a turn resumes
+// is `session.gatewayScope` (#376): one global session for all gateway traffic by
+// default, or one per conversation — and conversations then run on the runner's
+// per-thread queues, in parallel with each other, exactly as Discord threads do.
 // When a per-adapter gateway flag (e.g. USE_GATEWAY_TELEGRAM) is set, the adapter
 // hands the inbound to its submit*ToGateway helper and returns; this processor's
 // onEvent runs the agent.
@@ -537,6 +540,22 @@ export function gatewaySessionThreadId(
 }
 
 /**
+ * The runner session key a slash command (`/reset`, `/compact`, `/status`,
+ * `/context`) must act on for a conversation that goes through the gateway —
+ * the same answer `gatewaySessionThreadId` gives the turn itself, from the
+ * adapter's conversation ids. `undefined` = the global session.
+ */
+export function gatewayCommandSessionKey(
+  conversation: { channelId: string; threadId: string },
+  session: { gatewayScope: "global" | "conversation" },
+): string | undefined {
+  return gatewaySessionThreadId(
+    { conversationKey: conversationSessionKey(conversation.channelId, conversation.threadId) },
+    session,
+  );
+}
+
+/**
  * Initialize the event processor for use with the gateway.
  * This must be called before processing Discord/Telegram events through the gateway.
  *
@@ -568,8 +587,7 @@ export async function initGatewayProcessor(
         const source = event.source || normalizedEvent.channel;
         // #376: the persisted record carries the conversation; the caller
         // decides (by `session.gatewayScope`) whether the runner sees it.
-        const channelId: string = event.channelId ?? normalizedEvent.channelId ?? "";
-        const threadId: string = event.threadId ?? normalizedEvent.threadId ?? "default";
+        const { channelId, threadId } = event;
         const result = await processFn(source, prompt, {
           channelId,
           threadId,

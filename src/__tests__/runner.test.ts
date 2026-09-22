@@ -666,7 +666,8 @@ describe("killActive reaches a PTY session that is still booting (#394)", () => 
 // permission flags and `--model` must be passed again on every resumed turn.
 // The `claude -p` runner path passes the security flags, the appended system
 // prompt and the model (it uses none of the other four; the job path adds
-// `--mcp-config` in `buildJobArgs`, pinned by its own test). This pins that a
+// `--mcp-config` in `buildAgentJobArgs`, pinned by its own test; the PTY runtime
+// re-passes its own `--mcp-config` on every spawn, a different path). This pins that a
 // resumed turn's argv is the fresh turn's argv plus `--resume <id>`, and that
 // the resolved model is the same — so a refactor that builds the resume argv
 // on a shorter path cannot drop a flag silently.

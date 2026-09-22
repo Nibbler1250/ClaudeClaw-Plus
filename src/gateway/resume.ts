@@ -17,13 +17,11 @@ import {
   set,
   remove,
   getOrCreateMapping as sessionMapGetOrCreate,
-  attachClaudeSessionId as sessionMapAttachClaudeSessionId,
   recordClaudeSessionIdAtomic as sessionMapRecordAtomic,
   update as sessionMapUpdate,
   type SessionEntry,
   type SessionStatus,
 } from "./session-map";
-import type { NormalizedEvent } from "./normalizer";
 
 // --- Core types ---
 
@@ -105,9 +103,11 @@ export async function recordClaudeSessionId(
   // first id. One queued operation: lookup, duplicate check and write
   // together, so two turns finishing at once cannot race (CodeRabbit).
   const result = await sessionMapRecordAtomic(channelId, threadId, claudeSessionId);
+  // Also seen on a primary ↔ fallback flip (a rate-limited turn answers from
+  // the fallback session), so the line reports, it does not diagnose.
   if (result.outcome === "replaced") {
     console.log(
-      `[resume] channel=${channelId} thread=${threadId}: session ${result.previous.slice(0, 8)} → ${claudeSessionId.slice(0, 8)} (the runner replaced the conversation's session; the map follows, #376)`,
+      `[resume] channel=${channelId} thread=${threadId}: the runner now reports session ${claudeSessionId.slice(0, 8)} (was ${result.previous.slice(0, 8)}); the map follows (#376)`,
     );
   }
 }

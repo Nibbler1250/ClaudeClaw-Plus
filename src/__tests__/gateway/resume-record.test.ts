@@ -76,7 +76,7 @@ describe("recordClaudeSessionId (#376)", () => {
     await recordClaudeSessionId("telegram:1", "default", "sess-b"); // the runner rotated
     await recordClaudeSessionId("telegram:1", "default", "sess-b");
     expect((await get("telegram:1", "default"))?.claudeSessionId).toBe("sess-b"); // the map mirrors the runner
-    const l = logs.filter((x) => x.includes("sess-a → sess-b"));
+    const l = logs.filter((x) => x.includes("reports session sess-b (was sess-a)"));
     expect(l).toHaveLength(1);
     expect(warnings).toHaveLength(0);
   });

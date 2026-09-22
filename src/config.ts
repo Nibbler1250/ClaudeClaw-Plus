@@ -882,7 +882,9 @@ export interface SessionConfig {
    * gateway conversation shares the one global session, so what was said in
    * one channel is context for the answer in another. `"conversation"`: each
    * channel / thread / chat / topic gets its own session (keyed
-   * `channelId:threadId`, the gateway's own conversation identity). Splitting
+   * `channelId:threadId`, the gateway's own conversation identity), handled
+   * like a Discord thread session: its own queue (conversations run in
+   * parallel), no auto-rotation — `/reset` and `/compact` act on it. Splitting
    * one context into many costs more tokens and the assistant stops
    * remembering across channels — hence opt-in.
    */

@@ -257,10 +257,6 @@ export async function incrementTurnCount(channelId: string, threadId: string): P
 }
 
 /**
- * Attach a real Claude session ID to a mapping.
- * Will not overwrite an existing non-null Claude session ID unless forced.
- */
-/**
  * #376: record the id a turn reported, atomically with the lookup. Runs as one
  * queued write so two turns finishing together cannot both see an empty
  * mapping and race their attaches. The map mirrors the runner: when the runner
@@ -293,6 +289,10 @@ export async function recordClaudeSessionIdAtomic(
   });
 }
 
+/**
+ * Attach a real Claude session ID to a mapping.
+ * Will not overwrite an existing non-null Claude session ID unless forced.
+ */
 export async function attachClaudeSessionId(
   channelId: string,
   threadId: string,
