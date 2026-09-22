@@ -3977,6 +3977,7 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
           expect(deadline[0]!.ctx.agent_id).toBe("alpha");
           expect(deadline[0]!.ctx.limit).toBe(50);
           expect(deadline[0]!.ctx.generation).toBe(7);
+          expect(deadline[0]!.ctx.others).toBe(0); // one prompt held, none behind it
           // the wall clock, not the configured limit
           expect(deadline[0]!.ctx.waited).toBeGreaterThanOrEqual(50);
           const loud = lines.filter((l) => l.includes("compaction hold deadline"));
