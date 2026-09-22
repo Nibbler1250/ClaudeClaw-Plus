@@ -3963,7 +3963,13 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
           });
           bus.ingestSessionEvent(replayGen("alpha", 7));
           await prompt("alpha", "a compaction that never ends");
-          await new Promise((r) => setTimeout(r, 140));
+          // Wait on the outcome, not on a stopwatch: this suite drives the real
+          // timers, so a fixed sleep can land between the deadline callback and
+          // the verify it arms when the event loop is busy (CodeRabbit).
+          const deadlineAt = Date.now() + 5_000;
+          while (delivered.length < 2 && Date.now() < deadlineAt) {
+            await new Promise((r) => setTimeout(r, 10));
+          }
           expect(delivered).toHaveLength(2); // it still recovers the prompt
 
           const deadline = errors.filter((e) => e.ctx.ctx === "compactionHold");
