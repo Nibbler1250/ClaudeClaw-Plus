@@ -83,8 +83,18 @@ export async function ensureTrustAccepted(
     configPath?: string;
   },
 ): Promise<TrustHealResult> {
-  const home = opts?.homedir?.() ?? defaultHomedir();
-  const configPath = opts?.configPath ?? resolvePath(home, ".claude.json");
+  // #304: `PLUS_CLAUDE_CONFIG_PATH` overrides the DEFAULT file this heals —
+  // the test preload points it at a temp file so synthetic PTY spawns (every
+  // test cwd is a temp dir) stop adding `projects[<tmp>]` entries to the
+  // operator's real ~/.claude.json, which claude parses and backs up on every
+  // launch. An explicit `configPath` or `homedir` from the caller still wins.
+  const configPath =
+    opts?.configPath ??
+    (opts?.homedir
+      ? resolvePath(opts.homedir(), ".claude.json")
+      : process.env.PLUS_CLAUDE_CONFIG_PATH
+        ? resolvePath(process.env.PLUS_CLAUDE_CONFIG_PATH)
+        : resolvePath(defaultHomedir(), ".claude.json"));
   const absoluteCwd = resolvePath(cwd);
 
   const prev = _writeQueues.get(configPath) ?? Promise.resolve();

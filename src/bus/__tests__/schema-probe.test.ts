@@ -792,9 +792,15 @@ describe("captureClaudeVersion — win32 shell-true branch is platform-injectabl
 
 /* ───────────────────────────────────────────────────────────────────── */
 /* The env-gated smoke run against the real `claude` that used to sit here */
-/* was removed in #304: un-gated it does not pass (the probe sees no JSONL  */
-/* from `claude -p` within its budget on a current CLI, while a manual      */
-/* `claude -p` writes one) and it only ever reported green by accepting    */
-/* "failed". Tracked as a follow-up issue; a real-claude run belongs in     */
-/* tests/integration/ once the probe holds against the installed CLI.       */
+/* was removed in #304. Un-gated it cannot pass on a current CLI, and the   */
+/* fault is the probe's own runner (schema-probe-runner.ts), not the CLI:   */
+/* it spawns an interactive REPL in a fresh temp cwd without pre-accepting  */
+/* the trust dialog (its "\r" answers "No, exit" → exit 1), a second       */
+/* dialog (`--dangerously-load-development-channels` confirmation) eats the */
+/* first prompt when trust IS seeded, and it paces on fixed timeout/20 steps */
+/* rather than on JSONL events. The old test also passed `homeOverride` to  */
+/* a temp dir the child never used (`HOME` is inherited), so it looked for  */
+/* the JSONL where claude never writes it — it only reported green by       */
+/* accepting "failed". Tracked as a follow-up issue; a real-claude run       */
+/* belongs in tests/integration/ once the runner holds against the CLI.     */
 /* ───────────────────────────────────────────────────────────────────── */

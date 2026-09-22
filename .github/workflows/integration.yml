@@ -41,8 +41,9 @@ jobs:
           claude --version
 
       # Run from the directory: the repo's bunfig.toml scopes `bun test` to
-      # `src` (so a plain `bun test` never spawns a real claude), and bun
-      # applies that root even to an explicit path argument.
+      # `src` (so a plain `bun test` never spawns a real claude); a bare path
+      # argument is only a filter within that root, and bun reads bunfig from
+      # the cwd, so this directory gets its own discovery and no preload.
       - name: Run integration tests
         working-directory: tests/integration
         run: bun test

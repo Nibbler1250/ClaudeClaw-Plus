@@ -16,7 +16,7 @@
 import { describe, test, expect, beforeAll, beforeEach, afterAll, afterEach } from "bun:test";
 import { join } from "path";
 import { mkdir, copyFile, unlink, rm, readdir } from "fs/promises";
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { homedir } from "os";
 
 import { initConfig, loadSettings, reloadSettings } from "../../src/config";
@@ -85,7 +85,13 @@ function seedClaudeOnboarding(): void {
     }
   }
   if (cfg.hasCompletedOnboarding === true) return;
-  writeFileSync(path, `${JSON.stringify({ ...cfg, hasCompletedOnboarding: true }, null, 2)}\n`);
+  // Write-then-rename: claude rewrites this file itself (atomically, with
+  // backups); a partial write must never be what it reads.
+  const tmp = `${path}.pty-it-${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify({ ...cfg, hasCompletedOnboarding: true }, null, 2)}\n`, {
+    mode: 0o600,
+  });
+  renameSync(tmp, path);
 }
 
 beforeAll(async () => {
