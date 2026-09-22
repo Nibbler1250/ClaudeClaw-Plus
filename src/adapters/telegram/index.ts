@@ -1028,11 +1028,12 @@ export class TelegramAdapter {
 
     const pendingMatch = data.match(/^pending:(\d+):(.+)$/);
     if (pendingMatch) {
+      const [, pendingId = "", pendingValue = ""] = pendingMatch;
       // Not awaited: the resolver is a subprocess with a 5 s budget that may
       // itself call the Bot API. Awaiting it here would pin the poll loop —
       // every other update in the batch, and every later tap, would queue
       // behind it. The legacy path fires and forgets too.
-      void this.handlePendingCallback(query, pendingMatch[1]!, pendingMatch[2]!).catch((err) => {
+      void this.handlePendingCallback(query, pendingId, pendingValue).catch((err) => {
         this.logger.error("[telegram-adapter] pending callback failed", err);
       });
       return;
@@ -1116,12 +1117,13 @@ export class TelegramAdapter {
     // ack that asks the user to retry must not delete the buttons it points
     // them at, and neither must `details` (the action stays pending) or `skip`
     // (the resolver re-sent its own keyboard).
-    if (query.message && decisionStripsKeyboard(verdict, decision)) {
-      const originalText = query.message.text ?? "";
+    const message = query.message;
+    if (message && decisionStripsKeyboard(verdict, decision)) {
+      const originalText = message.text ?? "";
       await this.safe("editMessageText", () =>
         this.api.editMessageText({
-          chat_id: query.message!.chat.id,
-          message_id: query.message!.message_id,
+          chat_id: message.chat.id,
+          message_id: message.message_id,
           text: `${originalText}\n\n› ${ackText}`,
           reply_markup: { inline_keyboard: [] },
         }),
