@@ -40,6 +40,30 @@ describe("nextCronMatch", () => {
     expect(next?.getTime()).toBe(Date.UTC(2028, 1, 29, 0, 0, 0));
   });
 
+  it("finds Feb 29 on a given weekday (28-year cycle)", () => {
+    // 2044-02-29 is a Monday.
+    const after = new Date(Date.UTC(2026, 0, 1, 0, 0, 0));
+    const next = nextCronMatch("0 0 29 2 1", after);
+    expect(next?.getTime()).toBe(Date.UTC(2044, 1, 29, 0, 0, 0));
+  });
+
+  it("is not affected by the host's DST transitions (absolute-time arithmetic)", () => {
+    // Under a DST-observing host zone, walking the calendar with local
+    // setters lands an hour off across the fall-back night; the scan must
+    // use absolute milliseconds. 2026-11-01 05:30Z is 01:30 EDT, thirty
+    // minutes before the clocks go back in America/Toronto.
+    const saved = process.env.TZ;
+    process.env.TZ = "America/Toronto";
+    try {
+      const after = new Date(Date.UTC(2026, 10, 1, 5, 30, 0));
+      expect(nextCronMatch("30 0 2 11 *", after)?.getTime()).toBe(Date.UTC(2026, 10, 2, 0, 30, 0));
+      expect(nextCronMatch("30 6 * * *", after)?.getTime()).toBe(Date.UTC(2026, 10, 1, 6, 30, 0));
+    } finally {
+      if (saved === undefined) delete process.env.TZ;
+      else process.env.TZ = saved;
+    }
+  });
+
   it("returns null for a well-formed expression that never matches", () => {
     const after = new Date(Date.UTC(2026, 0, 1, 0, 0, 0));
     expect(nextCronMatch("0 0 31 2 *", after)).toBeNull();

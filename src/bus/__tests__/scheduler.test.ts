@@ -551,12 +551,63 @@ describe("BusScheduler.scheduleCron (cronExpr)", () => {
     expect(calls).toHaveLength(2);
   });
 
+  // Blind adversarial review of the #437 fix: once far-away matches are
+  // reachable, `setTimeout` gets delays above 2^31−1 ms, which Node/Bun
+  // clamp to 1 ms — the job would fire immediately and re-arm in a loop.
+  it("hops long waits so no single timer exceeds 2^31−1 ms and fires only at the match", () => {
+    const { bus, calls } = createFakeBus();
+    // 2026-09-20 12:00Z, schedule Dec 25 09:00 at −240 (13:00Z), 96 days out.
+    const start = Date.UTC(2026, 8, 20, 12, 0, 0);
+    const inner = makeFakeClock(start);
+    const delays: number[] = [];
+    const clock: FakeClock = {
+      ...inner,
+      setTimeout: (fn, ms) => {
+        delays.push(ms);
+        return inner.setTimeout(fn, ms);
+      },
+    };
+    scheduler = createBusScheduler({ bus, clock, timezoneOffsetMinutes: -240 });
+    scheduler.scheduleCron({ agent_id: "alpha", cronExpr: "0 9 25 12 *", prompt: "noel" });
+
+    const fireAt = Date.UTC(2026, 11, 25, 13, 0, 0);
+    inner.advance(fireAt - start - 1);
+    expect(calls).toHaveLength(0);
+    inner.advance(1);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].metadata?.fire_at).toBe(fireAt);
+    expect(delays.length).toBeGreaterThan(1);
+    for (const ms of delays) expect(ms).toBeLessThanOrEqual(2_147_483_647);
+  });
+
+  it("hops a far-away one-shot `at` the same way", () => {
+    const { bus, calls } = createFakeBus();
+    const start = Date.UTC(2026, 8, 20, 12, 0, 0);
+    const inner = makeFakeClock(start);
+    const delays: number[] = [];
+    const clock: FakeClock = {
+      ...inner,
+      setTimeout: (fn, ms) => {
+        delays.push(ms);
+        return inner.setTimeout(fn, ms);
+      },
+    };
+    scheduler = createBusScheduler({ bus, clock });
+    const at = new Date(start + 40 * 24 * 60 * 60_000);
+    scheduler.scheduleCron({ agent_id: "alpha", at, prompt: "later" });
+    inner.advance(at.getTime() - start - 1);
+    expect(calls).toHaveLength(0);
+    inner.advance(1);
+    expect(calls).toHaveLength(1);
+    for (const ms of delays) expect(ms).toBeLessThanOrEqual(2_147_483_647);
+  });
+
   it("rejects a well-formed cron expression that never matches", () => {
     const { bus } = createFakeBus();
     scheduler = createBusScheduler({ bus });
     expect(() =>
       scheduler.scheduleCron({ agent_id: "a", cronExpr: "0 0 31 2 *", prompt: "p" }),
-    ).toThrow(/never matches/);
+    ).toThrow(/no upcoming match/);
   });
 
   // Codex P2 fix on PR #117: malformed cron expressions used to be

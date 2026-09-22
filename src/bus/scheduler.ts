@@ -99,6 +99,9 @@ export interface BusScheduler {
   scheduleCron(req: ScheduleCronRequest): ScheduledTrigger;
 }
 
+/** Largest delay `setTimeout` accepts (2^31 − 1 ms); longer waits are hopped. */
+const MAX_TIMER_MS = 2_147_483_647;
+
 export interface BusSchedulerOptions {
   /** Bus core that receives `sendPrompt` calls. */
   bus: BusCore;
@@ -270,9 +273,27 @@ class BusSchedulerImpl implements BusScheduler {
 
   /* ─────────────────────────────── internals ─────────────────────────────── */
 
+  /**
+   * Arm `fn` on trigger `id` to run once `fireAt` is reached. `setTimeout`
+   * cannot wait longer than `MAX_TIMER_MS` (~24.8 days): Node and Bun clamp
+   * a larger delay to 1 ms, which would fire the job immediately and, for a
+   * recurring cron, re-arm in a tight loop. Longer waits are split into
+   * hops; each hop re-reads the clock and only calls `fn` once the
+   * remaining delay fits in a single timer.
+   */
+  private armAt(id: string, fireAt: number, fn: () => void): void {
+    const rec = this.timers.get(id);
+    if (!rec || this.stopped) return;
+    const remaining = Math.max(0, fireAt - this.clock.now());
+    if (remaining <= MAX_TIMER_MS) {
+      rec.handle = this.clock.setTimeout(fn, remaining);
+      return;
+    }
+    rec.handle = this.clock.setTimeout(() => this.armAt(id, fireAt, fn), MAX_TIMER_MS);
+  }
+
   private scheduleCronOneShot(id: string, at: Date, req: ScheduleCronRequest): ScheduledTrigger {
     const fireAt = at.getTime();
-    const delay = Math.max(0, fireAt - this.clock.now());
 
     const fire = () => {
       this.timers.delete(id);
@@ -305,7 +326,7 @@ class BusSchedulerImpl implements BusScheduler {
       },
     };
     this.timers.set(id, record);
-    record.handle = this.clock.setTimeout(fire, delay);
+    this.armAt(id, fireAt, fire);
     return { cancel: record.cancel };
   }
 
@@ -338,8 +359,7 @@ class BusSchedulerImpl implements BusScheduler {
         );
         return;
       }
-      const delay = Math.max(0, nextDate.getTime() - now);
-      rec.handle = this.clock.setTimeout(() => {
+      this.armAt(id, nextDate.getTime(), () => {
         // Re-fetch the record — `cancel`/`stop` may have purged it
         // between scheduling and firing.
         const live = this.timers.get(id);
@@ -362,7 +382,7 @@ class BusSchedulerImpl implements BusScheduler {
         });
         // Re-arm for the next match.
         arm();
-      }, delay);
+      });
     };
 
     const record: TimerRecord = {
@@ -441,7 +461,9 @@ export function validateCronExpression(cronExpr: string): void {
   // range check yet never fire. Reject them here so `schedule_task` fails
   // at creation time instead of silently producing a job that never runs.
   if (nextCronMatch(cronExpr, new Date()) === null) {
-    throw new Error(`scheduleCron: invalid cron expression "${cronExpr}": it never matches`);
+    throw new Error(
+      `scheduleCron: invalid cron expression "${cronExpr}": no upcoming match within the scan window`,
+    );
   }
 }
 

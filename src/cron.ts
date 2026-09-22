@@ -44,10 +44,12 @@ export function cronMatches(expr: string, date: Date, timezoneOffsetMinutes = 0)
 /**
  * Upper bound on the forward scan, in days. A valid expression can
  * legitimately have a multi-year gap between matches (`0 0 29 2 *` fires
- * every four years), so the bound has to cover that; beyond it the
- * expression is treated as never matching and `null` is returned.
+ * every four years; Feb 29 on a given weekday recurs every 28 years), so
+ * the bound has to cover that; beyond it the expression is treated as
+ * never matching and `null` is returned. Only date fields are checked
+ * on skipped days, so a full scan is ~10k cheap comparisons.
  */
-const MAX_SCAN_DAYS = 366 * 5;
+const MAX_SCAN_DAYS = 366 * 29;
 
 /**
  * Next instant strictly after `after` that matches `expr`, or `null` when
@@ -63,8 +65,8 @@ const MAX_SCAN_DAYS = 366 * 5;
 export function nextCronMatch(expr: string, after: Date, timezoneOffsetMinutes = 0): Date | null {
   const [, , dayOfMonth, month, dayOfWeek] = expr.trim().split(/\s+/);
   const d = new Date(after);
-  d.setSeconds(0, 0);
-  d.setMinutes(d.getMinutes() + 1);
+  d.setUTCSeconds(0, 0);
+  d.setTime(d.getTime() + 60_000);
   for (let day = 0; day < MAX_SCAN_DAYS; day++) {
     const shifted = shiftDateToOffset(d, timezoneOffsetMinutes);
     // Minutes left in the current day of the target offset, from `d` inclusive.
@@ -73,13 +75,18 @@ export function nextCronMatch(expr: string, after: Date, timezoneOffsetMinutes =
       matchCronField(dayOfMonth, shifted.getUTCDate()) &&
       matchCronField(month, shifted.getUTCMonth() + 1) &&
       matchCronField(dayOfWeek, shifted.getUTCDay());
+    // Advance in absolute milliseconds, never through the process-local
+    // calendar (`setMinutes`): on a host whose zone observes DST, a local
+    // hour is skipped or repeated once a year and the walk would land an
+    // hour off. The configured offset is fixed, so wall-clock math is not
+    // needed here.
     if (dateMatches) {
       for (let i = 0; i < remaining; i++) {
         if (cronMatches(expr, d, timezoneOffsetMinutes)) return d;
-        d.setMinutes(d.getMinutes() + 1);
+        d.setTime(d.getTime() + 60_000);
       }
     } else {
-      d.setMinutes(d.getMinutes() + remaining);
+      d.setTime(d.getTime() + remaining * 60_000);
     }
   }
   return null;
