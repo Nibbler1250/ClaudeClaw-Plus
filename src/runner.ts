@@ -2042,6 +2042,9 @@ async function execClaude(
     }
     const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
     let usedFallback = false;
+    // The fallback session the response came from, when the stream carried no
+    // id of its own (CodeRabbit on #376): resumed, so the CLI may omit it.
+    let fallbackSessionId: string | undefined;
 
     if (
       primaryRateLimit &&
@@ -2052,6 +2055,7 @@ async function execClaude(
         `[${new Date().toLocaleTimeString()}] Claude limit reached; retrying with fallback${fallbackConfig.model ? ` (${fallbackConfig.model})` : ""}...`,
       );
       const fallbackSession = await getFallbackSession(agentName, threadId);
+      fallbackSessionId = fallbackSession?.sessionId;
       const fallbackArgs = [
         CLAUDE_EXECUTABLE,
         "-p",
@@ -2284,7 +2288,7 @@ async function execClaude(
       // The id of the exec that produced THIS response: on a rate-limit
       // fallback that is the fallback session, not the primary (#376).
       ...(() => {
-        const reported = usedFallback ? exec.sessionId : sessionId;
+        const reported = usedFallback ? (exec.sessionId ?? fallbackSessionId) : sessionId;
         return reported && reported !== "unknown" ? { sessionId: reported } : {};
       })(),
     };

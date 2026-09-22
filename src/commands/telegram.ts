@@ -2229,8 +2229,22 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
     // Inject button press as a new user message to the running Claude session
     const chatId = query.message?.chat.id ?? query.from.id;
     const threadId = query.message?.message_thread_id;
+    // The session the chat's own messages use (#376, CodeRabbit): a press
+    // used to go to the global session even when the chat had its own — on
+    // the direct path for a group, and under `session.gatewayScope:
+    // "conversation"` for every chat. Without the message (a stale button
+    // from a deleted message) there is no chat to key on: global, as before.
+    const sessionKey = query.message
+      ? telegramSessionKey(
+          chatId,
+          threadId,
+          query.from.id,
+          query.message.chat.type === "private",
+          config.dmIsolation,
+        )
+      : undefined;
     try {
-      const result = await runUserMessage("telegram", `[Button pressed: ${label}]`);
+      const result = await runUserMessage("telegram", `[Button pressed: ${label}]`, sessionKey);
       if (result.exitCode === 0 && result.stdout) {
         const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(result.stdout);
         const { cleanedText: afterVoice, voicePaths } = extractVoiceDirectives(afterReact);
