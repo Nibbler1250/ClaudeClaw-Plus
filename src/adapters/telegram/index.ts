@@ -1117,6 +1117,12 @@ export class TelegramAdapter {
     // ack that asks the user to retry must not delete the buttons it points
     // them at, and neither must `details` (the action stays pending) or `skip`
     // (the resolver re-sent its own keyboard).
+    // Acknowledge first: the tap shows a spinner in the client until the
+    // callback query is answered, and the edit below is an unbounded fetch —
+    // a slow one would hold the spinner until Telegram times the query out.
+    // The edit is a best-effort follow-up (CodeRabbit on the PR).
+    await this.safeAnswerCallback({ callback_query_id: query.id, text: ackText });
+
     const message = query.message;
     if (message && decisionStripsKeyboard(verdict, decision)) {
       const originalText = message.text ?? "";
@@ -1129,8 +1135,6 @@ export class TelegramAdapter {
         }),
       );
     }
-
-    await this.safeAnswerCallback({ callback_query_id: query.id, text: ackText });
   }
 
   private resolveAgent(chatId: number): string | undefined {
