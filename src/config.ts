@@ -268,7 +268,13 @@ const DEFAULT_SETTINGS: Settings = {
   stallWatchdog: structuredClone(DEFAULT_STALL_CONFIG),
   agentJobs: structuredClone(DEFAULT_AGENT_JOB_CONFIG),
   governance: { watchdog: {} },
-  session: { autoRotate: false, maxMessages: 50, maxAgeHours: 24, summaryPath: "" },
+  session: {
+    autoRotate: false,
+    maxMessages: 50,
+    maxAgeHours: 24,
+    summaryPath: "",
+    gatewayScope: "global",
+  },
   // Default runtime: `bus` (Sprint 5.4 flip after Hetzner staging soak ended
   // 2026-05-25). `runtime: "pty"` remains as a permanent first-class option
   // for operators who need the `claude -p` / API-billed path — particularly
@@ -870,6 +876,19 @@ export interface SessionConfig {
   maxAgeHours: number;
   /** Directory to write markdown summaries before rotation. Empty string disables summaries. */
   summaryPath: string;
+  /**
+   * #376: which Claude session a gateway turn (Discord / Telegram through the
+   * event log) resumes. `"global"` (default, the behaviour so far): every
+   * gateway conversation shares the one global session, so what was said in
+   * one channel is context for the answer in another. `"conversation"`: each
+   * channel / thread / chat / topic gets its own session (keyed
+   * `channelId:threadId`, the gateway's own conversation identity), handled
+   * like a Discord thread session: its own queue (conversations run in
+   * parallel), no auto-rotation — `/reset` and `/compact` act on it. Splitting
+   * one context into many costs more tokens and the assistant stops
+   * remembering across channels — hence opt-in.
+   */
+  gatewayScope: "global" | "conversation";
 }
 
 let cached: Settings | null = null;
@@ -1187,6 +1206,8 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
       maxAgeHours: Number.isFinite(raw.session?.maxAgeHours) ? Number(raw.session.maxAgeHours) : 24,
       summaryPath:
         typeof raw.session?.summaryPath === "string" ? raw.session.summaryPath.trim() : "",
+      // Anything but the exact opt-in word keeps the shared session (#376).
+      gatewayScope: raw.session?.gatewayScope === "conversation" ? "conversation" : "global",
     },
     apiToken:
       typeof raw.apiToken === "string" && raw.apiToken.trim() ? raw.apiToken.trim() : undefined,

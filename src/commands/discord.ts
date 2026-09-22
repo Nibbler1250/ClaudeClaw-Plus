@@ -21,9 +21,13 @@ import { fireJob, parseFireArgs } from "./fire";
 import { mkdir } from "node:fs/promises";
 import { extname, join, basename, sep } from "node:path";
 import { processEventWithFallback, setGatewayEnabled } from "../gateway";
-import { normalizeDiscordMessage, type NormalizedEvent } from "../gateway/normalizer";
+import {
+  discordConversation,
+  normalizeDiscordMessage,
+  type NormalizedEvent,
+} from "../gateway/normalizer";
 import type { EventRecord } from "../event-log";
-import type { GatewayRunResult } from "../event-processor";
+import { type GatewayRunResult, gatewayCommandSessionKey } from "../event-processor";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
 import { encodeCwdForProjectsDir } from "../bus/jsonl-line-types";
 
@@ -1372,6 +1376,28 @@ async function handleMessageCreate(
 
 // --- Interaction handler (slash commands + secretary buttons) ---
 
+/**
+ * The runner session a slash command acts on. Direct path: a guild channel
+ * has its own session keyed by its channel id, a DM uses the global session.
+ * Gateway path (#376): the session the gateway gives the conversation — its
+ * own under `session.gatewayScope: "conversation"`, the global one otherwise
+ * — so /reset, /compact, /status and /context hit the session the next
+ * message will actually resume. `undefined` = the global session.
+ */
+export function interactionSessionKey(
+  interaction: Pick<DiscordInteraction, "guild_id" | "channel_id">,
+  gatewayOn = process.env.USE_GATEWAY_DISCORD === "true",
+): string | undefined {
+  if (!interaction.channel_id) return undefined;
+  if (gatewayOn) {
+    return gatewayCommandSessionKey(
+      discordConversation(interaction.guild_id, interaction.channel_id),
+      getSettings().session,
+    );
+  }
+  return interaction.guild_id ? interaction.channel_id : undefined;
+}
+
 async function handleInteractionCreate(
   token: string,
   interaction: DiscordInteraction,
@@ -1395,16 +1421,16 @@ async function handleInteractionCreate(
     }
 
     if (interaction.data.name === "reset") {
-      const isGuildCmd = !!interaction.guild_id && !!interaction.channel_id;
-      if (isGuildCmd) {
-        await removeThreadSession(interaction.channel_id!);
-        await resetFallbackSession(undefined, interaction.channel_id!);
+      const key = interactionSessionKey(interaction);
+      if (key) {
+        await removeThreadSession(key);
+        await resetFallbackSession(undefined, key);
       } else {
         await resetSession();
         await resetFallbackSession();
       }
       await respondToInteraction(interaction, {
-        content: isGuildCmd
+        content: key
           ? "Channel session reset. Next message starts fresh."
           : "Global session reset. Next message starts fresh.",
       });
@@ -1415,9 +1441,9 @@ async function handleInteractionCreate(
       await respondToInteraction(interaction, { content: "⏳ Compacting session..." });
       const compactChannelId = interaction.channel_id;
       const compactThreadInfo = compactChannelId ? knownThreads.get(compactChannelId) : undefined;
-      const isGuildCmd = !!interaction.guild_id && !!compactChannelId;
-      const result = isGuildCmd
-        ? await compactCurrentThreadSession(compactChannelId!, compactThreadInfo?.agentName)
+      const compactKey = interactionSessionKey(interaction);
+      const result = compactKey
+        ? await compactCurrentThreadSession(compactKey, compactThreadInfo?.agentName)
         : await compactCurrentSession();
       await fetch(
         `${DISCORD_API}/webhooks/${applicationId}/${interaction.token}/messages/@original`,
@@ -1431,10 +1457,8 @@ async function handleInteractionCreate(
     }
 
     if (interaction.data.name === "status") {
-      const isGuildCmd = !!interaction.guild_id && !!interaction.channel_id;
-      const session = isGuildCmd
-        ? await peekThreadSession(interaction.channel_id!)
-        : await peekSession();
+      const statusKey = interactionSessionKey(interaction);
+      const session = statusKey ? await peekThreadSession(statusKey) : await peekSession();
       const settings = getSettings();
       if (!session) {
         await respondToInteraction(interaction, { content: "📊 No active session." });
@@ -1467,10 +1491,8 @@ async function handleInteractionCreate(
     }
 
     if (interaction.data.name === "context") {
-      const isGuildCmd = !!interaction.guild_id && !!interaction.channel_id;
-      const session = isGuildCmd
-        ? await peekThreadSession(interaction.channel_id!)
-        : await peekSession();
+      const statusKey = interactionSessionKey(interaction);
+      const session = statusKey ? await peekThreadSession(statusKey) : await peekSession();
       if (!session) {
         await respondToInteraction(interaction, { content: "No active session." });
         return;

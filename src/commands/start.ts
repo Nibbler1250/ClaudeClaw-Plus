@@ -19,6 +19,7 @@ import {
   probeClaudeCliVersion,
 } from "../runner";
 import {
+  gatewaySessionThreadId,
   initGatewayProcessor,
   registerGatewayDelivery,
   unregisterGatewayDelivery,
@@ -834,7 +835,14 @@ export async function start(args: string[] = []) {
 
   // --- Gateway event processor ---
   // Wire up the event processor for gateway v2 path (Discord/Telegram → event log → processor → runUserMessage)
-  await initGatewayProcessor(async (source, prompt) => runUserMessage(source, prompt));
+  // #376: with `session.gatewayScope: "conversation"` each conversation resumes
+  // its own runner session (`sessions.ts` is the single source of truth — the
+  // gateway's session map only records what the runner reports); by default
+  // every gateway turn resumes the one global session, as before. Read at each
+  // turn so a hot reload of settings takes effect without a restart.
+  await initGatewayProcessor(async (source, prompt, ctx) =>
+    runUserMessage(source, prompt, gatewaySessionThreadId(ctx, getSettings().session)),
+  );
 
   // --- Discord ---
   let discordSendToUser: ((userId: string, text: string) => Promise<void>) | null = null;

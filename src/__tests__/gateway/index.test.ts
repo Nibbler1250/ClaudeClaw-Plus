@@ -332,13 +332,6 @@ describe("Gateway", () => {
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
           }),
-          getResumeArgsForEvent: vi.fn().mockResolvedValue({
-            mappingId: "mapping-1",
-            claudeSessionId: null,
-            args: [],
-            isNewMapping: true,
-            canResume: false,
-          }),
           updateSessionAfterProcessing: vi.fn().mockResolvedValue(undefined),
         },
       };
@@ -405,13 +398,6 @@ describe("Gateway", () => {
             lastActiveAt: new Date().toISOString(),
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
-          }),
-          getResumeArgsForEvent: vi.fn().mockResolvedValue({
-            mappingId: "mapping-1",
-            claudeSessionId: null,
-            args: [],
-            isNewMapping: true,
-            canResume: false,
           }),
           updateSessionAfterProcessing: vi.fn(),
         },
@@ -600,17 +586,6 @@ describe("Gateway", () => {
               }
               return mappings.get(key);
             }),
-          getResumeArgsForEvent: vi.fn().mockImplementation(async (event: NormalizedEvent) => {
-            const key = `${event.channelId}:${event.threadId}`;
-            const entry = mappings.get(key);
-            return {
-              mappingId: entry?.mappingId ?? "unknown",
-              claudeSessionId: entry?.claudeSessionId ?? null,
-              args: entry?.claudeSessionId ? ["--resume", entry.claudeSessionId] : [],
-              isNewMapping: !entry,
-              canResume: entry?.claudeSessionId !== null,
-            };
-          }),
           updateSessionAfterProcessing: vi
             .fn()
             .mockImplementation(async (channelId: string, threadId: string, seq: number) => {
@@ -786,13 +761,6 @@ describe("Concurrent events", () => {
           lastActiveAt: new Date().toISOString(),
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
-        }),
-        getResumeArgsForEvent: vi.fn().mockResolvedValue({
-          mappingId: "mapping-1",
-          claudeSessionId: null,
-          args: [],
-          isNewMapping: false,
-          canResume: false,
         }),
         updateSessionAfterProcessing: vi.fn().mockImplementation(async () => {
           callOrder.push("update");

@@ -32,7 +32,8 @@ import { submitTelegramToGateway } from "../gateway";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
 import { markdownToTelegramHtml } from "../adapters/telegram/format";
 import type { EventRecord } from "../event-log";
-import type { GatewayRunResult } from "../event-processor";
+import { type GatewayRunResult, gatewayCommandSessionKey } from "../event-processor";
+import { telegramConversation } from "../gateway/normalizer";
 import { encodeCwdForProjectsDir } from "../bus/jsonl-line-types";
 
 // --- Outbox sandbox for send-file / voice directives ---
@@ -1029,6 +1030,28 @@ function getTelegramSessionKey(
   return `tg:${chatId}`;
 }
 
+/**
+ * The runner session a chat's messages and slash commands act on. Direct
+ * path: the legacy `tg:` keys above. Gateway path (#376): the session the
+ * gateway gives the conversation — its own under `session.gatewayScope:
+ * "conversation"`, the global one otherwise — so /reset, /compact, /status
+ * and /context hit the session the next message will actually resume.
+ * `undefined` = the global session.
+ */
+export function telegramSessionKey(
+  chatId: number,
+  threadId: number | undefined,
+  userId: number | undefined,
+  isPrivate: boolean,
+  dmIsolation: "shared" | "perUser",
+  gatewayOn = process.env.USE_GATEWAY_TELEGRAM === "true",
+): string | undefined {
+  if (gatewayOn) {
+    return gatewayCommandSessionKey(telegramConversation(chatId, threadId), getSettings().session);
+  }
+  return getTelegramSessionKey(chatId, threadId, userId, isPrivate, dmIsolation);
+}
+
 // --- Message handler ---
 
 async function handleMessage(message: TelegramMessage): Promise<void> {
@@ -1045,7 +1068,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
   );
   const hasVoice = Boolean(message.voice || message.audio || isAudioDocument(message.document));
   const hasDocument = Boolean(message.document && isDocumentAttachment(message.document));
-  const sessionKey = getTelegramSessionKey(chatId, threadId, userId, isPrivate, config.dmIsolation);
+  const sessionKey = telegramSessionKey(chatId, threadId, userId, isPrivate, config.dmIsolation);
 
   if (!isPrivate && !isGroup) return;
 
@@ -2206,8 +2229,22 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
     // Inject button press as a new user message to the running Claude session
     const chatId = query.message?.chat.id ?? query.from.id;
     const threadId = query.message?.message_thread_id;
+    // The session the chat's own messages use (#376, CodeRabbit): a press
+    // used to go to the global session even when the chat had its own — on
+    // the direct path for a group, and under `session.gatewayScope:
+    // "conversation"` for every chat. Without the message (a stale button
+    // from a deleted message) there is no chat to key on: global, as before.
+    const sessionKey = query.message
+      ? telegramSessionKey(
+          chatId,
+          threadId,
+          query.from.id,
+          query.message.chat.type === "private",
+          config.dmIsolation,
+        )
+      : undefined;
     try {
-      const result = await runUserMessage("telegram", `[Button pressed: ${label}]`);
+      const result = await runUserMessage("telegram", `[Button pressed: ${label}]`, sessionKey);
       if (result.exitCode === 0 && result.stdout) {
         const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(result.stdout);
         const { cleanedText: afterVoice, voicePaths } = extractVoiceDirectives(afterReact);
