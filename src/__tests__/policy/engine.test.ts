@@ -715,12 +715,21 @@ describe("Policy Engine - Skill Overlay engine participation (#258 item 2)", () 
     }
   });
 
-  it("a quoted entry denies what it says, instead of matching nothing", () => {
+  it("a quoted entry, or one with a trailing comment, denies what it says instead of matching nothing", () => {
     cacheSkillOverlayFromContent(
       "quoted",
       ["---", "name: quoted", "deniedTools:", '  - "Bash"', "---", "Quoted."].join("\n"),
     );
     expect(evaluate(createRequest({ skillName: "quoted", toolName: "Bash" })).action).toBe("deny");
+    cacheSkillOverlayFromContent(
+      "commented",
+      ["---", "name: commented", "deniedTools:", "  - Bash # not for this skill", "---", "C."].join(
+        "\n",
+      ),
+    );
+    expect(evaluate(createRequest({ skillName: "commented", toolName: "Bash" })).action).toBe(
+      "deny",
+    );
   });
 
   it("an allow cached before the overlay was resolved does not survive it", async () => {

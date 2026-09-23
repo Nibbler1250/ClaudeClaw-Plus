@@ -67,9 +67,16 @@ export function parseSkillMetadata(skillContent: string, skillName: string): Ski
   let preferredTools: string[] | undefined;
   let deniedTools: string[] | undefined;
 
-  // A quoted entry (`- "Bash"`) used to parse as `"Bash"` with the quotes and
-  // then match nothing — a deny that silently does nothing (adversarial pass).
-  const stripQuotes = (v: string): string => v.replace(/^["']|["']$/g, "").trim();
+  // A deny that silently matches nothing is the worst kind of deny, and two
+  // ordinary YAML shapes produced one: a quoted entry (`- "Bash"`) parsed with
+  // its quotes, and a trailing comment (`- Bash # why`) parsed into the value.
+  // Tool names carry neither, so both are stripped (comment first — the `#` of
+  // a comment is never inside the quoted scalar we keep).
+  const stripQuotes = (v: string): string =>
+    v
+      .replace(/\s+#.*$/, "")
+      .replace(/^["']|["']$/g, "")
+      .trim();
 
   // Helper to parse array fields (handles both multiline and inline formats)
   function parseArrayField(fieldName: string): string[] | undefined {
