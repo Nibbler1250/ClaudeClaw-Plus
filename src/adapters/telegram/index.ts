@@ -717,8 +717,10 @@ export class TelegramAdapter {
    *
    * Order matters:
    *   1. The live entry is evicted synchronously, before any await, so a
-   *      concurrent progress handler (or the spinner) cannot re-arm itself on
-   *      the old message after the final (see the guard in handleResponseText).
+   *      progress or edit_message handler whose edit is still in flight does
+   *      not restart the spinner on the old message once it settles (see the
+   *      guards in handleResponseText and handleResponseEditText). The spinner
+   *      itself is already stopped at the top of handleResponseText.
    *   2. Send the final (HTML, plain-text fallback on a malformed-HTML 400 —
    *      same contract as the fresh-send path).
    *   3. Only once the final is out, delete the live message. A failed delete
@@ -864,9 +866,15 @@ export class TelegramAdapter {
             message_id: last.message_id,
             text: sendText,
           });
+        } else {
+          // Same contract as the progress path: leave the formatted message
+          // as is, but log it so a lost update is visible.
+          this.logger.warn(`[telegram-adapter] edit_message edit failed; message left as is`, err);
         }
       }
-      if (wasSpinning) {
+      // Same guard as the progress path: a final that landed while this edit
+      // was in flight has evicted (and deleted) the message; do not animate it.
+      if (wasSpinning && this.lastBotMessage.get(key)?.message_id === last.message_id) {
         this.startSpinner(key, newText, last.chat_id, last.message_id);
       }
     } catch (err) {
@@ -1331,8 +1339,9 @@ export class TelegramAdapter {
    * underlying API promise unwrapped, so `await this.sendHtml(x)` settles in
    * exactly one microtask hop — identical to `await this.api.sendMessage(x)`.
    * An extra hop would defer the caller's post-send bookkeeping (`turnActive` /
-   * `lastBotMessage`) past a back-to-back follow-up event, making a final reply
-   * fresh-send instead of editing the live message in place (regresses #141).
+   * `lastBotMessage`) past a back-to-back follow-up event, making a follow-up
+   * progress reply fresh-send instead of editing the live message in place, and
+   * a final miss the live message it should clean up (regresses #141).
    * The plain-text fallback for malformed-markup 400s lives in each caller's
    * `catch` (error path only, so it never affects success-path timing).
    */
