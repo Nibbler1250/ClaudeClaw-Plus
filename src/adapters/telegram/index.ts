@@ -609,11 +609,15 @@ export class TelegramAdapter {
     }
     if (cleanedText.length === 0) {
       // nothing textual; fall through to reactions.
+    } else if (!isProgress) {
+      await this.deliverFinal(key, target, displayText);
     } else if (this.turnActive.has(key)) {
-      // Live turn message exists (placeholder or earlier progress) — edit in place.
+      // Progress with a live turn message (placeholder or earlier progress) —
+      // edit in place. Edits never notify, which is what a progress update
+      // wants; the final goes out as a new message (see deliverFinal).
       const live = this.lastBotMessage.get(key);
       if (live) {
-        const editText = isProgress ? `${FRAMES[0]} ${cleanedText}` : displayText;
+        const editText = `${FRAMES[0]} ${cleanedText}`;
         try {
           await this.editHtml({
             chat_id: live.chat_id,
@@ -633,23 +637,27 @@ export class TelegramAdapter {
             } catch (err2) {
               this.logger.error(`[telegram-adapter] turn edit failed`, err2);
             }
+          } else {
+            // A benign/non-format error (e.g. "message is not modified",
+            // "message to edit not found", 429) — leave the formatted message
+            // as is; do NOT resend raw markdown (that would downgrade it). Log
+            // it so a lost update is visible.
+            this.logger.warn(`[telegram-adapter] progress edit failed; message left as is`, err);
           }
-          // else: a benign/non-format error (e.g. "message is not modified",
-          // "message to edit not found", 429) — leave the formatted message as
-          // is; do NOT resend raw markdown (that would downgrade it).
         }
-        if (isProgress) {
+        // Restart the spinner only if this is still the live turn message. A
+        // final that landed while the edit above was in flight has already
+        // evicted it; restarting here would animate stale progress text.
+        if (
+          this.turnActive.has(key) &&
+          this.lastBotMessage.get(key)?.message_id === live.message_id
+        ) {
           this.startSpinner(key, cleanedText, live.chat_id, live.message_id);
-        } else {
-          // Final — turn done. Evict so a later unprompted reply (cron /
-          // heartbeat) doesn't edit this now-stale message id.
-          this.turnActive.delete(key);
-          this.lastBotMessage.delete(key);
         }
       }
     } else {
-      // No live turn (unprompted reply / second final) — send fresh.
-      const sendText = isProgress ? `${FRAMES[0]} ${cleanedText}` : displayText;
+      // Progress with no live turn — send fresh and keep it for later edits.
+      const sendText = `${FRAMES[0]} ${cleanedText}`;
       try {
         let res: { ok: boolean; result?: { message_id: number } };
         try {
@@ -670,10 +678,7 @@ export class TelegramAdapter {
           });
         }
         const id = res?.ok && res.result ? res.result.message_id : null;
-        // Only retain the message for follow-up edits while a turn is live
-        // (progress). A fresh final reply needs no future edit, so leaving no
-        // entry avoids the stale-message_id edit bug.
-        if (id != null && isProgress) {
+        if (id != null) {
           this.lastBotMessage.set(key, {
             chat_id: target.chat_id,
             message_id: id,
@@ -697,6 +702,93 @@ export class TelegramAdapter {
           emoji,
         });
       }
+    }
+  }
+
+  /**
+   * Deliver a turn-final reply as a NEW message, then clean up the turn's live
+   * placeholder/progress message.
+   *
+   * Editing the live message in place (the previous behaviour) never notifies:
+   * Telegram only pushes a notification for a new message, so a final that
+   * replaced a "working on it…" progress line reached the chat silently and the
+   * user never saw the answer. A non-format edit error was also swallowed, which
+   * lost the final with no log line.
+   *
+   * Order matters:
+   *   1. The live entry is evicted synchronously, before any await, so a
+   *      concurrent progress handler (or the spinner) cannot re-arm itself on
+   *      the old message after the final (see the guard in handleResponseText).
+   *   2. Send the final (HTML, plain-text fallback on a malformed-HTML 400 —
+   *      same contract as the fresh-send path).
+   *   3. Only once the final is out, delete the live message. A failed delete
+   *      is logged and the message left in place: cleanup must never cost the
+   *      final.
+   *   4. If the send itself fails, log it and fall back to editing the live
+   *      message (silent, but visible in the chat — better than nothing).
+   * Every failure branch on this path logs.
+   */
+  private async deliverFinal(key: string, target: PendingPrompt, text: string): Promise<void> {
+    const live = this.turnActive.has(key) ? this.lastBotMessage.get(key) : undefined;
+    // Turn done — evict so a later unprompted reply (cron / heartbeat) or
+    // edit_message doesn't target this now-stale message id. A fresh final is
+    // never retained for follow-up edits (avoids the stale-message_id edit bug).
+    this.turnActive.delete(key);
+    this.lastBotMessage.delete(key);
+
+    const send = {
+      chat_id: target.chat_id,
+      text,
+      message_thread_id: target.message_thread_id,
+    };
+    let delivered = false;
+    try {
+      try {
+        await this.sendHtml(send);
+      } catch (err) {
+        // Only a malformed-HTML 400 warrants sending raw text; anything else
+        // (429 flood, network, benign 400) goes to the outer catch.
+        if (!isTelegramHtmlParseError(err)) throw err;
+        await this.api.sendMessage(send);
+      }
+      delivered = true;
+    } catch (err) {
+      this.logger.error(
+        live
+          ? `[telegram-adapter] final sendMessage failed; falling back to editing the live turn message`
+          : `[telegram-adapter] sendMessage failed`,
+        err,
+      );
+    }
+
+    if (!live) return;
+    if (delivered) {
+      try {
+        await this.api.deleteMessage({ chat_id: live.chat_id, message_id: live.message_id });
+      } catch (err) {
+        this.logger.warn(
+          `[telegram-adapter] could not delete the turn placeholder after the final reply; leaving it`,
+          err,
+        );
+      }
+      return;
+    }
+    try {
+      try {
+        await this.editHtml({ chat_id: live.chat_id, message_id: live.message_id, text });
+      } catch (err) {
+        if (!isTelegramHtmlParseError(err)) throw err;
+        await this.api.editMessageText({
+          chat_id: live.chat_id,
+          message_id: live.message_id,
+          text,
+        });
+      }
+    } catch (err) {
+      this.logger.error(
+        `[telegram-adapter] final reply lost: send and edit fallback both failed`,
+        err,
+      );
     }
   }
 
