@@ -682,6 +682,11 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
           // companion to the chat-error surfacing in start.ts's onChat.
           let busError: string | undefined;
           let ok = true;
+          // An inject is the daemon talking to the agent, not a user waiting
+          // on an answer: when the agent ends that turn without `reply`, its
+          // raw turn text (the #215 safety net) is internal and must not be
+          // pushed to Telegram. A real `reply` is still forwarded.
+          let synthesized = false;
           if (opts.bus) {
             const out = await opts.bus.sendPromptAndAwait(opts.bus.defaultAgentId, message, {
               origin: "webui",
@@ -689,6 +694,7 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
             });
             stdout = out.output;
             exitCode = out.exitCode;
+            synthesized = out.synthesized === true;
             if (!out.ok) {
               ok = false;
               busError = out.error;
@@ -700,7 +706,7 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
           }
           const text = stdout.trim();
           const { telegram } = opts.getSnapshot().settings;
-          if (text && telegram.token && telegram.allowedUserIds.length > 0) {
+          if (text && !synthesized && telegram.token && telegram.allowedUserIds.length > 0) {
             const chatId = telegram.allowedUserIds[0];
             fetch(`https://api.telegram.org/bot${telegram.token}/sendMessage`, {
               method: "POST",

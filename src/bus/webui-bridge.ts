@@ -89,6 +89,8 @@ export interface BusPromptResult {
   output: string;
   exitCode: number;
   error?: string;
+  /** The final was the #215 safety net's raw turn text, not a `reply` call. */
+  synthesized?: boolean;
 }
 
 const DEFAULT_PROMPT_TIMEOUT_MS = 5 * 60 * 1000;
@@ -271,7 +273,7 @@ function runPrompt(
           return;
         }
         if (!admitted) return;
-        const payload = event.payload as { text?: string; intent?: string };
+        const payload = event.payload as { text?: string; intent?: string; synthesized?: true };
         if (typeof payload.text === "string" && payload.text.length > 0) {
           accumulated += payload.text;
           if (opts.onChunk) {
@@ -288,6 +290,7 @@ function runPrompt(
               ok: true,
               output: accumulated || (payload.text ?? ""),
               exitCode: 0,
+              ...(payload.synthesized ? { synthesized: true } : {}),
             },
             "turn_observed",
             { output_chars: accumulated.length },
