@@ -2764,7 +2764,12 @@ export class BusCoreImpl implements BusCore {
     // deliver properly — inject a system reminder telling it to call `reply`
     // now. A curated reply is what the user actually wants; the synthesized
     // dump is a last resort. Bounded to one nudge per turn via `replyNudged`.
-    if (this.replyNudgeEnabled && !nudged) {
+    // A daemon inject (`/api/inject`, origin_id "inject") has no user waiting:
+    // ending it without `reply` is a legitimate silence, so don't nudge the
+    // agent into speaking. The synthesized final below still settles the
+    // awaiting inject route, which drops it instead of forwarding it.
+    const isInject = origin.origin_id === "inject";
+    if (this.replyNudgeEnabled && !nudged && !isInject) {
       console.warn(
         `[bus] silent-drop detected for agent=${agentId} (origin=${origin.origin}, ` +
           `chars=${deliverText.length}): turn ended with text but no reply tool call — ` +
