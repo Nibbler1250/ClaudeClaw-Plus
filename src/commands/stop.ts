@@ -132,10 +132,15 @@ export async function stop() {
   // #420: only if the file still names the daemon we stopped — a `start` that
   // raced us may already own it. "absent" is the normal graceful case: the
   // daemon removes its own file when it exits.
-  if ((await cleanupPidFileIf(Number(pid))) === "foreign") {
+  const cleanup = await cleanupPidFileIf(Number(pid));
+  if (cleanup === "foreign") {
     console.log(
       `PID file no longer names ${pid} (another daemon started meanwhile) — left in place.`,
     );
+  } else if (cleanup === "locked") {
+    // #435: a `start` holds the PID lock; the file it finds naming a dead
+    // PID is cleaned up by that start's own check.
+    console.log(`A start is in progress in this directory — PID file left to it.`);
   }
   await teardownStatusline();
 

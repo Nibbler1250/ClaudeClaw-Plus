@@ -1,5 +1,6 @@
 import { writeFile, unlink, readFile } from "fs/promises";
-import { join } from "path";
+import { linkSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
+import { dirname, join } from "path";
 
 const PID_FILE = join(process.cwd(), ".claude", "claudeclaw", "daemon.pid");
 
@@ -13,25 +14,30 @@ export function getPidPath(): string {
  * Returns the running PID if alive, or null.
  */
 export async function checkExistingDaemon(): Promise<number | null> {
-  let raw: string;
+  // #435: the whole check runs under the PID lock (re-entrant for `start`,
+  // which already holds it), so a concurrent start cannot write between the
+  // read and the stale cleanup. A start holding the lock past the wait is
+  // reported as a running daemon: one is about to be.
+  const lock = await acquirePidLock();
+  if (!lock.ok) return lock.holder;
   try {
-    raw = (await readFile(PID_FILE, "utf-8")).trim();
-  } catch {
-    return null; // no pid file
-  }
+    let raw: string;
+    try {
+      raw = (await readFile(PID_FILE, "utf-8")).trim();
+    } catch {
+      return null; // no pid file
+    }
 
-  const pid = Number(raw);
-  if (!pid || isNaN(pid)) {
-    await cleanupPidFile();
+    const pid = Number(raw);
+    // #420: EPERM means alive-but-not-ours — never treat it as stale, or a
+    // `start` by another user removes a live daemon's file and starts over it.
+    if (pid && !isNaN(pid) && isPidAlive(pid)) return pid;
+    // Corrupt, or the process is dead: remove the file — still the one read.
+    await compareAndUnlink(pid, PID_FILE);
     return null;
+  } finally {
+    releasePidLock();
   }
-
-  // #420: EPERM means alive-but-not-ours — never treat it as stale, or a
-  // `start` by another user removes a live daemon's file and starts over it.
-  if (isPidAlive(pid)) return pid;
-  // process is dead, clean up stale pid file
-  await cleanupPidFile();
-  return null;
 }
 
 export async function writePidFile(): Promise<void> {
@@ -76,11 +82,27 @@ export function isPidAlive(pid: number): boolean {
  * that daemon's file and let a later `start` launch a duplicate. Returns
  * whether the file was removed.
  */
-export type PidFileCleanup = "removed" | "absent" | "foreign";
+export type PidFileCleanup = "removed" | "absent" | "foreign" | "locked";
 export async function cleanupPidFileIf(
   expectedPid: number,
   pidFile: string = PID_FILE,
+  lockWaitMs = PID_LOCK_WAIT_MS,
 ): Promise<PidFileCleanup> {
+  // #435: read → compare → unlink under the project's PID lock, so it cannot
+  // interleave with a `start` between `checkExistingDaemon()` and
+  // `writePidFile()`. When the lock stays held (a `start` is mid-way), leave
+  // the file: a PID file naming a dead process is cleaned up by the next
+  // `checkExistingDaemon()`, while removing a live one starts a duplicate.
+  const lock = await acquirePidLock(pidFile, lockWaitMs);
+  if (!lock.ok) return "locked";
+  try {
+    return await compareAndUnlink(expectedPid, pidFile);
+  } finally {
+    releasePidLock(pidFile);
+  }
+}
+
+async function compareAndUnlink(expectedPid: number, pidFile: string): Promise<PidFileCleanup> {
   let raw: string;
   try {
     raw = (await readFile(pidFile, "utf-8")).trim();
@@ -96,11 +118,208 @@ export async function cleanupPidFileIf(
     return "removed";
   }
   if (current !== expectedPid) return "foreign";
-  // TOCTOU between this read and the unlink is one syscall wide and accepted:
-  // POSIX has no compare-and-unlink without a lock file, and the window used
-  // to be the whole drain.
+  // Every writer holds the PID lock too (#435), so nothing can write the file
+  // between this read and the unlink.
   await unlink(pidFile).catch(() => undefined);
   return "removed";
+}
+
+// --- PID lock (#435) ---------------------------------------------------------
+//
+// One lock per project, `daemon.lock` next to `daemon.pid`, shared by every
+// reader-that-removes, writer and remover of the PID file: `start` holds it
+// from `checkExistingDaemon()` through `writePidFile()`, and every removal is
+// a compare-and-unlink taken under it. Bun has no `flock`, so it is a file
+// created atomically (`link(2)` of a temp file that already holds our PID:
+// the lock never exists empty) and judged stale when the PID inside is gone.
+
+/** How long removers and `start` wait for a lock someone else holds. */
+export const PID_LOCK_WAIT_MS = 2_000;
+
+/** Locks this process holds, by path, with a re-entry count. */
+const heldLocks = new Map<string, number>();
+let exitHookInstalled = false;
+
+export function getPidLockPath(pidFile: string = PID_FILE): string {
+  return join(dirname(pidFile), "daemon.lock");
+}
+
+function readLockHolder(lockPath: string): number | null {
+  try {
+    const n = Number(readFileSync(lockPath, "utf-8").trim());
+    return Number.isInteger(n) && n > 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+function olderThan(path: string, ms: number): boolean {
+  try {
+    return Date.now() - statSync(path).mtimeMs > ms;
+  } catch {
+    return false;
+  }
+}
+
+/** `holder`: the live PID holding the lock when `ok` is false, null otherwise. */
+export interface PidLockResult {
+  ok: boolean;
+  holder: number | null;
+}
+
+/**
+ * Create `path` holding our PID, or fail if it exists. `link(2)` of a temp
+ * file that already holds the PID, so the file never exists empty; where
+ * hard links are not available, `O_CREAT|O_EXCL` then the PID — a reader
+ * may then briefly see it empty, which the stale rule does not take for
+ * stale until it is old. "unavailable": no lock file can be created here.
+ */
+function tryLink(path: string): "ok" | "busy" | "unavailable" {
+  const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}`;
+  try {
+    // A first `start` takes the lock before `initConfig()` creates the dir.
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(tmp, `${process.pid}\n`);
+  } catch {
+    return "unavailable";
+  }
+  try {
+    linkSync(tmp, path);
+    return "ok";
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") return "busy";
+  } finally {
+    try {
+      unlinkSync(tmp);
+    } catch {}
+  }
+  try {
+    writeFileSync(path, `${process.pid}\n`, { flag: "wx" });
+    return "ok";
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EEXIST" ? "busy" : "unavailable";
+  }
+}
+
+/**
+ * One attempt. Not ok with a null holder: a stale lock was removed (retry),
+ * or no lock can be taken right now (the caller fails at its deadline).
+ */
+function tryCreateLock(lockPath: string): PidLockResult {
+  const r = tryLink(lockPath);
+  if (r === "ok") return { ok: true, holder: null };
+  // Fail closed: proceeding unlocked is exactly the race #435 closes.
+  if (r === "unavailable") return { ok: false, holder: null };
+  const holder = readLockHolder(lockPath);
+  // Empty or unreadable: possibly an O_EXCL lock between create and write.
+  if (holder === null && !olderThan(lockPath, 5_000)) return { ok: false, holder: null };
+  // A holder that is gone (or a lock with our own PID that this process does
+  // not hold: a dead predecessor whose PID was recycled) is stale.
+  if (holder !== null && holder !== process.pid && isPidAlive(holder)) {
+    return { ok: false, holder };
+  }
+  stealStaleLock(lockPath, holder);
+  return { ok: false, holder: null };
+}
+
+/**
+ * Remove a stale lock. Two contenders may judge the same lock stale; if both
+ * removed "it", the second could remove the first one's fresh lock. So the
+ * removal happens under a second create-or-fail file, `daemon.lock.steal`,
+ * after re-reading the holder: only one contender at a time checks and
+ * removes, and a fresh lock (live holder) is never removed. The guard is held
+ * for two syscalls; one left by a contender that died inside them is itself
+ * judged stale by its PID and removed the same way.
+ */
+function stealStaleLock(lockPath: string, staleHolder: number | null): void {
+  const guard = `${lockPath}.steal`;
+  const g = tryLink(guard);
+  if (g === "busy") {
+    const guardHolder = readLockHolder(guard);
+    // Held for two syscalls: one older than a few seconds was left by a
+    // stealer that died, even if its PID has since been recycled.
+    if (guardHolder !== null && isPidAlive(guardHolder) && !olderThan(guard, 5_000)) return;
+    try {
+      if (readLockHolder(guard) === guardHolder) unlinkSync(guard);
+    } catch {}
+    return; // retry from the top
+  }
+  if (g === "unavailable") return;
+  try {
+    if (readLockHolder(lockPath) === staleHolder) unlinkSync(lockPath);
+  } catch {
+    /* already gone */
+  } finally {
+    try {
+      unlinkSync(guard);
+    } catch {}
+  }
+}
+
+/**
+ * Take the project's PID lock, waiting up to `waitMs` for a live holder.
+ * Re-entrant within a process. On failure, `holder` is the PID holding it.
+ */
+export async function acquirePidLock(
+  pidFile: string = PID_FILE,
+  waitMs = PID_LOCK_WAIT_MS,
+): Promise<PidLockResult> {
+  const lockPath = getPidLockPath(pidFile);
+  const depth = heldLocks.get(lockPath);
+  if (depth !== undefined) {
+    heldLocks.set(lockPath, depth + 1);
+    return { ok: true, holder: null };
+  }
+  const deadline = Date.now() + waitMs;
+  let justStole = false;
+  for (;;) {
+    const r = tryCreateLock(lockPath);
+    if (r.ok) {
+      heldLocks.set(lockPath, 1);
+      installExitHook();
+      return r;
+    }
+    // A stale lock was just removed: retry at once — but only once in a row,
+    // so a stale lock that cannot be removed does not spin.
+    if (r.holder === null && !justStole) {
+      justStole = true;
+      continue;
+    }
+    justStole = false;
+    if (Date.now() >= deadline) return r;
+    await Bun.sleep(Math.min(50, Math.max(1, deadline - Date.now())));
+  }
+}
+
+/** Release one level of the lock; the file goes when the count reaches zero. */
+export function releasePidLock(pidFile: string = PID_FILE): void {
+  const lockPath = getPidLockPath(pidFile);
+  const depth = heldLocks.get(lockPath);
+  if (depth === undefined) return;
+  if (depth > 1) {
+    heldLocks.set(lockPath, depth - 1);
+    return;
+  }
+  heldLocks.delete(lockPath);
+  removeOwnLock(lockPath);
+}
+
+function removeOwnLock(lockPath: string): void {
+  if (readLockHolder(lockPath) !== process.pid) return; // not ours any more
+  try {
+    unlinkSync(lockPath);
+  } catch {}
+}
+
+// `start` holds the lock across its setup and several `process.exit()` paths;
+// none of them should leave it behind for the stale rule to clean up.
+function installExitHook(): void {
+  if (exitHookInstalled) return;
+  exitHookInstalled = true;
+  process.on("exit", () => {
+    for (const lockPath of heldLocks.keys()) removeOwnLock(lockPath);
+    heldLocks.clear();
+  });
 }
 
 /**
@@ -130,13 +349,5 @@ export async function readConfiguredDrainMs(projectDir: string): Promise<number 
     return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
   } catch {
     return undefined;
-  }
-}
-
-export async function cleanupPidFile(): Promise<void> {
-  try {
-    await unlink(PID_FILE);
-  } catch {
-    // already gone
   }
 }
