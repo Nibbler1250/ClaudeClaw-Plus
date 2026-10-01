@@ -170,15 +170,28 @@ const fixtureLines = {
       version: "2.1.143",
     });
   },
-  exitEnvelope(sessionId: string): string {
+  /** The tool turn's closing line — a terminal assistant line after the
+   *  tool_result (claude 2.1.286: tool_use → tool_result → end_turn). */
+  assistantAfterTool(sessionId: string): string {
     return JSON.stringify({
-      parentUuid: null,
-      type: "system",
-      subtype: "local_command",
-      content: "<command-name>/exit</command-name>\n<command-message>exit</command-message>",
-      level: "info",
+      parentUuid: "u-3",
+      type: "assistant",
+      message: {
+        model: "claude-opus-4-7",
+        id: "msg_3",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "text", text: "DONE" }],
+        stop_reason: "end_turn",
+        usage: {
+          input_tokens: 4,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 120,
+          output_tokens: 2,
+        },
+      },
+      uuid: "a-3",
       timestamp: "2026-05-17T00:00:04.000Z",
-      uuid: "s-1",
       sessionId,
       version: "2.1.143",
     });
@@ -197,8 +210,6 @@ function makeMockFactory(
     primaryLines: (sessionId: string) => string[];
     /** If true, also write a sibling JSONL (simulates /clear rotation). */
     writeSibling?: boolean;
-    /** Where to put the exit envelope: 'primary' (default) or 'sibling'. */
-    exitTarget?: "primary" | "sibling" | "none";
     /** Optional pre-flight error to throw. */
     spawnError?: Error;
   },
@@ -209,28 +220,20 @@ function makeMockFactory(
     mkdirSync(projectDir, { recursive: true });
     const jsonlPath = join(projectDir, `${sessionId}.jsonl`);
     const lines = options.primaryLines(sessionId);
-    if (options.exitTarget === "primary") {
-      lines.push(fixtureLines.exitEnvelope(sessionId));
-    }
     writeFileSync(jsonlPath, `${lines.join("\n")}\n`, "utf8");
 
     if (options.writeSibling) {
       const siblingPath = join(projectDir, `${sessionId}-rotated.jsonl`);
-      const sibLines: string[] = [];
-      if (options.exitTarget === "sibling") {
-        sibLines.push(fixtureLines.exitEnvelope(sessionId));
-      } else {
-        // At minimum the sibling has the /clear envelope.
-        sibLines.push(
-          JSON.stringify({
-            type: "system",
-            subtype: "local_command",
-            content: "<command-name>/clear</command-name>",
-            sessionId,
-            version: "2.1.143",
-          }),
-        );
-      }
+      // The rotated file opens with the /clear envelope.
+      const sibLines = [
+        JSON.stringify({
+          type: "system",
+          subtype: "local_command",
+          content: "<local-command-stdout></local-command-stdout>",
+          sessionId,
+          version: "2.1.143",
+        }),
+      ];
       writeFileSync(siblingPath, `${sibLines.join("\n")}\n`, "utf8");
     }
 
@@ -258,12 +261,14 @@ function fullPrimary(sessionId: string): string[] {
     fixtureLines.assistantText(sessionId),
     fixtureLines.assistantToolUse(sessionId),
     fixtureLines.userToolResult(sessionId),
+    fixtureLines.assistantAfterTool(sessionId),
   ];
 }
 
 /**
- * Tight per-step pacing so the unit suite finishes in <1 s.
- * The mock runner writes JSONL up front so step waits are pure pacing.
+ * Tight budget so the unit suite stays fast. The mock runner writes JSONL
+ * up front, so every step's event is already there; a failing fixture
+ * waits out this budget once and then reports the step that never came.
  */
 const FAST_TIMEOUT_MS = 200;
 
@@ -447,7 +452,6 @@ describe("SchemaProbe.run() — cache hit", () => {
       makeMockFactory(harness.homeDir, {
         primaryLines: fullPrimary,
         writeSibling: true,
-        exitTarget: "sibling",
       }),
     );
     const res = await probe.run();
@@ -482,7 +486,6 @@ describe("SchemaProbe.run() — force flag", () => {
         return makeMockFactory(harness.homeDir, {
           primaryLines: fullPrimary,
           writeSibling: true,
-          exitTarget: "sibling",
         })(args);
       },
     );
@@ -509,7 +512,6 @@ describe("SchemaProbe.run() — all assertions pass", () => {
       makeMockFactory(harness.homeDir, {
         primaryLines: fullPrimary,
         writeSibling: true,
-        exitTarget: "sibling",
       }),
     );
     const res = await probe.run();
@@ -542,7 +544,6 @@ describe("SchemaProbe.run() — warn-only on failure", () => {
         // Missing assistant + tool_use + tool_result + sibling — many fails.
         primaryLines: (sid) => [fixtureLines.user(sid)],
         writeSibling: false,
-        exitTarget: "none",
       }),
     );
     const res = await probe.run();
@@ -578,7 +579,6 @@ describe("SchemaProbe.run() — warn-only on failure", () => {
           fixtureLines.assistantToolUse(sid),
         ],
         writeSibling: true,
-        exitTarget: "sibling",
       }),
     );
     const res = await probe.run();
@@ -602,7 +602,6 @@ describe("SchemaProbe.run() — required mode", () => {
       makeMockFactory(harness.homeDir, {
         primaryLines: (sid) => [fixtureLines.user(sid)],
         writeSibling: false,
-        exitTarget: "none",
       }),
     );
     await expect(probe.run()).rejects.toBeInstanceOf(SchemaProbeFailure);
@@ -621,7 +620,6 @@ describe("SchemaProbe.run() — required mode", () => {
       makeMockFactory(harness.homeDir, {
         primaryLines: fullPrimary,
         writeSibling: true,
-        exitTarget: "sibling",
       }),
     );
     const res = await probe.run();
@@ -666,7 +664,6 @@ describe("SchemaProbe.run() — schemaHash stability", () => {
       makeMockFactory(harness.homeDir, {
         primaryLines: fullPrimary,
         writeSibling: true,
-        exitTarget: "sibling",
       }),
     );
     const r1 = await probe1.run();
@@ -685,7 +682,6 @@ describe("SchemaProbe.run() — schemaHash stability", () => {
         makeMockFactory(h2.homeDir, {
           primaryLines: fullPrimary,
           writeSibling: true,
-          exitTarget: "sibling",
         }),
       );
       const r2 = await probe2.run();
@@ -791,16 +787,165 @@ describe("captureClaudeVersion — win32 shell-true branch is platform-injectabl
 });
 
 /* ───────────────────────────────────────────────────────────────────── */
-/* The env-gated smoke run against the real `claude` that used to sit here */
-/* was removed in #304. Un-gated it cannot pass on a current CLI, and the   */
-/* fault is the probe's own runner (schema-probe-runner.ts), not the CLI:   */
-/* it spawns an interactive REPL in a fresh temp cwd without pre-accepting  */
-/* the trust dialog (its "\r" answers "No, exit" → exit 1), a second       */
-/* dialog (`--dangerously-load-development-channels` confirmation) eats the */
-/* first prompt when trust IS seeded, and it paces on fixed timeout/20 steps */
-/* rather than on JSONL events. The old test also passed `homeOverride` to  */
-/* a temp dir the child never used (`HOME` is inherited), so it looked for  */
-/* the JSONL where claude never writes it — it only reported green by       */
-/* accepting "failed". Tracked as a follow-up issue; a real-claude run       */
-/* belongs in tests/integration/ once the runner holds against the CLI.     */
+/* The real-claude run lives in tests/integration/schema-probe-real-claude */
+/* .test.ts (nightly job, #441): strict `status === "passed"`, plus the    */
+/* assertions replayed over its own transcript with a field broken.        */
 /* ───────────────────────────────────────────────────────────────────── */
+
+/* ───────────────────────────────────────────────────────────────────── */
+/* #441 — pacing on observed events, not fixed sleeps                    */
+/* ───────────────────────────────────────────────────────────────────── */
+
+/**
+ * A runner that behaves like the CLI in time: nothing is in the JSONL until
+ * the REPL is up and a prompt has been typed, and each turn's lines land
+ * `turnMs` later. Records what the probe sent and what the transcript held
+ * at that moment.
+ */
+function makeTimedFactory(
+  homeDir: string,
+  opts: { turnMs: number; readyMs?: number; ready?: boolean; neverEndTurn?: boolean },
+): { factory: ProbeRunnerFactory; sent: Array<{ what: string; linesAtSend: number }> } {
+  const sent: Array<{ what: string; linesAtSend: number }> = [];
+  const factory: ProbeRunnerFactory = async ({ cwd, sessionId }) => {
+    const projectDir = join(homeDir, ".claude", "projects", encodeCwd(cwd));
+    mkdirSync(projectDir, { recursive: true });
+    const jsonlPath = join(projectDir, `${sessionId}.jsonl`);
+    const lineCount = () =>
+      existsSync(jsonlPath)
+        ? readFileSync(jsonlPath, "utf8").split("\n").filter(Boolean).length
+        : 0;
+    const append = (lines: string[]) => {
+      const prev = existsSync(jsonlPath) ? readFileSync(jsonlPath, "utf8") : "";
+      writeFileSync(jsonlPath, `${prev}${lines.join("\n")}\n`, "utf8");
+    };
+    let prompts = 0;
+    let exited = false;
+    return {
+      waitForReady: async () => {
+        await new Promise((r) => setTimeout(r, opts.readyMs ?? 0));
+        return opts.ready ?? true;
+      },
+      sendPrompt: async () => {
+        sent.push({ what: `prompt${++prompts}`, linesAtSend: lineCount() });
+        const n = prompts;
+        append([fixtureLines.user(sessionId)]);
+        if (opts.neverEndTurn) return;
+        setTimeout(() => {
+          append(
+            n === 1
+              ? [fixtureLines.assistantText(sessionId)]
+              : [
+                  fixtureLines.assistantToolUse(sessionId),
+                  fixtureLines.userToolResult(sessionId),
+                  fixtureLines.assistantAfterTool(sessionId),
+                ],
+          );
+        }, opts.turnMs);
+      },
+      sendSlash: async (cmd) => {
+        sent.push({ what: `/${cmd}`, linesAtSend: lineCount() });
+        if (cmd === "clear") {
+          setTimeout(
+            () => writeFileSync(join(projectDir, `${sessionId}-rotated.jsonl`), "{}\n"),
+            opts.turnMs,
+          );
+        }
+        if (cmd === "quit") setTimeout(() => (exited = true), opts.turnMs);
+      },
+      waitForExit: async (timeoutMs) => {
+        const end = Date.now() + timeoutMs;
+        while (!exited && Date.now() < end) await new Promise((r) => setTimeout(r, 5));
+        return exited;
+      },
+      kill: () => {},
+    };
+  };
+  return { factory, sent };
+}
+
+describe("SchemaProbe.run() — paces on JSONL events (#441)", () => {
+  it("sends each step only after the previous one's event, however slow", async () => {
+    // Each event takes 150 ms; the old fixed pacing (timeoutMs / 20 = 50 ms
+    // here) typed the next step while the turn was still running.
+    const { factory, sent } = makeTimedFactory(harness.homeDir, { turnMs: 150 });
+    const res = await new SchemaProbe(
+      {
+        cacheFile: harness.cacheFile,
+        claudeBin: harness.claudeBin,
+        homeOverride: harness.homeDir,
+        timeoutMs: 1000,
+      },
+      factory,
+    ).run();
+    expect(res.failedAssertions ?? []).toEqual([]);
+    expect(res.status).toBe("passed");
+    expect(sent.map((s) => s.what)).toEqual(["prompt1", "prompt2", "/clear", "/quit"]);
+    // prompt2 after turn 1 (user + assistant); /clear after the tool turn's
+    // closing line (+ user, tool_use, tool_result, final assistant).
+    expect(sent[1].linesAtSend).toBe(2);
+    expect(sent[2].linesAtSend).toBe(6);
+  });
+
+  it("names the step that never came and stops there", async () => {
+    const { factory, sent } = makeTimedFactory(harness.homeDir, {
+      turnMs: 10,
+      neverEndTurn: true,
+    });
+    const started = Date.now();
+    const res = await new SchemaProbe(
+      {
+        cacheFile: harness.cacheFile,
+        claudeBin: harness.claudeBin,
+        homeOverride: harness.homeDir,
+        timeoutMs: 300,
+      },
+      factory,
+    ).run();
+    expect(res.status).toBe("failed");
+    const names = (res.failedAssertions ?? []).map((f) => f.name);
+    expect(names).toContain("step_timeout_text_turn");
+    expect(names).toContain("assistant_text_present");
+    expect(sent.map((s) => s.what)).toEqual(["prompt1"]);
+    // Bounded by the budget, not by a fixed sum of sleeps.
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  it("types nothing when the REPL never comes up (a dialog it could not pass)", async () => {
+    const { factory, sent } = makeTimedFactory(harness.homeDir, { turnMs: 10, ready: false });
+    const res = await new SchemaProbe(
+      {
+        cacheFile: harness.cacheFile,
+        claudeBin: harness.claudeBin,
+        homeOverride: harness.homeDir,
+        timeoutMs: FAST_TIMEOUT_MS,
+      },
+      factory,
+    ).run();
+    expect(res.status).toBe("failed");
+    expect((res.failedAssertions ?? []).map((f) => f.name)).toContain("step_timeout_repl_ready");
+    expect(sent).toEqual([]);
+  });
+
+  it("hands homeOverride to the runner so the child writes where the probe reads", async () => {
+    let seen: string | undefined;
+    const inner = makeMockFactory(harness.homeDir, {
+      primaryLines: fullPrimary,
+      writeSibling: true,
+    });
+    const res = await new SchemaProbe(
+      {
+        cacheFile: harness.cacheFile,
+        claudeBin: harness.claudeBin,
+        homeOverride: harness.homeDir,
+        timeoutMs: FAST_TIMEOUT_MS,
+      },
+      async (args) => {
+        seen = args.homeDir;
+        return inner(args);
+      },
+    ).run();
+    expect(res.status).toBe("passed");
+    expect(seen).toBe(harness.homeDir);
+  });
+});
