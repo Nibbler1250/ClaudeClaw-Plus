@@ -92,6 +92,26 @@ function bootPty(): { handle: PtyHandle; writes: string[]; emit: (d: string) => 
   return { handle, writes, emit: (d) => dataCb?.(d) };
 }
 
+describe("PtyAgentProcess.send_slash (#441)", () => {
+  it("submits with a separate CR — a trailing LF only adds a line to the input box", async () => {
+    const { handle, writes } = bootPty();
+    const proc = new PtyAgentProcess("alpha", handle, { submitConfirmMs: 5 });
+    await proc.send_slash("clear");
+    expect(writes).toEqual(["/clear", "\r"]);
+  });
+
+  it("waits behind a prompt still being typed instead of interleaving with it", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("alpha", handle, { submitConfirmMs: 5 });
+    const iv = setInterval(() => emit("assistant is streaming a response chunk"), 2);
+    const a = proc.send_prompt_stream("hello");
+    const b = proc.send_slash("quit");
+    await Promise.all([a, b]);
+    clearInterval(iv);
+    expect(writes).toEqual(["hello", "\r", "/quit", "\r"]);
+  });
+});
+
 describe("PtyAgentProcess.send_prompt_stream delivery-confirm (#wedge)", () => {
   it("re-sends the submit keystroke when the idle REPL footer is still rendering (turn never started)", async () => {
     const { handle, writes, emit } = bootPty();
