@@ -3145,6 +3145,34 @@ describe("BusCore IPC", () => {
       expect(replies[0].synthesized).toBe(true);
     });
 
+    // The IPC nudge as the CLI renders it: a channel line carrying the text.
+    const NUDGE_CHANNEL_LINE =
+      '<channel source="plugin:claudeclaw-plus:plus-bus" origin="telegram" nudge="reply-tool">\n' +
+      "You ended your turn without calling the `reply` tool, so the user received " +
+      "nothing — your transcript text does not reach them. Call `reply` now with " +
+      "intent:'final' to send your answer for this turn.\n</channel>";
+    const ipcNudgeBus = async (nudges: string[]) => {
+      const sockPath = join(tempDir, "bus.sock");
+      const b = createBusCore({
+        eventLogAppend: createMockEventLog().append,
+        turnEndSettleMs: 0,
+        flushVerifyMs: 40,
+        socketPath: sockPath,
+        streamPromptHandler: async (_a: string, wrapped: string) => {
+          if (wrapped.includes("<system-reminder>")) nudges.push(wrapped);
+        },
+      });
+      await b.start();
+      const client = await connectIpcClient(sockPath);
+      client.send({
+        type: "hello",
+        agent_id: "alpha",
+        capabilities: ["claude/channel", "claude/channel/permission"],
+      });
+      await new Promise((r) => setTimeout(r, 50));
+      return { b, client };
+    };
+
     it("sends the reply nudge over IPC only when the MCP connection takes it (no PTY copy)", async () => {
       // An MCP-connected agent renders the IPC nudge as a channel message. Also
       // typing the <system-reminder> into the PTY gave the agent the same
@@ -3182,7 +3210,7 @@ describe("BusCore IPC", () => {
       expect(replies).toHaveLength(0); // still waiting on the nudged turn
       // The CLI opens the nudged turn from the channel notification: the PTY
       // fallback is disarmed and never types a second copy.
-      nudgePromptLine(bus, "alpha", "<channel>reply nudge</channel>");
+      nudgePromptLine(bus, "alpha", NUDGE_CHANNEL_LINE);
       await new Promise((r) => setTimeout(r, 80));
       expect(nudges).toHaveLength(0);
       client.close();
@@ -3202,7 +3230,11 @@ describe("BusCore IPC", () => {
             agent_id: "alpha",
             session_id: "s",
             topic: "session.queue",
-            payload: { operation: "remove", reason: "absorbed_mid_turn", content: "nudge" },
+            payload: {
+              operation: "remove",
+              reason: "absorbed_mid_turn",
+              content: NUDGE_CHANNEL_LINE,
+            },
           }),
       ],
     ] as const) {
@@ -3267,6 +3299,57 @@ describe("BusCore IPC", () => {
       await new Promise((r) => setTimeout(r, 80));
       expect(nudges).toHaveLength(1);
       client.close();
+    });
+
+    for (const [label, unrelated] of [
+      ["an unrelated prompt starts a turn", "prompt"],
+      ["an unrelated prompt is absorbed", "session.queue"],
+    ] as const) {
+      it(`keeps the PTY fallback armed when ${label}`, async () => {
+        // Only a line carrying the nudge proves the notification was taken;
+        // another prompt's turn says nothing about the nudge.
+        const nudges: string[] = [];
+        const { b, client } = await ipcNudgeBus(nudges);
+        bus = b;
+        await promptTg(b, "alpha");
+        turnEnd(b, "alpha", "uncurated scratch");
+        await tick();
+        b.ingestSessionEvent({
+          ts: Date.now(),
+          agent_id: "alpha",
+          session_id: "s",
+          topic: unrelated,
+          payload:
+            unrelated === "prompt"
+              ? { text: "<channel>something else</channel>" }
+              : { operation: "remove", reason: "absorbed_mid_turn", content: "something else" },
+        });
+        await new Promise((r) => setTimeout(r, 80));
+        expect(nudges).toHaveLength(1);
+        client.close();
+      });
+    }
+
+    it("a settled nudge's fallback cannot type a stale copy into the next nudge", async () => {
+      // Nudge 1 goes over IPC and is settled by a reply; nudge 2, inside nudge
+      // 1's window, goes straight to the PTY (MCP gone). Nudge 1's timer must
+      // not read nudge 2's state and type a second reminder.
+      const nudges: string[] = [];
+      const { b, client } = await ipcNudgeBus(nudges);
+      bus = b;
+      await promptTg(b, "alpha");
+      turnEnd(b, "alpha", "uncurated scratch");
+      await tick();
+      client.send({ type: "reply", agent_id: "alpha", text: "answer", intent: "final" });
+      await tick();
+      client.close();
+      await tick();
+      await promptTg(b, "alpha");
+      turnEnd(b, "alpha", "more scratch");
+      await tick();
+      expect(nudges).toHaveLength(1); // nudge 2, typed at once
+      await new Promise((r) => setTimeout(r, 80));
+      expect(nudges).toHaveLength(1);
     });
 
     it("types the reply nudge into the PTY when no MCP connection takes it", async () => {

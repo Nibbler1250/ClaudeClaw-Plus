@@ -882,8 +882,12 @@ export class BusCoreImpl implements BusCore {
   private readonly replyNudged = new Map<string, boolean>();
   private readonly pendingNudgeText = new Map<string, string>();
   /** An IPC-only reply nudge waiting for its turn to start; typed into the PTY
-   *  if none does within `flushVerifyMs` (see `nudgeForReply`). */
-  private readonly nudgePtyFallback = new Map<string, ReturnType<typeof setTimeout>>();
+   *  if none does within `flushVerifyMs` (see `nudgeForReply`). `key` is the
+   *  nudge's `promptLineKey`, so only a line carrying the nudge disarms it. */
+  private readonly nudgePtyFallback = new Map<
+    string,
+    { timer: ReturnType<typeof setTimeout>; key: string }
+  >();
 
   constructor(opts: BusCoreOptions = {}) {
     this.replyNudgeEnabled = opts.replyNudge ?? true;
@@ -1097,7 +1101,7 @@ export class BusCoreImpl implements BusCore {
     for (const pending of this.flushVerify.values())
       for (const entry of pending.values()) clearTimeout(entry.timer);
     this.flushVerify.clear();
-    for (const timer of this.nudgePtyFallback.values()) clearTimeout(timer);
+    for (const { timer } of this.nudgePtyFallback.values()) clearTimeout(timer);
     this.nudgePtyFallback.clear();
     this.inFlightDeliveries.clear();
     this.inFlightProof.clear();
@@ -2307,9 +2311,10 @@ export class BusCoreImpl implements BusCore {
    *  verify was pending is counted: that is the one `sendPrompt` incremented
    *  for and the tailer never opened a turn for. */
   private noteAbsorbedPrompt(agent_id: string, text: string): void {
-    // The CLI folded queued input into the running turn — for an IPC-only reply
-    // nudge, proof it reached the model; its PTY fallback must not type a copy.
-    this.clearNudgePtyFallback(agent_id);
+    // The CLI folded queued input into the running turn — if that input is the
+    // IPC-only reply nudge, it reached the model; its PTY fallback must not type
+    // a copy. Any other absorbed prompt leaves the fallback armed.
+    this.clearNudgePtyFallback(agent_id, text);
     // #239: a prompt folded into the running turn will never get a line of
     // its own; the running turn's terminator is the one to wait for now.
     const awaited = this.awaitOwnPromptLine.get(agent_id);
@@ -2847,6 +2852,9 @@ export class BusCoreImpl implements BusCore {
     this.currentTurnReplied.set(agentId, false);
     this.currentTurnFinalPublished.set(agentId, false);
     this.currentTurnFinalOrigins.delete(agentId);
+    // A fallback still armed from an earlier nudge must not outlive it: its
+    // callback would read this nudge's `replyNudged` and type a stale copy.
+    this.clearNudgePtyFallback(agentId);
     // IPC path (best-effort, no reconciler): reach an MCP-connected agent.
     // Wrapped so a synchronous send() throw can't skip the PTY path below or
     // propagate to the turn-end handler — the send is best-effort, mirroring
@@ -2885,14 +2893,14 @@ export class BusCoreImpl implements BusCore {
     // nudge is still outstanding (no reply, deadline, cancel or disconnect).
     if (ipcDelivered) {
       if (ptyAvailable) {
-        this.clearNudgePtyFallback(agentId);
         const timer = setTimeout(() => {
+          if (this.nudgePtyFallback.get(agentId)?.timer !== timer) return;
           this.nudgePtyFallback.delete(agentId);
           if (this.replyNudged.get(agentId) !== true) return;
           typeIntoPty();
         }, this.flushVerifyMs);
         timer.unref?.();
-        this.nudgePtyFallback.set(agentId, timer);
+        this.nudgePtyFallback.set(agentId, { timer, key: promptLineKey(text) });
       }
       return true;
     }
@@ -2903,10 +2911,14 @@ export class BusCoreImpl implements BusCore {
     return ptyAvailable;
   }
 
-  private clearNudgePtyFallback(agentId: string): void {
-    const timer = this.nudgePtyFallback.get(agentId);
-    if (timer === undefined) return;
-    clearTimeout(timer);
+  /** Disarm the IPC-only nudge's PTY fallback. With `seenText` (a turn-start or
+   *  absorbed line), only when that line carries the nudge — an unrelated
+   *  prompt proves nothing about whether the notification was taken. */
+  private clearNudgePtyFallback(agentId: string, seenText?: string): void {
+    const armed = this.nudgePtyFallback.get(agentId);
+    if (armed === undefined) return;
+    if (seenText !== undefined && !promptLineKey(seenText).includes(armed.key)) return;
+    clearTimeout(armed.timer);
     this.nudgePtyFallback.delete(agentId);
   }
 
@@ -2960,10 +2972,12 @@ export class BusCoreImpl implements BusCore {
         // Cancel the matching prompt's verify FIRST (attribution), then mark the
         // agent as having an active turn so a LATER prompt delivered during it
         // arms — and defers — its own verify.
-        if (typeof text === "string") this.noteFlushTurnStart(e.agent_id, text);
-        // A turn started — for an IPC-only reply nudge, that is the proof the
-        // CLI took the notification; its PTY fallback is no longer needed.
-        this.clearNudgePtyFallback(e.agent_id);
+        if (typeof text === "string") {
+          this.noteFlushTurnStart(e.agent_id, text);
+          // A turn started on the IPC-only reply nudge — proof the CLI took the
+          // notification; its PTY fallback is no longer needed.
+          this.clearNudgePtyFallback(e.agent_id, text);
+        }
         // #239: the prompt admitted after an early release has now started its
         // own turn — the next terminator is legitimately its own.
         const awaited = this.awaitOwnPromptLine.get(e.agent_id);
