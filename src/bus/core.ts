@@ -2426,6 +2426,9 @@ export class BusCoreImpl implements BusCore {
     for (const [agent, q] of this.deliveryQueue) if (q.length > 0) busy.add(agent);
     for (const [agent, held] of this.compactionHeld) if (held.size > 0) busy.add(agent);
     for (const [agent, carried] of this.pendingRedelivery) if (carried.length > 0) busy.add(agent);
+    // An IPC-only reply nudge whose turn has not started: the bus may still
+    // owe its PTY copy.
+    for (const agent of this.nudgePtyFallback.keys()) busy.add(agent);
     for (const [agent, pending] of this.flushVerify) {
       for (const entry of pending.values()) {
         if (!entry.redelivered) {
@@ -2897,6 +2900,11 @@ export class BusCoreImpl implements BusCore {
           if (this.nudgePtyFallback.get(agentId)?.timer !== timer) return;
           this.nudgePtyFallback.delete(agentId);
           if (this.replyNudged.get(agentId) !== true) return;
+          // A session (re)initialising would only queue the copy for after
+          // `replay_done`, unchecked against a reply landing meanwhile, and its
+          // context no longer holds the turn the reminder is about. The turn
+          // deadline still covers the outstanding nudge.
+          if (this.agentInitializing.has(agentId)) return;
           typeIntoPty();
         }, this.flushVerifyMs);
         timer.unref?.();

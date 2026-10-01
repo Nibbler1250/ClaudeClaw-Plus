@@ -3352,6 +3352,52 @@ describe("BusCore IPC", () => {
       expect(nudges).toHaveLength(1);
     });
 
+    it("counts the agent busy while the IPC nudge's PTY fallback is armed", async () => {
+      // A shutdown drain must not stop the agent while the bus still owes the
+      // reminder's PTY copy.
+      const nudges: string[] = [];
+      const { b, client } = await ipcNudgeBus(nudges);
+      bus = b;
+      await promptTg(b, "alpha");
+      turnEnd(b, "alpha", "uncurated scratch");
+      await tick();
+      expect(b.busyAgents?.()).toContain("alpha");
+      await new Promise((r) => setTimeout(r, 80));
+      expect(nudges).toHaveLength(1);
+      client.close();
+    });
+
+    it("does not queue the PTY fallback into a session that is re-initialising", async () => {
+      // A held copy would be flushed after replay_done without checking whether
+      // the reply landed meanwhile.
+      const nudges: string[] = [];
+      const { b, client } = await ipcNudgeBus(nudges);
+      bus = b;
+      await promptTg(b, "alpha");
+      turnEnd(b, "alpha", "uncurated scratch");
+      await tick();
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "s-new",
+        topic: "session.init",
+        payload: {},
+      });
+      await new Promise((r) => setTimeout(r, 80));
+      client.send({ type: "reply", agent_id: "alpha", text: "answer", intent: "final" });
+      await tick();
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "s-new",
+        topic: "bus.events.replay_done",
+        payload: {},
+      });
+      await tick();
+      expect(nudges).toHaveLength(0);
+      client.close();
+    });
+
     it("types the reply nudge into the PTY when no MCP connection takes it", async () => {
       const sockPath = join(tempDir, "bus.sock");
       const nudges: string[] = [];
