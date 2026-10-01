@@ -32,6 +32,7 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
 import { getMcpBridge } from "../mcp-bridge.js";
+import { recordToolCall } from "../../observability/tool-call-sink.js";
 import { getMetricsRegistry } from "./metrics.js";
 import { getResponseCache } from "./cache.js";
 import type { McpServerProcess } from "../mcp-proxy/server-process.js";
@@ -831,12 +832,29 @@ export class McpHttpHandler {
     // tools/call — proxy through to the upstream child after gating.
     sdkServer.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
+      // One `mcp.tool_call` per call, on every terminal path (refused /
+      // cache hit / success / error), timed from here. `recordToolCall`
+      // only buffers in memory — never awaited, never throws — so it
+      // cannot slow or fail the dispatch.
+      const t0 = performance.now();
+      const emitToolCall = (status: "ok" | "error", error?: string): void => {
+        recordToolCall({
+          ts: new Date().toISOString(),
+          plugin: this.serverName,
+          tool: name,
+          agent_id: bucketKey,
+          status,
+          duration_ms: performance.now() - t0,
+          ...(error !== undefined ? { error } : {}),
+        });
+      };
       if (!allowedNames.has(name)) {
         getMcpBridge().audit("multiplexer_tool_rejected", {
           server: this.serverName,
           tool: name,
           reason: "not_in_allowed_set",
         });
+        emitToolCall("error", "not_in_allowed_set");
         return {
           content: [
             {
@@ -874,6 +892,7 @@ export class McpHttpHandler {
         if (cached !== undefined) {
           const text = typeof cached === "string" ? cached : JSON.stringify(cached);
           timer.end(true);
+          emitToolCall("ok");
           return { content: [{ type: "text", text }] };
         }
       } else if (cache.shouldInvalidateOnNonCacheableCall(this.serverName)) {
@@ -890,6 +909,7 @@ export class McpHttpHandler {
         const result = await this.proc.call(name, args ?? {});
         const text = typeof result === "string" ? result : JSON.stringify(result);
         timer.end(true);
+        emitToolCall("ok");
         // Cache the raw response (not the serialized text) — a later
         // cache hit re-serializes via the same code path, matching
         // upstream's call() return shape.
@@ -900,6 +920,7 @@ export class McpHttpHandler {
       } catch (err) {
         timer.end(false);
         const message = err instanceof Error ? err.message : String(err);
+        emitToolCall("error", message);
         return {
           content: [{ type: "text", text: `Error: ${message}` }],
           isError: true,

@@ -35,12 +35,13 @@ import {
   type ToolCallIntent,
 } from "./tool-call.js";
 
-export const DEFAULT_TOOL_CALL_LOG = join(
-  homedir(),
-  ".claudeclaw",
-  "telemetry",
-  "mcp-tool-calls.jsonl",
-);
+/** `PLUS_TOOL_CALL_LOG_PATH` overrides the location — same seam as
+ *  `PLUS_PLUGIN_AUDIT_PATH` (#304): the test preload points it at a temp file
+ *  so suites that dispatch through the multiplexer never append to the
+ *  operator's live chain. */
+export const DEFAULT_TOOL_CALL_LOG =
+  process.env.PLUS_TOOL_CALL_LOG_PATH ||
+  join(homedir(), ".claudeclaw", "telemetry", "mcp-tool-calls.jsonl");
 
 /** The single method the sink needs from its backing chain. Narrowing to this
  *  lets tests inject a chain whose `append` throws (to exercise enforce's

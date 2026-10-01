@@ -34,6 +34,7 @@ import { _resetMcpBridge, getMcpBridge } from "../plugins/mcp-bridge.js";
 import { _resetIdentityStore, revokeIdentity } from "../plugins/mcp-multiplexer/pty-identity.js";
 import type { SessionPersistenceStore } from "../plugins/mcp-multiplexer/session-persistence.js";
 import { makeMuxSettingsView } from "./fixtures/mux-settings-view.js";
+import { __setToolCallSinkForTest, ToolCallSink } from "../observability/tool-call-sink.js";
 
 const MOCK_SERVER = fileURLToPath(new URL("./fixtures/mock-mcp-server.ts", import.meta.url));
 const BUN_BIN = process.execPath;
@@ -1136,4 +1137,60 @@ describe("mcp-multiplexer integration — onsessionclosed is throw-proof", () =>
 
     await conn.close();
   });
+});
+
+// ── 9) Every tools/call lands on the mcp.tool_call chain (#456) ─────────────
+
+describe("mcp-multiplexer integration — mcp.tool_call boundary capture", () => {
+  afterEach(() => {
+    __setToolCallSinkForTest(null);
+  });
+
+  it("records one mcp.tool_call per call — the dispatched one and the refused one", async () => {
+    const sink = new ToolCallSink({ path: null, autoFlush: false });
+    __setToolCallSinkForTest(sink);
+
+    const cfg = writeProxyConfig(tmpDir, ["alpha"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({ webEnabled: true, shared: ["alpha"] }),
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+    const ident = plugin.issueIdentity("pty-obs");
+    const { client, close } = await connectClient({
+      origin: gateway.origin,
+      server: "alpha",
+      ptyId: "pty-obs",
+      bearer: ident.headers.Authorization,
+    });
+
+    try {
+      await client.callTool({ name: "echo", arguments: { message: "hi" } });
+      // `secret_tool` is advertised by the child but not in `allowedTools`:
+      // the multiplexer refuses it. A refusal is a decision the chain must
+      // show, not only the plugin journal.
+      const refused = await client.callTool({ name: "secret_tool", arguments: {} });
+      expect(refused.isError).toBe(true);
+    } finally {
+      await close();
+    }
+
+    const events = sink.pending();
+    expect(events.length).toBe(2);
+    expect(events[0]).toMatchObject({
+      plugin: "alpha",
+      tool: "echo",
+      agent_id: "pty-obs",
+      status: "ok",
+    });
+    expect(typeof events[0]?.duration_ms).toBe("number");
+    expect(events[1]).toMatchObject({
+      plugin: "alpha",
+      tool: "secret_tool",
+      agent_id: "pty-obs",
+      status: "error",
+      error: "not_in_allowed_set",
+    });
+  }, 10000);
 });
