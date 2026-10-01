@@ -9,9 +9,23 @@ export function getPidPath(): string {
 }
 
 /**
+ * Whether a daemon runs here could not be determined: the PID lock could not
+ * be taken and nobody live holds it, or `daemon.pid` kept changing under the
+ * check. Thrown rather than reported as "no daemon": callers that act on that
+ * answer must refuse instead.
+ */
+export class DaemonStateUnknownError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DaemonStateUnknownError";
+  }
+}
+
+/**
  * Check if a daemon is already running in this directory.
  * If a stale PID file exists (process dead), it gets cleaned up.
- * Returns the running PID if alive, or null.
+ * Returns the running PID if alive, or null when there is none.
+ * Throws `DaemonStateUnknownError` when that cannot be determined.
  */
 export async function checkExistingDaemon(): Promise<number | null> {
   // #435: the whole check runs under the PID lock (re-entrant for `start`,
@@ -19,22 +33,34 @@ export async function checkExistingDaemon(): Promise<number | null> {
   // read and the stale cleanup. A start holding the lock past the wait is
   // reported as a running daemon: one is about to be.
   const lock = await acquirePidLock();
-  if (!lock.ok) return lock.holder;
+  if (!lock.ok) {
+    if (lock.holder !== null) return lock.holder;
+    throw new DaemonStateUnknownError(
+      `could not take the PID lock (${getPidLockPath()} could not be created or a stale one removed)`,
+    );
+  }
   try {
-    let raw: string;
-    try {
-      raw = (await readFile(PID_FILE, "utf-8")).trim();
-    } catch {
-      return null; // no pid file
-    }
+    // Writers that predate the lock do not take it: if the file changed under
+    // the cleanup, judge the new contents rather than report "none".
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let raw: string;
+      try {
+        raw = (await readFile(PID_FILE, "utf-8")).trim();
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return null; // no pid file
+        // Present but unreadable: it may name a live daemon.
+        throw new DaemonStateUnknownError(`${PID_FILE} could not be read: ${err}`);
+      }
 
-    const pid = Number(raw);
-    // #420: EPERM means alive-but-not-ours — never treat it as stale, or a
-    // `start` by another user removes a live daemon's file and starts over it.
-    if (pid && !isNaN(pid) && isPidAlive(pid)) return pid;
-    // Corrupt, or the process is dead: remove the file — still the one read.
-    await compareAndUnlink(pid, PID_FILE);
-    return null;
+      const pid = Number(raw);
+      // #420: EPERM means alive-but-not-ours — never treat it as stale, or a
+      // `start` by another user removes a live daemon's file and starts over it.
+      // Positive integers only: kill(-1, 0) succeeds and would name everyone.
+      if (Number.isInteger(pid) && pid > 0 && isPidAlive(pid)) return pid;
+      // Corrupt, or the process is dead: remove the file — still the one read.
+      if ((await compareAndUnlink(pid, PID_FILE)) !== "foreign") return null;
+    }
+    throw new DaemonStateUnknownError(`${PID_FILE} kept changing while it was checked`);
   } finally {
     releasePidLock();
   }
@@ -102,7 +128,10 @@ export async function cleanupPidFileIf(
   }
 }
 
-async function compareAndUnlink(expectedPid: number, pidFile: string): Promise<PidFileCleanup> {
+async function compareAndUnlink(
+  expectedPid: number,
+  pidFile: string,
+): Promise<Exclude<PidFileCleanup, "locked">> {
   let raw: string;
   try {
     raw = (await readFile(pidFile, "utf-8")).trim();

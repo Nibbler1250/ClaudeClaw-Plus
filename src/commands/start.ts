@@ -33,6 +33,7 @@ import {
   writePidFile,
   cleanupPidFileIf,
   checkExistingDaemon,
+  DaemonStateUnknownError,
   acquirePidLock,
   getPidLockPath,
   releasePidLock,
@@ -335,7 +336,17 @@ export async function start(args: string[] = []) {
 
   // One-shot mode: explicit prompt without trigger.
   if (hasPromptFlag && !hasTriggerFlag) {
-    const existingPid = await checkExistingDaemon();
+    let existingPid: number | null;
+    try {
+      existingPid = await checkExistingDaemon();
+    } catch (err) {
+      if (!(err instanceof DaemonStateUnknownError)) throw err;
+      // #435: unknown is not "none" — refuse rather than run beside a daemon.
+      console.error(
+        `\x1b[31mAborted: cannot tell whether a daemon is running: ${err.message}.\x1b[0m`,
+      );
+      process.exit(1);
+    }
     if (existingPid) {
       console.error(
         `\x1b[31mAborted: daemon already running in this directory (PID ${existingPid})\x1b[0m`,
@@ -370,7 +381,16 @@ export async function start(args: string[] = []) {
     process.exit(1);
   }
 
-  const existingPid = await checkExistingDaemon();
+  let existingPid: number | null;
+  try {
+    existingPid = await checkExistingDaemon();
+  } catch (err) {
+    if (!(err instanceof DaemonStateUnknownError)) throw err;
+    console.error(
+      `\x1b[31mAborted: cannot tell whether a daemon is running: ${err.message}.\x1b[0m`,
+    );
+    process.exit(1);
+  }
   if (existingPid) {
     if (!replaceExistingFlag) {
       console.error(

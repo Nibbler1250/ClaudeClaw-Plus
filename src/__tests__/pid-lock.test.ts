@@ -7,7 +7,16 @@
  * within one process it is re-entrant.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { acquirePidLock, cleanupPidFileIf, getPidLockPath, releasePidLock } from "../pid";
@@ -280,4 +289,111 @@ describe("PID lock (#435)", () => {
     releasePidLock(pidFile);
     expect(readFileSync(lockFile, "utf-8").trim()).toBe("1");
   });
+});
+
+/**
+ * A lock that can be neither taken nor judged stale leaves the daemon's state
+ * unknown. That must not read as "no daemon": `clear` and the one-shot
+ * `start` act on it. The project's `daemon.lock` is made a fresh directory —
+ * it exists (busy), holds no PID and is not old, so every attempt fails with
+ * no holder — while `daemon.pid` names a live process (this test runner).
+ */
+describe("PID lock state unknown (#435)", () => {
+  let proj: string;
+  let home: string;
+
+  beforeEach(() => {
+    proj = mkdtempSync(join(tmpdir(), "ccplus-pidlock-unknown-"));
+    home = mkdtempSync(join(tmpdir(), "ccplus-pidlock-home-"));
+    const stateDir = join(proj, ".claude", "claudeclaw");
+    mkdirSync(join(stateDir, "daemon.lock"), { recursive: true });
+    writeFileSync(join(stateDir, "daemon.pid"), `${process.pid}\n`);
+  });
+
+  afterEach(() => {
+    rmSync(proj, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  /** Run `code` with the temp project as cwd; killed if it outlives `maxMs`. */
+  async function runIn(code: string, maxMs = 15_000) {
+    const child = Bun.spawn([process.execPath, "-e", code], {
+      cwd: proj,
+      // A temp HOME, no `claude` on PATH and nothing else inherited: a
+      // one-shot that got past the check must not reach a real setup.
+      env: { HOME: home, PATH: "/nonexistent" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const timer = setTimeout(() => child.kill("SIGKILL"), maxMs);
+    const [stdout, stderr, code_] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    clearTimeout(timer);
+    return { stdout, stderr, code: code_ };
+  }
+
+  it("checkExistingDaemon throws DaemonStateUnknownError instead of reporting no daemon", async () => {
+    const r = await runIn(`
+      import { checkExistingDaemon, DaemonStateUnknownError } from ${JSON.stringify(PID_MODULE)};
+      try {
+        console.log("result=" + String(await checkExistingDaemon()));
+      } catch (err) {
+        console.log(err instanceof DaemonStateUnknownError ? "unknown" : "other: " + err);
+      }
+    `);
+    expect(r.stdout.trim()).toBe("unknown");
+  }, 20_000);
+
+  it("clear refuses with a non-zero exit instead of declaring no daemon, session untouched", async () => {
+    const session = join(proj, ".claude", "claudeclaw", "session.json");
+    const body = JSON.stringify({
+      sessionId: "s1",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:00:00.000Z",
+      turnCount: 1,
+      compactWarned: false,
+    });
+    writeFileSync(session, body);
+    const r = await runIn(`
+      import { clear } from ${JSON.stringify(resolve(import.meta.dir, "..", "commands", "clear.ts"))};
+      await clear();
+    `);
+    expect(r.stdout).not.toContain("No daemon running");
+    expect(r.stderr).toContain("cannot tell whether a daemon is running");
+    expect(r.code).toBe(1);
+    // Refused before the backup: the session was not rotated away.
+    expect(readFileSync(session, "utf-8")).toBe(body);
+  }, 20_000);
+
+  it.skipIf(process.getuid?.() === 0)(
+    "an unreadable daemon.pid is unknown, not absent",
+    async () => {
+      rmSync(join(proj, ".claude", "claudeclaw", "daemon.lock"), { recursive: true });
+      chmodSync(join(proj, ".claude", "claudeclaw", "daemon.pid"), 0o000);
+      const r = await runIn(`
+        import { checkExistingDaemon, DaemonStateUnknownError } from ${JSON.stringify(PID_MODULE)};
+        try {
+          console.log("result=" + String(await checkExistingDaemon()));
+        } catch (err) {
+          console.log(err instanceof DaemonStateUnknownError ? "unknown" : "other: " + err);
+        }
+      `);
+      expect(r.stdout.trim()).toBe("unknown");
+    },
+    20_000,
+  );
+
+  it("one-shot start refuses with a non-zero exit before running anything", async () => {
+    const r = await runIn(`
+      import { start } from ${JSON.stringify(resolve(import.meta.dir, "..", "commands", "start.ts"))};
+      await start(["--prompt", "hello"]);
+    `);
+    expect(r.stderr).toContain("cannot tell whether a daemon is running");
+    expect(r.code).toBe(1);
+    // It stopped at the check: the config step that follows never ran.
+    expect(existsSync(join(proj, ".claude", "claudeclaw", "settings.json"))).toBe(false);
+  }, 20_000);
 });
