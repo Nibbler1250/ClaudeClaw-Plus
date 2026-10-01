@@ -474,10 +474,21 @@ export class PtyAgentProcess implements AgentProcess {
 
   send_slash(cmd: string): Promise<void> {
     if (this._exited) return Promise.reject(new Error(`agent ${this.agent_id} has exited`));
-    // Spike 0.4 validated: bun-pty write with trailing newline fires the slash
-    // command and produces the expected `system.local_command` JSONL line.
-    this.pty.write(`/${cmd}\n`);
-    return Promise.resolve();
+    // #441: a trailing `\n` no longer submits. claude 2.1.286 takes LF as a
+    // newline inside the input box ("ctrl+g to edit in Vim"), so `/quit\n`
+    // and `/clear\n` just sat there (Spike 0.4 recorded the old behaviour).
+    // Submit the way `send_prompt_stream` does — text, settle, CR as its own
+    // keystroke — on the same write chain so a slash cannot interleave with
+    // a prompt still being typed.
+    const run = this.writeChain.then(async () => {
+      if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
+      this.pty.write(`/${cmd}`);
+      await new Promise((r) => setTimeout(r, 200));
+      if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
+      this.pty.write("\r");
+    });
+    this.writeChain = run.catch(() => {});
+    return run;
   }
 
   send_prompt_stream(line: string): Promise<PromptDeliveryOutcome> {
