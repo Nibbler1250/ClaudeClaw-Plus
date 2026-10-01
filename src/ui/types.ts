@@ -111,4 +111,6 @@ export interface BusWebUiPromptResult {
   output: string;
   exitCode: number;
   error?: string;
+  /** The final was the #215 safety net's raw turn text, not a `reply` call. */
+  synthesized?: boolean;
 }

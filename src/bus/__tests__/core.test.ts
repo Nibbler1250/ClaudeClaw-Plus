@@ -2761,6 +2761,28 @@ describe("BusCore IPC", () => {
       expect(nudges[0]).toContain("reply");
     });
 
+    it("does not nudge a daemon inject: settles it with the synthesized final at once", async () => {
+      const nudges: string[] = [];
+      const b = makeBus({ nudges });
+      const replies = captureReplies(b, "alpha");
+
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "webui",
+        origin_id: "inject",
+        user_id: "webui",
+        text: "[daemon] context note",
+      });
+      turnEnd(b, "alpha", "nothing waits, staying quiet");
+      await tick();
+
+      // Silence on an inject is legitimate: no reminder pushing the agent to
+      // speak, and the synthesized final is tagged so /api/inject drops it.
+      expect(nudges.length).toBe(0);
+      expect(replies.length).toBe(1);
+      expect(replies[0].synthesized).toBe(true);
+    });
+
     it("delivers the agent's real reply (not a synthesized dump) when the nudge works", async () => {
       const nudges: string[] = [];
       const b = makeBus({ nudges });

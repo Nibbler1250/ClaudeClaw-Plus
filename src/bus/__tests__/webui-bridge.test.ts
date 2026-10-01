@@ -103,6 +103,40 @@ describe("streamBusPrompt", () => {
     expect(result.output).toBe("chunk-1 chunk-2 done");
   });
 
+  it("flags a final synthesized by the silent-drop net (#215) so the caller can tell it from a reply", async () => {
+    const bus = makeBus();
+    const pending = streamBusPrompt(bus, "alpha", "hi", { timeoutMs: 2000 });
+    await Promise.resolve();
+    await Promise.resolve();
+    // The safety net publishes through ingestReply with `synthetic: true`;
+    // that option is internal to BusCoreImpl, not on the BusCore interface.
+    (
+      bus as unknown as {
+        ingestReply(
+          r: { agent_id: string; text: string; intent: "final" },
+          o: { synthetic: boolean },
+        ): void;
+      }
+    ).ingestReply(
+      { agent_id: "alpha", text: "raw turn text", intent: "final" },
+      { synthetic: true },
+    );
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(result.output).toBe("raw turn text");
+    expect(result.synthesized).toBe(true);
+  });
+
+  it("leaves `synthesized` unset on a real reply", async () => {
+    const bus = makeBus();
+    const pending = streamBusPrompt(bus, "alpha", "hi", { timeoutMs: 2000 });
+    await Promise.resolve();
+    await Promise.resolve();
+    bus.ingestReply({ agent_id: "alpha", text: "real answer", intent: "final" });
+    const result = await pending;
+    expect(result.synthesized).toBeUndefined();
+  });
+
   it("invokes onChunk for every response.text event", async () => {
     const bus = makeBus();
     const chunks: string[] = [];
