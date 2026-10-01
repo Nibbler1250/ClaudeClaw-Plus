@@ -18,7 +18,14 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createBusCore, encodeFrame, type BusCore } from "../core";
 import { FrameDecoder, validateUdsPath } from "../core-ipc";
-import type { BusEvent, IpcHello, IpcMessage, IpcPermissionRequest, IpcReply } from "../types";
+import type {
+  BusEvent,
+  IpcHello,
+  IpcMessage,
+  IpcPermissionRequest,
+  IpcPrompt,
+  IpcReply,
+} from "../types";
 import type { EventEntryInput, EventRecord } from "../../event-log";
 
 /** In-memory event-log mock — captures every append call. */
@@ -3136,6 +3143,153 @@ describe("BusCore IPC", () => {
       expect(replies.length).toBe(1);
       expect(replies[0].text).toBe("recovered answer");
       expect(replies[0].synthesized).toBe(true);
+    });
+
+    it("sends the reply nudge over IPC only when the MCP connection takes it (no PTY copy)", async () => {
+      // An MCP-connected agent renders the IPC nudge as a channel message. Also
+      // typing the <system-reminder> into the PTY gave the agent the same
+      // reminder twice, the second copy often landing after its real reply.
+      const sockPath = join(tempDir, "bus.sock");
+      const nudges: string[] = [];
+      bus = createBusCore({
+        eventLogAppend: createMockEventLog().append,
+        turnEndSettleMs: 0,
+        flushVerifyMs: 40,
+        socketPath: sockPath,
+        streamPromptHandler: async (_a: string, wrapped: string) => {
+          if (wrapped.includes("<system-reminder>")) nudges.push(wrapped);
+        },
+      });
+      await bus.start();
+      const client = await connectIpcClient(sockPath);
+      client.send({
+        type: "hello",
+        agent_id: "alpha",
+        capabilities: ["claude/channel", "claude/channel/permission"],
+      });
+      await new Promise((r) => setTimeout(r, 50));
+      const replies = captureReplies(bus, "alpha");
+
+      await promptTg(bus, "alpha");
+      turnEnd(bus, "alpha", "uncurated scratch");
+      await tick();
+
+      const ipcNudges = client.inbound.filter(
+        (m) => m.type === "prompt" && (m as IpcPrompt).metadata?.nudge === "reply-tool",
+      );
+      expect(ipcNudges).toHaveLength(1);
+      expect(nudges).toHaveLength(0);
+      expect(replies).toHaveLength(0); // still waiting on the nudged turn
+      // The CLI opens the nudged turn from the channel notification: the PTY
+      // fallback is disarmed and never types a second copy.
+      nudgePromptLine(bus, "alpha", "<channel>reply nudge</channel>");
+      await new Promise((r) => setTimeout(r, 80));
+      expect(nudges).toHaveLength(0);
+      client.close();
+    });
+
+    for (const [label, settle] of [
+      [
+        "a final reply lands",
+        (b: BusCore, c: { send: (m: IpcMessage) => void }) =>
+          c.send({ type: "reply", agent_id: "alpha", text: "answer", intent: "final" }),
+      ],
+      [
+        "the CLI absorbs the nudge into a running turn",
+        (b: BusCore) =>
+          b.ingestSessionEvent({
+            ts: Date.now(),
+            agent_id: "alpha",
+            session_id: "s",
+            topic: "session.queue",
+            payload: { operation: "remove", reason: "absorbed_mid_turn", content: "nudge" },
+          }),
+      ],
+    ] as const) {
+      it(`does not type the PTY fallback once ${label}`, async () => {
+        const sockPath = join(tempDir, "bus.sock");
+        const nudges: string[] = [];
+        bus = createBusCore({
+          eventLogAppend: createMockEventLog().append,
+          turnEndSettleMs: 0,
+          flushVerifyMs: 40,
+          socketPath: sockPath,
+          streamPromptHandler: async (_a: string, wrapped: string) => {
+            if (wrapped.includes("<system-reminder>")) nudges.push(wrapped);
+          },
+        });
+        await bus.start();
+        const client = await connectIpcClient(sockPath);
+        client.send({
+          type: "hello",
+          agent_id: "alpha",
+          capabilities: ["claude/channel", "claude/channel/permission"],
+        });
+        await new Promise((r) => setTimeout(r, 50));
+
+        await promptTg(bus, "alpha");
+        turnEnd(bus, "alpha", "uncurated scratch");
+        await tick();
+        settle(bus, client);
+        await new Promise((r) => setTimeout(r, 80));
+        expect(nudges).toHaveLength(0);
+        client.close();
+      });
+    }
+
+    it("types the reply nudge into the PTY when the IPC copy starts no turn", async () => {
+      // send() returning true only proves the socket write. If the CLI does not
+      // open a turn from the notification, the PTY copy is the backstop.
+      const sockPath = join(tempDir, "bus.sock");
+      const nudges: string[] = [];
+      bus = createBusCore({
+        eventLogAppend: createMockEventLog().append,
+        turnEndSettleMs: 0,
+        flushVerifyMs: 40,
+        socketPath: sockPath,
+        streamPromptHandler: async (_a: string, wrapped: string) => {
+          if (wrapped.includes("<system-reminder>")) nudges.push(wrapped);
+        },
+      });
+      await bus.start();
+      const client = await connectIpcClient(sockPath);
+      client.send({
+        type: "hello",
+        agent_id: "alpha",
+        capabilities: ["claude/channel", "claude/channel/permission"],
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      await promptTg(bus, "alpha");
+      turnEnd(bus, "alpha", "uncurated scratch");
+      await tick();
+      expect(nudges).toHaveLength(0);
+      await new Promise((r) => setTimeout(r, 80));
+      expect(nudges).toHaveLength(1);
+      client.close();
+    });
+
+    it("types the reply nudge into the PTY when no MCP connection takes it", async () => {
+      const sockPath = join(tempDir, "bus.sock");
+      const nudges: string[] = [];
+      bus = createBusCore({
+        eventLogAppend: createMockEventLog().append,
+        turnEndSettleMs: 0,
+        socketPath: sockPath,
+        onError: () => {},
+        streamPromptHandler: async (_a: string, wrapped: string) => {
+          if (wrapped.includes("<system-reminder>")) nudges.push(wrapped);
+        },
+      });
+      await bus.start(); // bound, but no agent ever says hello
+      const replies = captureReplies(bus, "alpha");
+
+      await promptTg(bus, "alpha");
+      turnEnd(bus, "alpha", "uncurated scratch");
+      await tick();
+
+      expect(nudges).toHaveLength(1);
+      expect(replies).toHaveLength(0);
     });
   });
 
