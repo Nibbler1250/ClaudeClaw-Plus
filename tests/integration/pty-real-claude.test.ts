@@ -16,7 +16,7 @@
 import { describe, test, expect, beforeAll, beforeEach, afterAll, afterEach } from "bun:test";
 import { join } from "path";
 import { mkdir, copyFile, unlink, rm, readdir } from "fs/promises";
-import { existsSync, readFileSync, renameSync, writeFileSync } from "fs";
+import { existsSync } from "fs";
 import { homedir } from "os";
 
 import { initConfig, loadSettings, reloadSettings } from "../../src/config";
@@ -32,6 +32,7 @@ import {
 } from "../../src/runner/pty-supervisor";
 import { createThreadSession, removeThreadSession } from "../../src/sessionManager";
 import { encodeCwdForProjectsDir } from "../../src/bus/jsonl-line-types";
+import { seedClaudeOnboarding, unseedClaudeOnboarding } from "./claude-onboarding";
 
 // Per-turn timeout passed to runTurn. Real Claude can take 30-60s for a cold
 // turn (model warmup, MCP attach, tool resolution); 120s is the operator
@@ -77,49 +78,6 @@ async function restoreSettings(): Promise<void> {
   } else if (!hadSettingsFile) {
     await rm(SETTINGS_FILE, { force: true }).catch(() => undefined);
   }
-}
-
-// On a fresh HOME (the nightly runner) claude boots into its onboarding
-// screens — theme picker first — and the PTY supervisor answers only the
-// trust dialog. Mark onboarding done, touching nothing else in the file and
-// leaving it alone when it already says so (a developer's own machine).
-let seededOnboarding = false;
-
-function readClaudeConfig(path: string): Record<string, unknown> | null {
-  if (!existsSync(path)) return {};
-  try {
-    return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-  } catch {
-    return null; // malformed: not ours to rewrite
-  }
-}
-
-// Write-then-rename: claude rewrites this file itself (atomically, with
-// backups); a partial write must never be what it reads.
-function writeClaudeConfig(path: string, cfg: Record<string, unknown>): void {
-  const tmp = `${path}.pty-it-${process.pid}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(cfg, null, 2)}\n`, { mode: 0o600 });
-  renameSync(tmp, path);
-}
-
-function seedClaudeOnboarding(): void {
-  const path = join(homedir(), ".claude.json");
-  const cfg = readClaudeConfig(path);
-  if (cfg === null || cfg.hasCompletedOnboarding === true) return;
-  writeClaudeConfig(path, { ...cfg, hasCompletedOnboarding: true });
-  seededOnboarding = true;
-}
-
-/** Undo the seed on the machine it was made on — a developer who had not
- *  onboarded gets their onboarding back; the runner's HOME is discarded. */
-function unseedClaudeOnboarding(): void {
-  if (!seededOnboarding) return;
-  const path = join(homedir(), ".claude.json");
-  const cfg = readClaudeConfig(path);
-  if (cfg === null) return;
-  const { hasCompletedOnboarding: _seeded, ...rest } = cfg;
-  writeClaudeConfig(path, rest);
-  seededOnboarding = false;
 }
 
 beforeAll(async () => {
