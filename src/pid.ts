@@ -266,8 +266,10 @@ function stealStaleLock(lockPath: string, staleHolder: number | null): void {
   if (g === "busy") {
     const guardHolder = readLockHolder(guard);
     // Held for two syscalls: one older than a few seconds was left by a
-    // stealer that died, even if its PID has since been recycled.
-    if (guardHolder !== null && isPidAlive(guardHolder) && !olderThan(guard, 5_000)) return;
+    // stealer that died, even if its PID has since been recycled. An empty one
+    // is an O_EXCL create not yet written — fresh, it is someone's, as for
+    // the lock itself.
+    if ((guardHolder === null || isPidAlive(guardHolder)) && !olderThan(guard, 5_000)) return;
     try {
       if (readLockHolder(guard) === guardHolder) unlinkSync(guard);
     } catch {}

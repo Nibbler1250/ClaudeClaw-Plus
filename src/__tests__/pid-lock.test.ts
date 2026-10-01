@@ -196,6 +196,15 @@ describe("PID lock (#435)", () => {
     expect(existsSync(`${lockFile}.steal`)).toBe(false);
   });
 
+  it("a fresh empty steal guard (an O_EXCL create not yet written) is not removed", async () => {
+    writeFileSync(lockFile, `${DEAD_PID}\n`); // stale: would be taken over...
+    writeFileSync(`${lockFile}.steal`, ""); // ...but another stealer is mid-create
+    const r = await acquirePidLock(pidFile, 300);
+    expect(r.ok).toBe(false);
+    expect(existsSync(`${lockFile}.steal`)).toBe(true);
+    expect(readFileSync(lockFile, "utf-8").trim()).toBe(String(DEAD_PID));
+  });
+
   it("an empty lock (an O_EXCL create not yet written) is not stale until it is old", async () => {
     writeFileSync(lockFile, "");
     expect(await acquirePidLock(pidFile, 100)).toEqual({ ok: false, holder: null });
