@@ -586,16 +586,28 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
                   const target = jobAgent ?? agent;
                   // #344: the job's own `timeout:` bounds the bridge WAIT (the
                   // agent's turn itself is not cancelled by the bridge).
+                  // #436: so `fireJob` restores the job's frontmatter when the
+                  // TURN is over, not when the wait is.
+                  let turnSettledResolve: () => void = () => undefined;
+                  const turnSettled = new Promise<void>((res) => {
+                    turnSettledResolve = res;
+                  });
                   const out = await (opts.bus as NonNullable<typeof opts.bus>).sendPromptAndAwait(
                     target,
                     prompt,
-                    { origin: "webui", originId: `job:${name}`, timeoutMs: extras?.timeoutMs },
+                    {
+                      origin: "webui",
+                      originId: `job:${name}`,
+                      timeoutMs: extras?.timeoutMs,
+                      onTurnSettled: () => turnSettledResolve(),
+                    },
                   );
                   if (!out.ok && out.error) busRunnerError = out.error;
                   return {
                     exitCode: out.exitCode,
                     stdout: out.output,
                     stderr: out.ok ? "" : (out.error ?? ""),
+                    turnSettled,
                   };
                 },
               }

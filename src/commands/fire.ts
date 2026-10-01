@@ -62,6 +62,93 @@ export interface FireRunExtras {
   modelOverride?: string;
 }
 
+export interface FireRunnerResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  /**
+   * #436: resolves when the agent's turn is over, when that is later than the
+   * runner's return — the bus runner returns when its WAIT ends (reply or
+   * timeout) and the turn can run on. The job's frontmatter is restored then,
+   * not before. Absent: the turn ended with the runner (the `run()` path
+   * kills the child at `timeout:`).
+   */
+  turnSettled?: Promise<unknown>;
+}
+
+/**
+ * #436: one frontmatter snapshot per job while any fired turn of it may still
+ * write. A second fire of the same job while the first turn runs on must not
+ * snapshot the file that turn may already have rewritten — it shares the
+ * first snapshot, and the restore runs when the last of them settles.
+ */
+const pendingRestores = new Map<
+  string,
+  { restore: () => Promise<boolean>; holders: number; restoring?: Promise<void> }
+>();
+
+async function holdFrontmatterSnapshot(jobName: string): Promise<() => Promise<void>> {
+  let entry = pendingRestores.get(jobName);
+  // A restore in flight: wait for it, so this fire snapshots the restored
+  // file rather than the one the previous turn rewrote.
+  while (entry?.restoring) {
+    await entry.restoring.catch(() => undefined);
+    entry = pendingRestores.get(jobName);
+  }
+  if (entry) {
+    entry.holders++;
+  } else {
+    // Two first fires can both reach this await: whichever publishes its
+    // snapshot first wins, the other joins it.
+    const restore = await snapshotJobFrontmatter(jobName);
+    entry = pendingRestores.get(jobName);
+    if (entry && !entry.restoring) entry.holders++;
+    else {
+      entry = { restore, holders: 1 };
+      pendingRestores.set(jobName, entry);
+    }
+  }
+  const held = entry;
+  let released = false;
+  return async () => {
+    if (released) return;
+    released = true;
+    if (pendingRestores.get(jobName) !== held) return; // already flushed at shutdown
+    if (--held.holders > 0) return;
+    // The entry stays until the restore lands (see the wait above).
+    held.restoring = (async () => {
+      try {
+        if (await held.restore()) console.log(`Restored frontmatter for job: ${jobName}`);
+      } finally {
+        if (pendingRestores.get(jobName) === held) pendingRestores.delete(jobName);
+      }
+    })();
+    await held.restoring;
+  };
+}
+
+/**
+ * #436: restore every snapshot still waiting on a turn. For daemon shutdown:
+ * the in-flight turns have been drained (or abandoned) by then, and a restore
+ * held in memory would otherwise be lost with the process.
+ */
+export async function restorePendingFrontmatter(): Promise<void> {
+  const entries = [...pendingRestores.entries()];
+  pendingRestores.clear();
+  for (const [jobName, entry] of entries) {
+    if (entry.restoring) {
+      await entry.restoring.catch(() => undefined); // already restoring
+      continue;
+    }
+    entry.holders = 0;
+    try {
+      if (await entry.restore()) console.log(`Restored frontmatter for job: ${jobName}`);
+    } catch (err) {
+      console.error(`[fire] frontmatter restore failed for ${jobName}:`, err);
+    }
+  }
+}
+
 export interface FireJobOptions {
   /** Injectable runner for tests. Defaults to the scheduled path's `run()` call. */
   runner?: (
@@ -69,7 +156,7 @@ export interface FireJobOptions {
     prompt: string,
     agent?: string,
     extras?: FireRunExtras,
-  ) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
+  ) => Promise<FireRunnerResult>;
   /** Injectable prompt resolver for tests. Defaults to config.resolvePrompt. */
   promptResolver?: (prompt: string) => Promise<string>;
   /** Injectable agent-job loader for tests. Defaults to loadAgentJobsUnfiltered. */
@@ -88,7 +175,7 @@ async function defaultRun(
   prompt: string,
   agent?: string,
   extras: FireRunExtras = {},
-): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+): Promise<FireRunnerResult> {
   return run(
     name,
     prompt,
@@ -166,7 +253,42 @@ export async function fireJob(
   // its own directory, and a turn that rewrites its job file must not drop
   // `schedule:`. Settings may not be loaded (tests): the clock then carries
   // no offset.
-  const restoreFrontmatter = await snapshotJobFrontmatter(job.name);
+  const releaseSnapshot = await holdFrontmatterSnapshot(job.name);
+  let result: FireRunnerResult;
+  try {
+    result = await runFired(job, promptResolver, runner);
+  } catch (err) {
+    // The runner's error is the one to surface, not a failed restore's.
+    await releaseSnapshot().catch((e) =>
+      console.error(`[fire] frontmatter restore failed for ${job.name}:`, e),
+    );
+    throw err;
+  }
+  if (result.turnSettled) {
+    // #436: the bus runner's wait is over; the turn may not be. Restore when
+    // it is — in the background, the caller has its result already.
+    void result.turnSettled
+      .catch(() => undefined)
+      .then(releaseSnapshot)
+      .catch((err) => console.error(`[fire] frontmatter restore failed for ${job.name}:`, err));
+  } else {
+    await releaseSnapshot();
+  }
+  return {
+    success: result.exitCode === 0,
+    exitCode: result.exitCode,
+    output: result.stdout,
+    stderr: result.stderr,
+    agent,
+    label,
+  };
+}
+
+async function runFired(
+  job: Job,
+  promptResolver: (prompt: string) => Promise<string>,
+  runner: NonNullable<FireJobOptions["runner"]>,
+): Promise<FireRunnerResult> {
   const resolved = await promptResolver(job.prompt);
   let tzOffset = 0;
   try {
@@ -179,16 +301,7 @@ export async function fireJob(
     timeoutMs: job.timeoutSeconds ? job.timeoutSeconds * 1000 : undefined,
     modelOverride: await resolveJobModel(job),
   };
-  const result = await runner(job.name, prompt, job.agent, extras);
-  if (await restoreFrontmatter()) console.log(`Restored frontmatter for job: ${job.name}`);
-  return {
-    success: result.exitCode === 0,
-    exitCode: result.exitCode,
-    output: result.stdout,
-    stderr: result.stderr,
-    agent,
-    label,
-  };
+  return runner(job.name, prompt, job.agent, extras);
 }
 
 /**

@@ -764,6 +764,14 @@ export async function start(args: string[] = []) {
         console.error("[bus-runtime] shutdown failed", err);
       }
     }
+    // #436: a web-UI fire's frontmatter restore waits for its turn to end;
+    // the turns are drained by now, and a pending restore dies with us.
+    try {
+      const { restorePendingFrontmatter } = await import("./fire");
+      await restorePendingFrontmatter();
+    } catch (err) {
+      console.error("[fire] pending frontmatter restore failed at shutdown", err);
+    }
     await teardownStatusline();
     // #420: only our own file — a replacement that already wrote its PID keeps it.
     // #435: a short lock wait: under `--replace-existing` the replacement holds
@@ -1383,6 +1391,7 @@ export async function start(args: string[] = []) {
                         origin: sendOpts?.origin as import("../bus/types").BusOrigin | undefined,
                         originId: sendOpts?.originId,
                         timeoutMs: sendOpts?.timeoutMs,
+                        onTurnSettled: sendOpts?.onTurnSettled,
                         // #227: rotate the live PTY when the threshold trips.
                         rotateAgent: busRuntimeHandle?.rotateAgent,
                       },
