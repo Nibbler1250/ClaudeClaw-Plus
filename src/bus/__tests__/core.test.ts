@@ -3301,34 +3301,26 @@ describe("BusCore IPC", () => {
       client.close();
     });
 
-    for (const [label, unrelated] of [
-      ["an unrelated prompt starts a turn", "prompt"],
-      ["an unrelated prompt is absorbed", "session.queue"],
-    ] as const) {
-      it(`keeps the PTY fallback armed when ${label}`, async () => {
-        // Only a line carrying the nudge proves the notification was taken;
-        // another prompt's turn says nothing about the nudge.
-        const nudges: string[] = [];
-        const { b, client } = await ipcNudgeBus(nudges);
-        bus = b;
-        await promptTg(b, "alpha");
-        turnEnd(b, "alpha", "uncurated scratch");
-        await tick();
-        b.ingestSessionEvent({
-          ts: Date.now(),
-          agent_id: "alpha",
-          session_id: "s",
-          topic: unrelated,
-          payload:
-            unrelated === "prompt"
-              ? { text: "<channel>something else</channel>" }
-              : { operation: "remove", reason: "absorbed_mid_turn", content: "something else" },
-        });
-        await new Promise((r) => setTimeout(r, 80));
-        expect(nudges).toHaveLength(1);
-        client.close();
+    it("keeps the PTY fallback armed when an unrelated prompt is absorbed", async () => {
+      // Only a line carrying the nudge proves the notification was taken;
+      // another prompt's absorption says nothing about the nudge.
+      const nudges: string[] = [];
+      const { b, client } = await ipcNudgeBus(nudges);
+      bus = b;
+      await promptTg(b, "alpha");
+      turnEnd(b, "alpha", "uncurated scratch");
+      await tick();
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "s",
+        topic: "session.queue",
+        payload: { operation: "remove", reason: "absorbed_mid_turn", content: "something else" },
       });
-    }
+      await new Promise((r) => setTimeout(r, 80));
+      expect(nudges).toHaveLength(1);
+      client.close();
+    });
 
     it("a settled nudge's fallback cannot type a stale copy into the next nudge", async () => {
       // Nudge 1 goes over IPC and is settled by a reply; nudge 2, inside nudge
@@ -3352,6 +3344,32 @@ describe("BusCore IPC", () => {
       expect(nudges).toHaveLength(1);
     });
 
+    it("defers the PTY fallback while an unrelated turn is streaming", async () => {
+      // The IPC copy may be queued behind that turn; a PTY copy typed into it
+      // could be absorbed, and the queued notification would deliver it again.
+      const nudges: string[] = [];
+      const { b, client } = await ipcNudgeBus(nudges);
+      bus = b;
+      await promptTg(b, "alpha");
+      turnEnd(b, "alpha", "uncurated scratch");
+      await tick();
+      nudgePromptLine(b, "alpha", "<channel>something else</channel>"); // unrelated turn starts
+      await new Promise((r) => setTimeout(r, 80));
+      expect(nudges).toHaveLength(0);
+      // That turn ends; the queued IPC nudge then opens its own turn.
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "s",
+        topic: "response.turn_end",
+        payload: { stop_reason: "end_turn", text: "" },
+      });
+      nudgePromptLine(b, "alpha", NUDGE_CHANNEL_LINE);
+      await new Promise((r) => setTimeout(r, 80));
+      expect(nudges).toHaveLength(0);
+      client.close();
+    });
+
     it("counts the agent busy while the IPC nudge's PTY fallback is armed", async () => {
       // A shutdown drain must not stop the agent while the bus still owes the
       // reminder's PTY copy.
@@ -3364,6 +3382,8 @@ describe("BusCore IPC", () => {
       expect(b.busyAgents?.()).toContain("alpha");
       await new Promise((r) => setTimeout(r, 80));
       expect(nudges).toHaveLength(1);
+      // Typed, but its turn has not started yet: still owed.
+      expect(b.busyAgents?.()).toContain("alpha");
       client.close();
     });
 

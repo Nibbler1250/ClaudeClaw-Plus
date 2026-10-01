@@ -2426,9 +2426,10 @@ export class BusCoreImpl implements BusCore {
     for (const [agent, q] of this.deliveryQueue) if (q.length > 0) busy.add(agent);
     for (const [agent, held] of this.compactionHeld) if (held.size > 0) busy.add(agent);
     for (const [agent, carried] of this.pendingRedelivery) if (carried.length > 0) busy.add(agent);
-    // An IPC-only reply nudge whose turn has not started: the bus may still
-    // owe its PTY copy.
-    for (const agent of this.nudgePtyFallback.keys()) busy.add(agent);
+    // An outstanding reply nudge: from its send — over IPC, PTY, or the IPC
+    // copy's armed PTY fallback — until the reply or the synthesized delivery,
+    // the bus still owes the user this turn's answer.
+    for (const [agent, nudged] of this.replyNudged) if (nudged) busy.add(agent);
     for (const [agent, pending] of this.flushVerify) {
       for (const entry of pending.values()) {
         if (!entry.redelivered) {
@@ -2896,19 +2897,33 @@ export class BusCoreImpl implements BusCore {
     // nudge is still outstanding (no reply, deadline, cancel or disconnect).
     if (ipcDelivered) {
       if (ptyAvailable) {
-        const timer = setTimeout(() => {
-          if (this.nudgePtyFallback.get(agentId)?.timer !== timer) return;
-          this.nudgePtyFallback.delete(agentId);
-          if (this.replyNudged.get(agentId) !== true) return;
-          // A session (re)initialising would only queue the copy for after
-          // `replay_done`, unchecked against a reply landing meanwhile, and its
-          // context no longer holds the turn the reminder is about. The turn
-          // deadline still covers the outstanding nudge.
-          if (this.agentInitializing.has(agentId)) return;
-          typeIntoPty();
-        }, this.flushVerifyMs);
-        timer.unref?.();
-        this.nudgePtyFallback.set(agentId, { timer, key: promptLineKey(text) });
+        const key = promptLineKey(text);
+        const arm = () => {
+          const timer = setTimeout(() => {
+            if (this.nudgePtyFallback.get(agentId)?.timer !== timer) return;
+            if (this.replyNudged.get(agentId) !== true) {
+              this.nudgePtyFallback.delete(agentId);
+              return;
+            }
+            // A turn is streaming: the IPC copy may be queued behind it, and a
+            // PTY copy typed now could be absorbed into it — the agent would get
+            // both. Wait for that turn to end, as the flush verifier does (#250).
+            if (this.agentTurnActive.has(agentId)) {
+              arm();
+              return;
+            }
+            this.nudgePtyFallback.delete(agentId);
+            // A session (re)initialising would only queue the copy for after
+            // `replay_done`, unchecked against a reply landing meanwhile, and its
+            // context no longer holds the turn the reminder is about. The turn
+            // deadline still covers the outstanding nudge.
+            if (this.agentInitializing.has(agentId)) return;
+            typeIntoPty();
+          }, this.flushVerifyMs);
+          timer.unref?.();
+          this.nudgePtyFallback.set(agentId, { timer, key });
+        };
+        arm();
       }
       return true;
     }
