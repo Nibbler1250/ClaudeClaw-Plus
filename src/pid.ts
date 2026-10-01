@@ -36,7 +36,7 @@ export async function checkExistingDaemon(): Promise<number | null> {
   if (!lock.ok) {
     if (lock.holder !== null) return lock.holder;
     throw new DaemonStateUnknownError(
-      `could not take the PID lock (${getPidLockPath()} could not be created or a stale one removed)`,
+      `could not take the PID lock (${getPidLockPath()} cannot be created, is unreadable, or a stale one could not be removed); if no claudeclaw start/stop runs here, remove it and its .steal and retry`,
     );
   }
   try {
@@ -173,13 +173,23 @@ export function getPidLockPath(pidFile: string = PID_FILE): string {
   return join(dirname(pidFile), "daemon.lock");
 }
 
-function readLockHolder(lockPath: string): number | null {
+/**
+ * Who holds a lock file: its PID; "empty" when it holds nothing yet (an
+ * O_EXCL create not yet written) or is gone; "unknown" when it cannot be read
+ * or does not hold a PID. An unknown lock is never judged stale: it may be a
+ * live holder's (#435).
+ */
+type LockHolder = number | "empty" | "unknown";
+function readLockHolder(lockPath: string): LockHolder {
+  let raw: string;
   try {
-    const n = Number(readFileSync(lockPath, "utf-8").trim());
-    return Number.isInteger(n) && n > 0 ? n : null;
-  } catch {
-    return null;
+    raw = readFileSync(lockPath, "utf-8").trim();
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT" ? "empty" : "unknown";
   }
+  if (raw === "") return "empty";
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : "unknown";
 }
 
 function olderThan(path: string, ms: number): boolean {
@@ -240,11 +250,13 @@ function tryCreateLock(lockPath: string): PidLockResult {
   // Fail closed: proceeding unlocked is exactly the race #435 closes.
   if (r === "unavailable") return { ok: false, holder: null };
   const holder = readLockHolder(lockPath);
-  // Empty or unreadable: possibly an O_EXCL lock between create and write.
-  if (holder === null && !olderThan(lockPath, 5_000)) return { ok: false, holder: null };
+  // Unreadable or not a PID: not ours to judge — fail closed.
+  if (holder === "unknown") return { ok: false, holder: null };
+  // Empty: possibly an O_EXCL lock between create and write.
+  if (holder === "empty" && !olderThan(lockPath, 5_000)) return { ok: false, holder: null };
   // A holder that is gone (or a lock with our own PID that this process does
   // not hold: a dead predecessor whose PID was recycled) is stale.
-  if (holder !== null && holder !== process.pid && isPidAlive(holder)) {
+  if (holder !== "empty" && holder !== process.pid && isPidAlive(holder)) {
     return { ok: false, holder };
   }
   stealStaleLock(lockPath, holder);
@@ -260,16 +272,17 @@ function tryCreateLock(lockPath: string): PidLockResult {
  * for two syscalls; one left by a contender that died inside them is itself
  * judged stale by its PID and removed the same way.
  */
-function stealStaleLock(lockPath: string, staleHolder: number | null): void {
+function stealStaleLock(lockPath: string, staleHolder: number | "empty"): void {
   const guard = `${lockPath}.steal`;
   const g = tryLink(guard);
   if (g === "busy") {
     const guardHolder = readLockHolder(guard);
+    if (guardHolder === "unknown") return;
     // Held for two syscalls: one older than a few seconds was left by a
     // stealer that died, even if its PID has since been recycled. An empty one
     // is an O_EXCL create not yet written — fresh, it is someone's, as for
     // the lock itself.
-    if ((guardHolder === null || isPidAlive(guardHolder)) && !olderThan(guard, 5_000)) return;
+    if ((guardHolder === "empty" || isPidAlive(guardHolder)) && !olderThan(guard, 5_000)) return;
     try {
       if (readLockHolder(guard) === guardHolder) unlinkSync(guard);
     } catch {}

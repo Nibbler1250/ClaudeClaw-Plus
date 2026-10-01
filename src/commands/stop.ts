@@ -138,9 +138,9 @@ export async function stop() {
       `PID file no longer names ${pid} (another daemon started meanwhile) — left in place.`,
     );
   } else if (cleanup === "locked") {
-    // #435: a `start` holds the PID lock; the file it finds naming a dead
-    // PID is cleaned up by that start's own check.
-    console.log(`A start is in progress in this directory — PID file left to it.`);
+    // #435: the PID lock is held (a `start` mid-way) or cannot be taken. A
+    // file naming a dead PID is removed by the next start's own check.
+    console.log("PID lock busy or unavailable in this directory — PID file left in place.");
   }
   await teardownStatusline();
 

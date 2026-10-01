@@ -196,6 +196,25 @@ describe("PID lock (#435)", () => {
     expect(existsSync(`${lockFile}.steal`)).toBe(false);
   });
 
+  it("an old lock that does not hold a PID is not judged stale (fail closed)", async () => {
+    writeFileSync(lockFile, "not-a-pid\n");
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lockFile, old, old);
+    const r = await acquirePidLock(pidFile, 300);
+    expect(r).toEqual({ ok: false, holder: null });
+    expect(readFileSync(lockFile, "utf-8")).toBe("not-a-pid\n");
+  });
+
+  it.skipIf(process.getuid?.() === 0)("an old unreadable lock is not judged stale", async () => {
+    writeFileSync(lockFile, "12345\n");
+    chmodSync(lockFile, 0o000);
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lockFile, old, old);
+    const r = await acquirePidLock(pidFile, 300);
+    expect(r).toEqual({ ok: false, holder: null });
+    expect(existsSync(lockFile)).toBe(true);
+  });
+
   it("a fresh empty steal guard (an O_EXCL create not yet written) is not removed", async () => {
     writeFileSync(lockFile, `${DEAD_PID}\n`); // stale: would be taken over...
     writeFileSync(`${lockFile}.steal`, ""); // ...but another stealer is mid-create

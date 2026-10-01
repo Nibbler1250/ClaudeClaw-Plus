@@ -375,9 +375,11 @@ export async function start(args: string[] = []) {
     console.error(
       pidLock.holder !== null
         ? `\x1b[31mAborted: another claudeclaw start/stop is in progress in this directory (PID ${pidLock.holder}).\x1b[0m`
-        : `\x1b[31mAborted: could not take the PID lock in this directory (${getPidLockPath()} could not be created or a stale one removed).\x1b[0m`,
+        : `\x1b[31mAborted: could not take the PID lock in this directory (${getPidLockPath()} cannot be created, is unreadable, or a stale one could not be removed).\x1b[0m`,
     );
-    console.error(`If no such process exists, remove ${getPidLockPath()} and retry.`);
+    console.error(
+      `If no such process exists, remove ${getPidLockPath()} (and ${getPidLockPath()}.steal) and retry.`,
+    );
     process.exit(1);
   }
 
