@@ -3,6 +3,32 @@ import { peekSession } from "../../sessions";
 import { SESSION_FILE, SETTINGS_FILE, STATE_FILE } from "../constants";
 import type { WebSnapshot } from "../types";
 
+/**
+ * What the dashboard is told about `settings.web`. Allowlisted rather than
+ * passed through: `web.bus.token` is a credential for the webui bus (it can
+ * send prompts to the agent), and the dashboard only needs to know whether
+ * one is set. A field added to the config later stays out until it is
+ * listed here.
+ */
+function sanitizeWeb(web: WebSnapshot["settings"]["web"]) {
+  return {
+    enabled: web.enabled,
+    host: web.host,
+    port: web.port,
+    ...(web.bus
+      ? {
+          bus: {
+            bind: web.bus.bind,
+            // Same resolution as the adapter: config first, then the env.
+            tokenConfigured: Boolean(web.bus.token?.trim() || process.env.CCAW_WEBUI_TOKEN?.trim()),
+            allowedAgentIds: web.bus.allowedAgentIds,
+            allowedOrigins: web.bus.allowedOrigins,
+          },
+        }
+      : {}),
+  };
+}
+
 export function sanitizeSettings(snapshot: WebSnapshot["settings"]) {
   return {
     timezone: snapshot.timezone,
@@ -17,7 +43,7 @@ export function sanitizeSettings(snapshot: WebSnapshot["settings"]) {
       configured: Boolean(snapshot.discord.token),
       allowedUserCount: snapshot.discord.allowedUserIds.length,
     },
-    web: snapshot.web,
+    web: sanitizeWeb(snapshot.web),
   };
 }
 
@@ -58,7 +84,7 @@ export async function buildState(snapshot: WebSnapshot) {
           lastUsedAt: session.lastUsedAt,
         }
       : null,
-    web: snapshot.settings.web,
+    web: sanitizeWeb(snapshot.settings.web),
   };
 }
 
