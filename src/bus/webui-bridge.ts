@@ -82,7 +82,24 @@ export interface StreamBusPromptOptions {
   rotateAgent?: (agentId: string) => Promise<void>;
   /** #390: override of the reconnect grace before the no-MCP warning (tests). */
   ipcWarningGraceMs?: number;
+  /**
+   * #436: called once when the turn this prompt started is over — which the
+   * returned promise does not say: it resolves on the reply or on `timeoutMs`,
+   * and the timeout ends the WAIT, not the turn. Fires on that turn's
+   * `response.turn_end` (matched by `promise_id`, not flagged ambiguous, and
+   * the agent no longer busy — else once it goes idle), at once when no turn
+   * will run (send failed, prompt withdrawn from the
+   * queue), and at `turnSettleCeilingMs` at the latest. Never called before
+   * the returned promise resolves.
+   */
+  onTurnSettled?: (reason: TurnSettleReason) => void;
+  /** #436: latest the turn-settled callback fires. Default 30 minutes. */
+  turnSettleCeilingMs?: number;
+  /** #436: idle-poll interval after a turn_end seen while the agent was busy (tests). */
+  turnSettlePollMs?: number;
 }
+
+export type TurnSettleReason = "turn_end" | "idle" | "no_turn" | "ceiling";
 
 export interface BusPromptResult {
   ok: boolean;
@@ -94,6 +111,8 @@ export interface BusPromptResult {
 }
 
 const DEFAULT_PROMPT_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_TURN_SETTLE_CEILING_MS = 30 * 60 * 1000;
+const DEFAULT_TURN_SETTLE_POLL_MS = 5_000;
 /**
  * #390: how long a prompt sent with no MCP connection waits before the
  * dashboard is told. A fresh spawn, a restart or a #227 rotation delivers the
@@ -148,8 +167,11 @@ export async function streamBusPrompt(
       /* upstream errors don't block our own attempt */
     }
   }
+  // #436: the turn-settled watcher is armed here, at the outer boundary,
+  // after the rotation work below — never before this function's promise.
+  const settleArm: { arm?: () => void } = {};
   try {
-    const result = await runPrompt(bus, agentId, message, opts);
+    const result = await runPrompt(bus, agentId, message, opts, settleArm);
     if (result.ok) {
       // Per-agent turn accounting for #213, scoped to the named agent's
       // own `session.json` (the long-lived PTY session) rather than the
@@ -199,6 +221,7 @@ export async function streamBusPrompt(
     // chained callers will overwrite the map entry themselves.
     if (agentMutex.get(agentId) === slot) agentMutex.delete(agentId);
     release();
+    settleArm.arm?.();
   }
 }
 
@@ -207,6 +230,7 @@ function runPrompt(
   agentId: string,
   message: string,
   opts: StreamBusPromptOptions,
+  settleArm: { arm?: () => void } = {},
 ): Promise<BusPromptResult> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS;
   const origin = opts.origin ?? "webui";
@@ -230,6 +254,9 @@ function runPrompt(
   return new Promise<BusPromptResult>((resolve) => {
     let resolved = false;
     let ipcWarningTimer: ReturnType<typeof setTimeout> | null = null;
+    // #436: the turn outlives the wait when the wait times out. `noTurn` is
+    // set when no turn will ever run for this prompt.
+    let noTurn = false;
     const finish = (
       r: BusPromptResult,
       finalState: "turn_observed" | "timeout" | "wedged_prompt",
@@ -250,6 +277,7 @@ function runPrompt(
       // so observers see the line within a tick.
       void receipt.close(finalState, notes);
       resolve(r);
+      if (settle) settleArm.arm = settle.arm;
     };
     // #239: the bus may queue this prompt behind another chat's running turn,
     // so that turn's final reliably lands on this agent-wide subscription
@@ -259,6 +287,7 @@ function runPrompt(
     // the agent names for another chat (#224).
     let promiseId: string | null = null;
     let admitted = false;
+    const settle = opts.onTurnSettled ? watchTurnSettled() : null;
     const sub = bus.subscribe(
       { agent_id: agentId, topics: ["prompt", "response.text"] },
       (event) => {
@@ -301,7 +330,9 @@ function runPrompt(
     const timer = setTimeout(() => {
       // #239: a prompt still waiting in the bus queue when its caller gives up
       // would run later with no listener — its reply lost, the turn wasted.
-      if (promiseId !== null && !admitted) bus.withdrawQueuedPrompt?.(agentId, promiseId);
+      if (promiseId !== null && !admitted && bus.withdrawQueuedPrompt?.(agentId, promiseId)) {
+        noTurn = true;
+      }
       finish(
         {
           ok: false,
@@ -362,6 +393,7 @@ function runPrompt(
         receipt.patch({ notes });
       })
       .catch((err) => {
+        noTurn = true;
         finish(
           {
             ok: false,
@@ -373,5 +405,100 @@ function runPrompt(
           { error: err instanceof Error ? err.message : String(err), stage: "bus_send_prompt" },
         );
       });
+
+    /**
+     * #436: tell the caller when the turn is over. Subscribed from the start
+     * so this prompt's admission and turn_end are seen even when they land
+     * after the wait gave up; the callback itself waits for `arm()` (the
+     * wait's resolution), so a caller never hears "settled" before its result.
+     */
+    function watchTurnSettled() {
+      const ceilingMs = opts.turnSettleCeilingMs ?? DEFAULT_TURN_SETTLE_CEILING_MS;
+      const pollMs = opts.turnSettlePollMs ?? DEFAULT_TURN_SETTLE_POLL_MS;
+      let seen: TurnSettleReason | null = null;
+      let armed = false;
+      let done = false;
+      let idlePolls = 0;
+      let pollTimer: ReturnType<typeof setInterval> | null = null;
+      let ceilingTimer: ReturnType<typeof setTimeout> | null = null;
+      const watchSub = bus.subscribe(
+        { agent_id: agentId, topics: ["prompt", "response.turn_end"] },
+        (event) => {
+          if (event.topic === "prompt") {
+            const p = event.payload as { origin?: string; origin_id?: string; text?: string };
+            if (
+              (promiseId !== null && event.promise_id === promiseId) ||
+              (p.origin === origin && p.origin_id === originId && p.text === message)
+            ) {
+              admitted = true;
+            }
+            return;
+          }
+          // Ours only when stamped with our id AND not flagged ambiguous: a
+          // released earlier turn's late turn_end is stamped with the id of
+          // whatever holds the slot now — possibly us, before we even started.
+          const amb = (event as { correlation_ambiguous?: boolean }).correlation_ambiguous;
+          if (promiseId !== null && event.promise_id === promiseId && amb !== true) {
+            seen = "turn_end";
+            if (armed) setTimeout(onOwnTurnEnd, 0);
+          }
+        },
+      );
+      const fire = (reason: TurnSettleReason) => {
+        if (done) return;
+        done = true;
+        try {
+          watchSub.close();
+        } catch {
+          /* idempotent close — fine */
+        }
+        if (pollTimer) clearInterval(pollTimer);
+        if (ceilingTimer) clearTimeout(ceilingTimer);
+        try {
+          opts.onTurnSettled?.(reason);
+        } catch {
+          /* a settle callback error must not escape into the bus */
+        }
+      };
+      const idle = () => {
+        const busy = bus.busyAgents?.() ?? bus.activeTurnAgents();
+        return !busy.includes(agentId);
+      };
+      // A turn_end of ours with the agent still busy (another prompt queued,
+      // or a mis-stamped terminator that slipped past the flag) is not trusted
+      // alone: the idle polls decide.
+      const onOwnTurnEnd = () => {
+        if (idle()) fire("turn_end");
+      };
+      return {
+        arm() {
+          if (armed) return;
+          armed = true;
+          // Deferred one tick: the caller handles its result before it hears
+          // the turn is over.
+          if (seen) setTimeout(onOwnTurnEnd, 0);
+          if (noTurn) {
+            setTimeout(() => fire("no_turn"), 0);
+            return;
+          }
+          ceilingTimer = setTimeout(() => fire("ceiling"), ceilingMs);
+          // After our own turn_end with the agent still busy, wait for it to go
+          // idle. Idleness alone is not an end: the bus releases a slow turn's
+          // busy state at its turn deadline while the turn may still run, so a
+          // turn with no turn_end (crash, restart) settles at the ceiling, or
+          // at daemon shutdown through the caller.
+          pollTimer = setInterval(() => {
+            if (noTurn) return fire("no_turn");
+            if (seen && idle()) {
+              if (++idlePolls >= 2) fire("idle");
+            } else {
+              idlePolls = 0;
+            }
+          }, pollMs);
+          (ceilingTimer as { unref?: () => void }).unref?.();
+          (pollTimer as { unref?: () => void }).unref?.();
+        },
+      };
+    }
   });
 }

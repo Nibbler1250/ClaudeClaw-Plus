@@ -72,7 +72,16 @@ export interface BusWebUiBridge {
   sendPromptAndAwait: (
     agentId: string,
     text: string,
-    opts?: { timeoutMs?: number; origin?: string; originId?: string },
+    opts?: {
+      timeoutMs?: number;
+      origin?: string;
+      originId?: string;
+      /**
+       * #436: called once the turn is over — the returned promise only
+       * says the WAIT is (reply or timeout). See `streamBusPrompt`.
+       */
+      onTurnSettled?: () => void;
+    },
   ) => Promise<BusWebUiPromptResult>;
   /**
    * Default agent id used when the route has no agent in the request

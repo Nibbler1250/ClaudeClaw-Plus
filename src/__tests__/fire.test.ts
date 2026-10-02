@@ -7,7 +7,12 @@
 import { describe, it, expect, afterEach } from "bun:test";
 import { readdir, readFile, rm, mkdir, writeFile } from "fs/promises";
 import { join } from "path";
-import { fireJob, runFireCommand, parseFireArgs } from "../commands/fire";
+import {
+  fireJob,
+  runFireCommand,
+  parseFireArgs,
+  restorePendingFrontmatter,
+} from "../commands/fire";
 import type { Job } from "../jobs";
 import { initConfig, loadSettings } from "../config";
 import * as runnerMod from "../runner";
@@ -260,6 +265,142 @@ describe("fireJob", () => {
     expect(result.success).toBe(true);
     expect(calls).toHaveLength(1);
     expect(bodyOf(calls[0].prompt)).toBe("disabled prompt");
+  });
+
+  // #436: in bus mode the runner returns when the bridge WAIT ends (reply or
+  // timeout); the agent's turn can run on and rewrite its own job file. The
+  // snapshot must be restored when the turn is over, not when the wait is.
+  it("restores the frontmatter when the turn settles, not when the bus runner's wait returns (#436)", async () => {
+    const agent = uniq("tail");
+    await writeAgentJob(agent, "nightly", "schedule: 0 2 * * *\nrecurring: true", "tidy up");
+    const jobFile = join(AGENTS_DIR, agent, "jobs", "nightly.md");
+    let settle: () => void = () => undefined;
+    const turnSettled = new Promise<void>((res) => {
+      settle = res;
+    });
+    const result = await fireJob(agent, "nightly", {
+      runner: async () => ({ exitCode: 1, stdout: "", stderr: "timed out", turnSettled }),
+      promptResolver: passthroughResolver,
+    });
+    expect(result.exitCode).toBe(1);
+    // The turn's tail, after the wait timed out: it rewrites its job file and drops `schedule:`.
+    await writeFile(jobFile, "---\nrecurring: true\n---\ntidy up\n", "utf8");
+    await Bun.sleep(20);
+    expect(await readFile(jobFile, "utf8")).not.toContain("schedule:"); // not restored yet
+    settle();
+    await Bun.sleep(50);
+    expect(await readFile(jobFile, "utf8")).toContain("schedule: 0 2 * * *");
+  });
+
+  it("a second fire while the first turn runs on shares the first snapshot (#436)", async () => {
+    const agent = uniq("twice");
+    await writeAgentJob(agent, "nightly", "schedule: 0 2 * * *\nrecurring: true", "tidy up");
+    const jobFile = join(AGENTS_DIR, agent, "jobs", "nightly.md");
+    const settles: Array<() => void> = [];
+    const runner = async () => {
+      const turnSettled = new Promise<void>((res) => settles.push(res));
+      return { exitCode: 1, stdout: "", stderr: "timed out", turnSettled };
+    };
+    await fireJob(agent, "nightly", { runner, promptResolver: passthroughResolver });
+    // First turn's tail rewrites its frontmatter before the second fire
+    // snapshots (a file with no `schedule:` would not load for a fire at all).
+    await writeFile(jobFile, "---\nschedule: 0 5 * * *\nrecurring: false\n---\ntidy up\n", "utf8");
+    await fireJob(agent, "nightly", { runner, promptResolver: passthroughResolver });
+    expect(settles).toHaveLength(2);
+    settles[0]();
+    await Bun.sleep(30);
+    expect(await readFile(jobFile, "utf8")).toContain("schedule: 0 5 * * *"); // second turn still running
+    settles[1]();
+    await Bun.sleep(50);
+    // The pre-fire frontmatter, not the rewritten one the second fire found.
+    expect(await readFile(jobFile, "utf8")).toContain("schedule: 0 2 * * *");
+  });
+
+  it("a fire arriving while a restore is in flight snapshots the restored file (#436)", async () => {
+    const agent = uniq("inflight");
+    await writeAgentJob(agent, "nightly", "schedule: 0 2 * * *\nrecurring: true", "tidy up");
+    const jobFile = join(AGENTS_DIR, agent, "jobs", "nightly.md");
+    let settle: () => void = () => undefined;
+    const turnSettled = new Promise<void>((res) => {
+      settle = res;
+    });
+    await fireJob(agent, "nightly", {
+      runner: async () => ({ exitCode: 1, stdout: "", stderr: "timed out", turnSettled }),
+      promptResolver: passthroughResolver,
+    });
+    await writeFile(jobFile, "---\nschedule: 0 5 * * *\nrecurring: false\n---\ntidy up\n", "utf8");
+    settle(); // the restore starts...
+    // ...and a second fire lands before it has written the file back.
+    await fireJob(agent, "nightly", {
+      runner: async () => {
+        await writeFile(jobFile, "---\nrecurring: true\n---\ntidy up\n", "utf8");
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+      promptResolver: passthroughResolver,
+    });
+    expect(await readFile(jobFile, "utf8")).toContain("schedule: 0 2 * * *");
+  });
+
+  it("a restore still waiting on its turn is flushed at daemon shutdown (#436)", async () => {
+    const agent = uniq("flush");
+    await writeAgentJob(agent, "nightly", "schedule: 0 2 * * *\nrecurring: true", "tidy up");
+    const jobFile = join(AGENTS_DIR, agent, "jobs", "nightly.md");
+    let settle: () => void = () => undefined;
+    const turnSettled = new Promise<void>((res) => {
+      settle = res;
+    });
+    await fireJob(agent, "nightly", {
+      runner: async () => ({ exitCode: 1, stdout: "", stderr: "timed out", turnSettled }),
+      promptResolver: passthroughResolver,
+    });
+    await writeFile(jobFile, "---\nrecurring: true\n---\ntidy up\n", "utf8");
+    await restorePendingFrontmatter();
+    expect(await readFile(jobFile, "utf8")).toContain("schedule: 0 2 * * *");
+    // The turn settling afterwards does not restore a second time.
+    await writeFile(jobFile, "---\nschedule: 0 4 * * *\n---\ntidy up\n", "utf8");
+    settle();
+    await Bun.sleep(30);
+    expect(await readFile(jobFile, "utf8")).toContain("schedule: 0 4 * * *");
+  });
+
+  it("restores at once when the runner carries no turn signal (the run() path)", async () => {
+    const agent = uniq("sync");
+    await writeAgentJob(agent, "nightly", "schedule: 0 2 * * *\nrecurring: true", "tidy up");
+    const jobFile = join(AGENTS_DIR, agent, "jobs", "nightly.md");
+    await fireJob(agent, "nightly", {
+      runner: async () => {
+        await writeFile(jobFile, "---\nrecurring: true\n---\ntidy up\n", "utf8");
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+      promptResolver: passthroughResolver,
+    });
+    expect(await readFile(jobFile, "utf8")).toContain("schedule: 0 2 * * *");
+  });
+
+  it("releases the snapshot when the runner throws", async () => {
+    const agent = uniq("throw");
+    await writeAgentJob(agent, "nightly", "schedule: 0 2 * * *\nrecurring: true", "tidy up");
+    const jobFile = join(AGENTS_DIR, agent, "jobs", "nightly.md");
+    await expect(
+      fireJob(agent, "nightly", {
+        runner: async () => {
+          await writeFile(jobFile, "---\nrecurring: true\n---\ntidy up\n", "utf8");
+          throw new Error("bridge down");
+        },
+        promptResolver: passthroughResolver,
+      }),
+    ).rejects.toThrow("bridge down");
+    expect(await readFile(jobFile, "utf8")).toContain("schedule: 0 2 * * *");
+    // Not left pending: a later fire takes a fresh snapshot.
+    await writeFile(jobFile, "---\nschedule: 0 3 * * *\n---\ntidy up\n", "utf8");
+    await fireJob(agent, "nightly", {
+      runner: async () => {
+        await writeFile(jobFile, "---\nrecurring: true\n---\ntidy up\n", "utf8");
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+      promptResolver: passthroughResolver,
+    });
+    expect(await readFile(jobFile, "utf8")).toContain("schedule: 0 3 * * *");
   });
 
   it("propagates runner exitCode on failure", async () => {
