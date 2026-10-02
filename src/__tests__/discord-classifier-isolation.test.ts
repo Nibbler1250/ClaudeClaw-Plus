@@ -19,6 +19,13 @@ describe("classifyThreadIntent isolation", () => {
     expect(CLASSIFIER_ARGS).toContain("--print");
   });
 
+  it("loads no settings file (hooks, user plugins) and no skills", () => {
+    const i = CLASSIFIER_ARGS.indexOf("--setting-sources");
+    expect(i).toBeGreaterThanOrEqual(0);
+    expect(CLASSIFIER_ARGS[i + 1]).toBe("");
+    expect(CLASSIFIER_ARGS).toContain("--disable-slash-commands");
+  });
+
   it("passes model auth and basics, drops chat tokens and other daemon secrets", () => {
     const env = classifierSpawnEnv({
       PATH: "/usr/bin",

@@ -12,8 +12,8 @@ import { getSettings, loadSettings, DEFAULT_IMAGE_OUTPUT_ROOT } from "../config"
 import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession } from "../sessionManager";
 import { readFile } from "node:fs/promises";
-import { existsSync, realpathSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
 import { cacheSkillOverlayFromContent } from "../policy/skill-overlays";
@@ -580,7 +580,10 @@ interface ThreadIntent {
  * The classifier reads a message from any allowed guild member. It only has
  * to answer with JSON, so it runs with no tools at all (`--tools ""`), no MCP
  * server (`--strict-mcp-config` with no `--mcp-config`) and no saved session:
- * an instruction hidden in the message has nothing to act with.
+ * an instruction hidden in the message has nothing to act with. It also loads
+ * no settings file (`--setting-sources ""`: no hooks, no user plugins) and no
+ * skills, and runs from an empty temp dir so no CLAUDE.md is in its context —
+ * otherwise a message can ask for that context back as "thread names".
  */
 export const CLASSIFIER_ARGS = [
   "--model",
@@ -592,6 +595,9 @@ export const CLASSIFIER_ARGS = [
   "",
   "--strict-mcp-config",
   "--no-session-persistence",
+  "--setting-sources",
+  "",
+  "--disable-slash-commands",
 ];
 
 /** Exact keys the classifier's `claude` keeps from the daemon env. */
@@ -656,12 +662,20 @@ Rules:
   try {
     const { execFileSync } = await import("node:child_process");
     const input = `${systemPrompt}\n\n---\nUser message: ${text}`;
-    const result = execFileSync("claude", CLASSIFIER_ARGS, {
-      input,
-      encoding: "utf-8",
-      timeout: 15000,
-      env: classifierSpawnEnv(),
-    }).trim();
+    // Empty cwd: no project CLAUDE.md for the classifier to read back.
+    const cwd = mkdtempSync(join(tmpdir(), "claudeclaw-classify-"));
+    let result: string;
+    try {
+      result = execFileSync("claude", CLASSIFIER_ARGS, {
+        input,
+        encoding: "utf-8",
+        timeout: 15000,
+        env: classifierSpawnEnv(),
+        cwd,
+      }).trim();
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
 
     if (!result || result === "null") return null;
     // Extract JSON from response (in case there's extra text)
