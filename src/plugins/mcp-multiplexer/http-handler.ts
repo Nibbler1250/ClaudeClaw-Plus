@@ -836,10 +836,11 @@ export class McpHttpHandler {
       // cache hit / success / error), timed from here. `recordToolCall`
       // only buffers in memory — never awaited, never throws — so it
       // cannot slow or fail the dispatch.
+      const ts = new Date().toISOString();
       const t0 = performance.now();
       const emitToolCall = (status: "ok" | "error", error?: string): void => {
         recordToolCall({
-          ts: new Date().toISOString(),
+          ts,
           plugin: this.serverName,
           tool: name,
           agent_id: bucketKey,

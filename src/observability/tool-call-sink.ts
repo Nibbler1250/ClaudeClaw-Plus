@@ -87,6 +87,10 @@ export class ToolCallSink {
    *  arbitrarily large (echoed bodies, paths). Truncate before it is retained on
    *  disk + in memory. */
   private static readonly MAX_ERROR_LEN = 2_000;
+  /** Cap the tool name the same way: on a refused call it is whatever the
+   *  caller sent (bounded only by the request body cap), and one oversized name
+   *  per call would force the chain to rotate away its own history. */
+  private static readonly MAX_TOOL_LEN = 256;
 
   constructor(opts: ToolCallSinkOptions = {}) {
     this.path = opts.path === undefined ? DEFAULT_TOOL_CALL_LOG : opts.path;
@@ -144,7 +148,7 @@ export class ToolCallSink {
       event: MCP_TOOL_CALL_INTENT_EVENT,
       subject: intent.plugin,
       detail: {
-        tool: intent.tool,
+        tool: ToolCallSink.clamp(intent.tool, ToolCallSink.MAX_TOOL_LEN),
         agent_id: intent.agent_id,
         event_ts: intent.ts,
       },
@@ -214,12 +218,14 @@ export class ToolCallSink {
           event: MCP_TOOL_CALL_EVENT,
           subject: e.plugin,
           detail: {
-            tool: e.tool,
+            tool: ToolCallSink.clamp(e.tool, ToolCallSink.MAX_TOOL_LEN),
             agent_id: e.agent_id,
             status: e.status,
             duration_ms: e.duration_ms,
             event_ts: e.ts,
-            ...(e.error !== undefined ? { error: ToolCallSink.clampError(e.error) } : {}),
+            ...(e.error !== undefined
+              ? { error: ToolCallSink.clamp(e.error, ToolCallSink.MAX_ERROR_LEN) }
+              : {}),
           },
         });
       }
@@ -228,12 +234,10 @@ export class ToolCallSink {
     }
   }
 
-  /** Bound an unredacted tool-error string before it is persisted + retained. */
-  private static clampError(error: string): string {
-    if (error.length <= ToolCallSink.MAX_ERROR_LEN) return error;
-    return `${error.slice(0, ToolCallSink.MAX_ERROR_LEN)}…[truncated ${
-      error.length - ToolCallSink.MAX_ERROR_LEN
-    } chars]`;
+  /** Bound a caller- or child-supplied string before it is persisted + retained. */
+  private static clamp(value: string, max: number): string {
+    if (value.length <= max) return value;
+    return `${value.slice(0, max)}…[truncated ${value.length - max} chars]`;
   }
 
   /** Test helper — events buffered but not yet flushed. */
