@@ -22,7 +22,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,7 +30,12 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { McpMultiplexerPlugin, _resetMcpMultiplexer } from "../plugins/mcp-multiplexer/index.js";
 import { _resetHttpGateway, getHttpGateway } from "../plugins/http-gateway.js";
-import { _resetMcpBridge, getMcpBridge } from "../plugins/mcp-bridge.js";
+import {
+  _resetMcpBridge,
+  _setMcpBridge,
+  getMcpBridge,
+  PluginMcpBridge,
+} from "../plugins/mcp-bridge.js";
 import { _resetIdentityStore, revokeIdentity } from "../plugins/mcp-multiplexer/pty-identity.js";
 import type { SessionPersistenceStore } from "../plugins/mcp-multiplexer/session-persistence.js";
 import { makeMuxSettingsView } from "./fixtures/mux-settings-view.js";
@@ -1211,6 +1216,166 @@ describe("mcp-multiplexer integration — mcp.tool_call boundary capture", () =>
       status: "error",
       error: "not_in_allowed_set",
     });
+  }, 10000);
+});
+
+// ── 9b) settings.mcp.audit: "enforce" — no log, no action (#232) ────────────
+
+describe("mcp-multiplexer integration — mandatory audit (enforce)", () => {
+  afterEach(() => {
+    __setToolCallSinkForTest(null);
+  });
+
+  async function callEcho(message: string) {
+    const cfg = writeProxyConfig(tmpDir, ["alpha"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({ webEnabled: true, shared: ["alpha"] }),
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+    const ident = plugin.issueIdentity("pty-enf");
+    const { client, close } = await connectClient({
+      origin: gateway.origin,
+      server: "alpha",
+      ptyId: "pty-enf",
+      bearer: ident.headers.Authorization,
+    });
+    try {
+      return await client.callTool({ name: "echo", arguments: { message } });
+    } finally {
+      await close();
+    }
+  }
+  const textOf = (r: unknown) =>
+    ((r as { content?: Array<{ text: string }> }).content ?? [])[0]?.text ?? "";
+
+  it("refuses the call, without dispatching it, when the intent cannot be logged", async () => {
+    const auditPath = join(tmpDir, "plugin-audit.jsonl");
+    _setMcpBridge(new PluginMcpBridge(auditPath));
+    const sink = new ToolCallSink({
+      path: null,
+      policy: "enforce",
+      autoFlush: false,
+      logFactory: () => ({
+        append() {
+          throw new Error("chain unwritable");
+        },
+      }),
+    });
+    __setToolCallSinkForTest(sink);
+
+    const r = await callEcho("ran-anyway");
+    expect(r.isError).toBe(true);
+    expect(textOf(r)).not.toContain("ran-anyway");
+    expect(textOf(r)).toContain("audit log is unavailable");
+    const rejects = readFileSync(auditPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((l) => l.event === "multiplexer_audit_enforced_reject");
+    expect(rejects).toHaveLength(1);
+    expect(rejects[0]).toMatchObject({ server: "alpha", tool: "echo", error: "chain unwritable" });
+    expect(sink.pending()[0]).toMatchObject({ status: "error", error: "audit_unavailable" });
+  }, 10000);
+
+  it("appends the intent before dispatch when the chain is writable", async () => {
+    const appended: Array<{ event: string }> = [];
+    const sink = new ToolCallSink({
+      path: null,
+      policy: "enforce",
+      autoFlush: false,
+      logFactory: () => ({
+        append(e: { event: string }) {
+          appended.push(e);
+        },
+      }),
+    });
+    __setToolCallSinkForTest(sink);
+
+    const r = await callEcho("logged");
+    expect(r.isError).toBeFalsy();
+    expect(textOf(r)).toContain("logged");
+    // Intent written synchronously; the result is still only buffered.
+    expect(appended.map((e) => e.event)).toEqual(["mcp.tool_call_intent"]);
+    sink.flush();
+    expect(appended.map((e) => e.event)).toEqual(["mcp.tool_call_intent", "mcp.tool_call"]);
+  }, 10000);
+
+  it("refuses a cache hit too when the intent cannot be logged", async () => {
+    const cfg = writeProxyConfig(tmpDir, ["alpha"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({
+        webEnabled: true,
+        shared: ["alpha"],
+        cache: {
+          enabled: true,
+          ttlMs: 60_000,
+          maxEntries: 100,
+          cacheable: { alpha: ["echo"] },
+          defensiveInvalidation: true,
+        },
+      }),
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+    const ident = plugin.issueIdentity("pty-enf-cache");
+    const { client, close } = await connectClient({
+      origin: gateway.origin,
+      server: "alpha",
+      ptyId: "pty-enf-cache",
+      bearer: ident.headers.Authorization,
+    });
+    try {
+      // Warm the cache while the chain is writable.
+      __setToolCallSinkForTest(
+        new ToolCallSink({
+          path: null,
+          policy: "enforce",
+          autoFlush: false,
+          logFactory: () => ({ append() {} }),
+        }),
+      );
+      const warm = await client.callTool({ name: "echo", arguments: { message: "cached" } });
+      expect(textOf(warm)).toContain("cached");
+      // Same call, now a cache hit, with the chain down: still refused.
+      __setToolCallSinkForTest(
+        new ToolCallSink({
+          path: null,
+          policy: "enforce",
+          autoFlush: false,
+          logFactory: () => ({
+            append() {
+              throw new Error("chain unwritable");
+            },
+          }),
+        }),
+      );
+      const hit = await client.callTool({ name: "echo", arguments: { message: "cached" } });
+      expect(hit.isError).toBe(true);
+      expect(textOf(hit)).not.toContain("cached");
+    } finally {
+      await close();
+    }
+  }, 10000);
+
+  it("best-effort never blocks a call on an unwritable chain", async () => {
+    __setToolCallSinkForTest(
+      new ToolCallSink({
+        path: null,
+        policy: "best-effort",
+        autoFlush: false,
+        logFactory: () => ({
+          append() {
+            throw new Error("chain unwritable");
+          },
+        }),
+      }),
+    );
+    const r = await callEcho("still-runs");
+    expect(r.isError).toBeFalsy();
+    expect(textOf(r)).toContain("still-runs");
   }, 10000);
 });
 
