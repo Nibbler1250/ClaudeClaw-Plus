@@ -380,6 +380,8 @@ export interface WebBusConfig {
   bind?: string;
   token?: string;
   allowedAgentIds?: string[];
+  /** Browser origins allowed to call the Web UI adapter cross-origin. */
+  allowedOrigins?: string[];
 }
 
 export interface TelegramConfig {
@@ -1540,11 +1542,17 @@ function parseWebBusConfig(raw: unknown): WebBusConfig | null {
   const allowedAgentIds = Array.isArray(r.allowedAgentIds)
     ? r.allowedAgentIds.filter((s): s is string => typeof s === "string" && s.length > 0)
     : [];
-  if (!bind && !token && allowedAgentIds.length === 0) return null;
+  const allowedOrigins = Array.isArray(r.allowedOrigins)
+    ? r.allowedOrigins
+        .filter((s): s is string => typeof s === "string" && s.trim().length > 0)
+        .map((s) => s.trim())
+    : [];
+  if (!bind && !token && allowedAgentIds.length === 0 && allowedOrigins.length === 0) return null;
   const out: WebBusConfig = {};
   if (bind) out.bind = bind;
   if (token) out.token = token;
   if (allowedAgentIds.length > 0) out.allowedAgentIds = allowedAgentIds;
+  if (allowedOrigins.length > 0) out.allowedOrigins = allowedOrigins;
   return out;
 }
 

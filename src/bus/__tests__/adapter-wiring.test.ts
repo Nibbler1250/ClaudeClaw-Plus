@@ -14,7 +14,12 @@
  */
 
 import { describe, it, expect } from "bun:test";
-import { wireBusAdapters, stopBusAdapters, configuredBusAdapterNames } from "../adapter-wiring";
+import {
+  wireBusAdapters,
+  stopBusAdapters,
+  configuredBusAdapterNames,
+  resolveWebUiToken,
+} from "../adapter-wiring";
 import type { BusCore } from "../core";
 import type { Settings } from "../../config";
 
@@ -374,5 +379,22 @@ describe("stopBusAdapters", () => {
 
   it("empty list is a no-op", async () => {
     await stopBusAdapters([], SILENT_LOGGER);
+  });
+});
+
+describe("resolveWebUiToken", () => {
+  it("falls back to CCAW_WEBUI_TOKEN when web.bus.token is unset", () => {
+    expect(resolveWebUiToken({}, { CCAW_WEBUI_TOKEN: " from-env " })).toBe("from-env");
+  });
+
+  it("prefers web.bus.token over the env", () => {
+    expect(resolveWebUiToken({ token: "from-settings" }, { CCAW_WEBUI_TOKEN: "from-env" })).toBe(
+      "from-settings",
+    );
+  });
+
+  it("stays undefined when neither is set", () => {
+    expect(resolveWebUiToken({}, {})).toBeUndefined();
+    expect(resolveWebUiToken({}, { CCAW_WEBUI_TOKEN: "  " })).toBeUndefined();
   });
 });

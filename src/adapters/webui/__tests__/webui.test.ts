@@ -565,3 +565,114 @@ describe("WebUiAdapter — multi-connection", () => {
     await waitFor(() => bus.state().subscriberCount === 0);
   });
 });
+
+describe("WebUiAdapter — Origin check", () => {
+  const promptBody = JSON.stringify({ agent_id: "triage", text: "hi" });
+
+  /** Resolves "open" if the upgrade succeeded, "error" if it was refused. */
+  async function wsOutcome(url: string, headers: Record<string, string>) {
+    // Bun's WebSocket client accepts a `headers` option; the DOM type does not know it.
+    const ws = new WebSocket(url, { headers } as unknown as string[]);
+    const outcome = await new Promise<"open" | "error">((resolve) => {
+      ws.addEventListener("open", () => resolve("open"), { once: true });
+      ws.addEventListener("error", () => resolve("error"), { once: true });
+      ws.addEventListener("close", () => resolve("error"), { once: true });
+    });
+    try {
+      ws.close();
+    } catch {}
+    return outcome;
+  }
+
+  it("refuses a cross-origin text/plain POST /prompt when no token is set", async () => {
+    adapter = await startAdapter();
+    const r = await fetch(`${baseUrl}/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain", Origin: "https://attacker.example" },
+      body: promptBody,
+    });
+    expect(r.status).toBe(403);
+    expect(((await r.json()) as { error: string }).error).toBe("origin_not_allowed");
+    expect(bus.prompts).toHaveLength(0);
+  });
+
+  it("refuses a cross-origin POST /prompt even with a valid token", async () => {
+    adapter = await startAdapter({ token: "sekret" });
+    const r = await fetch(`${baseUrl}/prompt`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer sekret",
+        Origin: "https://attacker.example",
+      },
+      body: promptBody,
+    });
+    expect(r.status).toBe(403);
+    expect(bus.prompts).toHaveLength(0);
+  });
+
+  it("refuses a cross-origin WS upgrade when no token is set", async () => {
+    adapter = await startAdapter();
+    expect(await wsOutcome(wsUrl, { Origin: "https://attacker.example" })).toBe("error");
+    expect(bus.subscriptions.size).toBe(0);
+  });
+
+  it("refuses an opaque `null` origin (sandboxed iframe, file://)", async () => {
+    adapter = await startAdapter();
+    const r = await fetch(`${baseUrl}/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain", Origin: "null" },
+      body: promptBody,
+    });
+    expect(r.status).toBe(403);
+    expect(bus.prompts).toHaveLength(0);
+  });
+
+  it("refuses a DNS-rebound page whose Origin and Host agree on a foreign name", async () => {
+    adapter = await startAdapter();
+    const port = new URL(baseUrl).port;
+    const r = await fetch(`${baseUrl}/prompt`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/plain",
+        Origin: `http://rebind.attacker.example:${port}`,
+        Host: `rebind.attacker.example:${port}`,
+      },
+      body: promptBody,
+    });
+    expect(r.status).toBe(403);
+    expect(bus.prompts).toHaveLength(0);
+  });
+
+  it("accepts a same-origin loopback request", async () => {
+    adapter = await startAdapter();
+    const r = await fetch(`${baseUrl}/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: baseUrl },
+      body: promptBody,
+    });
+    expect(r.status).toBe(200);
+    expect(bus.prompts).toHaveLength(1);
+  });
+
+  it("accepts an origin listed in allowedOrigins, on POST and on WS", async () => {
+    adapter = await startAdapter({ allowedOrigins: ["https://console.example/"] });
+    const r = await fetch(`${baseUrl}/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: "https://console.example" },
+      body: promptBody,
+    });
+    expect(r.status).toBe(200);
+    expect(await wsOutcome(wsUrl, { Origin: "https://console.example" })).toBe("open");
+  });
+
+  it("leaves non-browser clients (no Origin header) unaffected", async () => {
+    adapter = await startAdapter();
+    const r = await fetch(`${baseUrl}/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: promptBody,
+    });
+    expect(r.status).toBe(200);
+  });
+});
