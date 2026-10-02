@@ -620,6 +620,17 @@ export interface McpBridgePluginConfig {
 
 export interface McpBridgeConfig {
   plugins: Record<string, McpBridgePluginConfig>;
+  /**
+   * `true` → on the bridge, a tool is callable only if its plugin id or (for
+   * a proxied tool) its upstream server has an entry in `plugins`; anything
+   * else is refused and hidden, built-in plugins that register on the bridge
+   * included. An entry allows whatever carries that name: list servers rather
+   * than the `mcp-proxy` / `mcp-multiplexer` wrappers, whose entry counts for
+   * every server they proxy. Default false: unlisted plugins stay callable.
+   * Like the rest of this block it governs the bridge only, not a shared
+   * server's `/mcp/<server>` route (see `mcp-proxy.json`).
+   */
+  defaultDeny?: boolean;
 }
 
 /** #315: graceful drain on shutdown. */
@@ -1614,20 +1625,47 @@ function warnMcpSettingOnce(message: string): void {
 const BRIDGE_ENTRY_KEYS = new Set(["enabled", "allowedTools", "deniedTools"]);
 
 /**
- * Parse `settings.mcp.bridge` (#230). A malformed entry (not an object, an
- * unknown key such as a misspelt `deniedTools`, `enabled` not a boolean, a
- * tool list that is not an array of strings) turns that key OFF with a
- * warning: this block only ever restricts, so a typo must not leave a tool
- * callable that the operator meant to fence.
+ * Parse `settings.mcp.bridge` (#230). This block only ever restricts, so a
+ * typo must not leave open a tool the operator meant to fence: a malformed
+ * plugin entry (not an object, an unknown key such as a misspelt
+ * `deniedTools`, `enabled` not a boolean, a tool list that is not an array of
+ * strings) turns that key OFF, and a non-object block, an unknown key next to
+ * `plugins`, or a `defaultDeny` that is not a boolean turns deny-by-default
+ * ON. Each with one warning. `false` / `null` read as absent.
  */
 function parseMcpBridgeConfig(raw: unknown): McpBridgeConfig {
   const plugins: Record<string, McpBridgePluginConfig> = {};
-  if (raw === undefined || raw === null) return { plugins };
-  const rawPlugins = typeof raw === "object" ? (raw as { plugins?: unknown }).plugins : undefined;
-  if (rawPlugins === undefined) return { plugins };
+  if (raw === undefined || raw === null || raw === false) return { plugins };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    warnMcpSettingOnce(
+      "[mcp] settings.mcp.bridge must be an object; refusing every bridge tool (defaultDeny, nothing listed)",
+    );
+    return { plugins, defaultDeny: true };
+  }
+  const obj = raw as Record<string, unknown>;
+  // Same fail-closed rule one level up: a misspelt `defaultDeny`, or a value
+  // that is not a boolean, turns deny-by-default ON rather than off.
+  let defaultDeny = false;
+  for (const key of Object.keys(obj)) {
+    if (key === "plugins" || key === "defaultDeny") continue;
+    warnMcpSettingOnce(
+      `[mcp] settings.mcp.bridge.${key} is not a known key (plugins, defaultDeny); unlisted plugins are refused`,
+    );
+    defaultDeny = true;
+  }
+  if (obj.defaultDeny === true) defaultDeny = true;
+  else if (obj.defaultDeny !== undefined && obj.defaultDeny !== null && obj.defaultDeny !== false) {
+    warnMcpSettingOnce(
+      "[mcp] settings.mcp.bridge.defaultDeny must be a boolean; unlisted plugins are refused",
+    );
+    defaultDeny = true;
+  }
+  const done = (): McpBridgeConfig => ({ plugins, ...(defaultDeny ? { defaultDeny } : {}) });
+  const rawPlugins = obj.plugins;
+  if (rawPlugins === undefined) return done();
   if (!rawPlugins || typeof rawPlugins !== "object" || Array.isArray(rawPlugins)) {
     warnMcpSettingOnce("[mcp] settings.mcp.bridge.plugins must be an object; ignoring it");
-    return { plugins };
+    return done();
   }
   const toolList = (v: unknown): string[] | null =>
     Array.isArray(v) && v.every((t) => typeof t === "string") ? (v as string[]) : null;
@@ -1663,7 +1701,7 @@ function parseMcpBridgeConfig(raw: unknown): McpBridgeConfig {
     if (entry.deniedTools !== undefined) parsed.deniedTools = [...(entry.deniedTools as string[])];
     plugins[id] = parsed;
   }
-  return { plugins };
+  return done();
 }
 
 function parseMcpConfig(raw: any, webEnabled: unknown): McpConfig {

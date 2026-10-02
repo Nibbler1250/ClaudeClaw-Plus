@@ -402,6 +402,68 @@ describe("PluginMcpBridge", () => {
       expect(bridge.listTools()).toEqual([]);
     });
 
+    it("defaultDeny refuses and hides every plugin that has no entry", async () => {
+      const { bridge, auditPath } = makeBridge();
+      bridge.registerPluginTool("thirdparty", {
+        name: "anything",
+        description: "freshly registered",
+        schema: z.record(z.string(), z.unknown()),
+        handler: async () => "executed",
+      });
+      bridge.registerPluginTool("calc", addTool);
+      bridge.setToolPolicy({ plugins: { calc: {} }, defaultDeny: true });
+
+      await expect(bridge.invokeTool("thirdparty__anything", {})).rejects.toThrow(/default_deny/);
+      expect(await bridge.invokeTool("calc__add", { a: 1, b: 1 })).toBe(2);
+      expect(bridge.listTools().map((t) => t.fqn)).toEqual(["calc__add"]);
+      expect(readAuditLines(auditPath).find((l) => l.event === "policy_denied")).toMatchObject({
+        fqn: "thirdparty__anything",
+        reason: "default_deny",
+      });
+      expect(sink.pending()[0]).toMatchObject({
+        plugin: "thirdparty",
+        status: "error",
+        error: "default_deny",
+      });
+
+      bridge.setToolPolicy({ plugins: { calc: {} }, defaultDeny: false });
+      expect(await bridge.invokeTool("thirdparty__anything", {})).toBe("executed");
+      // Each flip of the posture is audited, an unchanged one is not.
+      bridge.setToolPolicy({ plugins: { calc: {} } });
+      expect(
+        readAuditLines(auditPath)
+          .filter((l) => l.event === "policy_default_deny")
+          .map((l) => [l.enabled, l.entries]),
+      ).toEqual([
+        [true, 1],
+        [false, 1],
+      ]);
+    });
+
+    it("defaultDeny lets a proxied tool through when its server or its wrapper is listed", async () => {
+      const { bridge } = makeBridge();
+      bridge.registerPluginTool("mcp-proxy", {
+        name: "github__search",
+        description: "proxied",
+        upstream: { server: "github", tool: "search" },
+        schema: z.object({}),
+        handler: async () => "found",
+      });
+      bridge.setToolPolicy({ plugins: {}, defaultDeny: true });
+      await expect(bridge.invokeTool("mcp-proxy__github__search", {})).rejects.toThrow(
+        /default_deny/,
+      );
+      bridge.setToolPolicy({ plugins: { github: {} }, defaultDeny: true });
+      expect(await bridge.invokeTool("mcp-proxy__github__search", {})).toBe("found");
+      bridge.setToolPolicy({ plugins: { "mcp-proxy": {} }, defaultDeny: true });
+      expect(await bridge.invokeTool("mcp-proxy__github__search", {})).toBe("found");
+      // Listed, and still fenced by its own entry.
+      bridge.setToolPolicy({ plugins: { github: { deniedTools: ["search"] } }, defaultDeny: true });
+      await expect(bridge.invokeTool("mcp-proxy__github__search", {})).rejects.toThrow(
+        /tool_denied/,
+      );
+    });
+
     it("refuses before validating or running anything", async () => {
       const { bridge } = makeBridge();
       let ran = false;
