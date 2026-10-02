@@ -838,14 +838,15 @@ describe("streamBusPrompt — the timeout covers the per-agent lock wait (#454)"
       return origSend(p);
     };
     const first = streamBusPrompt(bus, "alpha", "first", { timeoutMs: 5000 });
-    // 1000 ms budget, lock after ~920 ms: ~80 ms left is under a tenth
-    // (100 ms) but over a 50 ms cap, so it is sent. Scaled-down stand-in for
-    // a 5 min budget with 20 s left.
+    // 3000 ms budget, lock after ~2850 ms: ~150 ms left is under a tenth
+    // (300 ms) but over a 20 ms cap, so it is sent. Wide margins on both
+    // sides for slow runners. Scaled-down stand-in for a 5 min budget with
+    // 20 s left.
     const late = streamBusPrompt(bus, "alpha", "late", {
-      timeoutMs: 1000,
-      minReplyBudgetCapMs: 50,
+      timeoutMs: 3000,
+      minReplyBudgetCapMs: 20,
     });
-    await new Promise((r) => setTimeout(r, 920));
+    await new Promise((r) => setTimeout(r, 2850));
     bus.ingestReply({ agent_id: "alpha", text: "first-reply", intent: "final" });
     await first;
     await new Promise((r) => setTimeout(r, 5));
