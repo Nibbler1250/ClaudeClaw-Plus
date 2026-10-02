@@ -260,6 +260,166 @@ describe("PluginMcpBridge", () => {
     });
   });
 
+  // #230: per-plugin kill switch, `settings.mcp.bridge.plugins.<id>`.
+  describe("tool policy", () => {
+    const safeTool = {
+      name: "safe",
+      description: "read-only",
+      schema: z.object({}),
+      handler: async () => "safe-ran",
+    };
+    const dangerTool = {
+      name: "danger",
+      description: "side effect",
+      schema: z.object({}),
+      handler: async () => "danger-ran",
+    };
+    let sink: ToolCallSink;
+    beforeEach(() => {
+      sink = new ToolCallSink({ path: null, autoFlush: false });
+      __setToolCallSinkForTest(sink);
+    });
+    afterEach(() => __setToolCallSinkForTest(null));
+
+    function demoBridge(): { bridge: PluginMcpBridge; auditPath: string } {
+      const { bridge, auditPath } = makeBridge();
+      bridge.registerPluginTool("demo", safeTool);
+      bridge.registerPluginTool("demo", dangerTool);
+      bridge.registerPluginTool("other", echoTool);
+      return { bridge, auditPath };
+    }
+
+    it("absent policy keeps every tool callable and listed", async () => {
+      const { bridge } = demoBridge();
+      bridge.setToolPolicy(undefined);
+      expect(await bridge.invokeTool("demo__danger", {})).toBe("danger-ran");
+      expect(bridge.listTools().map((t) => t.fqn)).toEqual([
+        "demo__safe",
+        "demo__danger",
+        "other__echo",
+      ]);
+    });
+
+    it("deniedTools refuses one tool without touching the rest of the plugin", async () => {
+      const { bridge, auditPath } = demoBridge();
+      bridge.setToolPolicy({ plugins: { demo: { deniedTools: ["danger"] } } });
+
+      await expect(bridge.invokeTool("demo__danger", {})).rejects.toThrow(/tool_denied/);
+      expect(await bridge.invokeTool("demo__safe", {})).toBe("safe-ran");
+      expect(await bridge.invokeTool("other__echo", { message: "hi" })).toBe("hi");
+      expect(bridge.listTools().map((t) => t.fqn)).toEqual(["demo__safe", "other__echo"]);
+
+      const denied = readAuditLines(auditPath).filter((l) => l.event === "policy_denied");
+      expect(denied).toHaveLength(1);
+      expect(denied[0]).toMatchObject({
+        fqn: "demo__danger",
+        pluginId: "demo",
+        toolName: "danger",
+        reason: "tool_denied",
+      });
+      expect(
+        readAuditLines(auditPath).some((l) => l.event === "invoke" && l.fqn === "demo__danger"),
+      ).toBe(false);
+      expect(sink.pending()[0]).toMatchObject({
+        plugin: "demo",
+        tool: "danger",
+        status: "error",
+        error: "tool_denied",
+      });
+    });
+
+    it("allowedTools limits the plugin to the listed tools; deniedTools wins over it", async () => {
+      const { bridge } = demoBridge();
+      bridge.setToolPolicy({
+        plugins: { demo: { allowedTools: ["safe", "danger"], deniedTools: ["danger"] } },
+      });
+      await expect(bridge.invokeTool("demo__danger", {})).rejects.toThrow(/tool_denied/);
+
+      bridge.setToolPolicy({ plugins: { demo: { allowedTools: ["safe"] } } });
+      await expect(bridge.invokeTool("demo__danger", {})).rejects.toThrow(/not_in_allowed_set/);
+      expect(await bridge.invokeTool("demo__safe", {})).toBe("safe-ran");
+    });
+
+    it("enabled: false refuses and hides every tool of the plugin", async () => {
+      const { bridge } = demoBridge();
+      bridge.setToolPolicy({ plugins: { demo: { enabled: false } } });
+      await expect(bridge.invokeTool("demo__safe", {})).rejects.toThrow(/plugin_disabled/);
+      await expect(bridge.invokeTool("demo__danger", {})).rejects.toThrow(/plugin_disabled/);
+      expect(bridge.listTools().map((t) => t.fqn)).toEqual(["other__echo"]);
+    });
+
+    it("a new policy takes effect on the next call (hot reload), no re-registration", async () => {
+      const { bridge } = demoBridge();
+      bridge.setToolPolicy({ plugins: { demo: { deniedTools: ["danger"] } } });
+      await expect(bridge.invokeTool("demo__danger", {})).rejects.toThrow(/tool_denied/);
+      bridge.setToolPolicy({ plugins: {} });
+      expect(await bridge.invokeTool("demo__danger", {})).toBe("danger-ran");
+    });
+
+    it("fences a proxied tool by its upstream server or by its wrapper plugin", async () => {
+      const { bridge, auditPath } = makeBridge();
+      bridge.registerPluginTool("mcp-proxy", {
+        name: "github__delete_repo",
+        description: "proxied",
+        upstream: { server: "github", tool: "delete_repo" },
+        schema: z.object({}),
+        handler: async () => "deleted",
+      });
+      bridge.registerPluginTool("mcp-proxy", {
+        name: "github__search",
+        description: "proxied",
+        upstream: { server: "github", tool: "search" },
+        schema: z.object({}),
+        handler: async () => "found",
+      });
+
+      bridge.setToolPolicy({ plugins: { github: { deniedTools: ["delete_repo"] } } });
+      await expect(bridge.invokeTool("mcp-proxy__github__delete_repo", {})).rejects.toThrow(
+        /tool_denied/,
+      );
+      expect(await bridge.invokeTool("mcp-proxy__github__search", {})).toBe("found");
+      expect(readAuditLines(auditPath).find((l) => l.event === "policy_denied")).toMatchObject({
+        pluginId: "mcp-proxy",
+        toolName: "github__delete_repo",
+        upstream: { server: "github", tool: "delete_repo" },
+      });
+
+      bridge.setToolPolicy({ plugins: { "mcp-proxy": { deniedTools: ["github__delete_repo"] } } });
+      await expect(bridge.invokeTool("mcp-proxy__github__delete_repo", {})).rejects.toThrow(
+        /tool_denied/,
+      );
+
+      // Either key can refuse: the wrapper allows it, the server entry does not.
+      bridge.setToolPolicy({
+        plugins: {
+          "mcp-proxy": { allowedTools: ["github__delete_repo", "github__search"] },
+          github: { enabled: false },
+        },
+      });
+      await expect(bridge.invokeTool("mcp-proxy__github__search", {})).rejects.toThrow(
+        /plugin_disabled/,
+      );
+      expect(bridge.listTools()).toEqual([]);
+    });
+
+    it("refuses before validating or running anything", async () => {
+      const { bridge } = makeBridge();
+      let ran = false;
+      bridge.registerPluginTool("demo", {
+        name: "strict",
+        description: "",
+        schema: z.object({ v: z.string() }),
+        handler: async () => {
+          ran = true;
+        },
+      });
+      bridge.setToolPolicy({ plugins: { demo: { deniedTools: ["strict"] } } });
+      await expect(bridge.invokeTool("demo__strict", { v: 1 })).rejects.toThrow(/tool_denied/);
+      expect(ran).toBe(false);
+      expect(sink.pending()[0]).toMatchObject({ error: "tool_denied" });
+    });
+  });
+
   describe("HMAC signing", () => {
     it("signCall + verifyCall round-trip returns true", () => {
       const { bridge } = makeBridge();

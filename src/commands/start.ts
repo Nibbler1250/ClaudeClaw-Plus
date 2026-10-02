@@ -63,6 +63,7 @@ import { PluginManager, setPluginManager } from "../plugins";
 import { indexSessionsBackground } from "../memory";
 import { getMcpProxyPlugin } from "../plugins/mcp-proxy/index.js";
 import { getMcpMultiplexerPlugin } from "../plugins/mcp-multiplexer/index.js";
+import { getMcpBridge } from "../plugins/mcp-bridge.js";
 import { injectMcpIdentityIssuer } from "../runner/pty-supervisor";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
@@ -444,6 +445,10 @@ export async function start(args: string[] = []) {
   await initConfig();
   const settings = await loadSettings();
   await ensureProjectClaudeMd();
+
+  // #230: per-plugin kill switch on the plugin-tool bridge. Applied before any
+  // plugin registers or is called, and again on every hot-reload below.
+  getMcpBridge().setToolPolicy(settings.mcp.bridge);
 
   // Wire operator-facing governance config into the in-memory watchdog state
   // (#268). Without this, `settings.governance.watchdog.{enabled,limits}` is
@@ -1626,6 +1631,7 @@ export async function start(args: string[] = []) {
     try {
       const newSettings = await reloadSettings();
       const newJobs = await loadJobs();
+      getMcpBridge().setToolPolicy(newSettings.mcp.bridge);
 
       // Detect heartbeat config changes
       const hbChanged =
