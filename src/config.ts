@@ -574,6 +574,43 @@ export interface McpConfig {
      *  thrashing the cache. 5-agent review on PR #69 Agent 3 finding. */
     defensiveInvalidation: boolean;
   };
+  /**
+   * Per-plugin kill switch on the plugin-tool bridge (#230), with the words
+   * the multiplexer uses for its servers in `mcp-proxy.json`. Absent or empty
+   * → every registered tool stays callable (the behaviour before this block).
+   * Re-read by the settings hot-reload, so a tool can be switched off without
+   * unregistering its plugin or restarting.
+   *
+   * Scope: calls that go through the daemon's bridge (`invokeTool`: plugin
+   * HTTP gateway, in-process callers); `listTools` hides what it refuses. A
+   * shared server's `/mcp/<server>` route is governed by its `mcp-proxy.json`
+   * entry.
+   */
+  bridge?: McpBridgeConfig;
+}
+
+/**
+ * One entry in `settings.mcp.bridge.plugins`, keyed by plugin id — or, for a
+ * tool the mcp-proxy plugin or the multiplexer proxies from another MCP
+ * server, by that server's name (plugin ids and server names share this one
+ * namespace). Tool names are matched exactly against the name under that
+ * key: `{ "github": { "deniedTools": ["delete_repo"] } }` fences the proxied
+ * tool whichever wrapper carries it; `{ "mcp-proxy": { "deniedTools":
+ * ["github__delete_repo"] } }` fences it only as registered by mcp-proxy
+ * (the multiplexer registers as `mcp-multiplexer`). When both keys have an
+ * entry, either can refuse.
+ */
+export interface McpBridgePluginConfig {
+  /** `false` → every tool under this key is refused and hidden. Default true. */
+  enabled?: boolean;
+  /** When set, only these tools are callable. `[]` allows none. */
+  allowedTools?: string[];
+  /** Never callable, even when also listed in `allowedTools`. */
+  deniedTools?: string[];
+}
+
+export interface McpBridgeConfig {
+  plugins: Record<string, McpBridgePluginConfig>;
 }
 
 /** #315: graceful drain on shutdown. */
@@ -1556,6 +1593,70 @@ function parseWebBusConfig(raw: unknown): WebBusConfig | null {
   return out;
 }
 
+/** Bridge-policy warnings already printed: the hot-reload re-parses the
+ *  settings every 30 s, and one bad entry should not warn forever. */
+const bridgePolicyWarned = new Set<string>();
+function warnBridgePolicyOnce(message: string): void {
+  if (bridgePolicyWarned.has(message)) return;
+  bridgePolicyWarned.add(message);
+  console.warn(message);
+}
+
+const BRIDGE_ENTRY_KEYS = new Set(["enabled", "allowedTools", "deniedTools"]);
+
+/**
+ * Parse `settings.mcp.bridge` (#230). A malformed entry (not an object, an
+ * unknown key such as a misspelt `deniedTools`, `enabled` not a boolean, a
+ * tool list that is not an array of strings) turns that key OFF with a
+ * warning: this block only ever restricts, so a typo must not leave a tool
+ * callable that the operator meant to fence.
+ */
+function parseMcpBridgeConfig(raw: unknown): McpBridgeConfig {
+  const plugins: Record<string, McpBridgePluginConfig> = {};
+  if (raw === undefined || raw === null) return { plugins };
+  const rawPlugins = typeof raw === "object" ? (raw as { plugins?: unknown }).plugins : undefined;
+  if (rawPlugins === undefined) return { plugins };
+  if (!rawPlugins || typeof rawPlugins !== "object" || Array.isArray(rawPlugins)) {
+    warnBridgePolicyOnce("[mcp] settings.mcp.bridge.plugins must be an object; ignoring it");
+    return { plugins };
+  }
+  const toolList = (v: unknown): string[] | null =>
+    Array.isArray(v) && v.every((t) => typeof t === "string") ? (v as string[]) : null;
+  for (const [id, v] of Object.entries(rawPlugins as Record<string, unknown>)) {
+    // Cannot name a plugin or a server, and assigning it would set the
+    // object's prototype rather than add an entry.
+    if (id === "__proto__") {
+      warnBridgePolicyOnce(
+        "[mcp] settings.mcp.bridge.plugins.__proto__ is not a valid key; ignoring it",
+      );
+      continue;
+    }
+    const entry = v as Record<string, unknown> | null;
+    const malformed =
+      !entry ||
+      typeof entry !== "object" ||
+      Array.isArray(entry) ||
+      Object.keys(entry).some((k) => !BRIDGE_ENTRY_KEYS.has(k)) ||
+      (entry.enabled !== undefined && typeof entry.enabled !== "boolean") ||
+      (entry.allowedTools !== undefined && toolList(entry.allowedTools) === null) ||
+      (entry.deniedTools !== undefined && toolList(entry.deniedTools) === null);
+    if (malformed) {
+      warnBridgePolicyOnce(
+        `[mcp] settings.mcp.bridge.plugins.${id} is malformed (keys: enabled, allowedTools, deniedTools); all its tools are refused`,
+      );
+      plugins[id] = { enabled: false };
+      continue;
+    }
+    const parsed: McpBridgePluginConfig = {};
+    if (entry.enabled !== undefined) parsed.enabled = entry.enabled as boolean;
+    if (entry.allowedTools !== undefined)
+      parsed.allowedTools = [...(entry.allowedTools as string[])];
+    if (entry.deniedTools !== undefined) parsed.deniedTools = [...(entry.deniedTools as string[])];
+    plugins[id] = parsed;
+  }
+  return { plugins };
+}
+
 function parseMcpConfig(raw: any, webEnabled: unknown): McpConfig {
   const asStringList = (v: unknown): string[] =>
     Array.isArray(v)
@@ -1710,6 +1811,7 @@ function parseMcpConfig(raw: any, webEnabled: unknown): McpConfig {
       // setting false (e.g. cleanly-partitioned tools).
       defensiveInvalidation: rawCache?.defensiveInvalidation !== false,
     },
+    bridge: parseMcpBridgeConfig(raw?.bridge),
   };
 }
 
