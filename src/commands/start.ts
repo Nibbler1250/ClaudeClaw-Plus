@@ -31,9 +31,12 @@ import { migrateLegacyAgentJobs } from "../migrations";
 import { ensureUserSymlinks } from "../install";
 import {
   writePidFile,
-  cleanupPidFile,
   cleanupPidFileIf,
   checkExistingDaemon,
+  DaemonStateUnknownError,
+  acquirePidLock,
+  getPidLockPath,
+  releasePidLock,
   waitForPidExit,
   stopGraceMs,
   readConfiguredDrainMs,
@@ -333,7 +336,17 @@ export async function start(args: string[] = []) {
 
   // One-shot mode: explicit prompt without trigger.
   if (hasPromptFlag && !hasTriggerFlag) {
-    const existingPid = await checkExistingDaemon();
+    let existingPid: number | null;
+    try {
+      existingPid = await checkExistingDaemon();
+    } catch (err) {
+      if (!(err instanceof DaemonStateUnknownError)) throw err;
+      // #435: unknown is not "none" — refuse rather than run beside a daemon.
+      console.error(
+        `\x1b[31mAborted: cannot tell whether a daemon is running: ${err.message}.\x1b[0m`,
+      );
+      process.exit(1);
+    }
     if (existingPid) {
       console.error(
         `\x1b[31mAborted: daemon already running in this directory (PID ${existingPid})\x1b[0m`,
@@ -353,7 +366,33 @@ export async function start(args: string[] = []) {
     return;
   }
 
-  const existingPid = await checkExistingDaemon();
+  // #435: hold the project's PID lock from the check below through
+  // `writePidFile()`, so no other `start` / `stop` reads, writes or removes
+  // `daemon.pid` in between. A second `start` arriving meanwhile stops here
+  // instead of passing the same check and launching a duplicate.
+  const pidLock = await acquirePidLock();
+  if (!pidLock.ok) {
+    console.error(
+      pidLock.holder !== null
+        ? `\x1b[31mAborted: another claudeclaw start/stop is in progress in this directory (PID ${pidLock.holder}).\x1b[0m`
+        : `\x1b[31mAborted: could not take the PID lock in this directory (${getPidLockPath()} cannot be created, is unreadable, or a stale one could not be removed).\x1b[0m`,
+    );
+    console.error(
+      `If no such process exists, remove ${getPidLockPath()} (and ${getPidLockPath()}.steal) and retry.`,
+    );
+    process.exit(1);
+  }
+
+  let existingPid: number | null;
+  try {
+    existingPid = await checkExistingDaemon();
+  } catch (err) {
+    if (!(err instanceof DaemonStateUnknownError)) throw err;
+    console.error(
+      `\x1b[31mAborted: cannot tell whether a daemon is running: ${err.message}.\x1b[0m`,
+    );
+    process.exit(1);
+  }
   if (existingPid) {
     if (!replaceExistingFlag) {
       console.error(
@@ -492,6 +531,7 @@ export async function start(args: string[] = []) {
 
   await setupStatusline();
   await writePidFile();
+  releasePidLock();
   let web: WebServerHandle | null = null;
   let discordStopGateway: (() => void) | null = null;
   let slackStopFn: (() => void) | null = null;
@@ -726,7 +766,10 @@ export async function start(args: string[] = []) {
     }
     await teardownStatusline();
     // #420: only our own file — a replacement that already wrote its PID keeps it.
-    await cleanupPidFileIf(process.pid);
+    // #435: a short lock wait: under `--replace-existing` the replacement holds
+    // the lock for our whole drain and removes the file itself, and a file left
+    // naming our dead PID is cleaned by the next check anyway.
+    await cleanupPidFileIf(process.pid, undefined, 250);
     process.exit(0);
   }
   process.on("SIGTERM", shutdown);
