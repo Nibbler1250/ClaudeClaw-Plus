@@ -120,6 +120,7 @@ interface DiscordGuild {
   name: string;
   system_channel_id?: string | null;
   joined_at?: string;
+  owner_id?: string;
 }
 
 interface GatewayPayload {
@@ -1592,7 +1593,27 @@ async function handleInteractionCreate(
 
 // --- Guild join handler ---
 
-async function handleGuildCreate(token: string, guild: DiscordGuild): Promise<void> {
+/** Fixed greeting posted in the system channel of a newly joined server. */
+export const GUILD_ADDED_GREETING = "I was added to this server. Mention me to start.";
+
+interface GuildCreateDeps {
+  send: (token: string, channelId: string, text: string) => Promise<unknown>;
+  /** Injected so a test can assert the handler never starts a model turn. */
+  run: typeof run;
+}
+
+/**
+ * Bot added to a server. The greeting is a fixed string: the server name is
+ * chosen by whoever owns the server, so it must not reach a prompt — this used
+ * to run it through the GLOBAL session with the daemon's tools. GUILD_CREATE
+ * does not say who added the bot, so the allowlist is checked against the
+ * server owner.
+ */
+export async function handleGuildCreate(
+  _token: string,
+  guild: DiscordGuild,
+  deps: GuildCreateDeps = { send: sendMessage, run },
+): Promise<void> {
   const config = getSettings().discord;
 
   // Skip guilds we were already in at READY time
@@ -1601,27 +1622,24 @@ async function handleGuildCreate(token: string, guild: DiscordGuild): Promise<vo
   const channelId = guild.system_channel_id;
   if (!channelId) return;
 
-  console.log(`[Discord] Joined guild: ${guild.name} (${guild.id})`);
-
-  const eventPrompt =
-    `[Discord system event] I was added to a guild.\n` +
-    `Guild name: ${guild.name}\n` +
-    `Guild id: ${guild.id}\n` +
-    "Write a short first message for the server. Confirm I was added and explain how to trigger me (mention or reply).";
+  const guildName = JSON.stringify(String(guild.name ?? "").slice(0, 200));
+  if (
+    config.allowedUserIds.length > 0 &&
+    (!guild.owner_id || !config.allowedUserIds.includes(guild.owner_id))
+  ) {
+    console.log(
+      `[Discord] Joined guild ${guildName} (${guild.id}) owned by unauthorized user ${guild.owner_id ?? "unknown"} — not greeting`,
+    );
+    return;
+  }
+  console.log(`[Discord] Joined guild: ${guildName} (${guild.id})`);
 
   try {
-    const result = await run("discord", eventPrompt);
-    if (result.exitCode !== 0) {
-      await sendMessage(
-        config.token,
-        channelId,
-        "I was added to this server. Mention me to start.",
-      );
-      return;
-    }
-    await sendMessage(config.token, channelId, result.stdout || "I was added to this server.");
-  } catch {
-    await sendMessage(config.token, channelId, "I was added to this server. Mention me to start.");
+    await deps.send(config.token, channelId, GUILD_ADDED_GREETING);
+  } catch (err) {
+    console.error(
+      `[Discord] guild-added greeting error: ${err instanceof Error ? err.message : err}`,
+    );
   }
 }
 

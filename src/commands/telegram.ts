@@ -974,7 +974,26 @@ async function downloadDocumentFromMessage(
   return { localPath, originalName };
 }
 
-async function handleMyChatMember(update: TelegramMyChatMemberUpdate): Promise<void> {
+/** Fixed greeting posted when the bot is added to a group. */
+export const GROUP_ADDED_GREETING =
+  "I was added to this group. Mention me with a command to start.";
+
+interface MyChatMemberDeps {
+  send: (token: string, chatId: number, text: string) => Promise<unknown>;
+  /** Injected so a test can assert the handler never starts a model turn. */
+  run: typeof run;
+}
+
+/**
+ * Bot added to a group. The greeting is a fixed string: the group title and
+ * the adder's name are chosen by whoever adds the bot, so they must not reach
+ * a prompt — this used to run them through the GLOBAL session with the
+ * daemon's tools. And only an allowed user can make the bot speak.
+ */
+export async function handleMyChatMember(
+  update: TelegramMyChatMemberUpdate,
+  deps: MyChatMemberDeps = { send: sendMessage, run },
+): Promise<void> {
   const config = getSettings().telegram;
   const chat = update.chat;
   if (!botUsername && update.new_chat_member.user.username)
@@ -988,36 +1007,20 @@ async function handleMyChatMember(update: TelegramMyChatMemberUpdate): Promise<v
 
   if (!isGroup || !wasOut || !isIn) return;
 
-  const chatName = chat.title ?? String(chat.id);
+  const chatName = JSON.stringify((chat.title ?? String(chat.id)).slice(0, 200));
+  if (config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(update.from.id)) {
+    console.log(
+      `[Telegram] Added to ${chat.type} ${chatName} (${chat.id}) by unauthorized user ${update.from.id} — not greeting`,
+    );
+    return;
+  }
   console.log(`[Telegram] Added to ${chat.type}: ${chatName} (${chat.id}) by ${update.from.id}`);
 
-  const addedBy = update.from.username ?? `${update.from.first_name} (${update.from.id})`;
-  const eventPrompt =
-    `[Telegram system event] I was added to a ${chat.type}.\n` +
-    `Group title: ${chatName}\n` +
-    `Group id: ${chat.id}\n` +
-    `Added by: ${addedBy}\n` +
-    "Write a short first message for the group. It should confirm I was added and explain how to trigger me.";
-
   try {
-    const result = await run("telegram", eventPrompt);
-    if (result.exitCode !== 0) {
-      await sendMessage(
-        config.token,
-        chat.id,
-        "I was added to this group. Mention me with a command to start.",
-      );
-      return;
-    }
-    await sendMessage(config.token, chat.id, result.stdout || "I was added to this group.");
+    await deps.send(config.token, chat.id, GROUP_ADDED_GREETING);
   } catch (err) {
     console.error(
-      `[Telegram] group-added event error: ${err instanceof Error ? err.message : err}`,
-    );
-    await sendMessage(
-      config.token,
-      chat.id,
-      "I was added to this group. Mention me with a command to start.",
+      `[Telegram] group-added greeting error: ${err instanceof Error ? err.message : err}`,
     );
   }
 }
