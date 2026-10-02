@@ -139,3 +139,110 @@ describe("recursive redactSettings via buildTechnicalInfo (#164 item 5)", () => 
     expect(findValue(snap.settings, "apiToken")).toBe("<redacted:6 chars>");
   });
 });
+
+async function redactViaTechnicalInfo(settingsObj: unknown): Promise<unknown> {
+  const { buildTechnicalInfo } = await import("../services/state");
+  const info = (await buildTechnicalInfo({
+    pid: 1,
+    startedAt: Date.now(),
+    heartbeatNextAt: 0,
+    settings: settingsObj as never,
+    jobs: [],
+  })) as Record<string, unknown>;
+  return (info.snapshot as Record<string, unknown>).settings;
+}
+
+const REDACTED = /^<redacted:\d+ chars>$/;
+
+describe("redactSettings matches secret-shaped key names, not only exact ones (#510)", () => {
+  it("redacts slack.signingSecret and slack.busRouting.signingSecret", async () => {
+    const signing = `sig${"-"}secret-${"a".repeat(24)}`;
+    const routing = `sig${"-"}routing-${"b".repeat(24)}`;
+    const redacted = (await redactViaTechnicalInfo({
+      slack: {
+        botToken: SLACK_BOT,
+        signingSecret: signing,
+        busRouting: { signingSecret: routing },
+      },
+    })) as { slack: { signingSecret: unknown; busRouting: { signingSecret: unknown } } };
+
+    expect(redacted.slack.signingSecret).toMatch(REDACTED);
+    expect(redacted.slack.busRouting.signingSecret).toMatch(REDACTED);
+    const serialized = JSON.stringify(redacted);
+    expect(serialized).not.toContain(signing);
+    expect(serialized).not.toContain(routing);
+  });
+
+  it("redacts any key ending in a secret-shaped word, at any depth and in any case", async () => {
+    const values: Record<string, string> = {
+      clientSecret: "cs-value-1",
+      webhookSecret: "wh-value-2",
+      accessToken: "at-value-3",
+      REFRESH_TOKEN: "rt-value-4",
+      privateKey: "pk-value-5",
+      openai_api_key: "ok-value-6",
+      dbPassword: "db-value-7",
+      apiKeys: "ak-value-8",
+      secrets: "ss-value-9",
+      credentials: "cr-value-10",
+      passphrase: "pp-value-11",
+      smtpPasswd: "sp-value-12",
+      Authorization: "Bearer au-value-13",
+      cookie: "ck-value-14",
+    };
+    const redacted = await redactViaTechnicalInfo({
+      plugins: { someplugin: { enabled: true, config: { ...values } } },
+    });
+    for (const [key, raw] of Object.entries(values)) {
+      expect(findValue(redacted, key)).toMatch(REDACTED);
+      expect(JSON.stringify(redacted)).not.toContain(raw);
+    }
+    expect(findValue(redacted, "enabled")).toBe(true);
+  });
+
+  it("leaves non-secret keys that merely contain those words alone", async () => {
+    const redacted = await redactViaTechnicalInfo({
+      maxTokens: 4096,
+      keywords: ["deploy", "ship"],
+      tokenBudget: 1000,
+      secretsDir: "/etc/app",
+      credentialProbe: { enabled: false },
+      provider_credentials_env: { openai: "OPENAI_API_KEY" },
+    });
+    expect(findValue(redacted, "maxTokens")).toBe(4096);
+    expect(findValue(redacted, "keywords")).toEqual(["deploy", "ship"]);
+    expect(findValue(redacted, "tokenBudget")).toBe(1000);
+    expect(findValue(redacted, "secretsDir")).toBe("/etc/app");
+    expect(findValue(redacted, "credentialProbe")).toEqual({ enabled: false });
+    expect(findValue(redacted, "provider_credentials_env")).toEqual({ openai: "OPENAI_API_KEY" });
+  });
+
+  it("covers every secret-looking field declared in src/config.ts", async () => {
+    // Inventory of the Settings shape: every declared field whose name
+    // mentions a token/secret/key/password/credential/api. A new one fails
+    // here until it is classified, so a secret added later is redacted by
+    // default or consciously listed as not secret.
+    const SECRET = ["api", "apiToken", "appToken", "botToken", "signingSecret", "token"];
+    const NOT_SECRET = ["credentialProbe", "keywords", "provider_credentials_env"];
+    // Matched by the regex below but not settings fields: parseSettingsText's
+    // JSON reviver takes a `key` parameter.
+    const NOT_A_FIELD = ["key"];
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(join(import.meta.dir, "..", "..", "config.ts"), "utf8");
+    const declared = [
+      ...new Set([...src.matchAll(/^\s+([A-Za-z_][A-Za-z0-9_]*)\??:/gm)].map((m) => m[1])),
+    ]
+      .filter((name) => /token|secret|key|pass|cred|api|auth|cookie/i.test(name))
+      .filter((name) => !NOT_A_FIELD.includes(name));
+
+    const unclassified = declared.filter((n) => !SECRET.includes(n) && !NOT_SECRET.includes(n));
+    expect(unclassified).toEqual([]);
+
+    const settingsObj = Object.fromEntries(declared.map((n) => [n, `value-of-${n}`]));
+    const redacted = (await redactViaTechnicalInfo(settingsObj)) as Record<string, unknown>;
+    for (const name of declared) {
+      if (SECRET.includes(name)) expect(redacted[name]).toMatch(REDACTED);
+      else expect(redacted[name]).toBe(`value-of-${name}`);
+    }
+  });
+});
