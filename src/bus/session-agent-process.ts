@@ -512,9 +512,9 @@ export class PtyAgentProcess implements AgentProcess {
     //
     // Why not rely on `notifications/claude/channel` (the MCP path)? In a
     // headless, daemon-spawned claude (no human at the TTY) that notification
-    // is accepted at the JSON-RPC layer but does NOT start a turn — claude
-    // stays idle. Typing into the PTY (exactly what an interactive user does)
-    // reliably fires a turn.
+    // is accepted at the JSON-RPC layer but is not guaranteed to start a turn —
+    // older builds stayed idle; current ones usually open one. Typing into the
+    // PTY (exactly what an interactive user does) reliably fires a turn.
     //
     // claude's TUI enables bracketed-paste mode (ESC[?2004h). Writing the text
     // and the submitting CR in a single chunk is interpreted as a paste: the
