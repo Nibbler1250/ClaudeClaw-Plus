@@ -165,23 +165,39 @@ export class PluginMcpBridge {
   /** Replace the per-plugin policy (`settings.mcp.bridge`). Called at daemon
    *  start and on every settings hot-reload; absent → no restriction. */
   setToolPolicy(policy: McpBridgeConfig | undefined): void {
-    this.toolPolicy = policy ?? { plugins: {} };
+    const next = policy ?? { plugins: {} };
+    const wasDefaultDeny = this.toolPolicy.defaultDeny === true;
+    const isDefaultDeny = next.defaultDeny === true;
+    this.toolPolicy = next;
+    // The posture switch is the one an auditor looks for: say it when it flips.
+    if (wasDefaultDeny !== isDefaultDeny) {
+      const entries = Object.keys(next.plugins).length;
+      this.audit("policy_default_deny", { enabled: isDefaultDeny, entries });
+      console.log(
+        `[mcp] bridge deny-by-default ${isDefaultDeny ? `ON (${entries} entries)` : "OFF"}`,
+      );
+    }
   }
 
   /** Why the policy refuses this tool, or null when it is callable. The
    *  entry under the plugin id and, for a proxied tool, the one under the
-   *  upstream server are both consulted; either can refuse. */
+   *  upstream server are both consulted; either can refuse. Under
+   *  `defaultDeny`, a tool with no entry under either key is refused. */
   private policyDenial(pluginId: string, tool: PluginTool): string | null {
     const keys: Array<[string, string]> = [[pluginId, tool.name]];
     if (tool.upstream) keys.push([tool.upstream.server, tool.upstream.tool]);
     const { plugins } = this.toolPolicy;
+    let listed = false;
     for (const [key, name] of keys) {
       if (!Object.prototype.hasOwnProperty.call(plugins, key)) continue;
+      listed = true;
       const entry = plugins[key];
       if (entry.enabled === false) return "plugin_disabled";
       if (entry.deniedTools?.includes(name)) return "tool_denied";
       if (entry.allowedTools && !entry.allowedTools.includes(name)) return "not_in_allowed_set";
     }
+    // `defaultDeny`: no entry under any of its keys → not callable.
+    if (!listed && this.toolPolicy.defaultDeny === true) return "default_deny";
     return null;
   }
 
