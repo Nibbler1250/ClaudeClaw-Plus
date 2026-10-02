@@ -401,6 +401,27 @@ describe("PtyProcess — Bypass Permissions boot dialog (issue #460)", () => {
     expect(result.text).toContain("after-dialog");
     await proc.dispose();
   });
+
+  test("after answering, settle waits for the REPL instead of the next quiet gap", async () => {
+    // The REPL paints 600ms after the answer — three quiet windows later.
+    // Resolving on that gap would hand the first prompt to a TUI that is
+    // still switching screens.
+    const slowRepl = FAKE_BYPASS_DIALOG_CLI.replace("; printf 'bypass", "; sleep 0.6; printf 'bypass");
+    expect(slowRepl).not.toBe(FAKE_BYPASS_DIALOG_CLI);
+    const t0 = Date.now();
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", slowRepl],
+        _skipReadySettle: false,
+        quietWindowMs: 200,
+      }),
+    );
+    // 200ms Down→Enter gap + 600ms REPL paint + one quiet window.
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(800);
+    expect(proc.isAlive()).toBe(true);
+    await proc.dispose();
+  });
 });
 
 // ─── runTurn: sentinel-echo round-trip against /bin/cat ─────────────────────

@@ -921,7 +921,9 @@ class PtyProcessImpl implements PtyProcess {
    * the first runTurn's CR confirmed "No, exit", and claude exited 1. Answer
    * it here the way the bus does (#193): Down, then Enter, once — never a
    * blind Enter. After answering, settle waits for the REPL footer ("tab to
-   * cycle") instead of the first quiet gap, with a fresh hard-timeout window.
+   * cycle") instead of the first quiet gap, with a fresh hard-timeout window
+   * — so a spawn that hits the dialog can take up to 2 × `timeoutMs`. Only a
+   * dialog painted inside the settle window is answered.
    */
   _waitForReadySettle(timeoutMs: number): Promise<void> {
     return new Promise<void>((resolve) => {
@@ -986,7 +988,7 @@ class PtyProcessImpl implements PtyProcess {
         // REPL footer first, so a key is never injected into a live REPL.
         if (/tab\s*to\s*cycle/.test(bootText)) {
           awaitingRepl = false;
-        } else if (!answeredBypass && bootText.includes("Yes, I accept")) {
+        } else if (!answeredBypass && /Yes,\s*I\s*accept/.test(bootText)) {
           answeredBypass = true;
           awaitingRepl = true;
           dumpPtyTrace(`>> pid=${this._pid} answer bypass-permissions dialog`, "Down+CR");
