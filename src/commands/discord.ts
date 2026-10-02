@@ -576,6 +576,67 @@ interface ThreadIntent {
   names: string[];
 }
 
+/**
+ * The classifier reads a message from any allowed guild member. It only has
+ * to answer with JSON, so it runs with no tools at all (`--tools ""`), no MCP
+ * server (`--strict-mcp-config` with no `--mcp-config`) and no saved session:
+ * an instruction hidden in the message has nothing to act with.
+ */
+export const CLASSIFIER_ARGS = [
+  "--model",
+  "claude-sonnet-4-20250514",
+  "--print",
+  "--output-format",
+  "text",
+  "--tools",
+  "",
+  "--strict-mcp-config",
+  "--no-session-persistence",
+];
+
+/** Exact keys the classifier's `claude` keeps from the daemon env. */
+const CLASSIFIER_ENV_KEYS = new Set([
+  "PATH",
+  "USER",
+  "LOGNAME",
+  "LANG",
+  "TZ",
+  "TMPDIR",
+  "XDG_CONFIG_HOME",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+  "NODE_EXTRA_CA_CERTS",
+  "SSL_CERT_FILE",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "CLOUD_ML_REGION",
+]);
+/** Key prefixes kept: model auth/routing (Anthropic, Bedrock, Vertex) and locale. */
+const CLASSIFIER_ENV_PREFIXES = ["ANTHROPIC_", "CLAUDE_", "AWS_", "LC_"];
+
+/**
+ * Allowlisted env for the classifier: what `claude` needs to reach the model,
+ * nothing else — the chat-platform tokens, SSH agent socket and other daemon
+ * secrets stay out. Model credentials pass as they did before, so the
+ * classifier authenticates the same way it always has.
+ */
+export function classifierSpawnEnv(
+  env: Record<string, string | undefined> = process.env,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value !== "string") continue;
+    if (CLASSIFIER_ENV_KEYS.has(key) || CLASSIFIER_ENV_PREFIXES.some((p) => key.startsWith(p))) {
+      out[key] = value;
+    }
+  }
+  out.HOME = homedir();
+  return out;
+}
+
 async function classifyThreadIntent(text: string): Promise<ThreadIntent | null> {
   const systemPrompt = `You classify user messages into thread management intents.
 
@@ -593,17 +654,14 @@ Rules:
 - Return ONLY valid JSON or the word null. No explanation.`;
 
   try {
-    const { execSync } = await import("node:child_process");
+    const { execFileSync } = await import("node:child_process");
     const input = `${systemPrompt}\n\n---\nUser message: ${text}`;
-    const result = execSync(
-      `claude --model claude-sonnet-4-20250514 --print --output-format text`,
-      {
-        input,
-        encoding: "utf-8",
-        timeout: 15000,
-        env: { ...process.env, HOME: homedir() },
-      },
-    ).trim();
+    const result = execFileSync("claude", CLASSIFIER_ARGS, {
+      input,
+      encoding: "utf-8",
+      timeout: 15000,
+      env: classifierSpawnEnv(),
+    }).trim();
 
     if (!result || result === "null") return null;
     // Extract JSON from response (in case there's extra text)
