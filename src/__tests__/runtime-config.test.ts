@@ -264,6 +264,14 @@ describe("parseSettings — bus routing (Sprint 5.2b)", () => {
     });
   });
 
+  it("web.bus parses allowedOrigins", async () => {
+    await writeRawSettings({
+      web: { bus: { allowedOrigins: [" https://console.example ", "", 7] } },
+    });
+    await reloadSettings();
+    expect(getSettings().web.bus).toEqual({ allowedOrigins: ["https://console.example"] });
+  });
+
   it("web.bus drops empty config entirely", async () => {
     await writeRawSettings({ web: { bus: {} } });
     await reloadSettings();
