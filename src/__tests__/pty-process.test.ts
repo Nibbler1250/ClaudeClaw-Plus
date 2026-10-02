@@ -406,7 +406,10 @@ describe("PtyProcess — Bypass Permissions boot dialog (issue #460)", () => {
     // The REPL paints 600ms after the answer — three quiet windows later.
     // Resolving on that gap would hand the first prompt to a TUI that is
     // still switching screens.
-    const slowRepl = FAKE_BYPASS_DIALOG_CLI.replace("; printf 'bypass", "; sleep 0.6; printf 'bypass");
+    const slowRepl = FAKE_BYPASS_DIALOG_CLI.replace(
+      "; printf 'bypass",
+      "; sleep 0.6; printf 'bypass",
+    );
     expect(slowRepl).not.toBe(FAKE_BYPASS_DIALOG_CLI);
     const t0 = Date.now();
     const proc = await spawnPty(
