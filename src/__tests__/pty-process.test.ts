@@ -373,12 +373,14 @@ describe("PtyProcess — _waitForReadySettle two-phase (issue #84)", () => {
 // line ending without a preceding Down arrow exits 1; Down then Enter
 // "accepts" and the REPL (here: cat) comes up.
 
+// Words are separated by CHA cursor moves (`ESC[<n>G`), as the real CLI
+// renders them, so a matcher that only strips escapes sees "Yes,Iaccept".
 const FAKE_BYPASS_DIALOG_CLI = [
-  "printf 'WARNING: Claude Code running in Bypass Permissions mode\\r\\n'",
-  "printf '\\342\\235\\257 No, exit\\r\\n  Yes, I accept\\r\\n\\r\\nEnter to confirm \\302\\267 Esc to cancel\\r\\n'",
+  "printf 'WARNING: Claude\\033[13GCode\\033[18Grunning\\033[26Gin\\033[29GBypass\\033[36GPermissions\\033[48Gmode\\r\\n'",
+  "printf '\\342\\235\\257 No,\\033[7Gexit\\r\\n  Yes,\\033[8GI\\033[10Gaccept\\r\\n\\r\\nEnter to confirm \\302\\267 Esc to cancel\\r\\n'",
   "IFS= read -r key",
   'case "$key" in *"[B"*) ;; *) exit 1 ;; esac',
-  "printf 'bypass permissions on (shift+tab to cycle)\\r\\n'",
+  "printf 'bypass\\033[8Gpermissions\\033[20Gon\\033[23G(shift+tab\\033[34Gto\\033[37Gcycle)\\r\\n'",
   "exec cat",
 ].join("; ");
 

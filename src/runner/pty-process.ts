@@ -42,6 +42,7 @@ import {
   markSentinelWritten,
   resetTurn,
   startTurn,
+  stripAnsi,
   tick,
   type Parser,
 } from "./pty-output-parser";
@@ -913,12 +914,23 @@ class PtyProcessImpl implements PtyProcess {
    *   2. Wait for `quietWindowMs` of NO new data (TUI finished painting
    *      and is silent at the input prompt).
    * On every incoming chunk after phase 1, reset the quiet timer.
+   *
+   * Issue #460: on a fresh HOME, `--dangerously-skip-permissions` opens the
+   * "Bypass Permissions mode" warning before the REPL, with "No, exit"
+   * PRESELECTED. It goes quiet like a painted REPL, so pre-fix this resolved,
+   * the first runTurn's CR confirmed "No, exit", and claude exited 1. Answer
+   * it here the way the bus does (#193): Down, then Enter, once — never a
+   * blind Enter. After answering, settle waits for the REPL footer ("tab to
+   * cycle") instead of the first quiet gap, with a fresh hard-timeout window.
    */
   _waitForReadySettle(timeoutMs: number): Promise<void> {
     return new Promise<void>((resolve) => {
       let resolved = false;
       let quietTimer: ReturnType<typeof setTimeout> | null = null;
       const originalHandler = this._handleData.bind(this);
+      let bootRaw = "";
+      let answeredBypass = false;
+      let awaitingRepl = false;
 
       const done = () => {
         if (resolved) return;
@@ -931,15 +943,34 @@ class PtyProcessImpl implements PtyProcess {
         resolve();
       };
 
+      const onQuiet = () => {
+        // Dialog answered but the REPL has not painted yet: a quiet gap here
+        // is the TUI switching screens, not a settled REPL. The hard timer
+        // still bounds the wait; an exit (no more data) falls through to it.
+        if (awaitingRepl && this._alive) {
+          scheduleQuiet();
+          return;
+        }
+        done();
+      };
+
       const scheduleQuiet = () => {
         if (quietTimer) this._clearTimeout(quietTimer);
-        quietTimer = this._setTimeout(done, this._quietWindowMs);
+        quietTimer = this._setTimeout(onQuiet, this._quietWindowMs);
       };
 
       // Hard timeout: if the TUI never paints AT ALL within timeoutMs,
       // resolve anyway and let the caller proceed. This also guards
       // against a TUI that paints forever without ever going quiet.
-      const hardTimer = this._setTimeout(done, timeoutMs);
+      let hardTimer = this._setTimeout(done, timeoutMs);
+
+      const sendKey = (key: string) => {
+        try {
+          this._pty.write(key);
+        } catch {
+          /* pty may have exited — the settle check after resolve reports it */
+        }
+      };
 
       // Patch _handleData to reset the quiet timer on every incoming
       // chunk. The quiet timer only starts firing after the first chunk
@@ -947,6 +978,23 @@ class PtyProcessImpl implements PtyProcess {
       // elapsed with no further chunks (paint finished).
       this._handleData = (data: string) => {
         originalHandler(data);
+        // Strip the accumulated raw text, not each chunk: an escape sequence
+        // can straddle chunks. stripAnsi expands the cursor moves claude
+        // uses as word gaps (CHA, CUF) so "Yes, I accept" stays matchable.
+        bootRaw = (bootRaw + data).slice(-4000);
+        const bootText = stripAnsi(bootRaw);
+        // REPL footer first, so a key is never injected into a live REPL.
+        if (/tab\s*to\s*cycle/.test(bootText)) {
+          awaitingRepl = false;
+        } else if (!answeredBypass && bootText.includes("Yes, I accept")) {
+          answeredBypass = true;
+          awaitingRepl = true;
+          dumpPtyTrace(`>> pid=${this._pid} answer bypass-permissions dialog`, "Down+CR");
+          sendKey("\x1b[B");
+          this._setTimeout(() => sendKey("\r"), 200);
+          this._clearTimeout(hardTimer);
+          hardTimer = this._setTimeout(done, timeoutMs);
+        }
         scheduleQuiet();
       };
 
