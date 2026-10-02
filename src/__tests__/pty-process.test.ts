@@ -363,6 +363,44 @@ describe("PtyProcess — _waitForReadySettle two-phase (issue #84)", () => {
   });
 });
 
+// ─── Bypass Permissions boot dialog (issue #460) ───────────────────────────
+//
+// On a fresh HOME, `claude --dangerously-skip-permissions` opens a warning
+// dialog before the REPL with "No, exit" PRESELECTED. Pre-fix, readySettle
+// resolved once that dialog went quiet, the first runTurn wrote prompt + CR,
+// the CR confirmed "No, exit" and claude exited 1 — every real-claude PTY
+// test in the nightly failed this way. The fake CLI below mirrors that: a
+// line ending without a preceding Down arrow exits 1; Down then Enter
+// "accepts" and the REPL (here: cat) comes up.
+
+const FAKE_BYPASS_DIALOG_CLI = [
+  "printf 'WARNING: Claude Code running in Bypass Permissions mode\\r\\n'",
+  "printf '\\342\\235\\257 No, exit\\r\\n  Yes, I accept\\r\\n\\r\\nEnter to confirm \\302\\267 Esc to cancel\\r\\n'",
+  "IFS= read -r key",
+  'case "$key" in *"[B"*) ;; *) exit 1 ;; esac',
+  "printf 'bypass permissions on (shift+tab to cycle)\\r\\n'",
+  "exec cat",
+].join("; ");
+
+describe("PtyProcess — Bypass Permissions boot dialog (issue #460)", () => {
+  test("accepts the dialog during settle so the first turn reaches the REPL", async () => {
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", FAKE_BYPASS_DIALOG_CLI],
+        _skipReadySettle: false,
+        quietWindowMs: 200,
+        sentinelMaxWaitMs: 5000,
+      }),
+    );
+    expect(proc.isAlive()).toBe(true);
+    const result = await proc.runTurn("✻ after-dialog shift+tab to cycle", { timeoutMs: 5000 });
+    expect(proc.isAlive()).toBe(true);
+    expect(result.text).toContain("after-dialog");
+    await proc.dispose();
+  });
+});
+
 // ─── runTurn: sentinel-echo round-trip against /bin/cat ─────────────────────
 //
 // /bin/cat is the simplest live test for the sentinel flow: it echoes
