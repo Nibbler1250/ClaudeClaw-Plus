@@ -119,6 +119,7 @@ export class McpProxyPlugin {
               getMcpBridge().registerPluginTool("mcp-proxy", {
                 name: fqn,
                 description: tool.description,
+                upstream: { server: name, tool: tool.name },
                 schema: z.object({
                   arguments: z.record(z.string(), z.unknown()).optional().default({}),
                   mode: z.enum(["direct", "reasoned"]).optional().default("direct"),
