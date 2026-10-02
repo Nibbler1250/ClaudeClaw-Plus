@@ -11,6 +11,10 @@ import {
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 
+/** Cap on a handler error recorded in the audit log — same bound as the
+ *  `mcp.tool_call` chain's error field. */
+const MAX_AUDIT_ERROR_LEN = 2_000;
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -170,7 +174,14 @@ export class PluginMcpBridge {
       return result;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      this.audit("error", { fqn, pluginId, ts, signature, error: message, phase: "handler" });
+      // The message can carry a tool's own error text, of any size (an MCP
+      // child's `isError` result is thrown with it). The caller gets it whole;
+      // the audit line keeps a bounded copy.
+      const error =
+        message.length > MAX_AUDIT_ERROR_LEN
+          ? `${message.slice(0, MAX_AUDIT_ERROR_LEN)}…[truncated ${message.length - MAX_AUDIT_ERROR_LEN} chars]`
+          : message;
+      this.audit("error", { fqn, pluginId, ts, signature, error, phase: "handler" });
       throw err;
     }
   }
