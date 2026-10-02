@@ -420,6 +420,90 @@ describe("PluginMcpBridge", () => {
     });
   });
 
+  // #232: settings.mcp.audit "enforce" on the bridge path — no log, no action.
+  describe("mandatory audit (enforce)", () => {
+    afterEach(() => __setToolCallSinkForTest(null));
+
+    it("refuses before the handler runs when the intent cannot be logged", async () => {
+      const sink = new ToolCallSink({
+        path: null,
+        policy: "enforce",
+        autoFlush: false,
+        logFactory: () => ({
+          append() {
+            throw new Error("chain unwritable");
+          },
+        }),
+      });
+      __setToolCallSinkForTest(sink);
+      const { bridge, auditPath } = makeBridge();
+      let ran = false;
+      bridge.registerPluginTool("demo", {
+        name: "act",
+        description: "side effect",
+        schema: z.object({}),
+        handler: async () => {
+          ran = true;
+          return "done";
+        },
+      });
+
+      await expect(bridge.invokeTool("demo__act", {})).rejects.toThrow(/audit log is unavailable/);
+      expect(ran).toBe(false);
+      const lines = readAuditLines(auditPath);
+      expect(lines.find((l) => l.event === "audit_enforced_reject")).toMatchObject({
+        fqn: "demo__act",
+        pluginId: "demo",
+        error: "chain unwritable",
+      });
+      expect(lines.some((l) => l.event === "invoke")).toBe(false);
+      expect(sink.pending()[0]).toMatchObject({ status: "error", error: "audit_unavailable" });
+    });
+
+    it("appends the intent, then runs the call, when the chain is writable", async () => {
+      const appended: Array<{ event: string; subject?: string; detail?: unknown }> = [];
+      __setToolCallSinkForTest(
+        new ToolCallSink({
+          path: null,
+          policy: "enforce",
+          autoFlush: false,
+          logFactory: () => ({
+            append(e: { event: string; subject?: string; detail?: unknown }) {
+              appended.push(e);
+            },
+          }),
+        }),
+      );
+      const { bridge } = makeBridge();
+      bridge.registerPluginTool("calc", addTool);
+      expect(await bridge.invokeTool("calc__add", { a: 2, b: 3 })).toBe(5);
+      expect(appended).toHaveLength(1);
+      expect(appended[0]).toMatchObject({
+        event: "mcp.tool_call_intent",
+        subject: "calc",
+        detail: { tool: "add", agent_id: "plugin-bridge" },
+      });
+    });
+
+    it("best-effort never blocks a call on an unwritable chain", async () => {
+      __setToolCallSinkForTest(
+        new ToolCallSink({
+          path: null,
+          policy: "best-effort",
+          autoFlush: false,
+          logFactory: () => ({
+            append() {
+              throw new Error("chain unwritable");
+            },
+          }),
+        }),
+      );
+      const { bridge } = makeBridge();
+      bridge.registerPluginTool("calc", addTool);
+      expect(await bridge.invokeTool("calc__add", { a: 2, b: 3 })).toBe(5);
+    });
+  });
+
   describe("HMAC signing", () => {
     it("signCall + verifyCall round-trip returns true", () => {
       const { bridge } = makeBridge();
