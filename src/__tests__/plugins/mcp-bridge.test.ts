@@ -1,9 +1,10 @@
-import { describe, it, expect, beforeEach } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { z } from "zod";
 import { PluginMcpBridge, _resetMcpBridge, getMcpBridge } from "../../plugins/mcp-bridge.js";
+import { __setToolCallSinkForTest, ToolCallSink } from "../../observability/tool-call-sink.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -124,6 +125,138 @@ describe("PluginMcpBridge", () => {
         },
       });
       await expect(bridge.invokeTool("failing__fail", {})).rejects.toThrow("handler exploded");
+    });
+  });
+
+  // #230/#232: the bridge is the second dispatch path; its calls belong on the
+  // same `mcp.tool_call` chain as the multiplexer's, one event per call.
+  describe("mcp.tool_call chain", () => {
+    let sink: ToolCallSink;
+    beforeEach(() => {
+      sink = new ToolCallSink({ path: null, autoFlush: false });
+      __setToolCallSinkForTest(sink);
+    });
+    afterEach(() => __setToolCallSinkForTest(null));
+
+    it("records a successful call with plugin, tool, status and duration", async () => {
+      const { bridge } = makeBridge();
+      bridge.registerPluginTool("calc", addTool);
+      await bridge.invokeTool("calc__add", { a: 1, b: 2 });
+
+      expect(sink.pending()).toHaveLength(1);
+      const [e] = sink.pending();
+      expect(e).toMatchObject({
+        plugin: "calc",
+        tool: "add",
+        agent_id: "plugin-bridge",
+        status: "ok",
+      });
+      expect(e.error).toBeUndefined();
+      expect(typeof e.duration_ms).toBe("number");
+      expect(Number.isNaN(Date.parse(e.ts))).toBe(false);
+    });
+
+    it("records a handler failure with its message", async () => {
+      const { bridge } = makeBridge();
+      bridge.registerPluginTool("failing", {
+        name: "fail",
+        description: "Always fails",
+        schema: z.object({}),
+        handler: async () => {
+          throw new Error("handler exploded");
+        },
+      });
+      await expect(bridge.invokeTool("failing__fail", {})).rejects.toThrow("handler exploded");
+
+      expect(sink.pending()).toHaveLength(1);
+      expect(sink.pending()[0]).toMatchObject({
+        plugin: "failing",
+        tool: "fail",
+        status: "error",
+        error: "handler exploded",
+      });
+    });
+
+    it("records a validation refusal without the args", async () => {
+      const { bridge } = makeBridge();
+      bridge.registerPluginTool("my-plugin", echoTool);
+      await expect(
+        bridge.invokeTool("my-plugin__echo", { message: 42, secret: "hunter2" }),
+      ).rejects.toThrow(/Invalid args/);
+
+      expect(sink.pending()).toHaveLength(1);
+      const [e] = sink.pending();
+      expect(e).toMatchObject({
+        plugin: "my-plugin",
+        tool: "echo",
+        status: "error",
+        error: "invalid_args",
+      });
+      expect(JSON.stringify(e)).not.toContain("hunter2");
+    });
+
+    it("records a call to an unknown tool without taking its prefix as a plugin", async () => {
+      const { bridge } = makeBridge();
+      bridge.registerPluginTool("calc", addTool);
+      await expect(bridge.invokeTool("calc__missing", {})).rejects.toThrow(/Unknown tool/);
+
+      expect(sink.pending()).toHaveLength(1);
+      expect(sink.pending()[0]).toMatchObject({
+        plugin: "unknown",
+        tool: "calc__missing",
+        status: "error",
+        error: "unknown_tool",
+      });
+    });
+
+    it("names the upstream server and tool for a proxied tool", async () => {
+      const { bridge } = makeBridge();
+      bridge.registerPluginTool("mcp-multiplexer", {
+        name: "github__search",
+        description: "proxied",
+        upstream: { server: "github", tool: "search" },
+        schema: z.object({}),
+        handler: async () => "hit",
+      });
+      await bridge.invokeTool("mcp-multiplexer__github__search", {});
+
+      expect(sink.pending()[0]).toMatchObject({ plugin: "github", tool: "search", status: "ok" });
+    });
+
+    it("records a call that throws before the handler runs", async () => {
+      const { bridge } = makeBridge();
+      bridge.registerPluginTool("strict", {
+        name: "refined",
+        description: "refine throws",
+        schema: z.object({ v: z.string() }).refine((a) => {
+          throw new Error(`refine saw ${a.v}`);
+        }),
+        handler: async () => "unreachable",
+      });
+      bridge.registerPluginTool("calc", addTool);
+      bridge.signCall = () => {
+        throw new Error("secret store unavailable");
+      };
+      await expect(bridge.invokeTool("strict__refined", { v: "hunter2" })).rejects.toThrow(
+        "refine saw hunter2",
+      );
+      await expect(bridge.invokeTool("calc__add", { a: 1, b: 2 })).rejects.toThrow(
+        "secret store unavailable",
+      );
+
+      expect(sink.pending()).toHaveLength(2);
+      expect(sink.pending()[0]).toMatchObject({
+        plugin: "strict",
+        status: "error",
+        error: "invalid_args",
+      });
+      expect(JSON.stringify(sink.pending()[0])).not.toContain("hunter2");
+      expect(sink.pending()[1]).toMatchObject({
+        plugin: "calc",
+        tool: "add",
+        status: "error",
+        error: "secret store unavailable",
+      });
     });
   });
 

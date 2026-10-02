@@ -976,6 +976,7 @@ export class McpMultiplexerPlugin {
         bridge.registerPluginTool(PLUGIN_ID, {
           name: fqn,
           description: tool.description,
+          upstream: { server: serverName, tool: tool.name },
           schema: z.object({
             arguments: z.record(z.string(), z.unknown()).optional().default({}),
           }),

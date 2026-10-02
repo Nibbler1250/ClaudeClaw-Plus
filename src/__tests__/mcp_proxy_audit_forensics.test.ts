@@ -17,6 +17,7 @@ import { PluginMcpBridge, _resetMcpBridge, _setMcpBridge } from "../plugins/mcp-
 import { McpProxyPlugin, _resetMcpProxy } from "../plugins/mcp-proxy/index.js";
 import { getHttpGateway, _resetHttpGateway } from "../plugins/http-gateway.js";
 import type { PluginHttpGateway } from "../plugins/http-gateway.js";
+import { __setToolCallSinkForTest, ToolCallSink } from "../observability/tool-call-sink.js";
 
 const MOCK_SERVER = fileURLToPath(new URL("./fixtures/mock-mcp-server.ts", import.meta.url));
 const BUN_BIN = process.execPath;
@@ -140,6 +141,32 @@ describe("mcp-proxy audit forensics", () => {
     const withId = events.filter((e) => e.request_id === customRequestId);
     // gateway_invoke start + end both carry the same request_id → ≥2 entries
     expect(withId.length).toBeGreaterThanOrEqual(2);
+  });
+
+  // ── Test 1b — the call lands on the mcp.tool_call chain ─────────────────
+
+  it("a gateway invoke of a proxied tool records the upstream server and tool", async () => {
+    const sink = new ToolCallSink({ path: null, autoFlush: false });
+    __setToolCallSinkForTest(sink);
+    try {
+      const resp = await invokeViaTool(
+        gateway,
+        "mcp-proxy",
+        "test-server__echo",
+        { arguments: { message: "chain" }, mode: "direct" },
+        proxyToken,
+      );
+      expect(resp?.status).toBe(200);
+      expect(sink.pending()).toHaveLength(1);
+      expect(sink.pending()[0]).toMatchObject({
+        plugin: "test-server",
+        tool: "echo",
+        agent_id: "plugin-bridge",
+        status: "ok",
+      });
+    } finally {
+      __setToolCallSinkForTest(null);
+    }
   });
 
   // ── Test 2 — all event types captured ────────────────────────────────────
