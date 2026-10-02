@@ -700,3 +700,234 @@ describe("streamBusPrompt — dead IPC is surfaced after the reconnect grace (#3
     }
   });
 });
+
+/**
+ * #454: a caller's `timeoutMs` bounds the whole call, including the wait for
+ * the per-agent bridge lock held by another web-UI prompt — not only the wait
+ * for the reply once the lock is ours.
+ */
+describe("streamBusPrompt — the timeout covers the per-agent lock wait (#454)", () => {
+  let tmpDir: string;
+  let logPath: string;
+  let store: ReceiptStore;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "ccplus-bridge-lock-"));
+    logPath = join(tmpDir, "receipts.jsonl");
+    store = createReceiptStore({ path: logPath });
+  });
+
+  afterEach(() => {
+    if (existsSync(tmpDir)) rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  async function readReceiptsWhen(n: number): Promise<ReceiptRecord[]> {
+    const read = () =>
+      existsSync(logPath)
+        ? readFileSync(logPath, "utf-8")
+            .split("\n")
+            .filter((l) => l.trim().length > 0)
+            .map((l) => JSON.parse(l) as ReceiptRecord)
+        : [];
+    for (let i = 0; i < 50 && read().length < n; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return read();
+  }
+
+  const endTurn = (bus: BusCore, agent: string) =>
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: agent,
+      session_id: "s",
+      topic: "response.turn_end",
+      payload: { text: "" },
+    });
+
+  it("gives up after its own timeout while another prompt holds the lock, and never sends", async () => {
+    const bus = makeBus();
+    const sent: string[] = [];
+    const origSend = bus.sendPrompt.bind(bus);
+    bus.sendPrompt = (p) => {
+      sent.push(p.text);
+      return origSend(p);
+    };
+    const first = streamBusPrompt(bus, "alpha", "long inject", { timeoutMs: 5000 });
+    const t0 = Date.now();
+    const fire = await streamBusPrompt(bus, "alpha", "fired job", { timeoutMs: 100 });
+    const elapsed = Date.now() - t0;
+
+    expect(elapsed).toBeLessThan(1000);
+    expect(fire.ok).toBe(false);
+    expect(fire.exitCode).toBe(1);
+    expect(fire.error).toContain("timed out after 100ms");
+    expect(fire.error).toContain("another web-UI prompt");
+    expect(sent).toEqual(["long inject"]);
+
+    bus.ingestReply({ agent_id: "alpha", text: "first-reply", intent: "final" });
+    expect((await first).output).toBe("first-reply");
+  });
+
+  it("a caller that gave up keeps the queue in order: the next waiter still waits for the holder", async () => {
+    const bus = makeBus();
+    const first = streamBusPrompt(bus, "alpha", "first", { timeoutMs: 5000 });
+    const quitter = streamBusPrompt(bus, "alpha", "quitter", { timeoutMs: 50 });
+    const third = streamBusPrompt(bus, "alpha", "third", { timeoutMs: 5000 });
+    expect((await quitter).ok).toBe(false);
+    // The quitter is gone but the first still runs: the third must not start.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(bus.state().subscriberCount).toBe(1);
+
+    bus.ingestReply({ agent_id: "alpha", text: "first-reply", intent: "final" });
+    expect((await first).output).toBe("first-reply");
+    await new Promise((r) => setTimeout(r, 10));
+    endTurn(bus, "alpha");
+    bus.ingestReply({ agent_id: "alpha", text: "third-reply", intent: "final" });
+    expect((await third).output).toBe("third-reply");
+  });
+
+  it("once the lock is acquired, only the remaining budget is spent waiting for the reply", async () => {
+    const bus = makeBus();
+    const first = streamBusPrompt(bus, "alpha", "first", { timeoutMs: 5000 });
+    const t0 = Date.now();
+    const second = streamBusPrompt(bus, "alpha", "second", { timeoutMs: 400 });
+    await new Promise((r) => setTimeout(r, 250));
+    bus.ingestReply({ agent_id: "alpha", text: "first-reply", intent: "final" });
+    await first;
+    endTurn(bus, "alpha");
+    // No reply for the second: it times out on its own budget, counted from entry.
+    const r = await second;
+    const elapsed = Date.now() - t0;
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain("timed out after 400ms");
+    expect(elapsed).toBeLessThan(600);
+  });
+
+  it("does not send when the lock comes with almost none of the budget left", async () => {
+    const bus = makeBus();
+    const sent: string[] = [];
+    const origSend = bus.sendPrompt.bind(bus);
+    bus.sendPrompt = (p) => {
+      sent.push(p.text);
+      return origSend(p);
+    };
+    const first = streamBusPrompt(bus, "alpha", "first", { timeoutMs: 5000 });
+    const reasons: string[] = [];
+    const late = streamBusPrompt(bus, "alpha", "late", {
+      timeoutMs: 1000,
+      onTurnSettled: (r) => reasons.push(r),
+    });
+    // The lock frees with ~5% of the late caller's budget left.
+    await new Promise((r) => setTimeout(r, 950));
+    bus.ingestReply({ agent_id: "alpha", text: "first-reply", intent: "final" });
+    await first;
+    const r = await late;
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain("another web-UI prompt");
+    expect(sent).toEqual(["first"]);
+    await new Promise((res) => setTimeout(res, 20));
+    expect(reasons).toEqual(["no_turn"]);
+  });
+
+  it("caps the minimum reply budget, so a long timeout is not refused with seconds left", async () => {
+    const bus = makeBus();
+    const sent: string[] = [];
+    const origSend = bus.sendPrompt.bind(bus);
+    bus.sendPrompt = (p) => {
+      sent.push(p.text);
+      return origSend(p);
+    };
+    const first = streamBusPrompt(bus, "alpha", "first", { timeoutMs: 5000 });
+    // 1000 ms budget, lock after ~920 ms: ~80 ms left is under a tenth
+    // (100 ms) but over a 50 ms cap, so it is sent. Scaled-down stand-in for
+    // a 5 min budget with 20 s left.
+    const late = streamBusPrompt(bus, "alpha", "late", {
+      timeoutMs: 1000,
+      minReplyBudgetCapMs: 50,
+    });
+    await new Promise((r) => setTimeout(r, 920));
+    bus.ingestReply({ agent_id: "alpha", text: "first-reply", intent: "final" });
+    await first;
+    await new Promise((r) => setTimeout(r, 5));
+    expect(sent).toEqual(["first", "late"]);
+    await late;
+  });
+
+  it("an oversized timeout still waits for the lock instead of giving up at once", async () => {
+    const bus = makeBus();
+    const first = streamBusPrompt(bus, "alpha", "first", { timeoutMs: 5000 });
+    const huge = streamBusPrompt(bus, "alpha", "huge", { timeoutMs: 2 ** 32 });
+    await new Promise((r) => setTimeout(r, 50));
+    bus.ingestReply({ agent_id: "alpha", text: "first-reply", intent: "final" });
+    await first;
+    await new Promise((r) => setTimeout(r, 10));
+    endTurn(bus, "alpha");
+    bus.ingestReply({ agent_id: "alpha", text: "huge-reply", intent: "final" });
+    expect((await huge).output).toBe("huge-reply");
+  });
+
+  it("the receipt shows when the request arrived and how long it waited for the lock", async () => {
+    const bus = makeBus();
+    const first = streamBusPrompt(bus, "alpha", "first", { timeoutMs: 5000, receiptStore: store });
+    const arrived = Date.now();
+    const quitter = streamBusPrompt(bus, "alpha", "quitter", {
+      timeoutMs: 100,
+      receiptStore: store,
+      originId: "fire-1",
+    });
+    await quitter;
+    const [gaveUp] = await readReceiptsWhen(1);
+    expect(gaveUp.message_id).toMatch(/^webui:fire-1:/);
+    expect(gaveUp.final_state).toBe("timeout");
+    expect(Math.abs(Date.parse(gaveUp.received_at) - arrived)).toBeLessThan(50);
+    expect(gaveUp.duration_ms).toBeGreaterThanOrEqual(90);
+    expect(gaveUp.notes).toMatchObject({ stage: "bridge_lock", timeout_ms: 100 });
+    expect(gaveUp.notes?.lock_wait_ms as number).toBeGreaterThanOrEqual(90);
+    // The prompt that never went out is not indexed for the bus → PTY seam.
+    expect(store.findByPromptHash(hashPrompt("quitter"))).toBeUndefined();
+
+    const waited = streamBusPrompt(bus, "alpha", "waited", {
+      timeoutMs: 5000,
+      receiptStore: store,
+      originId: "fire-2",
+    });
+    await new Promise((r) => setTimeout(r, 120));
+    // Still waiting for the lock: not sent, so not findable by the seam yet.
+    expect(store.findByPromptHash(hashPrompt("waited"))).toBeUndefined();
+    bus.ingestReply({ agent_id: "alpha", text: "first-reply", intent: "final" });
+    await first;
+    await new Promise((r) => setTimeout(r, 10));
+    expect(store.findByPromptHash(hashPrompt("waited"))).toBeDefined();
+    endTurn(bus, "alpha");
+    bus.ingestReply({ agent_id: "alpha", text: "ok", intent: "final" });
+    await waited;
+    const recs = await readReceiptsWhen(3);
+    const w = recs.find((r) => r.message_id.startsWith("webui:fire-2:"));
+    expect(w?.final_state).toBe("turn_observed");
+    expect(w?.prompt_hash).toBe(hashPrompt("waited"));
+    expect(w?.notes?.lock_wait_ms as number).toBeGreaterThanOrEqual(100);
+    expect(w?.duration_ms as number).toBeGreaterThanOrEqual(w?.notes?.lock_wait_ms as number);
+  });
+
+  it("tells a turn-settled caller that no turn will run when it gave up on the lock", async () => {
+    const bus = makeBus();
+    const first = streamBusPrompt(bus, "alpha", "first", { timeoutMs: 5000 });
+    const reasons: string[] = [];
+    let resolvedFirst = false;
+    const quitter = streamBusPrompt(bus, "alpha", "quitter", {
+      timeoutMs: 50,
+      onTurnSettled: (r) => {
+        expect(resolvedFirst).toBe(true);
+        reasons.push(r);
+      },
+    }).then((r) => {
+      resolvedFirst = true;
+      return r;
+    });
+    expect((await quitter).ok).toBe(false);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(reasons).toEqual(["no_turn"]);
+    bus.ingestReply({ agent_id: "alpha", text: "first-reply", intent: "final" });
+    await first;
+  });
+});
