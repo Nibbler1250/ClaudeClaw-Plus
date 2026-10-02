@@ -382,6 +382,8 @@ describe("parseSettings — mcp block (MCP multiplexer, SPEC §5)", () => {
         cacheable: {},
         defensiveInvalidation: true,
       },
+      // #230 bridge kill switch: empty = no restriction.
+      bridge: { plugins: {} },
     });
   });
 });
@@ -461,5 +463,88 @@ describe("parseSettings — mcp session persistence (SPEC-DELTA-2026-05-16)", ()
     await writeRawSettings({ mcp: { sessionPersistencePath: 42 } });
     await reloadSettings();
     expect(getSettings().mcp.sessionPersistencePath).toBe("");
+  });
+});
+
+describe("parseSettings — mcp.bridge kill switch (#230)", () => {
+  it("is empty when absent: no restriction", async () => {
+    await writeRawSettings({});
+    await reloadSettings();
+    expect(getSettings().mcp.bridge).toEqual({ plugins: {} });
+  });
+
+  it("keeps enabled / allowedTools / deniedTools per plugin", async () => {
+    await writeRawSettings({
+      mcp: {
+        bridge: {
+          plugins: {
+            demo: { allowedTools: ["safe", "danger"], deniedTools: ["danger"] },
+            noisy: { enabled: false },
+          },
+        },
+      },
+    });
+    await reloadSettings();
+    expect(getSettings().mcp.bridge).toEqual({
+      plugins: {
+        demo: { allowedTools: ["safe", "danger"], deniedTools: ["danger"] },
+        noisy: { enabled: false },
+      },
+    });
+  });
+
+  it("turns a malformed plugin entry off instead of ignoring it", async () => {
+    await writeRawSettings({
+      mcp: {
+        bridge: {
+          plugins: {
+            a: { enabled: "false" },
+            b: { allowedTools: "safe" },
+            c: { deniedTools: ["x", 1] },
+            d: true,
+            e: { denyTools: ["danger"] },
+            ok: { deniedTools: [] },
+          },
+        },
+      },
+    });
+    await reloadSettings();
+    expect(getSettings().mcp.bridge?.plugins).toEqual({
+      a: { enabled: false },
+      b: { enabled: false },
+      c: { enabled: false },
+      d: { enabled: false },
+      e: { enabled: false },
+      ok: { deniedTools: [] },
+    });
+  });
+
+  it("warns once per malformed entry across hot-reloads, and skips __proto__", async () => {
+    const warn = console.warn;
+    const seen: string[] = [];
+    console.warn = (...args: unknown[]) => {
+      seen.push(String(args[0]));
+    };
+    try {
+      await writeRawSettings(
+        JSON.parse(
+          '{"mcp":{"bridge":{"plugins":{"__proto__":{"enabled":false},"z":{"enabled":1}}}}}',
+        ),
+      );
+      await reloadSettings();
+      await reloadSettings();
+    } finally {
+      console.warn = warn;
+    }
+    const plugins = getSettings().mcp.bridge?.plugins ?? {};
+    expect(Object.keys(plugins)).toEqual(["z"]);
+    expect(Object.getPrototypeOf(plugins)).toBe(Object.prototype);
+    expect(seen.filter((m) => m.includes("plugins.z is malformed"))).toHaveLength(1);
+  });
+
+  it("ignores a plugins value that is not an object", async () => {
+    await writeRawSettings({ mcp: { bridge: { plugins: ["demo"] } } });
+    await reloadSettings();
+    expect(getSettings().mcp.bridge).toEqual({ plugins: {} });
   });
 });

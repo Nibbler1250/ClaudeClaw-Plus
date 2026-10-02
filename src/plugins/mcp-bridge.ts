@@ -12,6 +12,7 @@ import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { recordToolCall } from "../observability/tool-call-sink.js";
 import type { ToolCallStatus } from "../observability/tool-call.js";
+import type { McpBridgeConfig } from "../config.js";
 
 /** Cap on a handler error recorded in the audit log — same bound as the
  *  `mcp.tool_call` chain's error field. */
@@ -61,6 +62,7 @@ export class PluginMcpBridge {
   private tools = new Map<string, RegisteredTool>();
   private secrets = new Map<string, Buffer>();
   private auditPath: string;
+  private toolPolicy: McpBridgeConfig = { plugins: {} };
 
   constructor(auditPath?: string) {
     // #304: `PLUS_PLUGIN_AUDIT_PATH` overrides the default journal location
@@ -158,6 +160,31 @@ export class PluginMcpBridge {
     }
   }
 
+  // ── Tool policy (#230) ────────────────────────────────────────────────
+
+  /** Replace the per-plugin policy (`settings.mcp.bridge`). Called at daemon
+   *  start and on every settings hot-reload; absent → no restriction. */
+  setToolPolicy(policy: McpBridgeConfig | undefined): void {
+    this.toolPolicy = policy ?? { plugins: {} };
+  }
+
+  /** Why the policy refuses this tool, or null when it is callable. The
+   *  entry under the plugin id and, for a proxied tool, the one under the
+   *  upstream server are both consulted; either can refuse. */
+  private policyDenial(pluginId: string, tool: PluginTool): string | null {
+    const keys: Array<[string, string]> = [[pluginId, tool.name]];
+    if (tool.upstream) keys.push([tool.upstream.server, tool.upstream.tool]);
+    const { plugins } = this.toolPolicy;
+    for (const [key, name] of keys) {
+      if (!Object.prototype.hasOwnProperty.call(plugins, key)) continue;
+      const entry = plugins[key];
+      if (entry.enabled === false) return "plugin_disabled";
+      if (entry.deniedTools?.includes(name)) return "tool_denied";
+      if (entry.allowedTools && !entry.allowedTools.includes(name)) return "not_in_allowed_set";
+    }
+    return null;
+  }
+
   // ── Tool invocation ───────────────────────────────────────────────────
 
   async invokeTool(fqn: string, args: unknown): Promise<unknown> {
@@ -185,6 +212,19 @@ export class PluginMcpBridge {
       const { plugin: pluginId, tool } = registered;
       subject = tool.upstream?.server ?? pluginId;
       toolName = tool.upstream?.tool ?? tool.name;
+
+      const denial = this.policyDenial(pluginId, tool);
+      if (denial) {
+        reason = denial;
+        this.audit("policy_denied", {
+          fqn,
+          pluginId,
+          toolName: tool.name,
+          ...(tool.upstream ? { upstream: tool.upstream } : {}),
+          reason: denial,
+        });
+        throw new Error(`Tool "${fqn}" is refused by settings.mcp.bridge (${denial})`);
+      }
 
       // Validate args via Zod schema. Set before the parse: a refine or
       // transform that throws its own error is recorded under it too, since
@@ -238,11 +278,14 @@ export class PluginMcpBridge {
   // ── Tool listing ──────────────────────────────────────────────────────
 
   listTools(): ListedTool[] {
-    return Array.from(this.tools.entries()).map(([fqn, { tool }]) => ({
-      fqn,
-      description: tool.description,
-      inputSchema: this.zodToJson(tool.schema),
-    }));
+    // A tool the policy refuses is not advertised either.
+    return Array.from(this.tools.entries())
+      .filter(([, { plugin, tool }]) => this.policyDenial(plugin, tool) === null)
+      .map(([fqn, { tool }]) => ({
+        fqn,
+        description: tool.description,
+        inputSchema: this.zodToJson(tool.schema),
+      }));
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────
