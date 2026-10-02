@@ -369,9 +369,10 @@ describe("PtyProcess — _waitForReadySettle two-phase (issue #84)", () => {
 // dialog before the REPL with "No, exit" PRESELECTED. Pre-fix, readySettle
 // resolved once that dialog went quiet, the first runTurn wrote prompt + CR,
 // the CR confirmed "No, exit" and claude exited 1 — every real-claude PTY
-// test in the nightly failed this way. The fake CLI below mirrors that: a
-// line ending without a preceding Down arrow exits 1; Down then Enter
-// "accepts" and the REPL (here: cat) comes up.
+// test in the nightly failed this way. The fake CLI below mirrors that: any
+// line other than a bare Down arrow exits 1; Down then Enter "accepts" and
+// the REPL (here: cat) comes up. The match is exact so the Enter has to come
+// from settle — a prompt's CR finishing the line does not count.
 
 // Words are separated by CHA cursor moves (`ESC[<n>G`), as the real CLI
 // renders them, so a matcher that only strips escapes sees "Yes,Iaccept".
@@ -379,7 +380,7 @@ const FAKE_BYPASS_DIALOG_CLI = [
   "printf 'WARNING: Claude\\033[13GCode\\033[18Grunning\\033[26Gin\\033[29GBypass\\033[36GPermissions\\033[48Gmode\\r\\n'",
   "printf '\\342\\235\\257 No,\\033[7Gexit\\r\\n  Yes,\\033[8GI\\033[10Gaccept\\r\\n\\r\\nEnter to confirm \\302\\267 Esc to cancel\\r\\n'",
   "IFS= read -r key",
-  'case "$key" in *"[B"*) ;; *) exit 1 ;; esac',
+  'case "$key" in "$(printf "\\033[B")") ;; *) exit 1 ;; esac',
   "printf 'bypass\\033[8Gpermissions\\033[20Gon\\033[23G(shift+tab\\033[34Gto\\033[37Gcycle)\\r\\n'",
   "exec cat",
 ].join("; ");
