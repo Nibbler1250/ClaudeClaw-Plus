@@ -232,6 +232,19 @@ describe("McpServerProcess — allowedTools enforcement at call() (#72 item 3)",
     }
   });
 
+  it("a child result with isError: true rejects with the child's text", async () => {
+    const proc = new McpServerProcess("test", {
+      ...makeServerConfig(),
+      allowedTools: ["echo", "fail_tool"],
+    });
+    try {
+      await proc.start();
+      await expect(proc.call("fail_tool", {})).rejects.toThrow("fail_tool: upstream refused");
+    } finally {
+      await proc.stop();
+    }
+  });
+
   it("allows tools that ARE in the configured allowlist (no regression)", async () => {
     const proc = new McpServerProcess("test", makeServerConfig());
     try {
