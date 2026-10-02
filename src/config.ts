@@ -15,6 +15,7 @@ import {
 } from "./bus/agent-jobs";
 import { parsePlugins, type PluginEntry } from "./plugins";
 import { parseMemorySearchSettings, type MemorySearchSettings } from "./memory";
+import type { AuditPolicy } from "./observability/tool-call";
 
 /** Re-exported under the name used in the Settings interface. */
 export type WatchdogSettings = WatchdogConfig;
@@ -587,6 +588,14 @@ export interface McpConfig {
    * entry.
    */
   bridge?: McpBridgeConfig;
+  /**
+   * Mandatory-audit policy for MCP tool calls, on both dispatch paths (the
+   * multiplexer and the plugin-tool bridge). `"enforce"`: a call whose intent
+   * cannot be appended to the `mcp.tool_call` chain is refused before it
+   * runs — no log, no action. `"best-effort"` (default): logging never blocks
+   * a call. Re-read by the settings hot-reload.
+   */
+  audit?: AuditPolicy;
 }
 
 /**
@@ -1593,12 +1602,12 @@ function parseWebBusConfig(raw: unknown): WebBusConfig | null {
   return out;
 }
 
-/** Bridge-policy warnings already printed: the hot-reload re-parses the
- *  settings every 30 s, and one bad entry should not warn forever. */
-const bridgePolicyWarned = new Set<string>();
-function warnBridgePolicyOnce(message: string): void {
-  if (bridgePolicyWarned.has(message)) return;
-  bridgePolicyWarned.add(message);
+/** `settings.mcp` warnings already printed: the hot-reload re-parses the
+ *  settings every 30 s, and one bad value should not warn forever. */
+const mcpSettingWarned = new Set<string>();
+function warnMcpSettingOnce(message: string): void {
+  if (mcpSettingWarned.has(message)) return;
+  mcpSettingWarned.add(message);
   console.warn(message);
 }
 
@@ -1617,7 +1626,7 @@ function parseMcpBridgeConfig(raw: unknown): McpBridgeConfig {
   const rawPlugins = typeof raw === "object" ? (raw as { plugins?: unknown }).plugins : undefined;
   if (rawPlugins === undefined) return { plugins };
   if (!rawPlugins || typeof rawPlugins !== "object" || Array.isArray(rawPlugins)) {
-    warnBridgePolicyOnce("[mcp] settings.mcp.bridge.plugins must be an object; ignoring it");
+    warnMcpSettingOnce("[mcp] settings.mcp.bridge.plugins must be an object; ignoring it");
     return { plugins };
   }
   const toolList = (v: unknown): string[] | null =>
@@ -1626,7 +1635,7 @@ function parseMcpBridgeConfig(raw: unknown): McpBridgeConfig {
     // Cannot name a plugin or a server, and assigning it would set the
     // object's prototype rather than add an entry.
     if (id === "__proto__") {
-      warnBridgePolicyOnce(
+      warnMcpSettingOnce(
         "[mcp] settings.mcp.bridge.plugins.__proto__ is not a valid key; ignoring it",
       );
       continue;
@@ -1641,7 +1650,7 @@ function parseMcpBridgeConfig(raw: unknown): McpBridgeConfig {
       (entry.allowedTools !== undefined && toolList(entry.allowedTools) === null) ||
       (entry.deniedTools !== undefined && toolList(entry.deniedTools) === null);
     if (malformed) {
-      warnBridgePolicyOnce(
+      warnMcpSettingOnce(
         `[mcp] settings.mcp.bridge.plugins.${id} is malformed (keys: enabled, allowedTools, deniedTools); all its tools are refused`,
       );
       plugins[id] = { enabled: false };
@@ -1812,7 +1821,23 @@ function parseMcpConfig(raw: any, webEnabled: unknown): McpConfig {
       defensiveInvalidation: rawCache?.defensiveInvalidation !== false,
     },
     bridge: parseMcpBridgeConfig(raw?.bridge),
+    audit: parseMcpAuditPolicy(raw?.audit),
   };
+}
+
+/**
+ * `settings.mcp.audit`. Absent or null → `best-effort`. Any value other than the two
+ * known ones is read as `enforce`, with a warning: someone who set the key
+ * asked for something stricter than the default, and a typo must not
+ * silently turn the guarantee off.
+ */
+function parseMcpAuditPolicy(raw: unknown): AuditPolicy {
+  if (raw === undefined || raw === null || raw === "best-effort") return "best-effort";
+  if (raw === "enforce") return "enforce";
+  warnMcpSettingOnce(
+    `[mcp] settings.mcp.audit must be "enforce" or "best-effort" (got ${JSON.stringify(raw)}); using "enforce"`,
+  );
+  return "enforce";
 }
 
 function parseTimezone(value: unknown): string {

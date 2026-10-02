@@ -32,7 +32,7 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
 import { getMcpBridge } from "../mcp-bridge.js";
-import { recordToolCall } from "../../observability/tool-call-sink.js";
+import { recordToolCall, recordToolCallIntent } from "../../observability/tool-call-sink.js";
 import { getMetricsRegistry } from "./metrics.js";
 import { getResponseCache } from "./cache.js";
 import type { McpServerProcess } from "../mcp-proxy/server-process.js";
@@ -861,6 +861,29 @@ export class McpHttpHandler {
             {
               type: "text",
               text: `Error: tool '${name}' is not exposed by server '${this.serverName}'`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      // `settings.mcp.audit: "enforce"`: the intent is appended synchronously
+      // before anything is served (cache hit included) and a failed append
+      // refuses the call — no log, no action. A no-op under best-effort.
+      try {
+        recordToolCallIntent({ ts, plugin: this.serverName, tool: name, agent_id: bucketKey });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        getMcpBridge().audit("multiplexer_audit_enforced_reject", {
+          server: this.serverName,
+          tool: name,
+          error: message.slice(0, 2_000),
+        });
+        emitToolCall("error", "audit_unavailable");
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: tool '${name}' refused — the audit log is unavailable and settings.mcp.audit is "enforce"`,
             },
           ],
           isError: true,

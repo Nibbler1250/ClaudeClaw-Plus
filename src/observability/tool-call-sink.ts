@@ -64,9 +64,22 @@ export interface ToolCallSinkOptions {
   logFactory?: (path: string | null) => AuditLogLike;
 }
 
+interface PendingPolicyRecord {
+  policy: AuditPolicy;
+  /** Absent on the boot record. */
+  previous?: AuditPolicy;
+  changed_at: string;
+}
+
 export class ToolCallSink {
   private enabled = true;
   private policy: AuditPolicy;
+  /** Set by the first `applyPolicy` (boot); later calls are reloads. */
+  private policyApplied = false;
+  /** Policy records (boot under enforce, later changes) not written yet. */
+  private pendingPolicyRecords: PendingPolicyRecord[] = [];
+  private droppedPolicyRecords = 0;
+  private static readonly MAX_PENDING_POLICY_RECORDS = 64;
   private buffer: ToolCallEvent[] = [];
   private flushArmed = false;
   private log: AuditLogLike | null = null;
@@ -144,6 +157,12 @@ export class ToolCallSink {
    */
   recordIntent(intent: ToolCallIntent): void {
     if (this.policy !== "enforce") return;
+    // A policy change waiting for the chain goes in before what it governs;
+    // if it still cannot, neither can this intent.
+    this.drainPolicyRecords();
+    if (this.pendingPolicyRecords.length > 0) {
+      throw new Error("audit chain unavailable (policy record pending)");
+    }
     this.ensureLog().append({
       event: MCP_TOOL_CALL_INTENT_EVENT,
       subject: intent.plugin,
@@ -163,13 +182,74 @@ export class ToolCallSink {
    */
   recordPolicy(): void {
     if (this.policy !== "enforce") return;
+    this.queuePolicyRecord({ policy: this.policy, changed_at: new Date().toISOString() });
+    this.drainPolicyRecords();
+  }
+
+  /**
+   * Apply the policy resolved from settings (`settings.mcp.audit`), at boot and
+   * on every settings reload. The first application records the boot
+   * provenance (enforce only, so best-effort stays write-free). Every later
+   * CHANGE is recorded in either direction: a switch from enforce to
+   * best-effort is exactly the window an auditor needs to see, and without it
+   * the chain would read "enforce" across calls that were never gated.
+   * A record that cannot be written (chain down at that moment) is kept and
+   * written, in order, before the next intent, result batch or reload that
+   * reaches the chain; past the queue bound the oldest is dropped and the
+   * next record carries the count. Unchanged and nothing pending → nothing.
+   */
+  applyPolicy(policy: AuditPolicy): void {
+    const now = new Date().toISOString();
+    if (!this.policyApplied) {
+      this.policyApplied = true;
+      this.policy = policy;
+      if (policy === "enforce") this.queuePolicyRecord({ policy, changed_at: now });
+    } else if (policy !== this.policy) {
+      this.queuePolicyRecord({ policy, previous: this.policy, changed_at: now });
+      this.policy = policy;
+    }
+    this.drainPolicyRecords();
+  }
+
+  private queuePolicyRecord(record: PendingPolicyRecord): void {
+    if (this.pendingPolicyRecords.length >= ToolCallSink.MAX_PENDING_POLICY_RECORDS) {
+      this.pendingPolicyRecords.shift();
+      this.droppedPolicyRecords++;
+    }
+    this.pendingPolicyRecords.push(record);
+  }
+
+  /** Write pending policy records in order; stop at the first failure and
+   *  keep the rest. Never throws. */
+  private drainPolicyRecords(): void {
+    while (this.pendingPolicyRecords.length > 0) {
+      if (!this.appendPolicyRecord(this.pendingPolicyRecords[0])) return;
+      this.pendingPolicyRecords.shift();
+    }
+  }
+
+  /** Swallows its own failure (reported as `false`): a policy record must
+   *  never crash daemon start, a settings reload or a call — the per-call
+   *  gate is what enforces. Without `record`, the active policy (boot). */
+  private appendPolicyRecord(record?: PendingPolicyRecord): boolean {
     try {
       this.ensureLog().append({
         event: MCP_AUDIT_POLICY_EVENT,
-        detail: { policy: this.policy, recorded_at: new Date().toISOString() },
+        detail: {
+          policy: record ? record.policy : this.policy,
+          ...(record?.previous !== undefined ? { previous: record.previous } : {}),
+          ...(record ? { changed_at: record.changed_at } : {}),
+          ...(record && this.droppedPolicyRecords > 0
+            ? { dropped_before: this.droppedPolicyRecords }
+            : {}),
+          recorded_at: new Date().toISOString(),
+        },
       });
+      if (record) this.droppedPolicyRecords = 0;
+      return true;
     } catch {
       // Provenance is documentation; the per-call gate is what enforces.
+      return false;
     }
   }
 
@@ -210,6 +290,10 @@ export class ToolCallSink {
     } catch {
       return;
     }
+    // A policy change waiting for the chain goes in before what it governs;
+    // until it does, the results stay buffered (bounded by MAX_BUFFER).
+    this.drainPolicyRecords();
+    if (this.pendingPolicyRecords.length > 0) return;
     const batch = this.buffer;
     this.buffer = [];
     try {

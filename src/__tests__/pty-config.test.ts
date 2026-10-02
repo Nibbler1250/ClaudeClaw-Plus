@@ -384,6 +384,8 @@ describe("parseSettings — mcp block (MCP multiplexer, SPEC §5)", () => {
       },
       // #230 bridge kill switch: empty = no restriction.
       bridge: { plugins: {} },
+      // #232 mandatory audit: off unless asked for.
+      audit: "best-effort",
     });
   });
 });
@@ -546,5 +548,34 @@ describe("parseSettings — mcp.bridge kill switch (#230)", () => {
     await writeRawSettings({ mcp: { bridge: { plugins: ["demo"] } } });
     await reloadSettings();
     expect(getSettings().mcp.bridge).toEqual({ plugins: {} });
+  });
+});
+
+describe("parseSettings — mcp.audit (#232)", () => {
+  it("defaults to best-effort", async () => {
+    await writeRawSettings({});
+    await reloadSettings();
+    expect(getSettings().mcp.audit).toBe("best-effort");
+  });
+
+  it("accepts enforce and best-effort", async () => {
+    await writeRawSettings({ mcp: { audit: "enforce" } });
+    await reloadSettings();
+    expect(getSettings().mcp.audit).toBe("enforce");
+    await writeRawSettings({ mcp: { audit: "best-effort" } });
+    await reloadSettings();
+    expect(getSettings().mcp.audit).toBe("best-effort");
+  });
+
+  it("reads null as absent", async () => {
+    await writeRawSettings({ mcp: { audit: null } });
+    await reloadSettings();
+    expect(getSettings().mcp.audit).toBe("best-effort");
+  });
+
+  it("reads an unknown value as enforce, not as the default", async () => {
+    await writeRawSettings({ mcp: { audit: "enforced" } });
+    await reloadSettings();
+    expect(getSettings().mcp.audit).toBe("enforce");
   });
 });

@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
-import { recordToolCall } from "../observability/tool-call-sink.js";
+import { recordToolCall, recordToolCallIntent } from "../observability/tool-call-sink.js";
 import type { ToolCallStatus } from "../observability/tool-call.js";
 import type { McpBridgeConfig } from "../config.js";
 
@@ -241,6 +241,24 @@ export class PluginMcpBridge {
       // Sign the call
       const signedAt = Date.now();
       const signature = this.signCall(pluginId, parsed.data, signedAt);
+
+      // `settings.mcp.audit: "enforce"`: the intent is appended synchronously
+      // before the handler runs and a failed append refuses the call — no
+      // log, no action. A no-op under best-effort.
+      try {
+        recordToolCallIntent({ ts, plugin: subject, tool: toolName, agent_id: BRIDGE_AGENT_ID });
+      } catch (err) {
+        reason = "audit_unavailable";
+        const message = err instanceof Error ? err.message : String(err);
+        this.audit("audit_enforced_reject", {
+          fqn,
+          pluginId,
+          error: message.slice(0, MAX_AUDIT_ERROR_LEN),
+        });
+        throw new Error(
+          `Tool "${fqn}" refused: the audit log is unavailable and settings.mcp.audit is "enforce"`,
+        );
+      }
 
       try {
         const result = await tool.handler(parsed.data);

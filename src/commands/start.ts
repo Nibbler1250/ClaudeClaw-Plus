@@ -64,6 +64,7 @@ import { indexSessionsBackground } from "../memory";
 import { getMcpProxyPlugin } from "../plugins/mcp-proxy/index.js";
 import { getMcpMultiplexerPlugin } from "../plugins/mcp-multiplexer/index.js";
 import { getMcpBridge } from "../plugins/mcp-bridge.js";
+import { getToolCallSink } from "../observability/tool-call-sink.js";
 import { injectMcpIdentityIssuer } from "../runner/pty-supervisor";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
@@ -449,6 +450,10 @@ export async function start(args: string[] = []) {
   // #230: per-plugin kill switch on the plugin-tool bridge. Applied before any
   // plugin registers or is called, and again on every hot-reload below.
   getMcpBridge().setToolPolicy(settings.mcp.bridge);
+  // settings.mcp.audit: under "enforce" a tool call whose intent cannot be
+  // logged is refused, on both dispatch paths. The chain records the boot
+  // policy (enforce only) and every later change.
+  getToolCallSink().applyPolicy(settings.mcp.audit ?? "best-effort");
 
   // Wire operator-facing governance config into the in-memory watchdog state
   // (#268). Without this, `settings.governance.watchdog.{enabled,limits}` is
@@ -1630,8 +1635,15 @@ export async function start(args: string[] = []) {
   setInterval(async () => {
     try {
       const newSettings = await reloadSettings();
-      const newJobs = await loadJobs();
+      // Tool governance first: nothing later in this tick (jobs, adapters) may
+      // keep a policy change from taking effect.
       getMcpBridge().setToolPolicy(newSettings.mcp.bridge);
+      const auditPolicy = newSettings.mcp.audit ?? "best-effort";
+      if (getToolCallSink().getPolicy() !== auditPolicy) {
+        console.log(`[${ts()}] MCP audit policy changed → ${auditPolicy}`);
+      }
+      getToolCallSink().applyPolicy(auditPolicy);
+      const newJobs = await loadJobs();
 
       // Detect heartbeat config changes
       const hbChanged =
