@@ -551,6 +551,41 @@ describe("parseSettings — mcp.bridge kill switch (#230)", () => {
   });
 });
 
+describe("parseSettings — mcp.bridge.defaultDeny (#230)", () => {
+  it("is off unless set to true", async () => {
+    await writeRawSettings({ mcp: { bridge: { plugins: { calc: {} } } } });
+    await reloadSettings();
+    expect(getSettings().mcp.bridge?.defaultDeny).toBeUndefined();
+    await writeRawSettings({ mcp: { bridge: { defaultDeny: false } } });
+    await reloadSettings();
+    expect(getSettings().mcp.bridge?.defaultDeny).toBeUndefined();
+    await writeRawSettings({ mcp: { bridge: { defaultDeny: true, plugins: { calc: {} } } } });
+    await reloadSettings();
+    expect(getSettings().mcp.bridge).toEqual({ plugins: { calc: {} }, defaultDeny: true });
+  });
+
+  it("turns on for a non-boolean value or a misspelt key", async () => {
+    await writeRawSettings({ mcp: { bridge: { defaultDeny: "yes" } } });
+    await reloadSettings();
+    expect(getSettings().mcp.bridge?.defaultDeny).toBe(true);
+    await writeRawSettings({ mcp: { bridge: { defaultdeny: false } } });
+    await reloadSettings();
+    expect(getSettings().mcp.bridge?.defaultDeny).toBe(true);
+  });
+
+  it("reads a bridge value that is not an object as deny-by-default, false and null as absent", async () => {
+    await writeRawSettings({ mcp: { bridge: true } });
+    await reloadSettings();
+    expect(getSettings().mcp.bridge).toEqual({ plugins: {}, defaultDeny: true });
+    await writeRawSettings({ mcp: { bridge: false } });
+    await reloadSettings();
+    expect(getSettings().mcp.bridge).toEqual({ plugins: {} });
+    await writeRawSettings({ mcp: { bridge: { defaultDeny: null } } });
+    await reloadSettings();
+    expect(getSettings().mcp.bridge).toEqual({ plugins: {} });
+  });
+});
+
 describe("parseSettings — mcp.audit (#232)", () => {
   it("defaults to best-effort", async () => {
     await writeRawSettings({});
