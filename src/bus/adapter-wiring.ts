@@ -288,6 +288,17 @@ async function mountSlack(
   };
 }
 
+/**
+ * Web UI adapter token: `web.bus.token` wins; the `CCAW_WEBUI_TOKEN` env is
+ * the fallback, so the secret can stay out of settings.json.
+ */
+export function resolveWebUiToken(
+  bus: { token?: string },
+  env: Record<string, string | undefined> = process.env,
+): string | undefined {
+  return bus.token || env.CCAW_WEBUI_TOKEN?.trim() || undefined;
+}
+
 async function mountWebUi(
   bus: BusCore,
   cfg: WebConfig,
@@ -298,11 +309,13 @@ async function mountWebUi(
   // one (and vice versa) by setting `web.enabled: false` + `web.bus: {…}`.
   if (!cfg.bus) return null;
   const { WebUiAdapter } = await import("../adapters/webui");
+  const token = resolveWebUiToken(cfg.bus);
   const adapter = new WebUiAdapter({
     bus,
     ...(cfg.bus.bind ? { bind: cfg.bus.bind } : {}),
-    ...(cfg.bus.token ? { token: cfg.bus.token } : {}),
+    ...(token ? { token } : {}),
     ...(cfg.bus.allowedAgentIds ? { allowedAgentIds: cfg.bus.allowedAgentIds } : {}),
+    ...(cfg.bus.allowedOrigins ? { allowedOrigins: cfg.bus.allowedOrigins } : {}),
     logger,
   });
   await adapter.start();

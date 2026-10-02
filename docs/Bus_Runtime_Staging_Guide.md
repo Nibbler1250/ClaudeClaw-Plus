@@ -107,6 +107,14 @@ Two non-obvious points:
   `web.enabled`. If you want to compare behaviour, do it across
   daemon restarts (flip `runtime`, restart, compare) rather than in
   one process.
+- The adapter refuses any browser request (one carrying an `Origin`
+  header) from a foreign origin with `403 origin_not_allowed`, on
+  `POST /prompt` and on the `/ws` upgrade, token or not. A browser
+  client served from another origin must be listed in
+  `web.bus.allowedOrigins` (e.g. `["https://console.example"]`).
+  curl and native clients send no `Origin` and are unaffected.
+- `web.bus.token` can be left out of `settings.json` and supplied as
+  the `CCAW_WEBUI_TOKEN` environment variable instead.
 
 ## Step 2 — restart the daemon
 
