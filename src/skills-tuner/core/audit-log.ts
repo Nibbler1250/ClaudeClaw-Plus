@@ -14,7 +14,17 @@
  * so the provenance of every number that fed a verdict is itself in the chain.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  statSync,
+} from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
@@ -191,17 +201,61 @@ export class AuditLog {
    *  state. */
   private resyncFromDisk(): void {
     if (!this.path || !existsSync(this.path)) return;
-    let text: string;
+    // Read only the end of the file: this runs on every append, and a full read
+    // made each append O(file size) — tens of ms per record near `rotateBytes`
+    // on a high-volume chain. Start with one window and double it until the
+    // tail and its predecessor are both in it, or the window covers the file.
+    let size: number;
     try {
-      text = readFileSync(this.path, "utf8");
+      size = statSync(this.path).size;
     } catch {
       return;
     }
-    const lines = text.split("\n");
+    for (let window = AuditLog.RESYNC_WINDOW; ; window *= 2) {
+      const start = Math.max(0, size - window);
+      let text: string;
+      try {
+        text = AuditLog.readRange(this.path, start, size - start);
+      } catch {
+        return;
+      }
+      const lines = text.split("\n");
+      // A window that starts mid-file starts mid-line: drop that fragment.
+      if (start > 0) lines.shift();
+      if (this.resyncFromLines(lines, start === 0)) return;
+    }
+  }
+
+  /** Initial read window for `resyncFromDisk`, in bytes. */
+  private static readonly RESYNC_WINDOW = 64 * 1024;
+
+  private static readRange(path: string, start: number, length: number): string {
+    const buf = Buffer.alloc(length);
+    const fd = openSync(path, "r");
+    try {
+      let read = 0;
+      while (read < length) {
+        const n = readSync(fd, buf, read, length - read, start + read);
+        if (n === 0) break;
+        read += n;
+      }
+      return buf.subarray(0, read).toString("utf8");
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  /** Walk `lines` backwards for the tail record and its predecessor; adopt the
+   *  tail as chain head when its last link verifies. `wholeFile` says the lines
+   *  start at the top of the file. Returns false when they ran out before the
+   *  predecessor was found and more of the file exists — the caller widens the
+   *  window — and true once the walk reached the same decision a full read would. */
+  private resyncFromLines(lines: string[], wholeFile: boolean): boolean {
     // Collect the on-disk tail and its immediate predecessor so we can verify
     // the final link before trusting the tail as our new chain head.
     let tail: AuditRecord | undefined;
     let prev: AuditRecord | undefined;
+    let stopped = false;
     for (let i = lines.length - 1; i >= 0 && prev === undefined; i--) {
       const trimmed = lines[i].trim();
       if (!trimmed) continue;
@@ -212,16 +266,19 @@ export class AuditLog {
         // Only the very last line can be torn by a concurrent append; skip it
         // to find the tail, but an earlier torn line ends the walk safely.
         if (tail === undefined) continue;
+        stopped = true;
         break;
       }
       if (typeof rec.seq !== "number" || typeof rec.hash !== "string") {
         if (tail === undefined) continue;
+        stopped = true;
         break;
       }
       if (tail === undefined) tail = rec;
       else prev = rec;
     }
-    if (!tail || tail.seq < this.seq) return;
+    if (!wholeFile && !prev && !stopped) return false;
+    if (!tail || tail.seq < this.seq) return true;
     // Verify the last link before adopting, so a forged tail record can't become
     // our chain head. Two checks: (a) the tail's stored hash matches a recompute
     // over its own content (self-consistent), and (b) its prev_hash chains from
@@ -234,10 +291,11 @@ export class AuditLog {
     const expectedPrevHash =
       prev?.seq === tail.seq - 1 ? prev.hash : tail.seq === 1 ? GENESIS_HASH : undefined;
     if (!selfConsistent || expectedPrevHash === undefined || tail.prev_hash !== expectedPrevHash) {
-      return;
+      return true;
     }
     this.seq = tail.seq;
     this.lastHash = tail.hash;
+    return true;
   }
 
   /** Rotate the active file to `<path>.1` once it grows past `rotateBytes`. The
