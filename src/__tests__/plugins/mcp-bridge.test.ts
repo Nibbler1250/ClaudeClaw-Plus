@@ -189,6 +189,28 @@ describe("PluginMcpBridge", () => {
       expect(invokeEntry?.success).toBe(true);
     });
 
+    it("bounds a handler error in the audit line, not for the caller", async () => {
+      const { bridge, auditPath } = makeBridge();
+      const long = `child said: ${"x".repeat(100_000)}`;
+      bridge.registerPluginTool("audit-test", {
+        name: "fails",
+        description: "Throws a long error",
+        schema: z.object({}),
+        handler: async () => {
+          throw new Error(long);
+        },
+      });
+
+      await expect(bridge.invokeTool("audit-test__fails", {})).rejects.toThrow(long);
+
+      const errorEntry = readAuditLines(auditPath).find((l) => l.event === "error");
+      expect(errorEntry?.phase).toBe("handler");
+      const recorded = errorEntry?.error as string;
+      expect(recorded.startsWith("child said: x")).toBe(true);
+      expect(recorded.length).toBeLessThan(2_100);
+      expect(recorded).toContain(`…[truncated ${long.length - 2_000} chars]`);
+    });
+
     it("writes error entry on validation failure", async () => {
       const { bridge, auditPath } = makeBridge();
 

@@ -118,10 +118,13 @@ function handleMessage(msg: { id?: unknown; method?: string; params?: unknown })
     if (name === "fail_tool") {
       // A tool that ran and failed: per the MCP spec this is a normal
       // JSON-RPC result carrying `isError: true`, not a protocol error.
+      // `size` pads the text, for the error-length bound.
+      const args = params?.arguments as { size?: number };
+      const text = `fail_tool: upstream refused${"x".repeat(args?.size ?? 0)}`;
       send({
         jsonrpc: "2.0",
         id,
-        result: { content: [{ type: "text", text: "fail_tool: upstream refused" }], isError: true },
+        result: { content: [{ type: "text", text }], isError: true },
       });
       return;
     }
