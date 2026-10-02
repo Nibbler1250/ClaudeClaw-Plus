@@ -971,12 +971,27 @@ describe("mcp-multiplexer integration — bridge callback path", () => {
     const fqns = bridge.listTools().map((t) => t.fqn);
     expect(fqns).toContain("mcp-multiplexer__alpha__echo");
 
-    const result = await bridge.invokeTool("mcp-multiplexer__alpha__echo", {
-      arguments: { message: "via-bridge" },
-    });
-    // Upstream returns `{ echo: "via-bridge" }` which is JSON-parsed
-    // by `McpServerProcess.call`, so the bridge result is the object.
-    expect(result).toEqual({ echo: "via-bridge" });
+    const sink = new ToolCallSink({ path: null, autoFlush: false });
+    __setToolCallSinkForTest(sink);
+    try {
+      const result = await bridge.invokeTool("mcp-multiplexer__alpha__echo", {
+        arguments: { message: "via-bridge" },
+      });
+      // Upstream returns `{ echo: "via-bridge" }` which is JSON-parsed
+      // by `McpServerProcess.call`, so the bridge result is the object.
+      expect(result).toEqual({ echo: "via-bridge" });
+      // Same keys as the HTTP path: the upstream server and tool, not the
+      // wrapper plugin and the namespaced name.
+      expect(sink.pending()).toHaveLength(1);
+      expect(sink.pending()[0]).toMatchObject({
+        plugin: "alpha",
+        tool: "echo",
+        agent_id: "plugin-bridge",
+        status: "ok",
+      });
+    } finally {
+      __setToolCallSinkForTest(null);
+    }
   });
 });
 
