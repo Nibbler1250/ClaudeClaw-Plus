@@ -198,6 +198,7 @@ export async function streamBusPrompt(
         () => releaseSlot(agentId, slot, release),
       );
       void receipt.close("timeout", {
+        reason: "bridge_lock_wait_exceeded",
         stage: "bridge_lock",
         timeout_ms: timeoutMs,
         lock_wait_ms: lockWaitMs,
@@ -435,7 +436,11 @@ function runPrompt(
             error: `timed out after ${timeoutMs}ms waiting for agent ${agentId} reply`,
           },
           "timeout",
-          { timeout_ms: timeoutMs, accumulated_chars: accumulated.length },
+          {
+            reason: "no_final_reply_within_timeout",
+            timeout_ms: timeoutMs,
+            accumulated_chars: accumulated.length,
+          },
         );
       },
       Math.min(remainingMs, MAX_TIMER_MS),
