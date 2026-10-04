@@ -2886,6 +2886,52 @@ describe("BusCore IPC", () => {
       expect(finals.filter((f) => f.silent === true)).toHaveLength(0);
     });
 
+    it("an unprompted final in a later turn does not route to the silently closed chat", async () => {
+      const b = makeBus({ nudges: [] });
+      const finals = captureFinals(b);
+
+      await promptTgText(b, "ok");
+      turnEnd(b, "alpha", "");
+      // A turn the bus did not admit (a task notification) starts, then the
+      // agent replies with no chat named.
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "",
+        topic: "prompt",
+        payload: { text: "<task-notification>job done</task-notification>" },
+      });
+      b.ingestReply({ agent_id: "alpha", text: "background job finished", intent: "final" });
+      await tick();
+
+      expect(finals).toHaveLength(2);
+      expect(finals[1]).toMatchObject({ text: "background job finished" });
+      expect(finals[1]?.origin_id).toBeUndefined();
+    });
+
+    for (const [surface, metadata] of [
+      ["Slack files", { files: [{ id: "F1", name: "x.png" }] }],
+      ["Discord attachment_count", { attachment_count: 1 }],
+    ] as const) {
+      it(`still nudges an 'ok' that comes with an attachment (${surface})`, async () => {
+        const nudges: string[] = [];
+        const b = makeBus({ nudges });
+
+        await b.sendPrompt({
+          agent_id: "alpha",
+          origin: "telegram",
+          origin_id: "tg-1",
+          user_id: "u1",
+          text: "ok",
+          metadata: { ...metadata },
+        });
+        turnEnd(b, "alpha", "Looked at the file.");
+        await tick();
+
+        expect(nudges).toHaveLength(1);
+      });
+    }
+
     it("still nudges an 'ok' that comes with an attachment", async () => {
       const nudges: string[] = [];
       const b = makeBus({ nudges });

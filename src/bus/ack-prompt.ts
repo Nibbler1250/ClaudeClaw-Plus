@@ -135,13 +135,14 @@ export function seenKey(agentId: string, originId: string): string {
   return `${agentId}\u0000${originId}`;
 }
 
-/** True when prompt metadata carries an attachment — a flat list (Telegram)
- *  or lists grouped by kind (`{ images: [...], voices: [...] }`). */
+/** True when prompt metadata carries an attachment: `attachments` (Telegram),
+ *  `files` (Slack) or `attachment_count` (Discord). */
 export function hasAttachments(metadata: Record<string, unknown> | undefined): boolean {
-  const a = metadata?.attachments;
-  if (Array.isArray(a)) return a.length > 0;
-  if (a && typeof a === "object") {
-    return Object.values(a).some((v) => (Array.isArray(v) ? v.length > 0 : v != null));
-  }
-  return false;
+  if (!metadata) return false;
+  const { attachments, files, attachment_count } = metadata;
+  return (
+    (Array.isArray(attachments) && attachments.length > 0) ||
+    (Array.isArray(files) && files.length > 0) ||
+    (typeof attachment_count === "number" && attachment_count > 0)
+  );
 }

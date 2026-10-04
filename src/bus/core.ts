@@ -437,7 +437,8 @@ export class BusCoreImpl implements BusCore {
   /** Origin of a turn a silent final just closed. A real `reply` that loses
    *  the race to that silent final is still delivered (see `ingestReply`); it
    *  routes here, since the silent final already cleared `lastPromptOrigin`.
-   *  Dropped once a real final lands or the next prompt is admitted. */
+   *  Dropped once a real final lands, the next turn opens, or the agent's
+   *  origin is cleared (disconnect, cancel, error). */
   private readonly silentClosedOrigin = new Map<
     string,
     { origin: BusOrigin; origin_id: string; userId?: string; skillName?: string }
@@ -1001,6 +1002,7 @@ export class BusCoreImpl implements BusCore {
           // origin and misroute (5-agent review on PR #138, A1 finding).
           const turnCounted = this.currentOperation.has(agentId);
           this.lastPromptOrigin.delete(agentId);
+          this.silentClosedOrigin.delete(agentId);
           this.originAmbiguous.delete(agentId);
           // Same lifecycle: no `response.turn_end` is coming either, so the
           // operation slot would stay filled and stamp the NEXT turn's events
@@ -1169,6 +1171,7 @@ export class BusCoreImpl implements BusCore {
     this.earlyReleased.clear();
     this.awaitOwnPromptLine.clear();
     this.pendingOrigin.clear();
+    this.silentClosedOrigin.clear();
     this.gateParked.clear();
     this.redeliveredSinceClose.clear();
     for (const timer of this.admitSettle.values()) clearTimeout(timer);
@@ -1522,8 +1525,6 @@ export class BusCoreImpl implements BusCore {
     this.pendingTurns.set(req.agent_id, (this.pendingTurns.get(req.agent_id) ?? 0) + 1);
     this.touchTurn(req.agent_id);
     this.publish(promptEvent);
-    // A new turn: a late reply to a silently closed one no longer routes there.
-    this.silentClosedOrigin.delete(req.agent_id);
     // A bare acknowledgement, or a repeat of a message already answered, does
     // not call for a reply: its turn may end without `reply` and that is not a
     // dropped answer (see `handleTurnEnd`). Daemon injects and scheduled jobs
@@ -2824,6 +2825,8 @@ export class BusCoreImpl implements BusCore {
     this.currentTurnReplied.set(agentId, false);
     this.currentTurnFinalPublished.set(agentId, false);
     this.currentTurnFinalOrigins.delete(agentId);
+    // A new turn: a late reply to a silently closed one no longer routes there.
+    this.silentClosedOrigin.delete(agentId);
   }
 
   /**
@@ -3646,6 +3649,7 @@ export class BusCoreImpl implements BusCore {
         // this agent doesn't inherit it and misroute (5-agent review
         // on PR #138, A1 finding).
         this.lastPromptOrigin.delete(agentId);
+        this.silentClosedOrigin.delete(agentId);
         this.originAmbiguous.delete(agentId);
         // No `response.turn_end` is coming, so release the operation slot
         // here too — otherwise the next turn's events carry the cancelled
@@ -3760,6 +3764,7 @@ export class BusCoreImpl implements BusCore {
         // scheduler events for this agent don't inherit the stale
         // origin (5-agent review on PR #138, A1 finding).
         this.lastPromptOrigin.delete(agentId);
+        this.silentClosedOrigin.delete(agentId);
         this.originAmbiguous.delete(agentId);
         // Same reason as `cancel`: no turn_end, so the slot must not survive
         // into the next turn.
