@@ -2752,6 +2752,237 @@ describe("BusCore IPC", () => {
       });
     const tick = () => new Promise((r) => setTimeout(r, 5));
 
+    /* ── no nudge after a bare acknowledgement or an answered repeat ── */
+
+    const promptTgText = (b: BusCore, text: string) =>
+      b.sendPrompt({
+        agent_id: "alpha",
+        origin: "telegram",
+        origin_id: "tg-1",
+        user_id: "u1",
+        text,
+      });
+    const captureFinals = (b: BusCore) => {
+      const finals: Record<string, unknown>[] = [];
+      b.subscribe({ agent_id: "alpha", topics: ["response.text"] }, (event) => {
+        const payload = event.payload as Record<string, unknown>;
+        if (payload?.intent === "final") finals.push(payload);
+      });
+      return finals;
+    };
+
+    for (const ack of ["ok", "👍", "Merci!"]) {
+      it(`closes a bare acknowledgement (${ack}) with a silent final: no nudge, nothing to show`, async () => {
+        const nudges: string[] = [];
+        const b = makeBus({ nudges });
+        const finals = captureFinals(b);
+
+        await promptTgText(b, ack);
+        turnEnd(b, "alpha", "Noted, nothing to do.");
+        await tick();
+
+        expect(nudges).toHaveLength(0);
+        expect(finals).toHaveLength(1);
+        expect(finals[0]).toMatchObject({
+          text: "",
+          silent: true,
+          synthesized: true,
+          origin: "telegram",
+          origin_id: "tg-1",
+        });
+      });
+    }
+
+    it("closes an acknowledgement turn that produced no text at all", async () => {
+      const nudges: string[] = [];
+      const b = makeBus({ nudges });
+      const finals = captureFinals(b);
+
+      await promptTgText(b, "ok");
+      turnEnd(b, "alpha", "");
+      await tick();
+
+      expect(nudges).toHaveLength(0);
+      expect(finals).toHaveLength(1);
+      expect(finals[0]?.silent).toBe(true);
+    });
+
+    it("still nudges a decision word or a real message that ends without reply", async () => {
+      for (const text of ["oui", "go", "ok send it", "check my mail"]) {
+        const nudges: string[] = [];
+        const b = makeBus({ nudges });
+        const finals = captureFinals(b);
+
+        await promptTgText(b, text);
+        turnEnd(b, "alpha", "working text");
+        await tick();
+
+        expect(nudges).toHaveLength(1);
+        expect(finals).toHaveLength(0);
+      }
+    });
+
+    it("still nudges an 'ok' that answers the agent's own question", async () => {
+      const nudges: string[] = [];
+      const b = makeBus({ nudges });
+      const finals = captureFinals(b);
+
+      await promptTgText(b, "the disk is full again");
+      b.ingestReply({
+        agent_id: "alpha",
+        text: "I can purge the old logs.\nShall I go ahead?",
+        intent: "final",
+      });
+      turnEnd(b, "alpha", "");
+      await promptTgText(b, "ok");
+      turnEnd(b, "alpha", "Purged 4 GB of logs.");
+      await tick();
+
+      expect(nudges).toHaveLength(1);
+      expect(finals.filter((f) => f.silent === true)).toHaveLength(0);
+    });
+
+    it("a real reply that loses the race to the silent final is still delivered", async () => {
+      const b = makeBus({ nudges: [] });
+      const finals = captureFinals(b);
+
+      await promptTgText(b, "ok");
+      turnEnd(b, "alpha", "");
+      b.ingestReply({ agent_id: "alpha", text: "noted, I'll ping you at 5", intent: "final" });
+      await tick();
+
+      expect(finals).toHaveLength(2);
+      expect(finals[0]?.silent).toBe(true);
+      // Routed to the chat it answers, not left without an origin.
+      expect(finals[1]).toMatchObject({
+        text: "noted, I'll ping you at 5",
+        origin: "telegram",
+        origin_id: "tg-1",
+      });
+      expect(finals[1]?.silent).toBeUndefined();
+    });
+
+    it("still nudges an approving 'ok' when a heartbeat ran in between", async () => {
+      const nudges: string[] = [];
+      const b = makeBus({ nudges });
+      const finals = captureFinals(b);
+
+      await promptTgText(b, "the disk is full again");
+      b.ingestReply({ agent_id: "alpha", text: "Shall I purge the old logs?", intent: "final" });
+      turnEnd(b, "alpha", "");
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "heartbeat",
+        origin_id: "heartbeat",
+        user_id: "system",
+        text: "heartbeat tick",
+      });
+      turnEnd(b, "alpha", "");
+      await promptTgText(b, "ok");
+      turnEnd(b, "alpha", "Purged 4 GB of logs.");
+      await tick();
+
+      expect(nudges).toHaveLength(1);
+      expect(finals.filter((f) => f.silent === true)).toHaveLength(0);
+    });
+
+    it("an unprompted final in a later turn does not route to the silently closed chat", async () => {
+      const b = makeBus({ nudges: [] });
+      const finals = captureFinals(b);
+
+      await promptTgText(b, "ok");
+      turnEnd(b, "alpha", "");
+      // A turn the bus did not admit (a task notification) starts, then the
+      // agent replies with no chat named.
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "",
+        topic: "prompt",
+        payload: { text: "<task-notification>job done</task-notification>" },
+      });
+      b.ingestReply({ agent_id: "alpha", text: "background job finished", intent: "final" });
+      await tick();
+
+      expect(finals).toHaveLength(2);
+      expect(finals[1]).toMatchObject({ text: "background job finished" });
+      expect(finals[1]?.origin_id).toBeUndefined();
+    });
+
+    for (const [surface, metadata] of [
+      ["Slack files", { files: [{ id: "F1", name: "x.png" }] }],
+      ["Discord attachment_count", { attachment_count: 1 }],
+    ] as const) {
+      it(`still nudges an 'ok' that comes with an attachment (${surface})`, async () => {
+        const nudges: string[] = [];
+        const b = makeBus({ nudges });
+
+        await b.sendPrompt({
+          agent_id: "alpha",
+          origin: "telegram",
+          origin_id: "tg-1",
+          user_id: "u1",
+          text: "ok",
+          metadata: { ...metadata },
+        });
+        turnEnd(b, "alpha", "Looked at the file.");
+        await tick();
+
+        expect(nudges).toHaveLength(1);
+      });
+    }
+
+    it("still nudges an 'ok' that comes with an attachment", async () => {
+      const nudges: string[] = [];
+      const b = makeBus({ nudges });
+      const finals = captureFinals(b);
+
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "telegram",
+        origin_id: "tg-1",
+        user_id: "u1",
+        text: "ok",
+        metadata: { attachments: [{ kind: "photo", path: "/tmp/x.jpg" }] },
+      });
+      turnEnd(b, "alpha", "The screenshot shows a 502.");
+      await tick();
+
+      expect(nudges).toHaveLength(1);
+      expect(finals.filter((f) => f.silent === true)).toHaveLength(0);
+    });
+
+    it("closes a repeat of an already-answered message silently", async () => {
+      const nudges: string[] = [];
+      const b = makeBus({ nudges });
+      const finals = captureFinals(b);
+
+      await promptTgText(b, "what time is the meeting");
+      b.ingestReply({ agent_id: "alpha", text: "3 pm", intent: "final" });
+      turnEnd(b, "alpha", "");
+      // The same message lands again (client resend, double tap).
+      await promptTgText(b, "what time is the meeting");
+      turnEnd(b, "alpha", "Already answered above.");
+      await tick();
+
+      expect(nudges).toHaveLength(0);
+      expect(finals).toHaveLength(2);
+      expect(finals[1]).toMatchObject({ text: "", silent: true });
+    });
+
+    it("still nudges a resend of a message that was never answered", async () => {
+      const nudges: string[] = [];
+      const b = makeBus({ nudges });
+
+      await promptTgText(b, "what time is the meeting");
+      turnEnd(b, "alpha", ""); // ended with nothing: no reply, no final
+      await promptTgText(b, "what time is the meeting");
+      turnEnd(b, "alpha", "working text");
+      await tick();
+
+      expect(nudges).toHaveLength(1);
+    });
+
     it("nudges the agent to call reply instead of synthesizing on the first miss", async () => {
       const nudges: string[] = [];
       const b = makeBus({ nudges });
@@ -3336,7 +3567,9 @@ describe("BusCore IPC", () => {
       await tick();
       client.close();
       await tick();
-      await promptTg(b, "alpha");
+      // A new message: the same "hi" again would be an answered repeat, which
+      // is closed silently instead of nudged.
+      await promptTgText(b, "and now?");
       turnEnd(b, "alpha", "more scratch");
       await tick();
       expect(nudges).toHaveLength(1); // nudge 2, typed at once
