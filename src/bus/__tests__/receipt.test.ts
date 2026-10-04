@@ -122,6 +122,22 @@ describe("ReceiptStore", () => {
     expect(recs.length).toBe(3);
     expect(recs.every((r) => r.final_state === "timeout")).toBe(true);
     expect(recs.every((r) => r.notes?.drained === true)).toBe(true);
+    expect(recs.every((r) => r.notes?.reason === "drained")).toBe(true);
+  });
+
+  test("a timeout closed without a reason is stamped reason=unspecified", async () => {
+    const store = createReceiptStore({ path: logPath });
+    await store.open("bare").close("timeout");
+    await store.open("noted").close("timeout", { timeout_ms: 5 });
+    await store.open("why").close("timeout", { reason: "superseded" });
+    await store.open("blank").close("timeout", { reason: "" });
+    await store.open("ok").close("turn_observed");
+    const byId = Object.fromEntries(readReceipts().map((r) => [r.message_id, r]));
+    expect(byId.bare.notes?.reason).toBe("unspecified");
+    expect(byId.noted.notes).toEqual({ timeout_ms: 5, reason: "unspecified" });
+    expect(byId.why.notes?.reason).toBe("superseded");
+    expect(byId.blank.notes?.reason).toBe("unspecified");
+    expect(byId.ok.notes).toBeUndefined();
   });
 
   test("missing parent directory is created on first append", async () => {
