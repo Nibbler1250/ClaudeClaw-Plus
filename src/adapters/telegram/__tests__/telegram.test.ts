@@ -1880,6 +1880,8 @@ describe("TelegramAdapter — inbound receipts (#211)", () => {
     const r = closedReceipts().find((r) => r.message_id === "tg-1");
     expect(r?.final_state).toBe("timeout");
     expect(r?.notes?.superseded).toBe(true);
+    // A timeout always says why: `superseded` is a reason, not only a flag.
+    expect(r?.notes?.reason).toBe("superseded");
   });
 
   it("drains open receipts as timeout(adapter_stopped) on stop()", async () => {
