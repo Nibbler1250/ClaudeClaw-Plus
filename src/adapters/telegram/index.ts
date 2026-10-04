@@ -567,7 +567,11 @@ export class TelegramAdapter {
     // real delivery comes from the agent's `reply` tool (ingestReply),
     // which carries no tailer source marker. Delivering both double-posts.
     if (isTailerOriginEvent(event)) return;
-    const payload = event.payload as { text?: string };
+    const payload = event.payload as { text?: string; silent?: boolean };
+    if (payload?.silent === true) {
+      await this.closeSilentTurn(agentId, event);
+      return;
+    }
     const rawText = typeof payload?.text === "string" ? payload.text : "";
     if (rawText.length === 0) return;
 
@@ -702,6 +706,32 @@ export class TelegramAdapter {
           emoji,
         });
       }
+    }
+  }
+
+  /**
+   * Close a turn the bus ended with a silent final (the prompt was a bare
+   * acknowledgement or an answered repeat, so silence is the answer): stop the
+   * spinner, close the receipt as observed, and delete the placeholder. Nothing
+   * is sent to the chat.
+   */
+  private async closeSilentTurn(agentId: string, event: BusEvent): Promise<void> {
+    const target = this.targetForOriginOrAgent(agentId, event);
+    if (!target) return;
+    const key = this.convKey(agentId, target.chat_id);
+    this.stopSpinner(key);
+    this.closeTelegramReceipt(key, "turn_observed", { silent: true });
+    const live = this.turnActive.has(key) ? this.lastBotMessage.get(key) : undefined;
+    this.turnActive.delete(key);
+    this.lastBotMessage.delete(key);
+    if (!live) return;
+    try {
+      await this.api.deleteMessage({ chat_id: live.chat_id, message_id: live.message_id });
+    } catch (err) {
+      this.logger.warn(
+        `[telegram-adapter] could not delete the turn placeholder after a silent final; leaving it`,
+        err,
+      );
     }
   }
 

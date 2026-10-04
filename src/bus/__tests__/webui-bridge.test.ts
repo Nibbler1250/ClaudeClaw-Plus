@@ -137,6 +137,43 @@ describe("streamBusPrompt", () => {
     expect(result.synthesized).toBeUndefined();
   });
 
+  it("a bare acknowledgement the agent leaves unanswered settles at turn end, not at the timeout", async () => {
+    const bus = makeBus();
+    const startedAt = Date.now();
+    const pending = streamBusPrompt(bus, "alpha", "ok 👍", { timeoutMs: 4000 });
+    await Promise.resolve();
+    await Promise.resolve();
+    // The turn ends with no `reply` and no text at all.
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "",
+      topic: "response.turn_end",
+      payload: { stop_reason: "end_turn", text: "" },
+    });
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(result.output).toBe("");
+    expect(Date.now() - startedAt).toBeLessThan(1000);
+  });
+
+  it("a scheduled job's 'ok' prompt keeps the safety net: its caller still gets the turn text", async () => {
+    const bus = makeBus();
+    const pending = streamBusPrompt(bus, "alpha", "ok", { originId: "job:daily", timeoutMs: 4000 });
+    await Promise.resolve();
+    await Promise.resolve();
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "",
+      topic: "response.turn_end",
+      payload: { stop_reason: "end_turn", text: "job output" },
+    });
+    const result = await pending;
+    expect(result.output).toBe("job output");
+    expect(result.synthesized).toBe(true);
+  });
+
   it("invokes onChunk for every response.text event", async () => {
     const bus = makeBus();
     const chunks: string[] = [];

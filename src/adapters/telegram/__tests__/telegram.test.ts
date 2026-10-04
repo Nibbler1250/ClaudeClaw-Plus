@@ -2047,6 +2047,42 @@ describe("TelegramAdapter — final reply is a new message (notifies), placehold
     expect(turnApi.deletes[0]?.message_id).toBe(placeholderId);
   });
 
+  it("a silent final (bare acknowledgement) deletes the placeholder, sends nothing, closes the receipt", async () => {
+    const placeholderId = await startTurn();
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: {
+        text: "",
+        intent: "final",
+        origin: "telegram",
+        origin_id: "100",
+        synthesized: true,
+        silent: true,
+      },
+    });
+    await waitFor(() => turnApi.deletes.length === 1);
+
+    expect(turnApi.deletes[0]).toEqual({ chat_id: 100, message_id: placeholderId });
+    // Only the placeholder was ever sent: nothing visible for the silent final.
+    expect(turnApi.sendMessages).toHaveLength(1);
+    expect(turnApi.editMessages).toHaveLength(0);
+    await waitFor(
+      () => existsSync(receiptPath) && readFileSync(receiptPath, "utf8").includes("tg-1"),
+    );
+    const closed = readFileSync(receiptPath, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as ReceiptRecord);
+    const receipt = closed.find((r) => r.message_id === "tg-1");
+    expect(receipt?.final_state).toBe("turn_observed");
+    expect(receipt?.notes).toMatchObject({ silent: true });
+    expect(logs.error).toHaveLength(0);
+  });
+
   it("a failed placeholder delete still delivers the final, and is logged", async () => {
     await startTurn();
     turnApi.failDelete = new Error(

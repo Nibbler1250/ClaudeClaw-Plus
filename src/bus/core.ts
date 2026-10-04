@@ -54,6 +54,12 @@ import type {
   PromptDeliveryOutcome,
 } from "./types";
 import { CHANNEL_DRIVEN_ORIGINS } from "./types";
+import {
+  endsWithQuestion,
+  isAnsweredRepeat,
+  isBareAcknowledgement,
+  type SeenPrompt,
+} from "./ack-prompt";
 import type { AgentJobHandler, JobView } from "./agent-jobs";
 
 /**
@@ -420,6 +426,10 @@ export class BusCoreImpl implements BusCore {
   // Settable post-hoc (like streamPromptHandler): the bus is constructed
   // before the SessionManager exists, so the reconciler is wired afterwards.
   private onMcpSendFailed: (agentId: string, ctx: { reason: string }) => void = () => {};
+  /** Last prompt admitted per agent, to tell a repeat of an already-answered
+   *  message from a fresh one (reply nudge, see `ack-prompt.ts`). */
+  private readonly lastPromptSeen = new Map<string, SeenPrompt>();
+
   /**
    * Tracks the origin (surface + channel id) of the most recent prompt
    * per agent. Adapters use this on outbound `response.text` events to
@@ -431,7 +441,13 @@ export class BusCoreImpl implements BusCore {
    */
   private readonly lastPromptOrigin = new Map<
     string,
-    { origin: BusOrigin; origin_id: string; userId?: string; skillName?: string }
+    {
+      origin: BusOrigin;
+      origin_id: string;
+      userId?: string;
+      skillName?: string;
+      silenceOk?: boolean;
+    }
   >();
 
   /**
@@ -583,7 +599,13 @@ export class BusCoreImpl implements BusCore {
    *  not the newcomer's. */
   private readonly pendingOrigin = new Map<
     string,
-    { origin: BusOrigin; origin_id: string; userId?: string; skillName?: string }
+    {
+      origin: BusOrigin;
+      origin_id: string;
+      userId?: string;
+      skillName?: string;
+      silenceOk?: boolean;
+    }
   >();
   /**
    * #239: agents whose IPC socket closed while a turn was live. The code's own
@@ -1487,6 +1509,28 @@ export class BusCoreImpl implements BusCore {
     this.pendingTurns.set(req.agent_id, (this.pendingTurns.get(req.agent_id) ?? 0) + 1);
     this.touchTurn(req.agent_id);
     this.publish(promptEvent);
+    // A bare acknowledgement, or a repeat of a message already answered, does
+    // not call for a reply: its turn may end without `reply` and that is not a
+    // dropped answer (see `handleTurnEnd`). Daemon injects and scheduled jobs
+    // keep their own handling — their callers read the turn's output.
+    // An "ok" that answers the agent's own question is an approval: it keeps
+    // the nudge.
+    const now = Date.now();
+    const prevSeen = this.lastPromptSeen.get(req.agent_id);
+    const repeat = isAnsweredRepeat(prevSeen, req.origin_id, req.text, now);
+    const answersQuestion = prevSeen?.asked === true && prevSeen.origin_id === req.origin_id;
+    const silenceOk =
+      req.origin_id !== "inject" &&
+      !req.origin_id.startsWith("job:") &&
+      (repeat || (isBareAcknowledgement(req.text) && !answersQuestion));
+    this.lastPromptSeen.set(req.agent_id, {
+      origin_id: req.origin_id,
+      text: req.text.trim(),
+      at: now,
+      // A silenced repeat inherits the answer, so a third copy stays silent.
+      answered: repeat,
+      ...(repeat && prevSeen?.asked ? { asked: true } : {}),
+    });
     // Remember the origin so `ingestReply` can attach it to the
     // outbound `response.text` event for surface-aware routing.
     //
@@ -1498,6 +1542,7 @@ export class BusCoreImpl implements BusCore {
     const originRecord = {
       origin: req.origin,
       origin_id: req.origin_id,
+      ...(silenceOk ? { silenceOk: true } : {}),
       // #258 item 3 slice 2: carry the inbound identity so the per-tool
       // permission gate can scope policy by user and (when a surface tags the
       // submit with metadata.command) by skill.
@@ -2484,7 +2529,13 @@ export class BusCoreImpl implements BusCore {
    *  cached identity ambiguous for the security gate). */
   private applyOrigin(
     agent_id: string,
-    record: { origin: BusOrigin; origin_id: string; userId?: string; skillName?: string },
+    record: {
+      origin: BusOrigin;
+      origin_id: string;
+      userId?: string;
+      skillName?: string;
+      silenceOk?: boolean;
+    },
   ): void {
     if (this.lastPromptOrigin.has(agent_id)) {
       this.originAmbiguous.add(agent_id);
@@ -2562,7 +2613,7 @@ export class BusCoreImpl implements BusCore {
     );
   }
 
-  ingestReply(req: IngestReplyRequest, opts?: { synthetic?: boolean }): void {
+  ingestReply(req: IngestReplyRequest, opts?: { synthetic?: boolean; silent?: boolean }): void {
     // Cross-transport dedup (#217 finding 2): a final reply can arrive both
     // as the agent's real `reply` IPC AND as the synthesized recovery from
     // `response.turn_end` (the JSONL tailer). They race on two unordered
@@ -2608,6 +2659,7 @@ export class BusCoreImpl implements BusCore {
       origin?: BusOrigin;
       origin_id?: string;
       synthesized?: true;
+      silent?: true;
     }> = {
       ts: Date.now(),
       agent_id: req.agent_id,
@@ -2622,6 +2674,10 @@ export class BusCoreImpl implements BusCore {
         // suppress it. The text was never curated through the `reply` tool — it
         // is the raw concatenated turn output #217 falls back to delivering.
         ...(opts?.synthetic ? { synthesized: true as const } : {}),
+        // A silent final closes the turn for every caller (webui / inject /
+        // job awaiters, the Telegram placeholder) with nothing to show: the
+        // prompt did not call for an answer (see `handleTurnEnd`).
+        ...(opts?.silent ? { silent: true as const } : {}),
       },
     };
     this.publish(event);
@@ -2652,7 +2708,10 @@ export class BusCoreImpl implements BusCore {
         this.lastPromptOrigin.delete(req.agent_id);
         this.originAmbiguous.delete(req.agent_id);
       }
-      if (effective) {
+      // A silent final answers nothing: it leaves the dedup below open, so a
+      // real `reply` that loses the race to the turn end is still delivered
+      // rather than dropped as a duplicate.
+      if (effective && !opts?.silent) {
         let answered = this.currentTurnFinalOrigins.get(req.agent_id);
         if (!answered) {
           answered = new Set();
@@ -2667,7 +2726,14 @@ export class BusCoreImpl implements BusCore {
       // #217 finding 2: record that a final was published for this turn so
       // the cross-transport race loser (real reply vs synthesized) is
       // suppressed above.
-      this.currentTurnFinalPublished.set(req.agent_id, true);
+      if (!opts?.silent) {
+        this.currentTurnFinalPublished.set(req.agent_id, true);
+        const seen = this.lastPromptSeen.get(req.agent_id);
+        if (seen && (!effective || effective.origin_id === seen.origin_id)) {
+          seen.answered = true;
+          seen.asked = endsWithQuestion(req.text);
+        }
+      }
       // Reply-tool enforcement (#215/#240): a final was delivered (incl. one a
       // nudge successfully produced) — clear the nudge state for the turn.
       this.replyNudged.delete(req.agent_id);
@@ -2746,6 +2812,25 @@ export class BusCoreImpl implements BusCore {
     // nudged that produced none — the original text stashed when we nudged, so a
     // nudged-but-still-silent turn never loses the first turn's output (#215).
     const nudged = this.replyNudged.get(agentId) === true;
+    // A bare acknowledgement ("ok", 👍) or a repeat of an answered message:
+    // silence is the answer, so no nudge into a filler reply and no raw text.
+    // The turn is still closed with a silent final — webui / job awaiters get
+    // their end and the Telegram placeholder is cleared — even when the turn
+    // produced no text at all.
+    const slot = this.lastPromptOrigin.get(agentId);
+    if (slot?.silenceOk && !nudged && CHANNEL_DRIVEN_ORIGINS.has(slot.origin)) {
+      console.warn(
+        `[bus] turn ended without reply for agent=${agentId} (origin=${slot.origin}) ` +
+          "on a bare acknowledgement or an answered repeat — closing it with a silent final " +
+          "(no nudge, nothing shown).",
+      );
+      this.currentTurnReplied.set(agentId, true);
+      this.ingestReply(
+        { agent_id: agentId, text: "", intent: "final" },
+        { synthetic: true, silent: true },
+      );
+      return;
+    }
     const ownText = text && text.trim().length > 0 ? text : "";
     const deliverText = ownText || (nudged ? (this.pendingNudgeText.get(agentId) ?? "") : "");
     if (deliverText.trim().length === 0) return;
