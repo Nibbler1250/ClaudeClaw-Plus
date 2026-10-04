@@ -37,6 +37,7 @@ import {
   selectModel as governanceSelectModel,
   configureRouter as configureGovernanceRouter,
 } from "./governance/model-router";
+import { setModeDispatchSink, fileModeDispatchSink } from "./governance/mode-dispatch-journal";
 import {
   recordInvocationStart,
   recordInvocationCompletion,
@@ -86,6 +87,9 @@ function ensureGovernanceRouter(modes?: AgenticMode[], defaultMode?: string): vo
       defaultProvider: "anthropic",
       defaultModel: "claude-3-5-sonnet",
     });
+    // Activate mode_dispatch telemetry: from here, each keyword/phrase route is
+    // journalled for the tuner's routing_reclassify_rate (inert until now).
+    setModeDispatchSink(fileModeDispatchSink());
     governanceInitialized = true;
   }
 }
