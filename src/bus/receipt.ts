@@ -247,6 +247,12 @@ export function createReceiptStore(opts: ReceiptStoreOptions = {}): ReceiptStore
         rec.final_state = state;
         rec.duration_ms = now().getTime() - startedAt.getTime();
         if (notes) rec.notes = { ...(rec.notes ?? {}), ...notes };
+        // Several causes share `timeout`; only `notes.reason` tells them
+        // apart. A caller that forgot one still lands as a countable reason.
+        const reason = rec.notes?.reason;
+        if (state === "timeout" && (typeof reason !== "string" || reason === "")) {
+          rec.notes = { ...(rec.notes ?? {}), reason: "unspecified" };
+        }
         openReceipts.delete(message_id);
         deindexHash(rec.prompt_hash);
         if (rec.prompt_hash) {
@@ -334,7 +340,7 @@ export function createReceiptStore(opts: ReceiptStoreOptions = {}): ReceiptStore
     },
     async drain(state: ReceiptFinalState): Promise<void> {
       const pending = [...openReceipts.values()];
-      await Promise.all(pending.map((r) => r.close(state, { drained: true })));
+      await Promise.all(pending.map((r) => r.close(state, { drained: true, reason: "drained" })));
     },
   };
 }

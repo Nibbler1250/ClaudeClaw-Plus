@@ -483,6 +483,7 @@ describe("streamBusPrompt — receipt chain", () => {
     expect(recs).toHaveLength(1);
     expect(recs[0].final_state).toBe("timeout");
     expect(recs[0].notes?.timeout_ms).toBe(100);
+    expect(recs[0].notes?.reason).toBe("no_final_reply_within_timeout");
   });
 
   it("indexes the open receipt by prompt_hash so the bus → PTY seam can patch", async () => {
@@ -919,7 +920,11 @@ describe("streamBusPrompt — the timeout covers the per-agent lock wait (#454)"
     expect(gaveUp.final_state).toBe("timeout");
     expect(Math.abs(Date.parse(gaveUp.received_at) - arrived)).toBeLessThan(50);
     expect(gaveUp.duration_ms).toBeGreaterThanOrEqual(90);
-    expect(gaveUp.notes).toMatchObject({ stage: "bridge_lock", timeout_ms: 100 });
+    expect(gaveUp.notes).toMatchObject({
+      reason: "bridge_lock_wait_exceeded",
+      stage: "bridge_lock",
+      timeout_ms: 100,
+    });
     expect(gaveUp.notes?.lock_wait_ms as number).toBeGreaterThanOrEqual(90);
     // The prompt that never went out is not indexed for the bus → PTY seam.
     expect(store.findByPromptHash(hashPrompt("quitter"))).toBeUndefined();

@@ -989,7 +989,7 @@ export class TelegramAdapter {
     // A new prompt arrived before the previous turn replied — close the
     // stale receipt as `timeout` (note `superseded`) so it doesn't leak,
     // distinct from a genuine no-reply timeout.
-    this.closeTelegramReceipt(key, "timeout", { superseded: true });
+    this.closeTelegramReceipt(key, "timeout", { superseded: true, reason: "superseded" });
     const receipt = openInboundReceipt({
       store: this.receiptStore,
       messageId: `tg-${updateId}`,
