@@ -92,6 +92,20 @@ export interface AuditRecord extends AuditEntry {
 
 const GENESIS_HASH = "0".repeat(64);
 
+/** True when a parsed line carries the chain fields an append can link to. */
+function isChained(rec: AuditRecord | null): rec is AuditRecord {
+  // A line can parse to any JSON value (`null`, a number); only an object can be
+  // chained, and only a positive safe-integer seq can be continued (`1e999 + 1`
+  // is Infinity, which serializes as null — the same break as #472).
+  return (
+    typeof rec === "object" &&
+    rec !== null &&
+    Number.isSafeInteger(rec.seq) &&
+    rec.seq > 0 &&
+    typeof rec.hash === "string"
+  );
+}
+
 /** Canonical, stable serialization of the chained fields (key order fixed). */
 function canonical(seq: number, ts: string, prevHash: string, entry: AuditEntry): string {
   return JSON.stringify({
@@ -186,7 +200,11 @@ export class AuditLog {
       this.records.push(rec);
       this.trimWindow();
     }
-    const last = this.records.at(-1);
+    // The chain head is the last record that carries chain fields. The same file
+    // also holds plain `auditLog()` lines ({ts, event, ...} — core/security.ts)
+    // and records an earlier writer left with `seq: null`; adopting one of those
+    // makes the next append write `seq: null` with no `prev_hash` (#472).
+    const last = this.records.findLast(isChained);
     if (last) {
       this.lastHash = last.hash;
       this.seq = last.seq;
@@ -269,11 +287,10 @@ export class AuditLog {
         stopped = true;
         break;
       }
-      if (typeof rec.seq !== "number" || typeof rec.hash !== "string") {
-        if (tail === undefined) continue;
-        stopped = true;
-        break;
-      }
+      // A record without chain fields (a plain `auditLog()` line, or a
+      // `seq: null` record) is not part of the chain: step over it wherever it
+      // sits, so it neither becomes the tail nor hides the tail's predecessor.
+      if (!isChained(rec)) continue;
       if (tail === undefined) tail = rec;
       else prev = rec;
     }
