@@ -116,6 +116,13 @@ describe("classifyTask matchedKeyword (dispatch-point provenance)", () => {
     const c = classifyTask("hello there", MODES, "coding");
     expect(c.matchedKeyword).toBe("");
   });
+
+  it("returns an empty matchedKeyword on a tie fallback (the tie-break picked the mode)", () => {
+    // "fix" (coding) and "roadmap" (planning) score one point each; defaultMode breaks the tie.
+    const c = classifyTask("fix the roadmap", MODES, "coding");
+    expect(c.mode).toBe("coding");
+    expect(c.matchedKeyword).toBe("");
+  });
 });
 
 describe("governance selectModel → recordModeDispatch (integration)", () => {

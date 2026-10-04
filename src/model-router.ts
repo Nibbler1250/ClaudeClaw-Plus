@@ -10,7 +10,7 @@ interface TaskClassification {
   model: string;
   confidence: number;
   reasoning: string;
-  /** The phrase/keyword that selected this mode ("" when none matched: default fallback, or a win on the "?" boost alone). */
+  /** The phrase/keyword that selected this mode ("" when no keyword decided it: default fallback, a tie, or a win on the "?" boost alone). */
   matchedKeyword: string;
 }
 
@@ -90,7 +90,8 @@ export function classifyTask(
       model: tiedFallback.mode.model,
       confidence: 0.6,
       reasoning: `Tie between ${tied.map((s) => s.mode.name).join(", ")} (score: ${top.score}), using ${tiedFallback.mode.name}`,
-      matchedKeyword: tiedFallback.firstKeyword,
+      // The tie-break picked the mode, not a keyword: no provenance to report.
+      matchedKeyword: "",
     };
   }
 
