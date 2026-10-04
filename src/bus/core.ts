@@ -56,9 +56,11 @@ import type {
 import { CHANNEL_DRIVEN_ORIGINS } from "./types";
 import {
   endsWithQuestion,
+  hasAttachments,
   isAnsweredRepeat,
   isBareAcknowledgement,
   type SeenPrompt,
+  seenKey,
 } from "./ack-prompt";
 import type { AgentJobHandler, JobView } from "./agent-jobs";
 
@@ -426,9 +428,20 @@ export class BusCoreImpl implements BusCore {
   // Settable post-hoc (like streamPromptHandler): the bus is constructed
   // before the SessionManager exists, so the reconciler is wired afterwards.
   private onMcpSendFailed: (agentId: string, ctx: { reason: string }) => void = () => {};
-  /** Last prompt admitted per agent, to tell a repeat of an already-answered
-   *  message from a fresh one (reply nudge, see `ack-prompt.ts`). */
+  /** Last user prompt admitted per agent and chat (`seenKey`), to tell a
+   *  repeat of an already-answered message from a fresh one, and an "ok" that
+   *  approves the agent's question from a bare acknowledgement (reply nudge,
+   *  see `ack-prompt.ts`). Keyed per chat so a heartbeat or another chat in
+   *  between does not erase what this chat was last asked. */
   private readonly lastPromptSeen = new Map<string, SeenPrompt>();
+  /** Origin of a turn a silent final just closed. A real `reply` that loses
+   *  the race to that silent final is still delivered (see `ingestReply`); it
+   *  routes here, since the silent final already cleared `lastPromptOrigin`.
+   *  Dropped once a real final lands or the next prompt is admitted. */
+  private readonly silentClosedOrigin = new Map<
+    string,
+    { origin: BusOrigin; origin_id: string; userId?: string; skillName?: string }
+  >();
 
   /**
    * Tracks the origin (surface + channel id) of the most recent prompt
@@ -1509,28 +1522,39 @@ export class BusCoreImpl implements BusCore {
     this.pendingTurns.set(req.agent_id, (this.pendingTurns.get(req.agent_id) ?? 0) + 1);
     this.touchTurn(req.agent_id);
     this.publish(promptEvent);
+    // A new turn: a late reply to a silently closed one no longer routes there.
+    this.silentClosedOrigin.delete(req.agent_id);
     // A bare acknowledgement, or a repeat of a message already answered, does
     // not call for a reply: its turn may end without `reply` and that is not a
     // dropped answer (see `handleTurnEnd`). Daemon injects and scheduled jobs
     // keep their own handling — their callers read the turn's output.
     // An "ok" that answers the agent's own question is an approval: it keeps
     // the nudge.
-    const now = Date.now();
-    const prevSeen = this.lastPromptSeen.get(req.agent_id);
-    const repeat = isAnsweredRepeat(prevSeen, req.origin_id, req.text, now);
-    const answersQuestion = prevSeen?.asked === true && prevSeen.origin_id === req.origin_id;
-    const silenceOk =
+    // A text that comes with an attachment ("ok" under a screenshot) is not
+    // a bare acknowledgement: the attachment is the message.
+    let silenceOk = false;
+    if (
+      CHANNEL_DRIVEN_ORIGINS.has(req.origin) &&
       req.origin_id !== "inject" &&
-      !req.origin_id.startsWith("job:") &&
-      (repeat || (isBareAcknowledgement(req.text) && !answersQuestion));
-    this.lastPromptSeen.set(req.agent_id, {
-      origin_id: req.origin_id,
-      text: req.text.trim(),
-      at: now,
-      // A silenced repeat inherits the answer, so a third copy stays silent.
-      answered: repeat,
-      ...(repeat && prevSeen?.asked ? { asked: true } : {}),
-    });
+      !req.origin_id.startsWith("job:")
+    ) {
+      const now = Date.now();
+      const key = seenKey(req.agent_id, req.origin_id);
+      const prevSeen = this.lastPromptSeen.get(key);
+      const repeat = isAnsweredRepeat(prevSeen, req.origin_id, req.text, now);
+      const answersQuestion = prevSeen?.asked === true;
+      silenceOk =
+        !hasAttachments(req.metadata) &&
+        (repeat || (isBareAcknowledgement(req.text) && !answersQuestion));
+      this.lastPromptSeen.set(key, {
+        origin_id: req.origin_id,
+        text: req.text.trim(),
+        at: now,
+        // A silenced repeat inherits the answer, so a third copy stays silent.
+        answered: repeat,
+        ...(repeat && prevSeen?.asked ? { asked: true } : {}),
+      });
+    }
     // Remember the origin so `ingestReply` can attach it to the
     // outbound `response.text` event for surface-aware routing.
     //
@@ -2630,7 +2654,12 @@ export class BusCoreImpl implements BusCore {
     // The origin this reply is EFFECTIVELY routed to: the named chat, else the
     // slot. Dedup and bookkeeping below use it, so an unnamed final answering
     // the slot's chat and a later final naming that same chat are one answer.
-    const effective = named ?? this.lastPromptOrigin.get(req.agent_id);
+    const effective =
+      named ??
+      this.lastPromptOrigin.get(req.agent_id) ??
+      (req.intent === "final" && !opts?.silent
+        ? this.silentClosedOrigin.get(req.agent_id)
+        : undefined);
     if (req.intent === "final" && !opts?.synthetic) {
       const answered = this.currentTurnFinalOrigins.get(req.agent_id);
       if (
@@ -2708,6 +2737,8 @@ export class BusCoreImpl implements BusCore {
         this.lastPromptOrigin.delete(req.agent_id);
         this.originAmbiguous.delete(req.agent_id);
       }
+      if (opts?.silent && slot) this.silentClosedOrigin.set(req.agent_id, slot);
+      else if (!opts?.silent) this.silentClosedOrigin.delete(req.agent_id);
       // A silent final answers nothing: it leaves the dedup below open, so a
       // real `reply` that loses the race to the turn end is still delivered
       // rather than dropped as a duplicate.
@@ -2728,8 +2759,10 @@ export class BusCoreImpl implements BusCore {
       // suppressed above.
       if (!opts?.silent) {
         this.currentTurnFinalPublished.set(req.agent_id, true);
-        const seen = this.lastPromptSeen.get(req.agent_id);
-        if (seen && (!effective || effective.origin_id === seen.origin_id)) {
+        const seen = effective
+          ? this.lastPromptSeen.get(seenKey(req.agent_id, effective.origin_id))
+          : undefined;
+        if (seen) {
           seen.answered = true;
           seen.asked = endsWithQuestion(req.text);
         }

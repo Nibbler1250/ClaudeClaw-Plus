@@ -2085,6 +2085,39 @@ describe("TelegramAdapter — final reply is a new message (notifies), placehold
     expect(logs.error).toHaveLength(0);
   });
 
+  it("a silent final keeps a turn message the agent wrote progress into, without the spinner", async () => {
+    const placeholderId = await startTurn();
+
+    emitReply("rerunning at 22:00", "progress");
+    await waitFor(() => turnApi.editMessages.length === 1);
+    // Let the progress path restart the spinner on the edited message.
+    await new Promise((r) => setTimeout(r, 10));
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: {
+        text: "",
+        intent: "final",
+        origin: "telegram",
+        origin_id: "100",
+        synthesized: true,
+        silent: true,
+      },
+    });
+    await waitFor(() => turnApi.editMessages.length === 2);
+
+    // The progress text is the agent's answer: it stays, the spinner frame goes.
+    expect(turnApi.deletes).toHaveLength(0);
+    expect(turnApi.sendMessages).toHaveLength(1);
+    expect(turnApi.editMessages[1]).toMatchObject({
+      message_id: placeholderId,
+      text: "rerunning at 22:00",
+    });
+    expect(logs.error).toHaveLength(0);
+  });
+
   it("a failed placeholder delete still delivers the final, and is logged", async () => {
     await startTurn();
     turnApi.failDelete = new Error(

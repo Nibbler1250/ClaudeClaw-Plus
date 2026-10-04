@@ -25,6 +25,8 @@ describe("isBareAcknowledgement", () => {
       "d’accord",
       "noté",
       "cool thx",
+      "❤️",
+      "✅ merci",
     ]) {
       expect(isBareAcknowledgement(t)).toBe(true);
     }
@@ -45,7 +47,14 @@ describe("isBareAcknowledgement", () => {
       "...",
       "",
       "merci merci merci merci",
+      "ok？",
     ]) {
+      expect(isBareAcknowledgement(t)).toBe(false);
+    }
+  });
+
+  it("rejects emoji that may ask, refuse or stop", () => {
+    for (const t of ["🤔", "❓", "👎", "❌", "😡", "🆘", "🚨", "⏹️", "ok 👎", "👍❌"]) {
       expect(isBareAcknowledgement(t)).toBe(false);
     }
   });

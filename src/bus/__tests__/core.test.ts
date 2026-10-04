@@ -2853,8 +2853,57 @@ describe("BusCore IPC", () => {
 
       expect(finals).toHaveLength(2);
       expect(finals[0]?.silent).toBe(true);
-      expect(finals[1]).toMatchObject({ text: "noted, I'll ping you at 5" });
+      // Routed to the chat it answers, not left without an origin.
+      expect(finals[1]).toMatchObject({
+        text: "noted, I'll ping you at 5",
+        origin: "telegram",
+        origin_id: "tg-1",
+      });
       expect(finals[1]?.silent).toBeUndefined();
+    });
+
+    it("still nudges an approving 'ok' when a heartbeat ran in between", async () => {
+      const nudges: string[] = [];
+      const b = makeBus({ nudges });
+      const finals = captureFinals(b);
+
+      await promptTgText(b, "the disk is full again");
+      b.ingestReply({ agent_id: "alpha", text: "Shall I purge the old logs?", intent: "final" });
+      turnEnd(b, "alpha", "");
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "heartbeat",
+        origin_id: "heartbeat",
+        user_id: "system",
+        text: "heartbeat tick",
+      });
+      turnEnd(b, "alpha", "");
+      await promptTgText(b, "ok");
+      turnEnd(b, "alpha", "Purged 4 GB of logs.");
+      await tick();
+
+      expect(nudges).toHaveLength(1);
+      expect(finals.filter((f) => f.silent === true)).toHaveLength(0);
+    });
+
+    it("still nudges an 'ok' that comes with an attachment", async () => {
+      const nudges: string[] = [];
+      const b = makeBus({ nudges });
+      const finals = captureFinals(b);
+
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "telegram",
+        origin_id: "tg-1",
+        user_id: "u1",
+        text: "ok",
+        metadata: { attachments: [{ kind: "photo", path: "/tmp/x.jpg" }] },
+      });
+      turnEnd(b, "alpha", "The screenshot shows a 502.");
+      await tick();
+
+      expect(nudges).toHaveLength(1);
+      expect(finals.filter((f) => f.silent === true)).toHaveLength(0);
     });
 
     it("closes a repeat of an already-answered message silently", async () => {

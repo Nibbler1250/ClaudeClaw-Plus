@@ -37,11 +37,48 @@ const ACK_WORDS = new Set([
 /** At most this many words for a text to count as a bare acknowledgement. */
 const ACK_MAX_WORDS = 3;
 
+/** Emoji that only acknowledge. Any other emoji (🤔 ❓ 👎 ❌ 🛑 …) may ask,
+ *  refuse or stop, so a text carrying one is not a bare acknowledgement. */
+const ACK_EMOJI = new Set([
+  "👍",
+  "👌",
+  "🙏",
+  "✅",
+  "✔",
+  "☑",
+  "👏",
+  "🙌",
+  "💯",
+  "❤",
+  "♥",
+  "😊",
+  "🙂",
+  "😀",
+  "😃",
+  "😄",
+  "😁",
+  "🤝",
+  "🫡",
+  "💪",
+  "🔥",
+  "😎",
+  "🤙",
+]);
+
+/** Emoji in `t` after dropping variation selectors and skin-tone modifiers. */
+function emojiIn(t: string): string[] {
+  return (
+    t.replace(/[\uFE0E\uFE0F\u{1F3FB}-\u{1F3FF}]/gu, "").match(/\p{Extended_Pictographic}/gu) ?? []
+  );
+}
+
 /** True when `text` is only an acknowledgement: ack words and/or emoji,
  *  nothing else (no question, no digits, no other word). */
 export function isBareAcknowledgement(text: string): boolean {
   const t = text.trim().toLowerCase();
-  if (t.length === 0 || t.length > 40 || t.includes("?")) return false;
+  if (t.length === 0 || t.length > 40 || /[?？]/.test(t)) return false;
+  const emoji = emojiIn(t);
+  if (!emoji.every((e) => ACK_EMOJI.has(e))) return false;
   // Emoji, symbols and punctuation carry no request; drop them.
   const words = t
     .replace(/[’`]/g, "'")
@@ -51,7 +88,7 @@ export function isBareAcknowledgement(text: string): boolean {
   if (words.length === 0) {
     // Only emoji / punctuation (👍, 👌, 🙏): an acknowledgement. Bare
     // punctuation ("!", "...") is not — it may be a nudge from the user.
-    return /\p{Extended_Pictographic}/u.test(t);
+    return emoji.length > 0;
   }
   if (words.length > ACK_MAX_WORDS) return false;
   return words.every((w, i) => ACK_WORDS.has(w) || (w === "you" && words[i - 1] === "thank"));
@@ -91,4 +128,20 @@ export function isAnsweredRepeat(
     prev.text === text.trim() &&
     now - prev.at <= REPEAT_WINDOW_MS
   );
+}
+
+/** Key of `BusCore`'s last-seen prompt map: one entry per agent and chat. */
+export function seenKey(agentId: string, originId: string): string {
+  return `${agentId}\u0000${originId}`;
+}
+
+/** True when prompt metadata carries an attachment — a flat list (Telegram)
+ *  or lists grouped by kind (`{ images: [...], voices: [...] }`). */
+export function hasAttachments(metadata: Record<string, unknown> | undefined): boolean {
+  const a = metadata?.attachments;
+  if (Array.isArray(a)) return a.length > 0;
+  if (a && typeof a === "object") {
+    return Object.values(a).some((v) => (Array.isArray(v) ? v.length > 0 : v != null));
+  }
+  return false;
 }

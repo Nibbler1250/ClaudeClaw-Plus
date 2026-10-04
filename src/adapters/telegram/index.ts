@@ -170,6 +170,10 @@ export class TelegramAdapter {
   >();
   /** Agents with a live turn message (placeholder/progress) the next reply edits in place. */
   private readonly turnActive = new Set<string>();
+  /** Text the agent put in the live turn message (progress / edit_message).
+   *  Absent while it is still the bare placeholder. A silent final keeps a
+   *  message that carries text and only deletes the bare placeholder. */
+  private readonly liveText = new Map<string, string>();
 
   /** Open per-message receipts (#211) keyed by convKey. Closed on the
    *  first final reply (`turn_observed`) or by timeout (`timeout`), so an
@@ -291,6 +295,7 @@ export class TelegramAdapter {
     this.pendingHumanAsks.clear();
     this.lastChatPerAgent.clear();
     this.lastBotMessage.clear();
+    this.liveText.clear();
     for (const id of Array.from(this.spinnerState.keys())) this.stopSpinner(id);
     this.turnActive.clear();
     // Receipt (#211): close any still-open receipts so their watchdog
@@ -468,6 +473,7 @@ export class TelegramAdapter {
           message_thread_id: message.message_thread_id,
         });
         this.turnActive.add(key);
+        this.liveText.delete(key);
         this.startSpinner(key, "...", chatId, id);
       }
     } catch (err) {
@@ -621,6 +627,7 @@ export class TelegramAdapter {
       // wants; the final goes out as a new message (see deliverFinal).
       const live = this.lastBotMessage.get(key);
       if (live) {
+        this.liveText.set(key, cleanedText);
         const editText = `${FRAMES[0]} ${cleanedText}`;
         try {
           await this.editHtml({
@@ -689,6 +696,7 @@ export class TelegramAdapter {
             message_thread_id: target.message_thread_id,
           });
           this.turnActive.add(key);
+          this.liveText.set(key, cleanedText);
           this.startSpinner(key, cleanedText, target.chat_id, id);
         }
       } catch (err) {
@@ -713,18 +721,34 @@ export class TelegramAdapter {
    * Close a turn the bus ended with a silent final (the prompt was a bare
    * acknowledgement or an answered repeat, so silence is the answer): stop the
    * spinner, close the receipt as observed, and delete the placeholder. Nothing
-   * is sent to the chat.
+   * is sent to the chat. A live message the agent already wrote into
+   * (progress / edit_message) is its answer: it stays, without the spinner.
    */
   private async closeSilentTurn(agentId: string, event: BusEvent): Promise<void> {
     const target = this.targetForOriginOrAgent(agentId, event);
     if (!target) return;
     const key = this.convKey(agentId, target.chat_id);
+    const spinning = this.spinnerState.has(key);
     this.stopSpinner(key);
     this.closeTelegramReceipt(key, "turn_observed", { silent: true });
     const live = this.turnActive.has(key) ? this.lastBotMessage.get(key) : undefined;
+    const text = this.liveText.get(key);
     this.turnActive.delete(key);
     this.lastBotMessage.delete(key);
+    this.liveText.delete(key);
     if (!live) return;
+    if (text !== undefined) {
+      if (!spinning) return;
+      try {
+        await this.editHtml({ chat_id: live.chat_id, message_id: live.message_id, text });
+      } catch (err) {
+        this.logger.warn(
+          `[telegram-adapter] could not clear the spinner from the turn message after a silent final; leaving it`,
+          err,
+        );
+      }
+      return;
+    }
     try {
       await this.api.deleteMessage({ chat_id: live.chat_id, message_id: live.message_id });
     } catch (err) {
@@ -767,6 +791,7 @@ export class TelegramAdapter {
     // never retained for follow-up edits (avoids the stale-message_id edit bug).
     this.turnActive.delete(key);
     this.lastBotMessage.delete(key);
+    this.liveText.delete(key);
 
     const send = {
       chat_id: target.chat_id,
@@ -878,6 +903,7 @@ export class TelegramAdapter {
     // Edit the live message; keep animating if a spinner was running.
     const wasSpinning = this.spinnerState.has(key);
     this.stopSpinner(key);
+    this.liveText.set(key, newText);
     const sendText = wasSpinning ? `${FRAMES[0]} ${newText}` : newText;
     try {
       try {
