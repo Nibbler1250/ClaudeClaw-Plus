@@ -1050,7 +1050,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
       token:
         process.env.TELEGRAM_TOKEN?.trim() ||
         (typeof raw.telegram?.token === "string" ? raw.telegram.token.trim() : ""),
-      allowedUserIds: raw.telegram?.allowedUserIds ?? [],
+      allowedUserIds: parseTelegramUserIds(raw.telegram?.allowedUserIds),
       listenChats: Array.isArray(raw.telegram?.listenChats)
         ? raw.telegram.listenChats.map(Number)
         : [],
@@ -1861,6 +1861,68 @@ function parseMcpConfig(raw: any, webEnabled: unknown): McpConfig {
     bridge: parseMcpBridgeConfig(raw?.bridge),
     audit: parseMcpAuditPolicy(raw?.audit),
   };
+}
+
+/** The `telegram.allowedUserIds` warnings printed by the last parse: the
+ *  hot-reload re-parses the settings every 30 s, and one bad value should not
+ *  warn forever. A clean parse clears it, so a value that goes bad again warns
+ *  again. */
+let telegramIdsLastWarnings = "";
+
+/** TEST-ONLY: forget the last printed warnings, so each test sees its own. */
+export function _resetTelegramIdsWarningsForTests(): void {
+  telegramIdsLastWarnings = "";
+}
+
+/**
+ * `telegram.allowedUserIds`: a list of integer ids. A list keeps its non-zero
+ * integers, and integer strings as the number they spell; any other entry is
+ * dropped with a warning. Negative ids (group chats) never match a sender but
+ * are kept: the list also names where job output is forwarded. Taken as-is, a
+ * string reached `includes` in the allow check and matched any user whose id
+ * is a substring of it.
+ *
+ * An empty list means "allow everyone", so a value that is present but holds
+ * no valid id (a lone string or number written by mistake, a list of junk)
+ * must not collapse to `[]`. It becomes `[0]`: no Telegram user has id 0, so
+ * both runtimes' allow checks refuse every sender. Outbound forwards that walk
+ * the list then target chat 0 and log a send error until the value is fixed.
+ */
+function parseTelegramUserIds(value: unknown): number[] {
+  const warnings: string[] = [];
+  const ids = telegramUserIdsOf(value, warnings);
+  const key = warnings.join("\n");
+  if (key !== telegramIdsLastWarnings) for (const w of warnings) console.warn(w);
+  telegramIdsLastWarnings = key;
+  return ids;
+}
+
+function telegramUserIdsOf(value: unknown, warnings: string[]): number[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    warnings.push(
+      `[config] telegram.allowedUserIds must be a list of integer user ids, got a ${typeof value}; no Telegram user is allowed until it is fixed`,
+    );
+    return [0];
+  }
+  const ids: number[] = [];
+  for (const entry of value) {
+    const id =
+      typeof entry === "string" && /^\s*-?\d+\s*$/.test(entry) ? Number(entry.trim()) : entry;
+    if (typeof id === "number" && Number.isSafeInteger(id) && id !== 0) ids.push(id);
+  }
+  if (ids.length < value.length) {
+    warnings.push(
+      `[config] telegram.allowedUserIds: ignored ${value.length - ids.length} entry(ies) that are not integer ids`,
+    );
+  }
+  if (value.length > 0 && ids.length === 0) {
+    warnings.push(
+      "[config] telegram.allowedUserIds has no valid user id; no Telegram user is allowed until it is fixed",
+    );
+    return [0];
+  }
+  return ids;
 }
 
 /**

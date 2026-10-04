@@ -582,8 +582,25 @@ describe("PluginMcpBridge", () => {
       const body = { foo: "bar" };
       const ts = Date.now();
       const sig = bridge.signCall("test-plugin", body, ts);
-      const tampered = sig.slice(0, -2) + "00";
+      // Flip the last hex char to a guaranteed-different one. A fixed suffix
+      // (e.g. "00") equals the real signature 1 time in 256 and flakes.
+      const tampered = sig.slice(0, -1) + (sig.at(-1) === "0" ? "1" : "0");
+      expect(tampered).not.toBe(sig);
       expect(bridge.verifyCall("test-plugin", body, ts, tampered)).toBe(false);
+    });
+
+    it("verifyCall rejects tampered signature even when the real one ends in 00 or 0/1", () => {
+      for (const real of ["ab".repeat(31) + "00", "ab".repeat(31) + "01", "ab".repeat(31) + "ff"]) {
+        const { bridge } = makeBridge();
+        bridge.signCall = () => real;
+        const body = { foo: "bar" };
+        const ts = Date.now();
+        const sig = bridge.signCall("test-plugin", body, ts);
+        const tampered = sig.slice(0, -1) + (sig.at(-1) === "0" ? "1" : "0");
+        expect(tampered).not.toBe(sig);
+        expect(bridge.verifyCall("test-plugin", body, ts, sig)).toBe(true);
+        expect(bridge.verifyCall("test-plugin", body, ts, tampered)).toBe(false);
+      }
     });
 
     it("verifyCall rejects tampered body", () => {
