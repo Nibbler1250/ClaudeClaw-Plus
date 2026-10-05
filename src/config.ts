@@ -1067,12 +1067,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
       token:
         process.env.DISCORD_TOKEN?.trim() ||
         (typeof raw.discord?.token === "string" ? raw.discord.token.trim() : ""),
-      allowedUserIds:
-        Array.isArray(discordUserIds) && discordUserIds.length > 0
-          ? discordUserIds
-          : Array.isArray(raw.discord?.allowedUserIds)
-            ? raw.discord.allowedUserIds.map(String)
-            : [],
+      allowedUserIds: parseChatUserIds("discord", raw.discord?.allowedUserIds, discordUserIds),
       listenChannels: Array.isArray(raw.discord?.listenChannels)
         ? raw.discord.listenChannels.map(String)
         : [],
@@ -1105,9 +1100,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
       appToken:
         process.env.SLACK_APP_TOKEN?.trim() ||
         (typeof raw.slack?.appToken === "string" ? raw.slack.appToken.trim() : ""),
-      allowedUserIds: Array.isArray(raw.slack?.allowedUserIds)
-        ? raw.slack.allowedUserIds.map(String)
-        : [],
+      allowedUserIds: parseChatUserIds("slack", raw.slack?.allowedUserIds),
       listenChannels: Array.isArray(raw.slack?.listenChannels)
         ? raw.slack.listenChannels.map(String)
         : [],
@@ -1922,6 +1915,50 @@ function telegramUserIdsOf(value: unknown, warnings: string[]): number[] {
     );
     return [0];
   }
+  return ids;
+}
+
+/** The `slack`/`discord` `allowedUserIds` warnings printed by the last parse,
+ *  per platform: same once-per-problem rule as `telegramIdsLastWarnings`. */
+const chatIdsLastWarnings = new Map<string, string>();
+
+/** TEST-ONLY: forget the last printed warnings, so each test sees its own. */
+export function _resetChatUserIdsWarningsForTests(): void {
+  chatIdsLastWarnings.clear();
+}
+
+/**
+ * `slack.allowedUserIds` / `discord.allowedUserIds`: a list of ids, kept as
+ * strings. Discord ids come from `preciseIds` when the raw text yielded any
+ * (`extractDiscordUserIds`: JSON numbers lose precision on snowflakes).
+ *
+ * An empty list means "allow everyone", so a value that is present but is not
+ * a list (a single id written as a string or a number by mistake) must not
+ * collapse to `[]`. It becomes `["0"]`: no Slack or Discord user has id "0",
+ * so every allow check refuses every sender. Outbound DMs that walk the list
+ * then target "0" and log a send error until the value is fixed. Same rule as
+ * `telegram.allowedUserIds`.
+ */
+function parseChatUserIds(
+  platform: "slack" | "discord",
+  value: unknown,
+  preciseIds?: string[],
+): string[] {
+  const warnings: string[] = [];
+  let ids: string[];
+  if (value === undefined || value === null) {
+    ids = [];
+  } else if (!Array.isArray(value)) {
+    warnings.push(
+      `[config] ${platform}.allowedUserIds must be a list of user ids, got a ${typeof value}; no ${platform === "slack" ? "Slack" : "Discord"} user is allowed until it is fixed`,
+    );
+    ids = ["0"];
+  } else {
+    ids = preciseIds && preciseIds.length > 0 ? preciseIds : value.map(String);
+  }
+  const key = warnings.join("\n");
+  if (key !== (chatIdsLastWarnings.get(platform) ?? "")) for (const w of warnings) console.warn(w);
+  chatIdsLastWarnings.set(platform, key);
   return ids;
 }
 
