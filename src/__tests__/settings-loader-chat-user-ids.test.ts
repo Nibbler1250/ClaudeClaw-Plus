@@ -176,6 +176,8 @@ describe("settings loader — slack/discord allowedUserIds", () => {
       '{"discord":{"busRouting":{"x":{"allowedUserIds":["1234567890123456790"]}},"allowedUserIds":[1234567890123456789]}}',
       '{"agents":{"a":{"discord":{"allowedUserIds":["1234567890123456790"]}}},"discord":{"allowedUserIds":[1234567890123456789]}}',
       '{"discord":{"allowedUserIds":["1234567890123456790"]},"discord":{"allowedUserIds":[1234567890123456789]}}',
+      '{"discord":{"allowedUserIds":["1234567890123456790"],"allowedUserIds":[1234567890123456789]}}',
+      '{"discord":{"token":"a{b","channelNames":{"1":"x"},"busRouting":{"x":{"allowedUserIds":["1234567890123456790"]}},"allowedUserIds":[1234567890123456789]}}',
     ];
     for (const text of layouts) {
       const { settings } = await loadText(text);
@@ -188,6 +190,27 @@ describe("settings loader — slack/discord allowedUserIds", () => {
       '{"discord":{"allowedUserIds":["999"],"allowedUserIds":["111"]}}',
     );
     expect(settings.discord.allowedUserIds).toEqual(["111"]);
+  });
+
+  it("discord: a nested allowedUserIds does not cost the real list its precision", async () => {
+    const { settings } = await loadText(
+      '{"discord":{"busRouting":{"x":{"allowedUserIds":["5"]}},"allowedUserIds":[123456789012345678901]}}',
+    );
+    expect(settings.discord.allowedUserIds).toEqual(["123456789012345678901"]);
+  });
+
+  it("discord: a list is kept as written when the raw ids do not spell it", async () => {
+    const { settings } = await loadText(
+      '{"discord":{"allowedUserIds":["123456789012345678901","not-an-id"]}}',
+    );
+    expect(settings.discord.allowedUserIds).toEqual(["123456789012345678901", "not-an-id"]);
+  });
+
+  it("discord: precision is kept with nested objects and braces in strings before the list", async () => {
+    const { settings } = await loadText(
+      '{"discord":{"token":"a{b\\"c","channelNames":{"1":"x"},"allowedUserIds":[123456789012345678901]}}',
+    );
+    expect(settings.discord.allowedUserIds).toEqual(["123456789012345678901"]);
   });
 
   it("discord: precision is kept when a nested object comes after the list", async () => {

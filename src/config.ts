@@ -2030,20 +2030,41 @@ function parseTimezoneOffsetMinutes(value: unknown, timezoneFallback?: string): 
  * so we regex them out of the raw text first.
  */
 function extractDiscordUserIds(rawText: string): string[] {
-  // Match the "discord" object's "allowedUserIds" array values. Only when the
-  // match is provably the top-level list: a single "discord" object in the
-  // file, and no nested object opening before the key. Otherwise the parsed
-  // list is used (a foreign id can round to the same double as a real one).
-  if ((rawText.match(/"discord"\s*:\s*\{/g) ?? []).length !== 1) return [];
-  const discordBlock = rawText.match(/"discord"\s*:\s*\{[\s\S]*?\}/);
-  if (!discordBlock) return [];
-  const arrayMatch = discordBlock[0].match(/"allowedUserIds"\s*:\s*\[([\s\S]*?)\]/);
-  if (!arrayMatch || arrayMatch.index === undefined) return [];
-  const body = discordBlock[0].indexOf("{") + 1;
-  if (discordBlock[0].slice(body, arrayMatch.index).includes("{")) return [];
+  // Only from the provable top-level list: a single "discord" object in the
+  // file, and a single "allowedUserIds" key directly inside it (JSON.parse
+  // keeps the last duplicate, a match could take another). Anything else
+  // falls back to the parsed list: a foreign id can round to the same double
+  // as a real one, so a near match is not good enough.
+  const starts = [...rawText.matchAll(/"discord"\s*:\s*\{/g)];
+  if (starts.length !== 1) return [];
+  const lists: string[] = [];
+  let depth = 0;
+  let inString = false;
+  for (let i = (starts[0].index ?? 0) + starts[0][0].length - 1; i < rawText.length; i++) {
+    const c = rawText[i];
+    if (inString) {
+      if (c === "\\") i++;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') {
+      const key =
+        depth === 1 ? /^"allowedUserIds"\s*:\s*\[([^\]]*)\]/.exec(rawText.slice(i)) : null;
+      if (key) {
+        lists.push(key[1]);
+        i += key[0].length - 1;
+      } else {
+        inString = true;
+      }
+      continue;
+    }
+    if (c === "{" || c === "[") depth++;
+    else if ((c === "}" || c === "]") && --depth === 0) break;
+  }
+  if (lists.length !== 1) return [];
   const items: string[] = [];
   // Match both quoted strings and bare numbers
-  for (const m of arrayMatch[1].matchAll(/("(\d+)"|(\d+))/g)) {
+  for (const m of lists[0].matchAll(/("(\d+)"|(\d+))/g)) {
     items.push(m[2] ?? m[3]);
   }
   return items;
