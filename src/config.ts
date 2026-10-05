@@ -1067,12 +1067,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
       token:
         process.env.DISCORD_TOKEN?.trim() ||
         (typeof raw.discord?.token === "string" ? raw.discord.token.trim() : ""),
-      allowedUserIds:
-        Array.isArray(discordUserIds) && discordUserIds.length > 0
-          ? discordUserIds
-          : Array.isArray(raw.discord?.allowedUserIds)
-            ? raw.discord.allowedUserIds.map(String)
-            : [],
+      allowedUserIds: parseChatUserIds("discord", raw.discord?.allowedUserIds, discordUserIds),
       listenChannels: Array.isArray(raw.discord?.listenChannels)
         ? raw.discord.listenChannels.map(String)
         : [],
@@ -1105,9 +1100,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
       appToken:
         process.env.SLACK_APP_TOKEN?.trim() ||
         (typeof raw.slack?.appToken === "string" ? raw.slack.appToken.trim() : ""),
-      allowedUserIds: Array.isArray(raw.slack?.allowedUserIds)
-        ? raw.slack.allowedUserIds.map(String)
-        : [],
+      allowedUserIds: parseChatUserIds("slack", raw.slack?.allowedUserIds),
       listenChannels: Array.isArray(raw.slack?.listenChannels)
         ? raw.slack.listenChannels.map(String)
         : [],
@@ -1925,6 +1918,77 @@ function telegramUserIdsOf(value: unknown, warnings: string[]): number[] {
   return ids;
 }
 
+/** The `slack`/`discord` `allowedUserIds` warnings printed by the last parse,
+ *  per platform: same once-per-problem rule as `telegramIdsLastWarnings`. */
+const chatIdsLastWarnings = new Map<string, string>();
+
+/** TEST-ONLY: forget the last printed warnings, so each test sees its own. */
+export function _resetChatUserIdsWarningsForTests(): void {
+  chatIdsLastWarnings.clear();
+}
+
+/**
+ * `slack.allowedUserIds` / `discord.allowedUserIds`: a list of ids, kept as
+ * strings. Discord ids come from `preciseIds` (`extractDiscordUserIds`: JSON
+ * numbers lose precision on snowflakes) only when they spell the parsed list
+ * entry for entry: the raw-text match can land on another `allowedUserIds`
+ * nested in the discord block, and those ids must never replace the real list.
+ *
+ * An empty list means "allow everyone", so a value that is present but is not
+ * a list (a single id written as a string or a number by mistake) must not
+ * collapse to `[]`. It becomes `["0"]`: no Slack or Discord user has id "0",
+ * so every allow check refuses every sender. Outbound DMs that walk the list
+ * then target "0" and log a send error until the value is fixed. Same rule as
+ * `telegram.allowedUserIds`.
+ */
+function parseChatUserIds(
+  platform: "slack" | "discord",
+  value: unknown,
+  preciseIds?: string[],
+): string[] {
+  const warnings: string[] = [];
+  let ids: string[];
+  if (value === undefined || value === null) {
+    ids = [];
+  } else if (!Array.isArray(value)) {
+    warnings.push(
+      `[config] ${platform}.allowedUserIds must be a list of user ids, got a ${typeof value}; no ${platform === "slack" ? "Slack" : "Discord"} user is allowed until it is fixed`,
+    );
+    ids = ["0"];
+  } else if (preciseIds && sameIds(preciseIds, value)) {
+    ids = preciseIds;
+  } else {
+    // A number past 2^53 was rounded by JSON.parse: its string is another id,
+    // not the one written (so is a nested list's: String([n])). Keep only
+    // strings and exact integers, drop the rest rather than allow whoever owns
+    // the rounded id; a list left empty that way allows nobody, not everyone.
+    const exact = (v: unknown) =>
+      typeof v === "string" || (typeof v === "number" && Number.isSafeInteger(v));
+    ids = value.filter(exact).map(String);
+    if (ids.length < value.length) {
+      warnings.push(
+        `[config] ${platform}.allowedUserIds holds an entry that is not an id, or an id written as a number too large to read exactly; write each id in quotes. It is ignored until then`,
+      );
+      if (ids.length === 0) ids = ["0"];
+    }
+  }
+  const key = warnings.join("\n");
+  if (key !== (chatIdsLastWarnings.get(platform) ?? "")) for (const w of warnings) console.warn(w);
+  chatIdsLastWarnings.set(platform, key);
+  return ids;
+}
+
+/** True when the raw-text ids are the parsed list, at full precision. */
+function sameIds(precise: string[], parsed: unknown[]): boolean {
+  return (
+    precise.length === parsed.length &&
+    precise.every((id, i) => {
+      const entry = parsed[i];
+      return typeof entry === "number" ? Number(id) === entry : entry === id;
+    })
+  );
+}
+
 /**
  * `settings.mcp.audit`. Absent or null → `best-effort`. Any value other than the two
  * known ones is read as `enforce`, with a warning: someone who set the key
@@ -1980,17 +2044,70 @@ function parseTimezoneOffsetMinutes(value: unknown, timezoneFallback?: string): 
  * so we regex them out of the raw text first.
  */
 function extractDiscordUserIds(rawText: string): string[] {
-  // Match the "discord" object's "allowedUserIds" array values
-  const discordBlock = rawText.match(/"discord"\s*:\s*\{[\s\S]*?\}/);
-  if (!discordBlock) return [];
-  const arrayMatch = discordBlock[0].match(/"allowedUserIds"\s*:\s*\[([\s\S]*?)\]/);
-  if (!arrayMatch) return [];
+  // Only from the provable top-level list: a single "discord" object in the
+  // file, and a single "allowedUserIds" key directly inside it (JSON.parse
+  // keeps the last duplicate, a match could take another). Anything else
+  // falls back to the parsed list: a foreign id can round to the same double
+  // as a real one, so a near match is not good enough.
+  // A key written with a \u escape is the same key to JSON.parse and not to
+  // this walk. An escape in a value changes no key, so only keys bail.
+  if (hasEscapedKey(rawText)) return [];
+  const starts = [...rawText.matchAll(/"discord"\s*:\s*\{/g)];
+  if (starts.length !== 1) return [];
+  const lists: string[] = [];
+  let depth = 0;
+  let inString = false;
+  for (let i = (starts[0].index ?? 0) + starts[0][0].length - 1; i < rawText.length; i++) {
+    const c = rawText[i];
+    if (inString) {
+      if (c === "\\") i++;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') {
+      const key =
+        depth === 1 ? /^"allowedUserIds"\s*:\s*\[([^\]]*)\]/.exec(rawText.slice(i)) : null;
+      if (key) {
+        // Ids only: a nested list or a string holding "]" ends this match
+        // early, and the walk would go on from inside the list.
+        if (!/^\s*(?:"\d+"|\d+)?(?:\s*,\s*(?:"\d+"|\d+))*\s*$/.test(key[1])) return [];
+        lists.push(key[1]);
+        i += key[0].length - 1;
+      } else {
+        inString = true;
+      }
+      continue;
+    }
+    if (c === "{" || c === "[") depth++;
+    else if ((c === "}" || c === "]") && --depth === 0) break;
+  }
+  if (lists.length !== 1) return [];
   const items: string[] = [];
   // Match both quoted strings and bare numbers
-  for (const m of arrayMatch[1].matchAll(/("(\d+)"|(\d+))/g)) {
+  for (const m of lists[0].matchAll(/("(\d+)"|(\d+))/g)) {
     items.push(m[2] ?? m[3]);
   }
   return items;
+}
+
+/** True when some object key in the raw JSON text holds a \u escape. */
+function hasEscapedKey(rawText: string): boolean {
+  for (let i = 0; i < rawText.length; i++) {
+    if (rawText[i] !== '"') continue;
+    let j = i + 1;
+    let escaped = false;
+    for (; j < rawText.length && rawText[j] !== '"'; j++) {
+      if (rawText[j] === "\\") {
+        if (rawText[j + 1] === "u") escaped = true;
+        j++;
+      }
+    }
+    let k = j + 1;
+    while (k < rawText.length && /\s/.test(rawText[k])) k++;
+    if (escaped && rawText[k] === ":") return true;
+    i = j;
+  }
+  return false;
 }
 
 export async function loadSettings(): Promise<Settings> {
