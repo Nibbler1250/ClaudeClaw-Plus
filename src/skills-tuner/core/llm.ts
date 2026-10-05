@@ -24,10 +24,16 @@ function buildPrompt(system: string, messages: Message[]): string {
 /**
  * Arguments for a one-shot `claude -p` call. The prompt carries untrusted text
  * (conversation turns, skill bodies), so the call runs with no built-in tools
- * and no MCP servers.
+ * and no MCP servers. With no configured model, or the env-routed "glm"
+ * alias, --model is left out and the CLI's default applies (same rule as the
+ * runner's spawn sites).
  */
-export function cliArgs(prompt: string, model: string): string[] {
-  return ["-p", prompt, "--model", model, "--tools", "", "--strict-mcp-config"];
+export function cliArgs(prompt: string, model: string | undefined): string[] {
+  const args = ["-p", prompt];
+  const m = model?.trim();
+  if (m && m.toLowerCase() !== "glm") args.push("--model", m);
+  args.push("--tools", "", "--strict-mcp-config");
+  return args;
 }
 
 export class ClaudeCliBackend implements LLMClient {
