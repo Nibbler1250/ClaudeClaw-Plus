@@ -85,12 +85,15 @@ describe("ClaudeCliBackend — CLI arguments", () => {
     expect(args).toContain("--strict-mcp-config");
   });
 
-  it("keeps the prompt as the value right after -p", async () => {
+  it("keeps the prompt right after -p, before the variadic --tools", async () => {
     const captured: Captured[] = [];
     await backend(captured).call("judge", "SYSTEM", [{ role: "user", content: "TURN" }]);
-    const prompt = flagValue(argsAt(captured, 0), "-p");
+    const args = argsAt(captured, 0);
+    const prompt = flagValue(args, "-p");
     expect(prompt).toContain("SYSTEM");
     expect(prompt).toContain("TURN");
+    // --tools is variadic: a prompt placed after it would be read as a tool name.
+    expect(args.indexOf("-p") + 1).toBeLessThan(args.indexOf("--tools"));
   });
 
   it("returns trimmed stdout on exit 0 and rejects on non-zero", async () => {
