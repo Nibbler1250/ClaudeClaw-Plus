@@ -1929,8 +1929,10 @@ export function _resetChatUserIdsWarningsForTests(): void {
 
 /**
  * `slack.allowedUserIds` / `discord.allowedUserIds`: a list of ids, kept as
- * strings. Discord ids come from `preciseIds` when the raw text yielded any
- * (`extractDiscordUserIds`: JSON numbers lose precision on snowflakes).
+ * strings. Discord ids come from `preciseIds` (`extractDiscordUserIds`: JSON
+ * numbers lose precision on snowflakes) only when they spell the parsed list
+ * entry for entry: the raw-text match can land on another `allowedUserIds`
+ * nested in the discord block, and those ids must never replace the real list.
  *
  * An empty list means "allow everyone", so a value that is present but is not
  * a list (a single id written as a string or a number by mistake) must not
@@ -1954,12 +1956,23 @@ function parseChatUserIds(
     );
     ids = ["0"];
   } else {
-    ids = preciseIds && preciseIds.length > 0 ? preciseIds : value.map(String);
+    ids = preciseIds && sameIds(preciseIds, value) ? preciseIds : value.map(String);
   }
   const key = warnings.join("\n");
   if (key !== (chatIdsLastWarnings.get(platform) ?? "")) for (const w of warnings) console.warn(w);
   chatIdsLastWarnings.set(platform, key);
   return ids;
+}
+
+/** True when the raw-text ids are the parsed list, at full precision. */
+function sameIds(precise: string[], parsed: unknown[]): boolean {
+  return (
+    precise.length === parsed.length &&
+    precise.every((id, i) => {
+      const entry = parsed[i];
+      return typeof entry === "number" ? Number(id) === entry : entry === id;
+    })
+  );
 }
 
 /**

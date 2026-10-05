@@ -31,19 +31,19 @@ function allows(ids: string[], userId: string): boolean {
 type Platform = "slack" | "discord";
 
 describe("settings loader — slack/discord allowedUserIds", () => {
-  let dir: string | null = null;
+  const dirs: string[] = [];
 
   beforeEach(() => _resetChatUserIdsWarningsForTests());
 
   afterEach(() => {
     _setSettingsFileForTests(undefined);
     _resetChatUserIdsWarningsForTests();
-    if (dir) rmSync(dir, { recursive: true, force: true });
-    dir = null;
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
   async function loadText(text: string) {
-    dir = mkdtempSync(join(tmpdir(), "ccplus-settings-chat-ids-"));
+    const dir = mkdtempSync(join(tmpdir(), "ccplus-settings-chat-ids-"));
+    dirs.push(dir);
     const file = join(dir, "settings.json");
     writeFileSync(file, text);
     _setSettingsFileForTests(file);
@@ -135,6 +135,49 @@ describe("settings loader — slack/discord allowedUserIds", () => {
     expect(allows(settings.discord.allowedUserIds, "42")).toBe(false);
     expect(warnings.some((w) => w.includes("slack.allowedUserIds must be a list"))).toBe(true);
     expect(warnings.some((w) => w.includes("discord.allowedUserIds must be a list"))).toBe(true);
+  });
+
+  it("discord: ids from a nested allowedUserIds never replace the real list", async () => {
+    // The raw-text extractor stops at the first "}" of the discord block, so
+    // a nested object holding its own allowedUserIds came first.
+    const { settings } = await loadText(
+      '{"discord":{"token":"t","busRouting":{"x":{"allowedUserIds":["999"]}},"allowedUserIds":["111"]}}',
+    );
+    expect(allows(settings.discord.allowedUserIds, "999")).toBe(false);
+    expect(allows(settings.discord.allowedUserIds, "111")).toBe(true);
+  });
+
+  it("discord: a nested list never replaces a numeric list, nor truncates a longer one", async () => {
+    const numeric = await loadText(
+      '{"discord":{"busRouting":{"x":{"allowedUserIds":["999"]}},"allowedUserIds":[111]}}',
+    );
+    expect(numeric.settings.discord.allowedUserIds).toEqual(["111"]);
+    const longer = await loadText(
+      '{"discord":{"busRouting":{"x":{"allowedUserIds":["111"]}},"allowedUserIds":["111","222"]}}',
+    );
+    expect(longer.settings.discord.allowedUserIds).toEqual(["111", "222"]);
+  });
+
+  it("discord: a nested list does not turn an explicit [] or a string into someone else's list", async () => {
+    const empty = await loadText(
+      '{"discord":{"busRouting":{"x":{"allowedUserIds":["999"]}},"allowedUserIds":[]}}',
+    );
+    expect(empty.settings.discord.allowedUserIds).toEqual([]);
+    const str = await loadText(
+      '{"discord":{"busRouting":{"x":{"allowedUserIds":["999"]}},"allowedUserIds":"111"}}',
+    );
+    expect(allows(str.settings.discord.allowedUserIds, "999")).toBe(false);
+    expect(allows(str.settings.discord.allowedUserIds, "111")).toBe(false);
+  });
+
+  it("discord: precision is kept for numeric and quoted snowflakes mixed in one list", async () => {
+    const { settings } = await loadText(
+      '{"discord":{"allowedUserIds":[123456789012345678901,"223456789012345678901"]}}',
+    );
+    expect(settings.discord.allowedUserIds).toEqual([
+      "123456789012345678901",
+      "223456789012345678901",
+    ]);
   });
 
   it("discord: a large numeric snowflake in a list keeps its precision", async () => {
