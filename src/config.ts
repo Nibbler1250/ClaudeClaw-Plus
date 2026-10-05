@@ -1959,13 +1959,15 @@ function parseChatUserIds(
     ids = preciseIds;
   } else {
     // A number past 2^53 was rounded by JSON.parse: its string is another id,
-    // not the one written. Drop it rather than allow whoever owns the rounded
-    // id; a list left empty that way allows nobody, not everyone.
-    const unsafe = value.filter((v) => typeof v === "number" && !Number.isSafeInteger(v));
-    ids = value.filter((v) => !unsafe.includes(v)).map(String);
-    if (unsafe.length > 0) {
+    // not the one written (so is a nested list's: String([n])). Keep only
+    // strings and exact integers, drop the rest rather than allow whoever owns
+    // the rounded id; a list left empty that way allows nobody, not everyone.
+    const exact = (v: unknown) =>
+      typeof v === "string" || (typeof v === "number" && Number.isSafeInteger(v));
+    ids = value.filter(exact).map(String);
+    if (ids.length < value.length) {
       warnings.push(
-        `[config] ${platform}.allowedUserIds holds an id written as a number too large to read exactly; write it in quotes. It is ignored until then`,
+        `[config] ${platform}.allowedUserIds holds an entry that is not an id, or an id written as a number too large to read exactly; write each id in quotes. It is ignored until then`,
       );
       if (ids.length === 0) ids = ["0"];
     }
@@ -2066,6 +2068,9 @@ function extractDiscordUserIds(rawText: string): string[] {
       const key =
         depth === 1 ? /^"allowedUserIds"\s*:\s*\[([^\]]*)\]/.exec(rawText.slice(i)) : null;
       if (key) {
+        // Ids only: a nested list or a string holding "]" ends this match
+        // early, and the walk would go on from inside the list.
+        if (!/^\s*(?:"\d+"|\d+)?(?:\s*,\s*(?:"\d+"|\d+))*\s*$/.test(key[1])) return [];
         lists.push(key[1]);
         i += key[0].length - 1;
       } else {

@@ -197,7 +197,7 @@ describe("settings loader — slack/discord allowedUserIds", () => {
     expect(allows(settings.discord.allowedUserIds, "1234567890123456800")).toBe(false);
     expect(allows(settings.discord.allowedUserIds, "111")).toBe(true);
     expect(
-      warnings.some((w) => w.includes("discord.allowedUserIds holds an id written as a number")),
+      warnings.some((w) => w.includes("discord.allowedUserIds holds an entry that is not an id")),
     ).toBe(true);
     const only = await loadText(
       '{"note\\u0073" :"x","discord":{"allowedUserIds":[1234567890123456789]}}',
@@ -213,6 +213,29 @@ describe("settings loader — slack/discord allowedUserIds", () => {
     );
     expect(settings.discord.allowedUserIds).toEqual(["1234567890123456789"]);
     expect(warnings.filter((w) => w.includes("discord.allowedUserIds"))).toEqual([]);
+  });
+
+  it("a nested list never yields a rounded id, on either platform", async () => {
+    for (const platform of ["discord", "slack"] as const) {
+      const { settings } = await loadText(
+        `{"${platform}":{"allowedUserIds":[[1234567890123456789]]}}`,
+      );
+      const ids = settings[platform].allowedUserIds;
+      expect(ids.length).toBeGreaterThan(0);
+      expect(allows(ids, "1234567890123456800")).toBe(false);
+      expect(allows(ids, "someone-else")).toBe(false);
+    }
+  });
+
+  it("discord: a dead duplicate list that ends early never feeds the live one", async () => {
+    // JSON.parse keeps the last list; a "]" inside the first must not let the
+    // raw-text walk stop there and adopt it.
+    for (const first of ["[[1234567890123456790]]", '[1234567890123456790,"]"]']) {
+      const { settings } = await loadText(
+        `{"discord":{"allowedUserIds":${first},"allowedUserIds":[1234567890123456789]}}`,
+      );
+      expect(allows(settings.discord.allowedUserIds, "1234567890123456790")).toBe(false);
+    }
   });
 
   it("discord: a duplicated allowedUserIds key uses the list JSON keeps (the last one)", async () => {
