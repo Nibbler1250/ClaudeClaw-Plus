@@ -1351,8 +1351,8 @@ export async function start(args: string[] = []) {
             // Bus runtime: route the chat through the bus's default
             // agent so it lands in the same claude session every other
             // surface (Discord/Telegram/cron) drives. Pass the chunk
-            // callback so each `response.text` event from the agent
-            // gets streamed back to the dashboard SSE in real time.
+            // callback so each `reply` from the agent gets streamed back
+            // to the dashboard SSE in real time.
             const bus = busCoreForWebUi;
             const defaultAgent = busRuntimeSpawnedAgents[0];
             if (bus && defaultAgent) {

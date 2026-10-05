@@ -213,6 +213,30 @@ describe("streamBusPrompt", () => {
     expect(chunks).toEqual(["the answer"]);
   });
 
+  it("a turn that ends without `reply` returns the safety net's text once, not echo + net (#215, #217)", async () => {
+    const bus = makeBus();
+    const pending = streamBusPrompt(bus, "alpha", "hi", { originId: "job:daily", timeoutMs: 4000 });
+    await Promise.resolve();
+    await Promise.resolve();
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "",
+      topic: "response.text",
+      payload: { text: "job output", _meta: { source: TAILER_EVENT_SOURCE } },
+    });
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "",
+      topic: "response.turn_end",
+      payload: { stop_reason: "end_turn", text: "job output" },
+    });
+    const result = await pending;
+    expect(result.output).toBe("job output");
+    expect(result.synthesized).toBe(true);
+  });
+
   it("does NOT receive events for other agents", async () => {
     const bus = makeBus();
     const pending = streamBusPrompt(bus, "alpha", "hi", { timeoutMs: 500 });
