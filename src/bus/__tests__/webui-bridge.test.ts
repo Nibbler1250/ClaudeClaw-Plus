@@ -22,6 +22,7 @@ import {
   type ReceiptRecord,
   type ReceiptStore,
 } from "../receipt";
+import { TAILER_EVENT_SOURCE } from "../types";
 import { streamBusPrompt } from "../webui-bridge";
 import { createSession, peekSession, incrementMessageCount } from "../../sessions";
 import { reloadSettings, _setSettingsFileForTests } from "../../config";
@@ -187,6 +188,53 @@ describe("streamBusPrompt", () => {
     bus.ingestReply({ agent_id: "alpha", text: "two", intent: "final" });
     await pending;
     expect(chunks).toEqual(["one", "two"]);
+  });
+
+  it("leaves out the transcript tailer's echo of the turn's text: output and chunks carry the reply only (#217)", async () => {
+    const bus = makeBus();
+    const chunks: string[] = [];
+    const pending = streamBusPrompt(bus, "alpha", "hi", {
+      timeoutMs: 2000,
+      onChunk: (t) => chunks.push(t),
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    // The agent writes a note between two tool calls; the tailer echoes it.
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "",
+      topic: "response.text",
+      payload: { text: "working note", _meta: { source: TAILER_EVENT_SOURCE } },
+    });
+    bus.ingestReply({ agent_id: "alpha", text: "the answer", intent: "final" });
+    const result = await pending;
+    expect(result.output).toBe("the answer");
+    expect(chunks).toEqual(["the answer"]);
+  });
+
+  it("a turn that ends without `reply` returns the safety net's text once, not echo + net (#215, #217)", async () => {
+    const bus = makeBus();
+    const pending = streamBusPrompt(bus, "alpha", "hi", { originId: "job:daily", timeoutMs: 4000 });
+    await Promise.resolve();
+    await Promise.resolve();
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "",
+      topic: "response.text",
+      payload: { text: "job output", _meta: { source: TAILER_EVENT_SOURCE } },
+    });
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "",
+      topic: "response.turn_end",
+      payload: { stop_reason: "end_turn", text: "job output" },
+    });
+    const result = await pending;
+    expect(result.output).toBe("job output");
+    expect(result.synthesized).toBe(true);
   });
 
   it("does NOT receive events for other agents", async () => {

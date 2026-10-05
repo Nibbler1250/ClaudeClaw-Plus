@@ -28,7 +28,7 @@
 import { randomBytes } from "node:crypto";
 import type { BusCore } from "./core";
 import { getDefaultReceiptStore, hashPrompt, type ReceiptStore } from "./receipt";
-import type { BusOrigin } from "./types";
+import { type BusOrigin, isTailerOriginEvent } from "./types";
 import { incrementMessageCount, peekSession } from "../sessions";
 import { needsRotation } from "../rotation";
 import { getSettings } from "../config";
@@ -58,7 +58,10 @@ export interface StreamBusPromptOptions {
   origin?: BusOrigin;
   /** Free-form correlation id stamped on the prompt event. */
   originId?: string;
-  /** Per-chunk callback. Called on every `response.text` event with non-empty text. */
+  /**
+   * Per-chunk callback. Called on every `response.text` event with non-empty
+   * text, except the JSONL tailer's echo of the turn's raw text (#217).
+   */
   onChunk?: (text: string) => void;
   /**
    * Hard ceiling on how long to wait for `intent: "final"`. Defaults to
@@ -396,6 +399,12 @@ function runPrompt(
           return;
         }
         if (!admitted) return;
+        // #217: the JSONL tailer echoes each text block of the turn for
+        // observability; what the agent sends comes through `reply`. Skip the
+        // echo as the chat adapters do, or a caller relaying `output` (an
+        // inject pushed to Telegram) sends the agent's working notes glued in
+        // front of its reply.
+        if (isTailerOriginEvent(event)) return;
         const payload = event.payload as { text?: string; intent?: string; synthesized?: true };
         if (typeof payload.text === "string" && payload.text.length > 0) {
           accumulated += payload.text;

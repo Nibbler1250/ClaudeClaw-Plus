@@ -180,7 +180,8 @@ export interface BusEvent<P = unknown> {
  * echoes, however, ALSO match what the channel adapters subscribe to and
  * deliver — so without a marker every reply would be delivered twice
  * (once by the agent's real `reply` tool → `ingestReply`, once by this
- * observability echo). Adapters use {@link isTailerOriginEvent} to skip
+ * observability echo). Adapters, and the web UI bridge
+ * (`streamBusPrompt`), use {@link isTailerOriginEvent} to skip
  * tailer-origin `response.text` so only `ingestReply`-produced deliveries
  * reach the user. Synthesized recovery replies go through `ingestReply`
  * (not the tailer) and therefore carry NO marker → still delivered.
