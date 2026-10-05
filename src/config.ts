@@ -2035,6 +2035,9 @@ function extractDiscordUserIds(rawText: string): string[] {
   // keeps the last duplicate, a match could take another). Anything else
   // falls back to the parsed list: a foreign id can round to the same double
   // as a real one, so a near match is not good enough.
+  // A key written with a \u escape is the same key to JSON.parse and not to
+  // this walk.
+  if (rawText.includes("\\u")) return [];
   const starts = [...rawText.matchAll(/"discord"\s*:\s*\{/g)];
   if (starts.length !== 1) return [];
   const lists: string[] = [];

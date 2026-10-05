@@ -177,6 +177,8 @@ describe("settings loader — slack/discord allowedUserIds", () => {
       '{"agents":{"a":{"discord":{"allowedUserIds":["1234567890123456790"]}}},"discord":{"allowedUserIds":[1234567890123456789]}}',
       '{"discord":{"allowedUserIds":["1234567890123456790"]},"discord":{"allowedUserIds":[1234567890123456789]}}',
       '{"discord":{"allowedUserIds":["1234567890123456790"],"allowedUserIds":[1234567890123456789]}}',
+      '{"discord":{"allowedUserIds":[1234567890123456790],"allowed\\u0055serIds":[1234567890123456789]}}',
+      '{"disc\\u006frd":{"allowedUserIds":[1234567890123456789]},"agents":{"a":{"discord":{"allowedUserIds":[1234567890123456790]}}}}',
       '{"discord":{"token":"a{b","channelNames":{"1":"x"},"busRouting":{"x":{"allowedUserIds":["1234567890123456790"]}},"allowedUserIds":[1234567890123456789]}}',
     ];
     for (const text of layouts) {
