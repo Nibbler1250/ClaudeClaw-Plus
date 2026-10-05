@@ -76,6 +76,30 @@ describe("ClaudeCliBackend — CLI arguments", () => {
     }
   });
 
+  it("omits --model when the config has no models section", async () => {
+    const captured: Captured[] = [];
+    // zod 4 does not apply nested defaults under .default({}), so models is {}.
+    const config = TunerConfigSchema.parse({});
+    await new ClaudeCliBackend(config, fakeSpawn(captured)).call("judge", "sys", []);
+    const args = argsAt(captured, 0);
+    expect(args).not.toContain("--model");
+    expect(args).not.toContain("undefined");
+  });
+
+  it("omits --model for the env-routed glm alias", async () => {
+    const captured: Captured[] = [];
+    const config = TunerConfigSchema.parse({ models: { judge: "GLM" } });
+    await new ClaudeCliBackend(config, fakeSpawn(captured)).call("judge", "sys", []);
+    expect(argsAt(captured, 0)).not.toContain("--model");
+  });
+
+  it("trims the configured model", async () => {
+    const captured: Captured[] = [];
+    const config = TunerConfigSchema.parse({ models: { judge: "  judge-model " } });
+    await new ClaudeCliBackend(config, fakeSpawn(captured)).call("judge", "sys", []);
+    expect(flagValue(argsAt(captured, 0), "--model")).toBe("judge-model");
+  });
+
   it("disables built-in tools and MCP servers", async () => {
     const captured: Captured[] = [];
     await backend(captured).call("proposer", "sys", [{ role: "user", content: "hi" }]);
