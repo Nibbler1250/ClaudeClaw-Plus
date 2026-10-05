@@ -1955,8 +1955,20 @@ function parseChatUserIds(
       `[config] ${platform}.allowedUserIds must be a list of user ids, got a ${typeof value}; no ${platform === "slack" ? "Slack" : "Discord"} user is allowed until it is fixed`,
     );
     ids = ["0"];
+  } else if (preciseIds && sameIds(preciseIds, value)) {
+    ids = preciseIds;
   } else {
-    ids = preciseIds && sameIds(preciseIds, value) ? preciseIds : value.map(String);
+    // A number past 2^53 was rounded by JSON.parse: its string is another id,
+    // not the one written. Drop it rather than allow whoever owns the rounded
+    // id; a list left empty that way allows nobody, not everyone.
+    const unsafe = value.filter((v) => typeof v === "number" && !Number.isSafeInteger(v));
+    ids = value.filter((v) => !unsafe.includes(v)).map(String);
+    if (unsafe.length > 0) {
+      warnings.push(
+        `[config] ${platform}.allowedUserIds holds an id written as a number too large to read exactly; write it in quotes. It is ignored until then`,
+      );
+      if (ids.length === 0) ids = ["0"];
+    }
   }
   const key = warnings.join("\n");
   if (key !== (chatIdsLastWarnings.get(platform) ?? "")) for (const w of warnings) console.warn(w);
@@ -2036,8 +2048,8 @@ function extractDiscordUserIds(rawText: string): string[] {
   // falls back to the parsed list: a foreign id can round to the same double
   // as a real one, so a near match is not good enough.
   // A key written with a \u escape is the same key to JSON.parse and not to
-  // this walk.
-  if (rawText.includes("\\u")) return [];
+  // this walk. An escape in a value changes no key, so only keys bail.
+  if (hasEscapedKey(rawText)) return [];
   const starts = [...rawText.matchAll(/"discord"\s*:\s*\{/g)];
   if (starts.length !== 1) return [];
   const lists: string[] = [];
@@ -2071,6 +2083,26 @@ function extractDiscordUserIds(rawText: string): string[] {
     items.push(m[2] ?? m[3]);
   }
   return items;
+}
+
+/** True when some object key in the raw JSON text holds a \u escape. */
+function hasEscapedKey(rawText: string): boolean {
+  for (let i = 0; i < rawText.length; i++) {
+    if (rawText[i] !== '"') continue;
+    let j = i + 1;
+    let escaped = false;
+    for (; j < rawText.length && rawText[j] !== '"'; j++) {
+      if (rawText[j] === "\\") {
+        if (rawText[j + 1] === "u") escaped = true;
+        j++;
+      }
+    }
+    let k = j + 1;
+    while (k < rawText.length && /\s/.test(rawText[k])) k++;
+    if (escaped && rawText[k] === ":") return true;
+    i = j;
+  }
+  return false;
 }
 
 export async function loadSettings(): Promise<Settings> {

@@ -187,6 +187,34 @@ describe("settings loader — slack/discord allowedUserIds", () => {
     }
   });
 
+  it("discord: an id JSON could only read rounded is never allowed in its rounded form", async () => {
+    // 1234567890123456789 reads back as 1234567890123456800. When the raw ids
+    // are not usable (here a key written with a \u escape), the rounded id
+    // must not become someone's access.
+    const { settings, warnings } = await loadText(
+      '{"note\\u0073":"x","discord":{"allowedUserIds":[1234567890123456789,"111"]}}',
+    );
+    expect(allows(settings.discord.allowedUserIds, "1234567890123456800")).toBe(false);
+    expect(allows(settings.discord.allowedUserIds, "111")).toBe(true);
+    expect(
+      warnings.some((w) => w.includes("discord.allowedUserIds holds an id written as a number")),
+    ).toBe(true);
+    const only = await loadText(
+      '{"note\\u0073" :"x","discord":{"allowedUserIds":[1234567890123456789]}}',
+    );
+    expect(only.settings.discord.allowedUserIds.length).toBeGreaterThan(0);
+    expect(allows(only.settings.discord.allowedUserIds, "1234567890123456800")).toBe(false);
+    expect(allows(only.settings.discord.allowedUserIds, "someone-else")).toBe(false);
+  });
+
+  it("discord: a \\u escape in a value does not cost the list its precision", async () => {
+    const { settings, warnings } = await loadText(
+      '{"x":"caf\\u00e9","discord":{"token":"\\u0074","allowedUserIds":[1234567890123456789]}}',
+    );
+    expect(settings.discord.allowedUserIds).toEqual(["1234567890123456789"]);
+    expect(warnings.filter((w) => w.includes("discord.allowedUserIds"))).toEqual([]);
+  });
+
   it("discord: a duplicated allowedUserIds key uses the list JSON keeps (the last one)", async () => {
     const { settings } = await loadText(
       '{"discord":{"allowedUserIds":["999"],"allowedUserIds":["111"]}}',
