@@ -21,10 +21,22 @@ function buildPrompt(system: string, messages: Message[]): string {
   return lines.join("\n");
 }
 
+/**
+ * Arguments for a one-shot `claude -p` call. The prompt carries untrusted text
+ * (conversation turns, skill bodies), so the call runs with no built-in tools
+ * and no MCP servers.
+ */
+export function cliArgs(prompt: string, model: string): string[] {
+  return ["-p", prompt, "--model", model, "--tools", "", "--strict-mcp-config"];
+}
+
 export class ClaudeCliBackend implements LLMClient {
   private readonly models: TunerConfig["models"];
 
-  constructor(config: TunerConfig) {
+  constructor(
+    config: TunerConfig,
+    private readonly spawnFn: typeof spawn = spawn,
+  ) {
     this.models = config.models;
   }
 
@@ -41,10 +53,17 @@ export class ClaudeCliBackend implements LLMClient {
     )[role];
   }
 
-  async call(role: Role, system: string, messages: Message[], maxTokens = 4096): Promise<string> {
+  // The claude CLI has no output-length flag, so maxTokens is accepted for
+  // interface compatibility but not forwarded.
+  async call(
+    role: Role,
+    system: string,
+    messages: Message[],
+    _maxTokens?: number,
+  ): Promise<string> {
     const prompt = buildPrompt(system, messages);
     return new Promise((resolve, reject) => {
-      const child = spawn("claude", ["-p", prompt, "--max-tokens", String(maxTokens)], {
+      const child = this.spawnFn("claude", cliArgs(prompt, this.modelFor(role)), {
         stdio: ["ignore", "pipe", "pipe"],
       });
       let out = "";
