@@ -170,6 +170,33 @@ describe("settings loader — slack/discord allowedUserIds", () => {
     expect(allows(str.settings.discord.allowedUserIds, "111")).toBe(false);
   });
 
+  it("discord: a foreign id that rounds to a real numeric id is never adopted", async () => {
+    // 1234567890123456789 and ...790 are the same double.
+    const layouts = [
+      '{"discord":{"busRouting":{"x":{"allowedUserIds":["1234567890123456790"]}},"allowedUserIds":[1234567890123456789]}}',
+      '{"agents":{"a":{"discord":{"allowedUserIds":["1234567890123456790"]}}},"discord":{"allowedUserIds":[1234567890123456789]}}',
+      '{"discord":{"allowedUserIds":["1234567890123456790"]},"discord":{"allowedUserIds":[1234567890123456789]}}',
+    ];
+    for (const text of layouts) {
+      const { settings } = await loadText(text);
+      expect(allows(settings.discord.allowedUserIds, "1234567890123456790")).toBe(false);
+    }
+  });
+
+  it("discord: a duplicated allowedUserIds key uses the list JSON keeps (the last one)", async () => {
+    const { settings } = await loadText(
+      '{"discord":{"allowedUserIds":["999"],"allowedUserIds":["111"]}}',
+    );
+    expect(settings.discord.allowedUserIds).toEqual(["111"]);
+  });
+
+  it("discord: precision is kept when a nested object comes after the list", async () => {
+    const { settings } = await loadText(
+      '{"discord":{"allowedUserIds":[123456789012345678901],"channelNames":{"1":"general"}}}',
+    );
+    expect(settings.discord.allowedUserIds).toEqual(["123456789012345678901"]);
+  });
+
   it("discord: precision is kept for numeric and quoted snowflakes mixed in one list", async () => {
     const { settings } = await loadText(
       '{"discord":{"allowedUserIds":[123456789012345678901,"223456789012345678901"]}}',

@@ -2030,11 +2030,17 @@ function parseTimezoneOffsetMinutes(value: unknown, timezoneFallback?: string): 
  * so we regex them out of the raw text first.
  */
 function extractDiscordUserIds(rawText: string): string[] {
-  // Match the "discord" object's "allowedUserIds" array values
+  // Match the "discord" object's "allowedUserIds" array values. Only when the
+  // match is provably the top-level list: a single "discord" object in the
+  // file, and no nested object opening before the key. Otherwise the parsed
+  // list is used (a foreign id can round to the same double as a real one).
+  if ((rawText.match(/"discord"\s*:\s*\{/g) ?? []).length !== 1) return [];
   const discordBlock = rawText.match(/"discord"\s*:\s*\{[\s\S]*?\}/);
   if (!discordBlock) return [];
   const arrayMatch = discordBlock[0].match(/"allowedUserIds"\s*:\s*\[([\s\S]*?)\]/);
-  if (!arrayMatch) return [];
+  if (!arrayMatch || arrayMatch.index === undefined) return [];
+  const body = discordBlock[0].indexOf("{") + 1;
+  if (discordBlock[0].slice(body, arrayMatch.index).includes("{")) return [];
   const items: string[] = [];
   // Match both quoted strings and bare numbers
   for (const m of arrayMatch[1].matchAll(/("(\d+)"|(\d+))/g)) {
