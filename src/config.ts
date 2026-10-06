@@ -1929,10 +1929,9 @@ export function _resetChatUserIdsWarningsForTests(): void {
 
 /**
  * `slack.allowedUserIds` / `discord.allowedUserIds`: a list of ids, kept as
- * strings. Discord ids come from `preciseIds` (`extractDiscordUserIds`: JSON
+ * strings. Discord ids come from `preciseIds` (`parseSettingsText`: JSON
  * numbers lose precision on snowflakes) only when they spell the parsed list
- * entry for entry: the raw-text match can land on another `allowedUserIds`
- * nested in the discord block, and those ids must never replace the real list.
+ * entry for entry.
  *
  * An empty list means "allow everyone", so a value that is present but is not
  * a list (a single id written as a string or a number by mistake) must not
@@ -2039,90 +2038,60 @@ function parseTimezoneOffsetMinutes(value: unknown, timezoneFallback?: string): 
 }
 
 /**
- * Extract discord.allowedUserIds as raw strings from the JSON text.
- * JSON.parse destroys precision on large numeric snowflakes (>2^53),
- * so we regex them out of the raw text first.
+ * Parse the settings text and read `discord.allowedUserIds` at full precision.
+ * JSON numbers lose precision past 2^53 (Discord snowflakes), so the parse
+ * keeps the source text of every number held in an array, keyed by the array
+ * JSON.parse built. The ids are then read from the very list the settings
+ * use: another "discord" or "allowedUserIds" anywhere in the file, a
+ * duplicated key or a key written with a \u escape cannot stand in for it.
+ * A runtime without the reviver's source text gives no ids, and the parsed
+ * list is used as is (a rounded id is dropped there, never allowed).
  */
-function extractDiscordUserIds(rawText: string): string[] {
-  // Only from the provable top-level list: a single "discord" object in the
-  // file, and a single "allowedUserIds" key directly inside it (JSON.parse
-  // keeps the last duplicate, a match could take another). Anything else
-  // falls back to the parsed list: a foreign id can round to the same double
-  // as a real one, so a near match is not good enough.
-  // A key written with a \u escape is the same key to JSON.parse and not to
-  // this walk. An escape in a value changes no key, so only keys bail.
-  if (hasEscapedKey(rawText)) return [];
-  const starts = [...rawText.matchAll(/"discord"\s*:\s*\{/g)];
-  if (starts.length !== 1) return [];
-  const lists: string[] = [];
-  let depth = 0;
-  let inString = false;
-  for (let i = (starts[0].index ?? 0) + starts[0][0].length - 1; i < rawText.length; i++) {
-    const c = rawText[i];
-    if (inString) {
-      if (c === "\\") i++;
-      else if (c === '"') inString = false;
-      continue;
+function parseSettingsText(rawText: string) {
+  const numberSources = new WeakMap<object, string[]>();
+  function keepNumberSource(
+    this: unknown,
+    key: string,
+    value: unknown,
+    context?: { source?: string },
+  ): unknown {
+    if (Array.isArray(this) && typeof value === "number" && typeof context?.source === "string") {
+      const sources = numberSources.get(this) ?? [];
+      sources[Number(key)] = context.source;
+      numberSources.set(this, sources);
     }
-    if (c === '"') {
-      const key =
-        depth === 1 ? /^"allowedUserIds"\s*:\s*\[([^\]]*)\]/.exec(rawText.slice(i)) : null;
-      if (key) {
-        // Ids only: a nested list or a string holding "]" ends this match
-        // early, and the walk would go on from inside the list.
-        if (!/^\s*(?:"\d+"|\d+)?(?:\s*,\s*(?:"\d+"|\d+))*\s*$/.test(key[1])) return [];
-        lists.push(key[1]);
-        i += key[0].length - 1;
-      } else {
-        inString = true;
-      }
-      continue;
-    }
-    if (c === "{" || c === "[") depth++;
-    else if ((c === "}" || c === "]") && --depth === 0) break;
+    return value;
   }
-  if (lists.length !== 1) return [];
-  const items: string[] = [];
-  // Match both quoted strings and bare numbers
-  for (const m of lists[0].matchAll(/("(\d+)"|(\d+))/g)) {
-    items.push(m[2] ?? m[3]);
-  }
-  return items;
+  const raw = JSON.parse(rawText, keepNumberSource);
+  return { raw, discordUserIds: discordUserIdsOf(raw?.discord?.allowedUserIds, numberSources) };
 }
 
-/** True when some object key in the raw JSON text holds a \u escape. */
-function hasEscapedKey(rawText: string): boolean {
-  for (let i = 0; i < rawText.length; i++) {
-    if (rawText[i] !== '"') continue;
-    let j = i + 1;
-    let escaped = false;
-    for (; j < rawText.length && rawText[j] !== '"'; j++) {
-      if (rawText[j] === "\\") {
-        if (rawText[j + 1] === "u") escaped = true;
-        j++;
-      }
-    }
-    let k = j + 1;
-    while (k < rawText.length && /\s/.test(rawText[k])) k++;
-    if (escaped && rawText[k] === ":") return true;
-    i = j;
+/** The ids of `list` as written, or [] unless every entry is a plain integer. */
+function discordUserIdsOf(list: unknown, numberSources: WeakMap<object, string[]>): string[] {
+  if (!Array.isArray(list)) return [];
+  const sources = numberSources.get(list) ?? [];
+  const ids: string[] = [];
+  for (let i = 0; i < list.length; i++) {
+    const id = typeof list[i] === "number" ? sources[i] : list[i];
+    if (typeof id !== "string" || !/^\d+$/.test(id)) return [];
+    ids.push(id);
   }
-  return false;
+  return ids;
 }
 
 export async function loadSettings(): Promise<Settings> {
   if (cached) return cached;
   const rawText = await Bun.file(SETTINGS_FILE).text();
-  const raw = JSON.parse(rawText);
-  cached = parseSettings(raw, extractDiscordUserIds(rawText));
+  const { raw, discordUserIds } = parseSettingsText(rawText);
+  cached = parseSettings(raw, discordUserIds);
   return cached;
 }
 
 /** Re-read settings from disk, bypassing cache. */
 export async function reloadSettings(): Promise<Settings> {
   const rawText = await Bun.file(SETTINGS_FILE).text();
-  const raw = JSON.parse(rawText);
-  cached = parseSettings(raw, extractDiscordUserIds(rawText));
+  const { raw, discordUserIds } = parseSettingsText(rawText);
+  cached = parseSettings(raw, discordUserIds);
   return cached;
 }
 
