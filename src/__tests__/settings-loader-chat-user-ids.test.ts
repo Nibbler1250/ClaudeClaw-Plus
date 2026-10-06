@@ -188,20 +188,18 @@ describe("settings loader — slack/discord allowedUserIds", () => {
   });
 
   it("discord: an id JSON could only read rounded is never allowed in its rounded form", async () => {
-    // 1234567890123456789 reads back as 1234567890123456800. When the raw ids
-    // are not usable (here a key written with a \u escape), the rounded id
-    // must not become someone's access.
+    // 1234567890123456789 reads back as 1234567890123456800. When the list
+    // cannot be read as ids at full precision (here it also holds an entry
+    // that is not an id), the rounded id must not become someone's access.
     const { settings, warnings } = await loadText(
-      '{"note\\u0073":"x","discord":{"allowedUserIds":[1234567890123456789,"111"]}}',
+      '{"discord":{"allowedUserIds":[1234567890123456789,"111","x"]}}',
     );
     expect(allows(settings.discord.allowedUserIds, "1234567890123456800")).toBe(false);
     expect(allows(settings.discord.allowedUserIds, "111")).toBe(true);
     expect(
       warnings.some((w) => w.includes("discord.allowedUserIds holds an entry that is not an id")),
     ).toBe(true);
-    const only = await loadText(
-      '{"note\\u0073" :"x","discord":{"allowedUserIds":[1234567890123456789]}}',
-    );
+    const only = await loadText('{"discord":{"allowedUserIds":[1234567890123456789,1.5]}}');
     expect(only.settings.discord.allowedUserIds.length).toBeGreaterThan(0);
     expect(allows(only.settings.discord.allowedUserIds, "1234567890123456800")).toBe(false);
     expect(allows(only.settings.discord.allowedUserIds, "someone-else")).toBe(false);
@@ -281,6 +279,41 @@ describe("settings loader — slack/discord allowedUserIds", () => {
       "123456789012345678901",
       "223456789012345678901",
     ]);
+  });
+
+  it("discord: precision is kept whatever else in the file is called discord (#488)", async () => {
+    // The real list is the top-level one JSON.parse keeps; another "discord"
+    // object anywhere, a duplicated top-level key or a \\u-escaped key must
+    // not cost its owner the exact id (a rounded id is dropped, so the owner
+    // would be refused).
+    const layouts = [
+      '{"agents":{"a":{"discord":{"enabled":true}}},"discord":{"allowedUserIds":[123456789012345678901]}}',
+      '{"discord":{"allowedUserIds":[123456789012345678901]},"busRouting":{"discord":{"x":1}}}',
+      '{"discord":{"allowedUserIds":["5"]},"discord":{"allowedUserIds":[123456789012345678901]}}',
+      '{"note\\u0073":"x","discord":{"allowedUserIds":[123456789012345678901]}}',
+      '{"disc\\u006frd":{"allowedUserIds":[123456789012345678901]}}',
+      '{"discord":{"allowed\\u0055serIds":[123456789012345678901]}}',
+    ];
+    for (const text of layouts) {
+      const { settings, warnings } = await loadText(text);
+      expect(settings.discord.allowedUserIds).toEqual(["123456789012345678901"]);
+      expect(warnings.filter((w) => w.includes("discord.allowedUserIds"))).toEqual([]);
+    }
+  });
+
+  it("discord: a number that is not a plain integer literal is never read as an id", async () => {
+    // 1.2345678901234568e18 and 1234567890123456789.0 are numbers JSON reads,
+    // but their text is not an id: dropped with the warning, never rounded in.
+    for (const literal of ["1.2345678901234568e18", "1234567890123456789.0"]) {
+      _resetChatUserIdsWarningsForTests();
+      const { settings, warnings } = await loadText(
+        `{"discord":{"allowedUserIds":[${literal},"111"]}}`,
+      );
+      expect(settings.discord.allowedUserIds).toEqual(["111"]);
+      expect(
+        warnings.some((w) => w.includes("discord.allowedUserIds holds an entry that is not an id")),
+      ).toBe(true);
+    }
   });
 
   it("discord: a large numeric snowflake in a list keeps its precision", async () => {
