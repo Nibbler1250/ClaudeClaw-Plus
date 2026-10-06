@@ -246,3 +246,292 @@ describe("redactSettings matches secret-shaped key names, not only exact ones (#
     }
   });
 });
+
+describe("secrets carried in values, under container keys, and in session/state files (#510)", () => {
+  // Assembled at runtime, like the values above, to dodge the secrets scanner.
+  const PASS = `p4ss${"-"}word-in-url`;
+  const QTOKEN = `qt${"-"}${"c".repeat(20)}`;
+  const ARG = `ghp${"_"}${"d".repeat(30)}`;
+  const HOOK = `https://hooks.slack.com/services/T000/B000/${"e".repeat(24)}`;
+  const DISCORD = `https://discord.com/api/webhooks/123456/${"f".repeat(40)}`;
+  const DISCORD_PTB = `https://ptb.discord.com/api/webhooks/654321/${"g".repeat(40)}`;
+
+  it("scrubs userinfo and secret-named query parameters out of URLs, keeping the rest", async () => {
+    const redacted = (await redactViaTechnicalInfo({
+      plugins: {
+        db: { url: `postgres://app:${PASS}@db.local:5432/main` },
+        gitUserOnly: { remote: `https://${ARG}@github.com/o/r.git` },
+        feed: { endpoint: `https://api.example.com/v1?api_key=${QTOKEN}&lang=en` },
+        alt: { endpoint: `https://api.example.com/v1?lang=en&access_token=${QTOKEN}#top` },
+        plain: { homepage: "https://example.com/docs?page=2" },
+      },
+    })) as { plugins: Record<string, Record<string, string>> };
+    const out = JSON.stringify(redacted);
+    for (const leaked of [PASS, QTOKEN, ARG]) expect(out).not.toContain(leaked);
+    expect(redacted.plugins.db.url).toContain("@db.local:5432/main");
+    expect(redacted.plugins.db.url.startsWith("postgres://")).toBe(true);
+    expect(redacted.plugins.gitUserOnly.remote).toContain("@github.com/o/r.git");
+    expect(redacted.plugins.feed.endpoint).toContain("lang=en");
+    expect(redacted.plugins.alt.endpoint).toContain("lang=en");
+    expect(redacted.plugins.alt.endpoint).toContain("#top");
+    expect(redacted.plugins.plain.homepage).toBe("https://example.com/docs?page=2");
+  });
+
+  it("redacts webhook URLs, by key name and by known shape", async () => {
+    const redacted = (await redactViaTechnicalInfo({
+      notify: { webhookUrl: "https://my.example.com/hook/abc", webhook: "https://x.example/y" },
+      misc: { target: HOOK, other: DISCORD, beta: DISCORD_PTB },
+    })) as { notify: Record<string, string>; misc: Record<string, string> };
+    expect(redacted.notify.webhookUrl).toMatch(REDACTED);
+    expect(redacted.notify.webhook).toMatch(REDACTED);
+    const out = JSON.stringify(redacted);
+    expect(out).not.toContain("hook/abc");
+    expect(out).not.toContain("e".repeat(24));
+    expect(out).not.toContain("f".repeat(40));
+    expect(out).not.toContain("g".repeat(40));
+  });
+
+  it("redacts the value after a secret-named flag, in both --flag value and --flag=value forms", async () => {
+    const redacted = (await redactViaTechnicalInfo({
+      plugins: {
+        mcp: {
+          command: "npx",
+          args: ["-y", "some-server", "--token", ARG, `--api-key=${QTOKEN}`, "--port", "8080"],
+          env: ["DEBUG=1", `GITHUB_TOKEN=${ARG}`],
+        },
+      },
+    })) as { plugins: { mcp: { args: string[]; env: string[] } } };
+    const out = JSON.stringify(redacted);
+    expect(out).not.toContain(ARG);
+    expect(out).not.toContain(QTOKEN);
+    const { args, env } = redacted.plugins.mcp;
+    expect(args.slice(0, 3)).toEqual(["-y", "some-server", "--token"]);
+    expect(args[3]).toMatch(REDACTED);
+    expect(args[4].startsWith("--api-key=")).toBe(true);
+    expect(args.slice(5)).toEqual(["--port", "8080"]);
+    expect(env[0]).toBe("DEBUG=1");
+    expect(env[1].startsWith("GITHUB_TOKEN=")).toBe(true);
+  });
+
+  it("redacts a bearer credential carried inside a string value", async () => {
+    const redacted = (await redactViaTechnicalInfo({
+      plugins: { http: { headerLine: `Bearer ${QTOKEN}`, note: "Bearer of good news" } },
+    })) as { plugins: { http: Record<string, string> } };
+    expect(JSON.stringify(redacted)).not.toContain(QTOKEN);
+    expect(redacted.plugins.http.headerLine.startsWith("Bearer ")).toBe(true);
+  });
+
+  it("redacts string leaves under a container key like tokens or auth, keeping numbers", async () => {
+    const redacted = (await redactViaTechnicalInfo({
+      tokens: { github: ARG, limit: 10, fallbacks: [QTOKEN] },
+      auth: { bearer: QTOKEN, scheme: "custom", github: PASS },
+      maxTokens: 4096,
+    })) as {
+      tokens: { github: string; limit: number; fallbacks: string[] };
+      auth: { bearer: string; scheme: string; github: string };
+      maxTokens: number;
+    };
+    expect(redacted.tokens.github).toMatch(REDACTED);
+    expect(redacted.tokens.limit).toBe(10);
+    expect(redacted.tokens.fallbacks[0]).toMatch(REDACTED);
+    expect(redacted.auth.bearer).toMatch(REDACTED);
+    expect(redacted.auth.github).toMatch(REDACTED);
+    expect(redacted.maxTokens).toBe(4096);
+    const out = JSON.stringify(redacted);
+    expect(out).not.toContain(ARG);
+    expect(out).not.toContain(QTOKEN);
+  });
+
+  it("runs session.json and state.json through the same redactor", async () => {
+    const paths = {
+      settings: join(tmp, "settings.json"),
+      session: join(tmp, "session.json"),
+      state: join(tmp, "state.json"),
+    };
+    writeFileSync(paths.session, JSON.stringify({ sessionId: "abc", apiToken: ARG }));
+    writeFileSync(
+      paths.state,
+      JSON.stringify({ heartbeat: { nextAt: 5 }, lastUrl: `https://u:${PASS}@h.example/` }),
+    );
+    const { buildTechnicalInfo } = await import("../services/state");
+    const info = (await buildTechnicalInfo(
+      { pid: 1, startedAt: Date.now(), heartbeatNextAt: 0, settings: {} as never, jobs: [] },
+      paths,
+    )) as { files: { sessionJson: Record<string, unknown>; stateJson: Record<string, unknown> } };
+    expect(info.files.sessionJson.sessionId).toBe("abc");
+    expect(info.files.sessionJson.apiToken).toMatch(REDACTED);
+    expect(info.files.stateJson.heartbeat).toEqual({ nextAt: 5 });
+    const out = JSON.stringify(info.files);
+    expect(out).not.toContain(ARG);
+    expect(out).not.toContain(PASS);
+  });
+
+  it("scrubs job prompts in the snapshot", async () => {
+    const { buildTechnicalInfo } = await import("../services/state");
+    const info = (await buildTechnicalInfo({
+      pid: 1,
+      startedAt: Date.now(),
+      heartbeatNextAt: 0,
+      settings: {} as never,
+      jobs: [{ name: "ping", prompt: `curl -X POST ${HOOK} -d hi` }] as never,
+    })) as { snapshot: { jobs: { name: string; prompt: string }[] } };
+    expect(info.snapshot.jobs[0].name).toBe("ping");
+    expect(info.snapshot.jobs[0].prompt.startsWith("curl -X POST ")).toBe(true);
+    expect(JSON.stringify(info.snapshot)).not.toContain("e".repeat(24));
+  });
+
+  it("catches the shapes the first version missed", async () => {
+    const cases: string[] = [
+      `SLACK_URL=${HOOK}`,
+      `  ${DISCORD}`,
+      `https://discord.com/api/v10/webhooks/1/${QTOKEN}`,
+      `authorization: bearer ${QTOKEN}`,
+      `BEARER ${QTOKEN}`,
+      `Authorization: Basic ${QTOKEN}`,
+      `Authorization: token ${QTOKEN}`,
+      `X-Api-Key: ${QTOKEN}`,
+      `postgres://u:p@${QTOKEN}@db/main`,
+      `export GITHUB_TOKEN=${QTOKEN}`,
+      `A=1 GITHUB_TOKEN=${QTOKEN} npx srv`,
+      `npx srv --token ${QTOKEN}`,
+      `claude --api-key=${QTOKEN} -p hi`,
+      `https://x.example/cb#access_token=${QTOKEN}`,
+      `https://s3.example/o?X-Amz-Signature=${QTOKEN}`,
+      `GH_PAT=${QTOKEN}`,
+      `{"token":"${QTOKEN}","user":"me"}`,
+    ];
+    const redacted = (await redactViaTechnicalInfo({ notes: cases })) as { notes: string[] };
+    for (const [i, out] of redacted.notes.entries()) {
+      expect(`${i}: ${out}`).not.toContain(QTOKEN);
+    }
+    expect(redacted.notes[16]).toContain('"user":"me"');
+    const flags = (await redactViaTechnicalInfo({
+      args: ["--auth", QTOKEN, "--password", 12345, "--no-key", "--port", "8080"],
+      webhook_url: "https://n8n.example/webhook/abc123",
+      webhooks: { port: 8080, path: "/in" },
+    })) as { args: unknown[]; webhook_url: string; webhooks: { port: number; path: string } };
+    expect(flags.args[1]).toMatch(REDACTED);
+    expect(flags.args[3]).toMatch(REDACTED);
+    expect(flags.args.slice(4)).toEqual(["--no-key", "--port", "8080"]);
+    expect(flags.webhook_url).toMatch(REDACTED);
+    expect(flags.webhooks.port).toBe(8080);
+  });
+
+  it("does not let a non-secret name hide a secret later on the line, and handles quotes", async () => {
+    const BOT = `${"1".repeat(9)}:AA${"h".repeat(33)}`;
+    const ANT = `sk-ant-api03-${"i".repeat(30)}`;
+    const cases: string[] = [
+      `see http://x.com then X-Api-Key: ${QTOKEN}`,
+      `curl http://x -H X-Api-Key:${QTOKEN}`,
+      `note: Authorization: Token ${QTOKEN}`,
+      `user: bob password: ${QTOKEN}`,
+      `url: https://h/x token: ${QTOKEN}`,
+      `password: '${QTOKEN}'`,
+      `password: "${QTOKEN}"`,
+      `{'password': '${QTOKEN}'}`,
+      `--password="${QTOKEN}"`,
+      `--token '${QTOKEN}'`,
+      `export API_KEY='${QTOKEN} x'`,
+      `GH_TOKEN = ${QTOKEN}`,
+      `https://api.telegram.org/bot${BOT}/sendMessage`,
+      `key is ${ANT} ok`,
+      `https://hooks.slack.com:443/services/T/B/${QTOKEN}`,
+      `discord.com/api/webhooks/123/${QTOKEN}`,
+    ];
+    const out = (await redactViaTechnicalInfo({ notes: cases })) as { notes: string[] };
+    for (const [i, v] of out.notes.entries()) {
+      expect(`${i}: ${v}`).not.toContain(QTOKEN);
+      expect(`${i}: ${v}`).not.toContain("h".repeat(33));
+      expect(`${i}: ${v}`).not.toContain("i".repeat(30));
+    }
+    expect(out.notes[0].startsWith("see http://x.com then X-Api-Key: ")).toBe(true);
+    expect(out.notes[3].startsWith("user: bob password: ")).toBe(true);
+  });
+
+  it("leaves ordinary values alone", async () => {
+    const plain = [
+      "http://host:8080/path",
+      "time: 12:30",
+      "C:\\x\\y",
+      "anthropic:claude-opus",
+      "model: opus",
+      "--port 8080",
+      "compass=north",
+      "passport: x",
+      "*/5 * * * *",
+      "Bearer of good news",
+    ];
+    const out = (await redactViaTechnicalInfo({ notes: plain })) as { notes: string[] };
+    expect(out.notes).toEqual(plain);
+  });
+
+  it("redacts each value once, keeps JSON shape, and covers the whole value", async () => {
+    const GHP = `ghp${"_"}${"j".repeat(36)}`;
+    const out = (await redactViaTechnicalInfo({
+      notes: [
+        '{"token": "abc", "user": "bob"}',
+        '{"auth":{"token":"x"}}',
+        '{"credentials": ["a","b"]}',
+        `Authorization: Bearer ${GHP}`,
+        "PASSWORD=abc,def;ghi",
+        "--password abc;def",
+        "password: correct horse battery staple",
+        "pip install sk-learn-something-extended-module",
+        "log 1696291200:connection_reset_by_peer_after_timeout",
+      ],
+    })) as { notes: string[] };
+    const n = out.notes;
+    expect(n[0]).toBe('{"token":"<redacted:3 chars>", "user": "bob"}');
+    expect(n[1]).toBe('{"auth":{"token":"<redacted:1 chars>"}}');
+    expect(n[2]).toBe('{"credentials": ["a","b"]}');
+    expect(n[3]).toBe(`Authorization: Bearer <redacted:${GHP.length} chars>`);
+    expect(n[4]).toBe("PASSWORD=<redacted:11 chars>");
+    expect(n[5]).toBe("--password <redacted:7 chars>");
+    expect(n[6]).toBe("password: <redacted:7 chars> horse battery staple");
+    expect(n[7]).toBe("pip install sk-learn-something-extended-module");
+    expect(n[8]).toBe("log 1696291200:connection_reset_by_peer_after_timeout");
+  });
+
+  it("a declined or already-redacted pair does not hide the next one on the line", async () => {
+    const ANT = `sk-ant-api03-${"k".repeat(30)}`;
+    const out = (await redactViaTechnicalInfo({
+      notes: [
+        `api_key: ${ANT} password: hunter2xyz`,
+        "compass: north password: hunter2xyz",
+        "token: abc, secret: hunter2xyz",
+        '{"note":"password: hunter2xyz","x":1}',
+        "API_KEY=[hunter2xyz]",
+        `sk-svcacct-${"m".repeat(40)} sk-or-v1-${"0".repeat(64)}`,
+        `110201543:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw`,
+        'password: hunter2xyz"tail',
+        "password: hunt'hunter2xyz",
+      ],
+    })) as { notes: string[] };
+    for (const [i, v] of out.notes.entries()) {
+      expect(`${i}: ${v}`).not.toContain("hunter2xyz");
+      expect(`${i}: ${v}`).not.toContain("m".repeat(40));
+      expect(`${i}: ${v}`).not.toContain("0".repeat(64));
+      expect(`${i}: ${v}`).not.toContain("SeofSAs0K5PALDsaw");
+    }
+    expect(out.notes[3].endsWith('","x":1}')).toBe(true);
+  });
+
+  it("stays linear on long hostile strings", async () => {
+    const long = 100_000;
+    const inputs = [
+      "a".repeat(long),
+      "?".repeat(long),
+      "a-".repeat(long / 2),
+      "&a".repeat(long / 2),
+      "a:".repeat(long / 2),
+      '"'.repeat(long),
+      "x ".repeat(long / 2),
+      "--a ".repeat(long / 4),
+      "a://".repeat(long / 4),
+      `"${"a".repeat(long)}`,
+    ];
+    const t0 = performance.now();
+    await redactViaTechnicalInfo({ blobs: inputs });
+    expect(performance.now() - t0).toBeLessThan(1500);
+  });
+});
