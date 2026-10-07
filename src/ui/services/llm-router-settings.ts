@@ -10,6 +10,7 @@
 
 import { readFile, writeFile } from "fs/promises";
 import { SETTINGS_FILE } from "../constants";
+import { parseSettingsForRewrite } from "./settings-json";
 
 export interface LlmRouterTiers {
   fast: string[];
@@ -65,7 +66,7 @@ export async function updateLlmRouterSettings(
   patch: LlmRouterSettingsPatch,
 ): Promise<LlmRouterSettingsData> {
   const raw = await readFile(SETTINGS_FILE, "utf-8");
-  const data = JSON.parse(raw) as Record<string, unknown>;
+  const data = parseSettingsForRewrite(raw);
   if (!data.llmRouter || typeof data.llmRouter !== "object") {
     data.llmRouter = {
       tiers: { fast: [], balanced: [], reasoning: [] },

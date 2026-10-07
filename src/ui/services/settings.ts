@@ -1,5 +1,6 @@
 import { readFile, writeFile } from "fs/promises";
 import { SETTINGS_FILE } from "../constants";
+import { parseSettingsForRewrite } from "./settings-json";
 
 export async function setHeartbeatEnabled(enabled: boolean): Promise<void> {
   await updateHeartbeatSettings({ enabled });
@@ -37,7 +38,7 @@ export async function updateHeartbeatSettings(
   patch: HeartbeatSettingsPatch,
 ): Promise<HeartbeatSettingsData> {
   const raw = await readFile(SETTINGS_FILE, "utf-8");
-  const data = JSON.parse(raw) as Record<string, any>;
+  const data = parseSettingsForRewrite(raw) as Record<string, any>;
   if (!data.heartbeat || typeof data.heartbeat !== "object") data.heartbeat = {};
 
   if (typeof patch.enabled === "boolean") {
