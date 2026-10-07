@@ -2095,6 +2095,11 @@ export async function reloadSettings(): Promise<Settings> {
   return cached;
 }
 
+/** Path of the settings.json the loader and the web UI save handlers use. */
+export function getSettingsFile(): string {
+  return SETTINGS_FILE;
+}
+
 export function getSettings(): Settings {
   if (!cached) throw new Error("Settings not loaded. Call loadSettings() first.");
   return cached;
@@ -2104,7 +2109,8 @@ export function getSettings(): Settings {
  * TEST-ONLY: redirect the settings file path so tests never read or write the
  * developer's real `<cwd>/.claude/claudeclaw/settings.json` (which is frozen at
  * module load to the start-up cwd). Pass a temp path to point there; call with
- * no argument to restore the default. Clears the settings cache so the next
+ * no argument to restore the default. The web UI save handlers follow it too.
+ * Clears the settings cache so the next
  * `loadSettings()` / `reloadSettings()` reads from the (new) path. Pair with a
  * call in the test's `afterEach` to avoid leaking the override or cached
  * settings across tests.
