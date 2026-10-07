@@ -9,7 +9,7 @@
  */
 
 import { readFile, writeFile } from "fs/promises";
-import { SETTINGS_FILE } from "../constants";
+import { getSettingsFile } from "../../config";
 import { parseSettingsForRewrite } from "../../settings-json";
 
 export interface LlmRouterTiers {
@@ -58,14 +58,14 @@ function canonical(data: Record<string, unknown>): LlmRouterSettingsData {
 }
 
 export async function readLlmRouterSettings(): Promise<LlmRouterSettingsData> {
-  const raw = await readFile(SETTINGS_FILE, "utf-8");
+  const raw = await readFile(getSettingsFile(), "utf-8");
   return canonical(JSON.parse(raw) as Record<string, unknown>);
 }
 
 export async function updateLlmRouterSettings(
   patch: LlmRouterSettingsPatch,
 ): Promise<LlmRouterSettingsData> {
-  const raw = await readFile(SETTINGS_FILE, "utf-8");
+  const raw = await readFile(getSettingsFile(), "utf-8");
   const data = parseSettingsForRewrite(raw);
   if (!data.llmRouter || typeof data.llmRouter !== "object") {
     data.llmRouter = {
@@ -84,6 +84,6 @@ export async function updateLlmRouterSettings(
     if (patch.tiers.reasoning !== undefined) tiers.reasoning = toIdList(patch.tiers.reasoning);
   }
 
-  await writeFile(SETTINGS_FILE, `${JSON.stringify(data, null, 2)}\n`);
+  await writeFile(getSettingsFile(), `${JSON.stringify(data, null, 2)}\n`);
   return canonical(data);
 }

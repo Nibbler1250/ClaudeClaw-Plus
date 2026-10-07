@@ -1,5 +1,5 @@
 import { readFile, writeFile } from "fs/promises";
-import { SETTINGS_FILE } from "../constants";
+import { getSettingsFile } from "../../config";
 import { parseSettingsForRewrite } from "../../settings-json";
 
 export async function setHeartbeatEnabled(enabled: boolean): Promise<void> {
@@ -21,7 +21,7 @@ export interface HeartbeatSettingsData {
 }
 
 export async function readHeartbeatSettings(): Promise<HeartbeatSettingsData> {
-  const raw = await readFile(SETTINGS_FILE, "utf-8");
+  const raw = await readFile(getSettingsFile(), "utf-8");
   const data = JSON.parse(raw) as Record<string, any>;
   if (!data.heartbeat || typeof data.heartbeat !== "object") data.heartbeat = {};
   return {
@@ -37,7 +37,7 @@ export async function readHeartbeatSettings(): Promise<HeartbeatSettingsData> {
 export async function updateHeartbeatSettings(
   patch: HeartbeatSettingsPatch,
 ): Promise<HeartbeatSettingsData> {
-  const raw = await readFile(SETTINGS_FILE, "utf-8");
+  const raw = await readFile(getSettingsFile(), "utf-8");
   const data = parseSettingsForRewrite(raw) as Record<string, any>;
   if (!data.heartbeat || typeof data.heartbeat !== "object") data.heartbeat = {};
 
@@ -56,7 +56,7 @@ export async function updateHeartbeatSettings(
   }
 
   const text = JSON.stringify(data, null, 2) + "\n";
-  await writeFile(SETTINGS_FILE, text);
+  await writeFile(getSettingsFile(), text);
   // Answer from a plain parse of what was written: the kept integers are
   // JSON.rawJSON objects, which Number() cannot read.
   const saved = (JSON.parse(text) as Record<string, any>).heartbeat;

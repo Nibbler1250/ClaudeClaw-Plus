@@ -4,18 +4,21 @@
  * written, or the loader reads the rounded text as an exact id: the owner is
  * refused and whoever holds the rounded id is allowed (#496).
  */
-import { describe, it, expect, beforeAll, afterAll, afterEach } from "bun:test";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
 import { join } from "node:path";
-import { mkdir, copyFile, unlink, writeFile, readFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
+import { existsSync, readFileSync, statSync } from "node:fs";
 
 import { updateHeartbeatSettings } from "../services/settings";
 import { updateLlmRouterSettings } from "../services/llm-router-settings";
-import { _setSettingsFileForTests, reloadSettings } from "../../config";
+import { _setSettingsFileForTests, getSettingsFile, reloadSettings } from "../../config";
 
-const SETTINGS_DIR = join(process.cwd(), ".claude", "claudeclaw");
-const SETTINGS_FILE = join(SETTINGS_DIR, "settings.json");
-const BACKUP_FILE = join(SETTINGS_DIR, "settings.json.save-precision-test-backup");
+// The handlers read and write a temp file through _setSettingsFileForTests,
+// never the real <cwd>/.claude/claudeclaw/settings.json.
+const REAL_SETTINGS_FILE = join(process.cwd(), ".claude", "claudeclaw", "settings.json");
+let tempDir = "";
+let SETTINGS_FILE = "";
 
 const OWNER = "123456789012345678901";
 const ROUNDED = String(Number(OWNER)); // "123456789012345680000"
@@ -32,22 +35,26 @@ const SEED = `{
 `;
 
 beforeAll(async () => {
-  await mkdir(SETTINGS_DIR, { recursive: true });
-  if (existsSync(SETTINGS_FILE)) await copyFile(SETTINGS_FILE, BACKUP_FILE);
+  tempDir = await mkdtemp(join(tmpdir(), "settings-save-precision-"));
+  SETTINGS_FILE = join(tempDir, "settings.json");
 });
 
 afterAll(async () => {
-  if (existsSync(BACKUP_FILE)) {
-    await copyFile(BACKUP_FILE, SETTINGS_FILE);
-    await unlink(BACKUP_FILE);
-  } else if (existsSync(SETTINGS_FILE)) {
-    await unlink(SETTINGS_FILE);
-  }
+  await rm(tempDir, { recursive: true, force: true });
+});
+
+beforeEach(() => {
+  _setSettingsFileForTests(SETTINGS_FILE);
 });
 
 afterEach(() => {
   _setSettingsFileForTests();
 });
+
+function snapshot(path: string): { mtimeMs: number; text: string } | null {
+  if (!existsSync(path)) return null;
+  return { mtimeMs: statSync(path).mtimeMs, text: readFileSync(path, "utf-8") };
+}
 
 async function expectIdsKept(): Promise<void> {
   const text = await readFile(SETTINGS_FILE, "utf-8");
@@ -57,11 +64,25 @@ async function expectIdsKept(): Promise<void> {
   expect(text).toContain("900719925474099312345");
   expect(text).not.toContain(ROUNDED);
 
-  _setSettingsFileForTests(SETTINGS_FILE);
   const settings = await reloadSettings();
   expect(settings.discord.allowedUserIds).toContain(OWNER);
   expect(settings.discord.allowedUserIds).not.toContain(ROUNDED);
 }
+
+describe("web UI settings save stays in the test's temp dir", () => {
+  it("reads and writes only the redirected file, never the real settings.json", async () => {
+    expect(getSettingsFile().startsWith(tempDir)).toBe(true);
+    const before = snapshot(REAL_SETTINGS_FILE);
+    await writeFile(SETTINGS_FILE, '{"heartbeat":{"interval":15,"prompt":"temp-seed"}}\n');
+    const r = await updateHeartbeatSettings({ interval: 30 });
+    expect(r.prompt).toBe("temp-seed");
+    await updateLlmRouterSettings({ tiers: { fast: ["a/b"] } });
+    const data = JSON.parse(await readFile(SETTINGS_FILE, "utf-8"));
+    expect(data.heartbeat).toEqual({ interval: 30, prompt: "temp-seed" });
+    expect(data.llmRouter.tiers.fast).toEqual(["a/b"]);
+    expect(snapshot(REAL_SETTINGS_FILE)).toEqual(before);
+  });
+});
 
 describe("web UI settings save keeps large integers as written (#496)", () => {
   it("updateHeartbeatSettings applies the patch and keeps the Discord ids", async () => {
