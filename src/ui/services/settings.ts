@@ -1,6 +1,6 @@
 import { readFile, writeFile } from "fs/promises";
 import { SETTINGS_FILE } from "../constants";
-import { parseSettingsForRewrite } from "./settings-json";
+import { parseSettingsForRewrite } from "../../settings-json";
 
 export async function setHeartbeatEnabled(enabled: boolean): Promise<void> {
   await updateHeartbeatSettings({ enabled });
@@ -55,13 +55,15 @@ export async function updateHeartbeatSettings(
     data.heartbeat.excludeWindows = patch.excludeWindows;
   }
 
-  await writeFile(SETTINGS_FILE, JSON.stringify(data, null, 2) + "\n");
+  const text = JSON.stringify(data, null, 2) + "\n";
+  await writeFile(SETTINGS_FILE, text);
+  // Answer from a plain parse of what was written: the kept integers are
+  // JSON.rawJSON objects, which Number() cannot read.
+  const saved = (JSON.parse(text) as Record<string, any>).heartbeat;
   return {
-    enabled: Boolean(data.heartbeat.enabled),
-    interval: Number(data.heartbeat.interval) || 15,
-    prompt: typeof data.heartbeat.prompt === "string" ? data.heartbeat.prompt : "",
-    excludeWindows: Array.isArray(data.heartbeat.excludeWindows)
-      ? data.heartbeat.excludeWindows
-      : [],
+    enabled: Boolean(saved.enabled),
+    interval: Number(saved.interval) || 15,
+    prompt: typeof saved.prompt === "string" ? saved.prompt : "",
+    excludeWindows: Array.isArray(saved.excludeWindows) ? saved.excludeWindows : [],
   };
 }

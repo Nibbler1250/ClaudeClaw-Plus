@@ -10,7 +10,7 @@
 
 import { readFile, writeFile } from "fs/promises";
 import { SETTINGS_FILE } from "../constants";
-import { parseSettingsForRewrite } from "./settings-json";
+import { parseSettingsForRewrite } from "../../settings-json";
 
 export interface LlmRouterTiers {
   fast: string[];

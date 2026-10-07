@@ -121,4 +121,18 @@ describe("web UI settings save keeps large integers as written (#496)", () => {
       heartbeat: { interval: 5 },
     });
   });
+
+  it("answers the save even when a heartbeat field itself holds a large integer", async () => {
+    await writeFile(
+      SETTINGS_FILE,
+      '{"heartbeat":{"interval":100000000000000000000,"excludeWindows":[{"start":"01:00","end":"02:00","days":[123456789012345678901]}]}}\n',
+    );
+    const r = await updateHeartbeatSettings({ enabled: true });
+    expect(r.enabled).toBe(true);
+    expect(r.interval).toBe(1e20);
+    expect(r.excludeWindows[0]?.days).toEqual([Number("123456789012345678901")]);
+    const text = await readFile(SETTINGS_FILE, "utf-8");
+    expect(text).toContain("100000000000000000000");
+    expect(text).toContain("123456789012345678901");
+  });
 });

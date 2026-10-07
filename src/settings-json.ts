@@ -1,7 +1,7 @@
 /**
  * Read settings.json for a rewrite without losing integers past 2^53.
  *
- * The save handlers parse the whole file, patch one section and write it all
+ * The dashboard save handlers and the tuner's model switch parse the whole file, patch one section and write it all
  * back. A plain `JSON.parse` rounds a bare integer such as a Discord snowflake
  * (`123456789012345678901` → `123456789012345680000`), and the loader then
  * reads the rounded text as an exact id (#496). Here every integer literal
