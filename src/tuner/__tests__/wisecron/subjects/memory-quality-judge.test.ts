@@ -106,6 +106,22 @@ describe("MemorySubject — entry quality judge failure reason", () => {
     expect(warned()).not.toContain("AbCdEf");
   });
 
+  it("a CLI exit keeps its exit code, never the CLI's stderr", async () => {
+    await judged(
+      throwing("claude CLI exited 1: Error near: - [Alpha](alpha.md) private note"),
+    ).measureEntryQuality(12);
+    const r = cache().reason;
+    expect(r).toEqual({ code: "CLI_EXIT", message: "claude CLI exited 1" });
+    expect(readFileSync(qcPath, "utf8")).not.toContain("private note");
+    expect(warned()).toContain("memory quality judge failed: CLI_EXIT: claude CLI exited 1");
+    expect(warned()).not.toContain("private note");
+  });
+
+  it("a CLI killed by a signal (exit code null) keeps no stderr either", async () => {
+    await judged(throwing("claude CLI exited null: killed mid-entry text")).measureEntryQuality(12);
+    expect(cache().reason).toEqual({ code: "CLI_EXIT", message: "claude CLI exited null" });
+  });
+
   it("does not call the judge again within the failure cooldown", async () => {
     let calls = 0;
     const llm: LLMClient = {
