@@ -2785,10 +2785,14 @@ export class BusCoreImpl implements BusCore {
    * names that turn's chat and the text goes straight there. The flags are
    * then handed back to the newcomer clean.
    */
-  private handleStaleTurnEnd(agentId: string, text: string): void {
+  private handleStaleTurnEnd(agentId: string, text: string, injectPrompt = false): void {
     if (text.trim().length === 0) return;
     const origin = this.lastPromptOrigin.get(agentId);
     if (!origin || !CHANNEL_DRIVEN_ORIGINS.has(origin.origin)) return;
+    if (injectPrompt && origin.origin_id !== "inject") {
+      this.keepInjectTurnInternal(agentId, origin.origin, text.length);
+      return;
+    }
     console.warn(
       `[bus] silent-drop recovered for agent=${agentId} (origin=${origin.origin}, ` +
         `chars=${text.length}): a released turn ended with text but no reply — ` +
@@ -2829,6 +2833,24 @@ export class BusCoreImpl implements BusCore {
     this.silentClosedOrigin.delete(agentId);
   }
 
+  /** Inject turns whose text the net kept off a user's chat, per agent. */
+  private readonly injectTurnsKeptInternal = new Map<string, number>();
+
+  /** Number of inject turns the net kept internal for `agentId`. */
+  injectTurnsKeptInternalCount(agentId: string): number {
+    return this.injectTurnsKeptInternal.get(agentId) ?? 0;
+  }
+
+  private keepInjectTurnInternal(agentId: string, slotOrigin: BusOrigin, chars: number): void {
+    const count = (this.injectTurnsKeptInternal.get(agentId) ?? 0) + 1;
+    this.injectTurnsKeptInternal.set(agentId, count);
+    console.warn(
+      `[bus] inject turn kept internal for agent=${agentId} (slot origin=${slotOrigin}, ` +
+        `chars=${chars}, count=${count}): the turn answered a daemon inject and ended ` +
+        "without reply — not nudged, not forwarded. See #215.",
+    );
+  }
+
   /**
    * Silent-drop safety net handler (issue #215). Wired by
    * `ingestSessionEvent`/JSONL tailer when it observes a `response.turn_end`
@@ -2839,11 +2861,29 @@ export class BusCoreImpl implements BusCore {
    * the user-facing surface gets nothing — confirmed live 2x in 12h
    * on a real bus-mode deployment after issue #215 was filed.
    */
-  private handleTurnEnd(agentId: string, text: string): void {
+  private handleTurnEnd(agentId: string, text: string, injectPrompt = false): void {
     if (this.currentTurnReplied.get(agentId) === true) return;
     // #217 finding 2: if a final already published for this turn (e.g. the
     // real reply IPC landed first), don't synthesize a duplicate.
     if (this.currentTurnFinalPublished.get(agentId) === true) return;
+    // The transcript says this turn answered a daemon inject, but the bus slot
+    // names another chat: a re-delivered copy of the inject ran while a user
+    // prompt was waiting behind it. Its text is internal — nudging or
+    // synthesizing here would ship it to that user's chat. The user's own turn
+    // is still to come and keeps the net. A slot that IS the inject falls
+    // through: its synthesized final settles /api/inject, which drops it.
+    const slotOrigin = this.lastPromptOrigin.get(agentId);
+    if (
+      injectPrompt &&
+      slotOrigin &&
+      CHANNEL_DRIVEN_ORIGINS.has(slotOrigin.origin) &&
+      slotOrigin.origin_id !== "inject"
+    ) {
+      if (text.trim().length > 0) {
+        this.keepInjectTurnInternal(agentId, slotOrigin.origin, text.length);
+      }
+      return;
+    }
     // Effective text to deliver: this turn's own text, or — on a turn we already
     // nudged that produced none — the original text stashed when we nudged, so a
     // nudged-but-still-silent turn never loses the first turn's output (#215).
@@ -3184,7 +3224,7 @@ export class BusCoreImpl implements BusCore {
     let releaseSlot = false;
     let staleTerminator = false;
     if (e.topic === "response.turn_end" && e.agent_id) {
-      const payload = e.payload as { text?: string; message_id?: string };
+      const payload = e.payload as { text?: string; message_id?: string; inject_prompt?: boolean };
       // #239: after an early release the admitted prompt's own line has not
       // been tailed yet — this terminator is the RELEASED turn's, arriving
       // late. The net still runs (that turn's text still needs its chat), the
@@ -3216,9 +3256,9 @@ export class BusCoreImpl implements BusCore {
         this.publishUncorrelated(e);
         return;
       } else if (staleTerminator) {
-        this.handleStaleTurnEnd(e.agent_id, payload?.text ?? "");
+        this.handleStaleTurnEnd(e.agent_id, payload?.text ?? "", payload?.inject_prompt === true);
       } else {
-        this.handleTurnEnd(e.agent_id, payload?.text ?? "");
+        this.handleTurnEnd(e.agent_id, payload?.text ?? "", payload?.inject_prompt === true);
       }
       // The turn ended → the REPL is free, so a prompt queued behind it can now
       // start; stop deferring its flush-verify (see agentTurnActive).
