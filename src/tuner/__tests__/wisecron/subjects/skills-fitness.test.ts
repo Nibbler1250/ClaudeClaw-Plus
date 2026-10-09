@@ -197,10 +197,10 @@ describe("SkillsSubject — description quality judge failure reason", () => {
 
   it("keeps only the first line of an error", async () => {
     skill("alpha", "Alpha does alpha");
-    await judged(throwing("claude CLI exited 1: boom\nsecond line")).measureDescriptionQuality(12);
+    await judged(throwing("spawn failed: boom\nsecond line")).measureDescriptionQuality(12);
     const r = cache().reason;
     expect(r?.code).toBeUndefined();
-    expect(r?.message).toBe("claude CLI exited 1: boom");
+    expect(r?.message).toBe("spawn failed: boom");
   });
 
   it("redacts token-shaped text from the reason", async () => {
@@ -219,9 +219,7 @@ describe("SkillsSubject — description quality judge failure reason", () => {
 
   it("caps a long error message", async () => {
     skill("alpha", "Alpha does alpha");
-    await judged(throwing(`claude CLI exited 1: ${"word ".repeat(80)}`)).measureDescriptionQuality(
-      12,
-    );
+    await judged(throwing(`spawn failed: ${"word ".repeat(80)}`)).measureDescriptionQuality(12);
     expect(cache().reason?.message.length).toBe(200);
   });
 
