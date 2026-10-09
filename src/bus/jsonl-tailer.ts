@@ -198,6 +198,35 @@ export function isTerminalStopReason(stopReason: unknown): stopReason is string 
   );
 }
 
+/**
+ * A prompt the daemon sent through `/api/inject`, in either recorded form: the
+ * CLI's rendering of the MCP channel push (`origin="webui" origin_id="inject"`)
+ * or the bus's PTY wrapper (`source="webui" chat_id="inject"`), possibly inside
+ * a paste wrapper. Only the opening `<channel>` tag is read; the prompt body is
+ * XML-escaped, so user text cannot forge one.
+ */
+export function isDaemonInjectPrompt(text: string): boolean {
+  const m = text.match(/^\s*(?:<pasted_content\b[^>]*>\s*)?<channel\s([^>]*)>/);
+  if (!m) return false;
+  // Whole attribute names, first occurrence wins: the identity attributes are
+  // written before any metadata, so a metadata key (`data-origin`, a repeated
+  // `origin_id`) can neither forge nor override them. The second attribute
+  // tells the two forms apart (`origin` for the CLI's, `chat_id` for ours).
+  const names: string[] = [];
+  const attrs = new Map<string, string>();
+  for (const [, name, value] of m[1].matchAll(/(?:^|\s)([\w:.-]+)="([^"]*)"/g)) {
+    names.push(name);
+    if (!attrs.has(name)) attrs.set(name, value);
+  }
+  if (names[1] === "origin") {
+    return attrs.get("origin") === "webui" && attrs.get("origin_id") === "inject";
+  }
+  if (names[1] === "chat_id") {
+    return attrs.get("source") === "webui" && attrs.get("chat_id") === "inject";
+  }
+  return false;
+}
+
 export class JsonlTailer {
   private readonly bus: BusCore;
   private readonly agent_id: string;
@@ -212,6 +241,12 @@ export class JsonlTailer {
   /** #212: the last top-level prompt this tailer ingested (the `user` line),
    *  which the next turn boundary belongs to. */
   private lastIngestedPrompt: { text: string; promptId?: string } | null = null;
+  /** The turn in progress was opened by a daemon inject (`/api/inject`), read
+   *  from the transcript itself rather than from the bus's single origin slot:
+   *  a re-delivered copy of an inject can run while the bus already believes a
+   *  Telegram prompt owns the turn. Survives the CLI's own continuation lines
+   *  ("no visible output", a Stop-hook note), which carry on the same work. */
+  private turnPromptIsInject = false;
   private lastBoundaryMessageId: string | undefined;
   /** Set when a prompt is adopted; cleared when a boundary consumes it. */
   private promptSinceLastBoundary = false;
@@ -664,6 +699,7 @@ export class JsonlTailer {
       return;
     }
     if (text.length === 0) return;
+    this.turnPromptIsInject = isDaemonInjectPrompt(text);
     this.lastIngestedPrompt = { text, promptId: line.promptId };
     this.promptSinceLastBoundary = true;
   }
@@ -781,6 +817,7 @@ export class JsonlTailer {
           text: turnText,
           message_id: line.message?.id,
           ...(synthetic ? { synthetic: true } : {}),
+          ...(this.turnPromptIsInject ? { inject_prompt: true } : {}),
         },
         line,
       );
@@ -834,6 +871,22 @@ export class JsonlTailer {
     // subtypes still go through (forward-compat). We don't gate on
     // `BUS_CRITICAL_ATTACHMENT_SUBTYPES` — that set is for downstream
     // filtering, not for dropping events here.
+    // A prompt the CLI folds into the running turn makes that turn answer it
+    // too: an inject turn that absorbed a user's message is no longer internal.
+    // A task notification folded in is the agent's own business, not a user's.
+    if (subtype === "queued_command" && line.isSidechain !== true) {
+      const { prompt, commandMode } = line.attachment as {
+        prompt?: unknown;
+        commandMode?: unknown;
+      };
+      if (
+        typeof prompt === "string" &&
+        commandMode !== "task-notification" &&
+        !isDaemonInjectPrompt(prompt)
+      ) {
+        this.turnPromptIsInject = false;
+      }
+    }
     const topic = `attachment.${subtype}` as BusEventTopic;
     this.publish(topic, line.attachment, line, {
       bus_critical: BUS_CRITICAL_ATTACHMENT_SUBTYPES.has(subtype),
