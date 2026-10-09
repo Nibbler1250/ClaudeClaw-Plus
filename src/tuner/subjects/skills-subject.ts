@@ -20,6 +20,12 @@ import { skillsHealth, accessedSkills } from "./skills-signal.js";
 import { ARTIFACT_SOURCE } from "../../skills-tuner/core/telemetry.js";
 import type { DateRange, Metric, TelemetryProvider } from "../../skills-tuner/core/telemetry.js";
 import { median } from "../../skills-tuner/core/aggregate.js";
+import {
+  describeError,
+  errorReason,
+  parseJudgeScores,
+  type QualityFailureReason,
+} from "./judge-failure.js";
 
 const SKILLS_MIN = 4; // need a few skills before "dead ratio" means anything
 const SKILLS_MAX_DEAD_RATIO = 0.5;
@@ -173,40 +179,7 @@ function stripFences(text: string): string {
   return text.trim();
 }
 
-/** Why the description-quality judge produced no median. */
-export interface QualityFailureReason {
-  code?: string;
-  message: string;
-}
-
-// Token-shaped runs (API keys, bearer tokens, long hex/base64) never reach a log
-// or the cache, even when an error message carries one.
-const SECRET_LIKE_RE = /\b(?:sk|pk|rk)-[\w-]{8,}|\bBearer\s+\S+|[A-Za-z0-9+/_=-]{32,}/g;
-
-/** Error code + first line of the message, capped and redacted: enough to
- * diagnose (e.g. ENOENT when the CLI is not on PATH), short enough to keep a
- * CLI's stderr dump out. */
-function errorReason(e: unknown): QualityFailureReason {
-  // Called from catch blocks: it must not throw itself (a null-prototype object
-  // has no String(), a getter can throw).
-  try {
-    const c = e && typeof e === "object" ? (e as { code?: unknown }).code : undefined;
-    const code = typeof c === "string" ? c : undefined;
-    const raw = e instanceof Error ? e.message : String(e);
-    const message = (typeof raw === "string" ? raw : "")
-      .split("\n")[0]!
-      .replace(SECRET_LIKE_RE, "[redacted]")
-      .slice(0, 200);
-    return code ? { code, message } : { message };
-  } catch {
-    return { message: "unprintable error" };
-  }
-}
-
-function describeError(e: unknown): string {
-  const r = errorReason(e);
-  return r.code ? `${r.code}: ${r.message}` : r.message;
-}
+export type { QualityFailureReason };
 
 export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject {
   readonly name = "skills";
@@ -718,14 +691,7 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
     const user = sample.map((s) => `- ${s.name}: ${s.desc}`).join("\n");
     try {
       const raw = await this.llm.call("judge", system, [{ role: "user", content: user }], 400);
-      let nums: unknown[] = [];
-      try {
-        const parsed: unknown = JSON.parse((raw.match(/\[[\s\S]*\]/) ?? ["[]"])[0]);
-        if (Array.isArray(parsed)) nums = parsed;
-      } catch {
-        // Malformed array → UNPARSEABLE below. Not the parser's message: it quotes the reply.
-      }
-      const scores = nums.filter((n): n is number => typeof n === "number" && n >= 1 && n <= 5);
+      const scores = parseJudgeScores(raw);
       if (scores.length === 0) {
         // The reply itself is not recorded: it may echo skill descriptions.
         this.stampQualityFailure({ code: "UNPARSEABLE", message: "judge reply had no 1-5 scores" });
