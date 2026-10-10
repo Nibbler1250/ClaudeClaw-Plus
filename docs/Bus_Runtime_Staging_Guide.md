@@ -155,7 +155,7 @@ within a few seconds.
 | 2 | Send a Discord message in a routed guild channel | Same as DM but in the channel. |
 | 3 | Send a message in an UNROUTED channel (or one not in `busRouting.channels`) | Silently dropped. No legacy fallback. |
 | 4 | Open the Bus Web UI at `http://127.0.0.1:4632` with the `web.bus.token` | Conversation view shows agent activity; subscribing to `default` works. |
-| 5 | Toggle a cron job's `enabled: true → false` in its `.md` frontmatter | Within 30s daemon logs `Bus scheduler reloaded — N trigger(s)`; job stops firing. |
+| 5 | Toggle a cron job's `enabled: true → false` in its `.md` frontmatter | Within 30s daemon logs `Jobs reloaded: N job(s)`; job stops firing. Jobs run from the 60 s job loop under every runtime, so the bus scheduler's trigger count covers the heartbeat only. |
 | 6 | Change `heartbeat.interval` in `settings.json` | Same — within 30s daemon logs the reload. |
 | 7 | Add an `excludeWindows` entry (e.g. `"22:00"–"07:00"`) for quiet hours | Heartbeat skips inside that window. Verifies PR #126 wiring. |
 | 8 | Send SIGTERM (`kill <pid>`) | Banner logs `[bus-runtime] mounted; …` order in reverse: adapters → scheduler → agents → bus. No orphan `claude` children (`pgrep claude` empty). |
@@ -188,10 +188,11 @@ don't waste time investigating:
   a daemon restart. The scheduler reloads on heartbeat / jobs changes
   (PR #126), but adapter reload would invalidate pending permission /
   ask maps — deferred until a session-migration story exists.
-- **Per-job model / timeout overrides not honoured.** Under Bus, route
-  the job to a different agent instead (declare a second agent with the
-  model you want, set `job.agent: "<that-id>"`). Cleaner architectural
-  fit; documented in PR #126. The global per-session cap defaults to
+- **Jobs run outside the bus agents' sessions.** Under Bus the 60 s job
+  loop still runs each job as its own `claude -p`, so per-job
+  `model:`, `timeoutSeconds`, `retry` / `retryDelay` and `notify` apply
+  as on the legacy runtime, and `job.agent` does not route a job to a
+  bus agent (see *Multi-agent fan-out*). The global per-session cap defaults to
   **120 minutes** (`sessionTimeoutMs`); override in the daemon's
   project-local settings file (`<cwd>/.claude/claudeclaw/settings.json`
   — for the Hetzner staging flow that's
@@ -270,13 +271,13 @@ look like:
 Once the single-global soak is stable, you can split topics across
 agents by adding more entries to `settings.agents` and mapping channels
 to them. The first agent in the array is still the default for the
-heartbeat + jobs lacking an explicit `job.agent`. Example: a haiku agent
-for cheap routine cron work + a sonnet agent for inbound traffic:
+heartbeat. Example: a plan-mode agent for inbound traffic + a second
+agent for other channels:
 
 ```jsonc
 "agents": [
   { "id": "inbound", "permission_mode": "plan" },
-  { "id": "cron-haiku", "permission_mode": "default" }
+  { "id": "ops", "permission_mode": "default" }
 ],
 "discord": {
   "busRouting": {
@@ -286,5 +287,10 @@ for cheap routine cron work + a sonnet agent for inbound traffic:
 }
 ```
 
-Set `job.agent: "cron-haiku"` in each job's frontmatter to route cron
-to the cheap agent.
+Jobs do not run in these agents' sessions: the 60 s job loop runs each
+job as its own `claude -p` under every runtime. `job.agent` names a
+legacy agent directory (`agents/<name>/`, its persona and model), not an
+entry of `settings.agents`; when it names a bus agent with no such
+directory, the daemon logs a warning and the job runs on the default
+model. To run routine cron work on a cheap model, set `model:` in each
+job's frontmatter, e.g. `model: haiku`.

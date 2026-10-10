@@ -746,6 +746,27 @@ export function agentExists(name: string): boolean {
   );
 }
 
+/**
+ * Whether `agents/<name>/` holds a persona file (IDENTITY.md, SOUL.md or
+ * CLAUDE.md) with content. `ensureAgentDir` creates the directory on a job's
+ * first run, so its existence alone says nothing.
+ */
+export async function agentHasPersona(name: string): Promise<boolean> {
+  // Not agentExists(): its NAME_RE is narrower than a bus agent id (`_`, a
+  // leading digit), and the runner loads such a persona all the same.
+  if (typeof name !== "string" || !name || name === "." || name === "..") return false;
+  if (name.includes("/") || name.includes("\\")) return false;
+  if (!existsSync(join(agentsDir(), name))) return false;
+  for (const file of ["IDENTITY.md", "SOUL.md", "CLAUDE.md"]) {
+    try {
+      if ((await readFile(join(agentsDir(), name, file), "utf8")).trim()) return true;
+    } catch {
+      // missing file: try the next one
+    }
+  }
+  return false;
+}
+
 export async function loadAgent(name: string): Promise<AgentContext> {
   const dir = join(agentsDir(), name);
   if (!existsSync(dir)) {
