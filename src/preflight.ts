@@ -137,6 +137,15 @@ function isEnabledInProject(pluginKey: string, projectPath: string): boolean {
   return !!enabled?.[pluginKey];
 }
 
+// An explicit `false` in the project's enabledPlugins is the operator opting out:
+// never install or re-enable that plugin. A missing key is not an opt-out.
+function isDisabledInProject(pluginKey: string, projectPath: string): boolean {
+  const projSettings = join(projectPath, ".claude", "settings.json");
+  const settings = readJSON<Record<string, unknown>>(projSettings, {});
+  const enabled = settings.enabledPlugins as Record<string, boolean> | undefined;
+  return enabled?.[pluginKey] === false;
+}
+
 function enableInProject(pluginKey: string, projectPath: string): void {
   const projSettings = join(projectPath, ".claude", "settings.json");
   const settings = readJSON<Record<string, unknown>>(projSettings, {});
@@ -169,7 +178,7 @@ function startWhisperWarmupInBackground(): void {
 
 // ── Install a single-repo plugin ────────────────────────────────────
 
-function installRepoPlugin(
+export function installRepoPlugin(
   repoUrl: string,
   projectPath: string,
   pkgMgr: string,
@@ -190,6 +199,11 @@ function installRepoPlugin(
     const pluginName = marketplace.plugins[0].name;
     const skillPath = marketplace.plugins[0].skills?.[0];
     const pluginKey = `${pluginName}@${marketplaceName}`;
+
+    if (isDisabledInProject(pluginKey, projectPath)) {
+      console.log(`  skip: ${pluginKey} (disabled in project settings)`);
+      return "skipped";
+    }
 
     if (isCached(pluginKey) && isEnabledInProject(pluginKey, projectPath)) {
       console.log(`  skip: ${pluginKey} (already installed)`);
@@ -264,7 +278,7 @@ function installRepoPlugin(
 
 // ── Install cherry-picked plugins from the official monorepo ────────
 
-function installOfficialPlugins(
+export function installOfficialPlugins(
   pluginNames: string[],
   projectPath: string,
   pkgMgr: string,
@@ -281,7 +295,10 @@ function installOfficialPlugins(
   const enableOnly: string[] = [];
   for (const name of pluginNames) {
     const pluginKey = `${name}@${marketplaceName}`;
-    if (isCached(pluginKey) && isEnabledInProject(pluginKey, projectPath)) {
+    if (isDisabledInProject(pluginKey, projectPath)) {
+      console.log(`  skip: ${pluginKey} (disabled in project settings)`);
+      skipped++;
+    } else if (isCached(pluginKey) && isEnabledInProject(pluginKey, projectPath)) {
       console.log(`  skip: ${pluginKey} (already installed)`);
       skipped++;
     } else if (isCached(pluginKey)) {
