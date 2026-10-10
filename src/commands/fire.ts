@@ -14,10 +14,11 @@
  *   (`agent:<name>`, the same one its scheduled runs use). A `claudeclaw fire`
  *   from a second process therefore resumes the same session as the daemon's
  *   cron tick — do not fire a job at the minute it is due.
- * - under `runtime: "bus"` the scheduled turn is the raw `job.prompt` handed to
- *   the bus scheduler (no clock, no timeout, the agent's own model); a fire
- *   through the web UI's bus runner sends the clock-prefixed prompt and bounds
- *   its wait with the job's timeout — the model stays the agent's.
+ * - under `runtime: "bus"` the scheduled turn still comes from the 60 s job
+ *   loop (`job-loop.ts`: a one-shot `claude -p` on the job's model, #506); a
+ *   fire through the web UI's bus runner sends the clock-prefixed prompt to the
+ *   bus agent and bounds its wait with the job's timeout — the model stays the
+ *   agent's.
  *
  * Closes GAP-17-05: no more waiting on cron to smoke-test a new job.
  */
