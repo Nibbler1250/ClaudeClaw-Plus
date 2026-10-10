@@ -25,7 +25,10 @@ import {
   unregisterGatewayDelivery,
 } from "../event-processor";
 import { writeState, type StateData } from "../statusline";
-import { cronMatches, nextCronMatch } from "../cron";
+import { nextCronMatch } from "../cron";
+import { busSchedulerJobs, createJobLoop } from "../job-loop";
+import { busJobRelay } from "../job-relay";
+import { agentHasPersona } from "../agents";
 import { clearJobSchedule, loadJobs, resolveJobModel, snapshotJobFrontmatter } from "../jobs";
 import { migrateLegacyAgentJobs } from "../migrations";
 import { ensureUserSymlinks } from "../install";
@@ -1109,12 +1112,20 @@ export async function start(args: string[] = []) {
       busRuntimeHandle.attachAdapters(adapters);
       busRuntimeAdapterNames = busRuntimeHandle.mountedAdapterNames;
 
+      // The job loop runs every job under the bus too, but the legacy
+      // Telegram/Discord init was skipped above, so job results had nowhere to
+      // go. Send-only senders: the bus adapters keep polling and the gateway.
+      ({ telegramSend, discordSendToUser } = await busJobRelay({
+        telegramToken: currentSettings.telegram.token,
+        discordToken: currentSettings.discord.token,
+      }));
+
       const { wireBusScheduler } = await import("../bus/scheduler-wiring");
       const schedulerHandle = await wireBusScheduler({
         bus: busRuntimeHandle.bus,
         defaultAgentId: busRuntimeHandle.spawnedAgentIds[0] ?? null,
         heartbeat: currentSettings.heartbeat,
-        jobs: currentJobs,
+        jobs: busSchedulerJobs(currentJobs),
         timezoneOffsetMinutes: currentSettings.timezoneOffsetMinutes,
       });
       busRuntimeHandle.attachScheduler(schedulerHandle);
@@ -1718,7 +1729,7 @@ export async function start(args: string[] = []) {
             bus: busRuntimeHandle.bus,
             defaultAgentId: busRuntimeHandle.spawnedAgentIds[0] ?? null,
             heartbeat: newSettings.heartbeat,
-            jobs: newJobs,
+            jobs: busSchedulerJobs(newJobs),
             timezoneOffsetMinutes: newSettings.timezoneOffsetMinutes,
           });
           // attachScheduler stops the previous scheduler before
@@ -1770,108 +1781,28 @@ export async function start(args: string[] = []) {
     writeState(state);
   }
 
-  // In-memory retry state: resets on daemon restart (no stale debt across restarts).
-  const jobRetryState = new Map<string, { failCount: number; retryAt: number }>();
-
-  // Track each job's most recent outcome so state.json can expose lastResult/lastRanAt
-  // for crash-recovery + status displays. Resets on daemon restart (in-memory only).
-  const jobLastResult = new Map<string, { result: "ok" | "error" | "skipped"; ranAt: number }>();
+  const jobLoop = createJobLoop({
+    run,
+    resolvePrompt,
+    resolveJobModel,
+    snapshotJobFrontmatter,
+    clearJobSchedule,
+    forward: (label, r) => {
+      forwardToTelegram(label, r);
+      forwardToDiscord(label, r);
+    },
+    busAgentIds: () => (busRuntimeHandle ? currentSettings.agents.map((a) => a.id) : []),
+    hasLegacyPersona: agentHasPersona,
+    isRateLimited,
+    timezoneOffsetMinutes: () => currentSettings.timezoneOffsetMinutes,
+  });
+  const jobRetryState = jobLoop.retryState;
+  const jobLastResult = jobLoop.lastResult;
 
   updateState();
 
-  function runJob(job: (typeof currentJobs)[0]) {
-    const timeoutMs = job.timeoutSeconds ? job.timeoutSeconds * 1000 : undefined;
-    snapshotJobFrontmatter(job.name).then((restoreFrontmatter) =>
-      resolvePrompt(job.prompt)
-        .then(async (prompt) => {
-          const modelOverride = await resolveJobModel(job);
-          const clock = buildClockPromptPrefix(new Date(), currentSettings.timezoneOffsetMinutes);
-          return run(
-            job.name,
-            `${clock}\n${prompt}`,
-            job.agent ? `agent:${job.agent}` : job.name,
-            modelOverride ?? job.model,
-            timeoutMs,
-            job.agent,
-            "job",
-          );
-        })
-        .then(async (r) => {
-          const restored = await restoreFrontmatter();
-          if (restored) console.log(`[${ts()}] Restored frontmatter for job: ${job.name}`);
-          jobLastResult.set(job.name, {
-            result: r.exitCode === 0 ? "ok" : "error",
-            ranAt: Date.now(),
-          });
-          if (r.exitCode === 0) {
-            jobRetryState.delete(job.name);
-          } else if (job.retry && job.retry > 0) {
-            // Preserve existing state so failCount accumulates correctly across retries.
-            const state = jobRetryState.get(job.name) ?? { failCount: 0, retryAt: 0 };
-            state.failCount += 1;
-            if (state.failCount <= job.retry) {
-              const delayMs = (job.retryDelay ?? 300) * 1000;
-              state.retryAt = Date.now() + delayMs;
-              jobRetryState.set(job.name, state);
-              console.log(
-                `[${ts()}] Job ${job.name} failed (attempt ${state.failCount}/${job.retry}), retrying in ${job.retryDelay ?? 300}s`,
-              );
-            } else {
-              jobRetryState.delete(job.name);
-              console.log(`[${ts()}] Job ${job.name} exhausted ${job.retry} retries`);
-            }
-          }
-          if (job.notify === false) return;
-          if (job.notify === "error" && r.exitCode === 0) return;
-          const forwardLabel = job.agent && job.label ? `${job.agent}: ${job.label}` : job.name;
-          forwardToTelegram(forwardLabel, r);
-          forwardToDiscord(forwardLabel, r);
-        })
-        .finally(async () => {
-          if (job.recurring) return;
-          // Only clear one-shot schedule when no retry is pending.
-          if (jobRetryState.has(job.name)) return;
-          try {
-            await clearJobSchedule(job.name);
-            console.log(`[${ts()}] Cleared schedule for one-time job: ${job.name}`);
-          } catch (err) {
-            console.error(`[${ts()}] Failed to clear schedule for ${job.name}:`, err);
-          }
-        }),
-    );
-  }
-
   setInterval(() => {
-    const now = new Date();
-    if (!isRateLimited()) {
-      for (const job of currentJobs) {
-        // Fire pending retries before checking the cron schedule.
-        const retryState = jobRetryState.get(job.name);
-        if (retryState && retryState.retryAt <= Date.now()) {
-          // Push retryAt to sentinel so subsequent cron ticks don't re-fire while in flight.
-          // runJob's .then() handler overwrites this with the real next-retry time (or deletes it).
-          retryState.retryAt = Number.MAX_SAFE_INTEGER;
-          console.log(
-            `[${ts()}] Retrying job: ${job.name} (attempt ${retryState.failCount + 1}/${job.retry})`,
-          );
-          runJob(job);
-          continue;
-        }
-        if (cronMatches(job.schedule, now, currentSettings.timezoneOffsetMinutes)) {
-          runJob(job);
-        }
-      }
-    } else {
-      const skippedAt = Date.now();
-      for (const job of currentJobs) {
-        const retryState = jobRetryState.get(job.name);
-        const retryDue = !!retryState && retryState.retryAt <= skippedAt;
-        const scheduleDue = cronMatches(job.schedule, now, currentSettings.timezoneOffsetMinutes);
-        if (retryDue || scheduleDue) {
-          jobLastResult.set(job.name, { result: "skipped", ranAt: skippedAt });
-        }
-      }
-    }
+    jobLoop.tick(currentJobs);
     updateState();
   }, 60_000);
 }
