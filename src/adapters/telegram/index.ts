@@ -18,6 +18,13 @@ import {
   isTailerOriginEvent,
   withSynthesizedNotice,
 } from "../../bus/types";
+import {
+  defaultOutboxPath,
+  getTelegramOutbox,
+  type OutboxChunk,
+  type TelegramOutbox,
+} from "../../telegram-outbox";
+import { quietHoldUntil, type QuietHoursState } from "../../quiet-hours";
 import { createTelegramApi } from "./api";
 import { extractReactionDirectives } from "./directives";
 import { markdownToTelegramHtml, isTelegramHtmlParseError } from "./format";
@@ -71,6 +78,18 @@ export interface TelegramAdapterOptions {
   receiptStore?: ReceiptStore;
   /** Override the API client (tests inject a fake). */
   api?: TelegramApi;
+  /**
+   * Durable retry for lost proactive sends (final replies, operator alerts).
+   * Defaults to the process-wide outbox in the daemon's state dir when the
+   * real API client is used, and to none when `api` is injected, so tests
+   * never write to the working directory unless they pass one.
+   */
+  outbox?: TelegramOutbox | null;
+  /**
+   * Quiet hours (#512), read on every proactive send so a settings reload
+   * applies without a restart. Absent, or no windows = nothing is held.
+   */
+  quietHours?: () => QuietHoursState | undefined;
   /** Optional structured logger; defaults to `console`. */
   logger?: Pick<Console, "warn" | "info" | "error">;
 }
@@ -92,6 +111,15 @@ interface PendingPrompt {
 interface PendingHumanAsk {
   ask_id: string;
   agent_id: string;
+}
+
+/**
+ * #512: a reply to a scheduled turn (cron / heartbeat) is unprompted, so quiet
+ * hours hold it. Every other origin may be answering the user and is never held.
+ */
+function isProactiveReply(event: BusEvent): boolean {
+  const origin = (event.payload as { origin?: string } | undefined)?.origin;
+  return origin === "cron" || origin === "heartbeat";
 }
 
 /**
@@ -117,6 +145,7 @@ function eventBelongsToTelegram(event: BusEvent): boolean {
 export class TelegramAdapter {
   private readonly bus: BusCore;
   private readonly api: TelegramApi;
+  private readonly outbox: TelegramOutbox | null;
   private readonly allowedUserIds: ReadonlySet<number>;
   private readonly routingChats: Record<string, string>;
   private readonly defaultAgentId: string | undefined;
@@ -127,6 +156,7 @@ export class TelegramAdapter {
   private readonly receiptMaxBudgetMultiplier: number;
   private readonly receiptStore: ReceiptStore;
   private readonly logger: Pick<Console, "warn" | "info" | "error">;
+  private readonly quietHours: (() => QuietHoursState | undefined) | undefined;
 
   /** getUpdates offset cursor — bumped past the highest processed update_id. */
   private nextOffset = 0;
@@ -221,6 +251,14 @@ export class TelegramAdapter {
 
     this.bus = opts.bus;
     this.api = opts.api ?? createTelegramApi(opts.token);
+    const outboxSender = (chatId: number, chunk: OutboxChunk, threadId?: number) =>
+      this.sendOutboxChunk(chatId, chunk, threadId);
+    if (opts.outbox !== undefined) {
+      this.outbox = opts.outbox;
+      this.outbox?.setSender(outboxSender);
+    } else {
+      this.outbox = opts.api ? null : getTelegramOutbox(defaultOutboxPath(), outboxSender);
+    }
     this.allowedUserIds = new Set(opts.allowedUserIds);
     this.routingChats = { ...opts.routing.chats };
     this.defaultAgentId = opts.routing.defaultAgentId;
@@ -231,12 +269,16 @@ export class TelegramAdapter {
       opts.receiptMaxBudgetMultiplier ?? TelegramAdapter.DEFAULT_MAX_TURN_BUDGET_MULTIPLIER;
     this.receiptStore = opts.receiptStore ?? getDefaultReceiptStore();
     this.logger = opts.logger ?? console;
+    this.quietHours = opts.quietHours;
+    const quietHours = opts.quietHours;
+    if (quietHours) this.outbox?.setQuietHours((now) => quietHoldUntil(quietHours(), now));
   }
 
   async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
     this.generation += 1;
+    this.outbox?.start();
 
     // Subscribe for every routed agent + the default, so fallback-only
     // agents still receive `response.text`.
@@ -266,6 +308,7 @@ export class TelegramAdapter {
     if (!this.running) return;
     this.running = false;
     this.generation += 1; // signal the loop to exit on next iteration
+    this.outbox?.stop();
 
     // Abort the long-poll so stop() returns promptly (legacy waits 30s).
     if (this.inflightAbort) {
@@ -555,16 +598,31 @@ export class TelegramAdapter {
     // degrade to unformatted text, not vanish. Dropping it here would
     // contradict the no-silent-drop rule enforced just above.
     const send = { chat_id: target.chat_id, text, message_thread_id: target.message_thread_id };
-    await this.safe("sendMessage", async () => {
+    // #512: an alert is never a reply; quiet hours hold it, unless it is
+    // `critical` and the operator let critical alerts through, or the user is
+    // waiting on an answer in that chat (a stall alert about their own turn).
+    const urgent =
+      ((payload as { level?: string }).level === "critical" &&
+        this.quietHours?.()?.urgentBypass === true) ||
+      this.openReceipts.has(this.convKey(agentId, target.chat_id));
+    if (!urgent) {
+      if (this.holdForQuietHours(send)) return;
+      await this.outbox?.releaseHeld(send.chat_id);
+    }
+    try {
       try {
-        return await this.sendHtml(send);
+        await this.sendHtml(send);
       } catch (err) {
         // Only a malformed-HTML 400 warrants raw text; anything else (429,
-        // network, benign 400) rethrows to `safe`, which logs it.
+        // network, benign 400) rethrows to the outer catch.
         if (!isTelegramHtmlParseError(err)) throw err;
-        return await this.api.sendMessage(send);
+        await this.api.sendMessage(send);
       }
-    });
+    } catch (err) {
+      // Logged, then handed to the durable outbox instead of dropped.
+      this.logger.error("[telegram-adapter] sendMessage failed", err);
+      this.queueForRetry(send, err, !urgent);
+    }
   }
 
   private async handleResponseText(agentId: string, event: BusEvent): Promise<void> {
@@ -593,13 +651,17 @@ export class TelegramAdapter {
 
     const intent = (event.payload as { intent?: string })?.intent;
     const isProgress = intent === "progress";
+    const key = this.convKey(agentId, target.chat_id);
+    // #512: a user waiting on an answer in this chat (open receipt) is awake;
+    // nothing for it is held. Also covers a late user reply whose origin slot a
+    // queued cron prompt already took over.
+    const proactive = isProactiveReply(event) && !this.openReceipts.has(key);
     const FRAMES = TelegramAdapter.SPINNER_FRAMES;
     // #240: a synthesized (silent-drop safety-net) final carries raw, uncurated
     // turn output — prefix the shared notice so it is not mistaken for a curated
     // reply. No-op for curated replies and empty text; only the non-progress
     // arms below use displayText, so progress frames are untouched.
     const displayText = withSynthesizedNotice(cleanedText, event.payload);
-    const key = this.convKey(agentId, target.chat_id);
     // Receipt timeout is INACTIVITY-based, not a wall-clock budget: any assistant
     // output for this turn — progress OR final — proves the turn is alive, so
     // rearm the timeout. A long, actively-working turn (subagents, tool calls)
@@ -620,7 +682,7 @@ export class TelegramAdapter {
     if (cleanedText.length === 0) {
       // nothing textual; fall through to reactions.
     } else if (!isProgress) {
-      await this.deliverFinal(key, target, displayText);
+      await this.deliverFinal(key, target, displayText, proactive);
     } else if (this.turnActive.has(key)) {
       // Progress with a live turn message (placeholder or earlier progress) —
       // edit in place. Edits never notify, which is what a progress update
@@ -666,6 +728,9 @@ export class TelegramAdapter {
           this.startSpinner(key, cleanedText, live.chat_id, live.message_id);
         }
       }
+    } else if (proactive && this.outbox?.quietEndsAt() != null) {
+      // #512: progress of a scheduled turn inside quiet hours would notify;
+      // nothing is shown, and the turn's final is held for the window's end.
     } else {
       // Progress with no live turn — send fresh and keep it for later edits.
       const sendText = `${FRAMES[0]} ${cleanedText}`;
@@ -784,7 +849,12 @@ export class TelegramAdapter {
    *      message (silent, but visible in the chat — better than nothing).
    * Every failure branch on this path logs.
    */
-  private async deliverFinal(key: string, target: PendingPrompt, text: string): Promise<void> {
+  private async deliverFinal(
+    key: string,
+    target: PendingPrompt,
+    text: string,
+    proactive = false,
+  ): Promise<void> {
     const live = this.turnActive.has(key) ? this.lastBotMessage.get(key) : undefined;
     // Turn done — evict so a later unprompted reply (cron / heartbeat) or
     // edit_message doesn't target this now-stale message id. A fresh final is
@@ -798,7 +868,18 @@ export class TelegramAdapter {
       text,
       message_thread_id: target.message_thread_id,
     };
+    // #512: a scheduled turn's final inside quiet hours waits for the window's
+    // end. A progress message left from before the window is removed, as after
+    // a delivered final (a delete never notifies).
+    if (proactive) {
+      if (this.holdForQuietHours(send)) {
+        if (live) await this.deleteLiveMessage(live);
+        return;
+      }
+      await this.outbox?.releaseHeld(send.chat_id);
+    }
     let delivered = false;
+    let sendError: unknown;
     try {
       try {
         await this.sendHtml(send);
@@ -810,6 +891,7 @@ export class TelegramAdapter {
       }
       delivered = true;
     } catch (err) {
+      sendError = err;
       this.logger.error(
         live
           ? `[telegram-adapter] final sendMessage failed; falling back to editing the live turn message`
@@ -818,16 +900,14 @@ export class TelegramAdapter {
       );
     }
 
-    if (!live) return;
+    if (!live) {
+      // No live turn message to fall back on (cron / heartbeat reply, or a
+      // turn whose placeholder is gone): queue it for a later retry.
+      if (!delivered) this.queueForRetry(send, sendError, proactive);
+      return;
+    }
     if (delivered) {
-      try {
-        await this.api.deleteMessage({ chat_id: live.chat_id, message_id: live.message_id });
-      } catch (err) {
-        this.logger.warn(
-          `[telegram-adapter] could not delete the turn placeholder after the final reply; leaving it`,
-          err,
-        );
-      }
+      await this.deleteLiveMessage(live);
       return;
     }
     try {
@@ -844,6 +924,18 @@ export class TelegramAdapter {
     } catch (err) {
       this.logger.error(
         `[telegram-adapter] final reply lost: send and edit fallback both failed`,
+        err,
+      );
+      this.queueForRetry(send, sendError ?? err, proactive);
+    }
+  }
+
+  private async deleteLiveMessage(live: { chat_id: number; message_id: number }): Promise<void> {
+    try {
+      await this.api.deleteMessage({ chat_id: live.chat_id, message_id: live.message_id });
+    } catch (err) {
+      this.logger.warn(
+        `[telegram-adapter] could not delete the turn placeholder after the final reply; leaving it`,
         err,
       );
     }
@@ -1374,6 +1466,60 @@ export class TelegramAdapter {
       }
     }
     return null;
+  }
+
+  /**
+   * Hand a message whose send failed to the durable outbox (if any), so it is
+   * retried with backoff instead of dropped. The first attempt already ran.
+   */
+  private queueForRetry(
+    send: { chat_id: number; text: string; message_thread_id?: number },
+    err: unknown,
+    proactive = false,
+  ): void {
+    if (!this.outbox) return;
+    this.outbox.enqueueFailed(this.outboxMessage(send), err, { proactive });
+  }
+
+  /**
+   * #512: hold an unprompted message in the outbox while a quiet window is
+   * open. True when held; false when not quiet (or no outbox), send it now.
+   */
+  private holdForQuietHours(send: {
+    chat_id: number;
+    text: string;
+    message_thread_id?: number;
+  }): boolean {
+    return this.outbox?.hold(this.outboxMessage(send)) ?? false;
+  }
+
+  private outboxMessage(send: { chat_id: number; text: string; message_thread_id?: number }) {
+    return {
+      chatId: send.chat_id,
+      threadId: send.message_thread_id,
+      chunks: [
+        { text: markdownToTelegramHtml(send.text), parseMode: "HTML" as const, plain: send.text },
+      ],
+    };
+  }
+
+  /** Outbox sender: one chunk as HTML, raw text on a malformed-HTML 400. */
+  private async sendOutboxChunk(
+    chatId: number,
+    chunk: OutboxChunk,
+    threadId?: number,
+  ): Promise<void> {
+    const base = { chat_id: chatId, message_thread_id: threadId };
+    if (chunk.parseMode !== "HTML") {
+      await this.api.sendMessage({ ...base, text: chunk.text });
+      return;
+    }
+    try {
+      await this.api.sendMessage({ ...base, text: chunk.text, parse_mode: "HTML" });
+    } catch (err) {
+      if (!isTelegramHtmlParseError(err) || chunk.plain === undefined) throw err;
+      await this.api.sendMessage({ ...base, text: chunk.plain });
+    }
   }
 
   /** Best-effort API call — any throw is logged, never propagated. */

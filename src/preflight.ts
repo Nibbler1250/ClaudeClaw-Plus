@@ -132,7 +132,7 @@ function isCached(pluginKey: string): boolean {
 
 function isEnabledInProject(pluginKey: string, projectPath: string): boolean {
   const projSettings = join(projectPath, ".claude", "settings.json");
-  const settings = readJSON<Record<string, unknown>>(projSettings, {});
+  const settings = readProjectSettings(projSettings) ?? {};
   const enabled = settings.enabledPlugins as Record<string, boolean> | undefined;
   return !!enabled?.[pluginKey];
 }
@@ -141,14 +141,44 @@ function isEnabledInProject(pluginKey: string, projectPath: string): boolean {
 // never install or re-enable that plugin. A missing key is not an opt-out.
 function isDisabledInProject(pluginKey: string, projectPath: string): boolean {
   const projSettings = join(projectPath, ".claude", "settings.json");
-  const settings = readJSON<Record<string, unknown>>(projSettings, {});
+  const settings = readProjectSettings(projSettings) ?? {};
   const enabled = settings.enabledPlugins as Record<string, boolean> | undefined;
   return enabled?.[pluginKey] === false;
 }
 
+/**
+ * The project's settings object, `{}` when the file is missing or empty, or
+ * `null` when it exists but is not a JSON object (a comment, a trailing comma,
+ * a half-written file): writing it back would drop every other key (#512).
+ */
+function readProjectSettings(projSettings: string): Record<string, unknown> | null {
+  let raw: string;
+  try {
+    raw = readFileSync(projSettings, "utf-8");
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === "ENOENT" ? {} : null;
+  }
+  if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+  if (raw.trim() === "") return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 function enableInProject(pluginKey: string, projectPath: string): void {
   const projSettings = join(projectPath, ".claude", "settings.json");
-  const settings = readJSON<Record<string, unknown>>(projSettings, {});
+  const settings = readProjectSettings(projSettings);
+  if (!settings) {
+    console.warn(
+      `preflight: ${projSettings} could not be read as a JSON object; left untouched, ${pluginKey} not enabled in it`,
+    );
+    return;
+  }
   if (!settings.enabledPlugins) settings.enabledPlugins = {};
   (settings.enabledPlugins as Record<string, boolean>)[pluginKey] = true;
   writeJSON(projSettings, settings);

@@ -5,7 +5,8 @@
  * forwarding, and its results still reach Telegram/Discord under the bus.
  */
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BusCore } from "../bus/core";
 import { wireBusScheduler } from "../bus/scheduler-wiring";
@@ -13,6 +14,7 @@ import type { HeartbeatConfig } from "../config";
 import { busSchedulerJobs, createJobLoop, type JobRunResult } from "../job-loop";
 import { busJobRelay } from "../job-relay";
 import type { Job } from "../jobs";
+import { getTelegramOutbox, type OutboxChunk, TelegramOutbox } from "../telegram-outbox";
 
 const START = Date.UTC(2026, 9, 7, 3, 0, 0); // a round minute
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -297,16 +299,107 @@ describe("job.agent naming a bus-only agent", () => {
 describe("job results reach Telegram/Discord under the bus runtime", () => {
   it("Telegram: send-only sender with the configured token, no polling", async () => {
     const sent: { token: string; chatId: number; text: string }[] = [];
+    const dir = mkdtempSync(join(tmpdir(), "job-relay-"));
     const relay = await busJobRelay({
       telegramToken: "tg",
       discordToken: "",
       telegramSend: async (token, chatId, text) => {
         sent.push({ token, chatId, text });
       },
+      outbox: new TelegramOutbox({ path: join(dir, "outbox.json"), send: async () => {} }),
     });
+    rmSync(dir, { recursive: true, force: true });
     expect(relay.discordSendToUser).toBeNull();
     await relay.telegramSend?.(42, "[daily]\ndone");
     expect(sent).toEqual([{ token: "tg", chatId: 42, text: "[daily]\ndone" }]);
+  });
+
+  // #512: job results under the bus go through the durable outbox, like the
+  // legacy runtime's: a failed send is retried, quiet hours hold it.
+  describe("Telegram job results through the outbox", () => {
+    let dir = "";
+    const quietAllDay = { windows: [{ start: "00:00", end: "23:59" }], urgentBypass: false };
+    const make = (send: (chatId: number, chunk: OutboxChunk) => Promise<void>, now = START) => {
+      dir = mkdtempSync(join(tmpdir(), "job-relay-"));
+      return new TelegramOutbox({
+        path: join(dir, "outbox.json"),
+        send,
+        now: () => now,
+        logger: { info() {}, warn() {}, error() {} },
+      });
+    };
+    const relayWith = (outbox: TelegramOutbox, quiet?: typeof quietAllDay) =>
+      busJobRelay({
+        telegramToken: "tg",
+        discordToken: "",
+        telegramSend: async () => {},
+        outbox,
+        quietHours: () => (quiet ? { ...quiet, timezoneOffsetMinutes: 0 } : undefined),
+      });
+
+    it("delivers through the outbox when it is not quiet", async () => {
+      const sent: string[] = [];
+      const outbox = make(async (chatId, chunk) => void sent.push(`${chatId}|${chunk.text}`));
+      const relay = await relayWith(outbox);
+      expect(await relay.telegramDeliver?.(42, "done", "daily")).toBe(true);
+      expect(sent).toEqual(["42|done"]);
+      outbox.stop();
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("queues a failed send for retry instead of dropping it", async () => {
+      const outbox = make(async () => {
+        throw new Error("Telegram API sendMessage: 502 Bad Gateway");
+      });
+      const relay = await relayWith(outbox);
+      expect(await relay.telegramDeliver?.(42, "done", "daily")).toBe(false);
+      expect(outbox.list()).toHaveLength(1);
+      expect(outbox.list()[0].label).toBe("daily");
+      outbox.stop();
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("holds a job result during quiet hours", async () => {
+      const sent: string[] = [];
+      const outbox = make(async (_c, chunk) => void sent.push(chunk.text));
+      const relay = await relayWith(outbox, quietAllDay);
+      expect(await relay.telegramDeliver?.(42, "done", "daily")).toBe(false);
+      expect(sent).toEqual([]);
+      expect(outbox.list()[0].heldAt).toBe(START);
+      outbox.stop();
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("keeps the sender of the outbox the Telegram adapter already opened", async () => {
+      dir = mkdtempSync(join(tmpdir(), "job-relay-"));
+      const path = join(dir, "outbox.json");
+      const viaAdapter: string[] = [];
+      const shared = getTelegramOutbox(
+        path,
+        async (_c, chunk) => void viaAdapter.push(chunk.text),
+        {
+          info() {},
+          warn() {},
+          error() {},
+        },
+      );
+      const relay = await busJobRelay({
+        telegramToken: "tg",
+        discordToken: "",
+        telegramSend: async () => {},
+        outboxPath: path,
+      });
+      expect(await relay.telegramDeliver?.(42, "done", "daily")).toBe(true);
+      expect(viaAdapter).toEqual(["done"]);
+      shared.stop();
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("start.ts takes the outbox sender from busJobRelay, with the quiet hours", () => {
+      expect(START_TS).toMatch(
+        /\(\{ telegramSend, telegramDeliver, discordSendToUser \} = await busJobRelay\(\{[^}]*quietHours: \(\) => quietHoursFrom\(currentSettings\)/,
+      );
+    });
   });
 
   it("Discord: a job result is sent as a DM with the configured token", async () => {

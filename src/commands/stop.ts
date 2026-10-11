@@ -1,4 +1,4 @@
-import { writeFile, unlink, readdir, readFile } from "fs/promises";
+import { unlink, readdir, readFile } from "fs/promises";
 import { join } from "path";
 import { homedir } from "os";
 import {
@@ -12,6 +12,7 @@ import {
 import { getSession } from "../sessions";
 import { loadSettings, type SecurityConfig } from "../config";
 import { getMemoryPath } from "../memory";
+import { removeStatuslineSetting } from "../statusline-settings";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
 const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
@@ -20,11 +21,9 @@ const CLAUDE_SETTINGS_FILE = join(CLAUDE_DIR, "settings.json");
 
 async function teardownStatusline() {
   try {
-    const settings = await Bun.file(CLAUDE_SETTINGS_FILE).json();
-    delete settings.statusLine;
-    await writeFile(CLAUDE_SETTINGS_FILE, JSON.stringify(settings, null, 2) + "\n");
-  } catch {
-    // file doesn't exist, nothing to clean up
+    await removeStatuslineSetting(CLAUDE_SETTINGS_FILE);
+  } catch (err) {
+    console.warn("[statusline] teardown failed:", err);
   }
 
   try {
