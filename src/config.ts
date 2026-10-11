@@ -285,10 +285,11 @@ const DEFAULT_SETTINGS: Settings = {
   // One default agent so a fresh install actually mounts something. The
   // runtime default is `bus`, which spawns one `claude` per `agents[]` entry;
   // an empty default would mount the bus with zero agents — daemon up,
-  // channels polling, but nothing behind them ("no agents declared"). This is
-  // the *fresh-install* default only: `parseBusAgents` builds from `raw.agents`
-  // and never reads this list, so existing installs that omit `agents` or set
-  // `agents: []` are unaffected (#196 / cause #1 of #193).
+  // channels polling, but nothing behind them ("no agents declared"). Written
+  // by `initConfig` for a fresh install (#196 / cause #1 of #193), and used by
+  // `parseSettings` when an existing file omits `agents` — the shape of every
+  // config carried over from the original claudeclaw (#508). An explicit
+  // `agents: []` is still honoured as "no agent".
   agents: [{ id: "default" }],
   plugins: {},
   memorySearch: {},
@@ -789,8 +790,9 @@ export interface Settings {
    * `runtime: "pty"` ignores this field entirely. Empty list = the daemon
    * mounts the Bus stack but spawns no agents (operator wires them via
    * REST/CLI later). A fresh install ships one `{ id: "default" }` entry
-   * (see `DEFAULT_SETTINGS`) so the bus mounts a working agent out of the box;
-   * clearing the list back to `[]` is a deliberate "wire later" opt-out.
+   * (see `DEFAULT_SETTINGS`), and a file with no `agents` key parses to the
+   * same entry (#508), so the bus mounts a working agent out of the box;
+   * setting the list to `[]` is a deliberate "wire later" opt-out.
    * See `BusAgentSettings` for the per-agent shape.
    */
   agents: BusAgentSettings[];
@@ -1243,7 +1245,11 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
           : 30_000,
     },
     runtime: parseRuntimeMode(raw.runtime),
-    agents: parseBusAgents(raw.agents),
+    // #508: absent key → the fresh-install default; `[]` stays empty.
+    agents:
+      raw.agents === undefined
+        ? structuredClone(DEFAULT_SETTINGS.agents)
+        : parseBusAgents(raw.agents),
     mcp: parseMcpConfig(raw.mcp, raw.web?.enabled),
     watchdog: parseWatchdogConfig(raw.watchdog),
     stallWatchdog: parseStallWatchdogConfig(raw.stallWatchdog),

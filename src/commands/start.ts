@@ -826,6 +826,12 @@ export async function start(args: string[] = []) {
         ? "no adapters configured"
         : `adapters=[${configuredBusAdapters.join(", ")}] (wired after agents)`;
     console.log(`  Runtime: bus (Bus stack mounted, ${agentsLabel}, ${adaptersLabel})`);
+    // #508: an explicit `agents: []` mounts the bus with nothing behind it.
+    if (settings.agents.length === 0) {
+      console.warn(
+        `  WARNING: no agent — chat channels and heartbeat stay idle. Add "agents": [{ "id": "default" }] to settings.json, or set "runtime": "pty".`,
+      );
+    }
   } else if (settings.runtime === "bus") {
     console.log(`  Runtime: bus (Bus mount failed; legacy surfaces only)`);
   } else {
