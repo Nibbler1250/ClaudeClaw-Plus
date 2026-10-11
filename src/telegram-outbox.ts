@@ -471,6 +471,11 @@ const instances = new Map<string, TelegramOutbox>();
  * `send` replaces the previous one, so the runtime that currently owns the
  * token is the one that delivers, and two runtimes never drain the same file.
  */
+/** The outbox already open for `path`, if any; its sender is left as is. */
+export function findTelegramOutbox(path: string): TelegramOutbox | undefined {
+  return instances.get(path);
+}
+
 export function getTelegramOutbox(
   path: string,
   send: OutboxSender,

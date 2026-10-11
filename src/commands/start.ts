@@ -1137,9 +1137,10 @@ export async function start(args: string[] = []) {
       // The job loop runs every job under the bus too, but the legacy
       // Telegram/Discord init was skipped above, so job results had nowhere to
       // go. Send-only senders: the bus adapters keep polling and the gateway.
-      ({ telegramSend, discordSendToUser } = await busJobRelay({
+      ({ telegramSend, telegramDeliver, discordSendToUser } = await busJobRelay({
         telegramToken: currentSettings.telegram.token,
         discordToken: currentSettings.discord.token,
+        quietHours: () => quietHoursFrom(currentSettings),
       }));
 
       const { wireBusScheduler } = await import("../bus/scheduler-wiring");
