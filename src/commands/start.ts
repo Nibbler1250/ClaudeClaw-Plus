@@ -25,6 +25,7 @@ import {
   unregisterGatewayDelivery,
 } from "../event-processor";
 import { writeState, type StateData } from "../statusline";
+import { ensureStatuslineSetting, removeStatuslineSetting } from "../statusline-settings";
 import { nextCronMatch } from "../cron";
 import { busSchedulerJobs, createJobLoop } from "../job-loop";
 import { busJobRelay } from "../job-relay";
@@ -234,26 +235,14 @@ async function setupStatusline() {
   await mkdir(CLAUDE_DIR, { recursive: true });
   await writeFile(STATUSLINE_FILE, STATUSLINE_SCRIPT);
 
-  let settings: Record<string, unknown> = {};
-  try {
-    settings = await Bun.file(CLAUDE_SETTINGS_FILE).json();
-  } catch {
-    // file doesn't exist or isn't valid JSON
-  }
-  settings.statusLine = {
-    type: "command",
-    command: "node .claude/statusline.cjs",
-  };
-  await writeFile(CLAUDE_SETTINGS_FILE, JSON.stringify(settings, null, 2) + "\n");
+  await ensureStatuslineSetting(CLAUDE_SETTINGS_FILE);
 }
 
 async function teardownStatusline() {
   try {
-    const settings = await Bun.file(CLAUDE_SETTINGS_FILE).json();
-    delete settings.statusLine;
-    await writeFile(CLAUDE_SETTINGS_FILE, JSON.stringify(settings, null, 2) + "\n");
-  } catch {
-    // file doesn't exist, nothing to clean up
+    await removeStatuslineSetting(CLAUDE_SETTINGS_FILE);
+  } catch (err) {
+    console.warn("[statusline] teardown failed:", err);
   }
 
   try {
