@@ -108,6 +108,37 @@ describe("preflight — repo plugins", () => {
   });
 });
 
+describe("preflight — a settings.json that does not parse (#512)", () => {
+  const raw = '{\n  // operator note\n  "permissions": { "allow": ["Bash(ls:*)"] }\n}\n';
+
+  test("is never written over", () => {
+    mkdirSync(join(project, ".claude"), { recursive: true });
+    writeFileSync(join(project, ".claude", "settings.json"), raw);
+    expect(call("installRepoPlugin", repoUrl, project, "bun")).toBe("installed");
+    expect(readSettings()).toBe(raw);
+  });
+
+  test("a BOM file with the key set to false: opt-out honoured", () => {
+    mkdirSync(join(project, ".claude"), { recursive: true });
+    const before = `\uFEFF${JSON.stringify({ enabledPlugins: { [repoKey]: false } })}`;
+    writeFileSync(join(project, ".claude", "settings.json"), before);
+    expect(call("installRepoPlugin", repoUrl, project, "bun")).toBe("skipped");
+    expect(readFileSync(join(project, ".claude", "settings.json"), "utf-8")).toBe(before);
+  });
+
+  test("a BOM is accepted and the plugin enabled, other keys kept", () => {
+    mkdirSync(join(project, ".claude"), { recursive: true });
+    writeFileSync(
+      join(project, ".claude", "settings.json"),
+      `\uFEFF${JSON.stringify({ permissions: { allow: ["x"] } })}`,
+    );
+    expect(call("installRepoPlugin", repoUrl, project, "bun")).toBe("installed");
+    const after = JSON.parse(readSettings());
+    expect(after.enabledPlugins[repoKey]).toBe(true);
+    expect(after.permissions).toEqual({ allow: ["x"] });
+  });
+});
+
 describe("preflight — official plugins", () => {
   test("key set to false and cached: skipped, settings untouched", () => {
     markCached(officialKey);

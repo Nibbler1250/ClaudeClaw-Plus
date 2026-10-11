@@ -29,7 +29,7 @@ import { fireJob, parseFireArgs } from "./fire";
 import { extname, join } from "node:path";
 import { submitTelegramToGateway } from "../gateway";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
-import { markdownToTelegramHtml } from "../adapters/telegram/format";
+import { isTelegramHtmlParseError, markdownToTelegramHtml } from "../adapters/telegram/format";
 import {
   ackForResolution,
   decisionStripsKeyboard,
@@ -42,6 +42,7 @@ import type { EventRecord } from "../event-log";
 import { type GatewayRunResult, gatewayCommandSessionKey } from "../event-processor";
 import { telegramConversation } from "../gateway/normalizer";
 import { encodeCwdForProjectsDir } from "../bus/jsonl-line-types";
+import type { OutboxChunk } from "../telegram-outbox";
 
 // --- Outbox sandbox for send-file / voice directives ---
 
@@ -380,9 +381,73 @@ async function callApi<T>(
     signal: AbortSignal.timeout(httpTimeout),
   });
   if (!res.ok) {
-    throw new Error(`Telegram API ${method}: ${res.status} ${res.statusText}`);
+    // Keep Telegram's reason and flood window in the message: the outbound
+    // retry (telegram-outbox.ts) records the first and honours the second.
+    let description = "";
+    let retryAfter = 0;
+    try {
+      const errBody = (await res.json()) as {
+        description?: string;
+        parameters?: { retry_after?: number };
+      };
+      description = errBody?.description ?? "";
+      retryAfter = errBody?.parameters?.retry_after ?? 0;
+    } catch {
+      /* error body was not JSON — ignore */
+    }
+    throw new Error(
+      `Telegram API ${method}: ${res.status} ${res.statusText}${
+        retryAfter ? ` (retry_after ${retryAfter}s)` : ""
+      }${description ? `: ${description}` : ""}`,
+    );
   }
   return (await res.json()) as T;
+}
+
+/** Split a reply into Telegram-sized chunks: HTML, with its plain-text fallback. */
+function buildTelegramChunks(text: string): OutboxChunk[] {
+  const normalized = normalizeTelegramText(text).replace(/\[react:[^\]\r\n]+\]/gi, "");
+  const html = markdownToTelegramHtml(normalized);
+  const MAX_LEN = 4096;
+  const chunks: OutboxChunk[] = [];
+  for (let i = 0; i < html.length; i += MAX_LEN) {
+    chunks.push({
+      text: html.slice(i, i + MAX_LEN),
+      parseMode: "HTML",
+      plain: normalized.slice(i, i + MAX_LEN),
+    });
+  }
+  return chunks;
+}
+
+async function sendTelegramChunk(
+  token: string,
+  chatId: number,
+  chunk: OutboxChunk,
+  threadId?: number,
+): Promise<void> {
+  const thread = threadId ? { message_thread_id: threadId } : {};
+  if (chunk.parseMode !== "HTML") {
+    await callApi(token, "sendMessage", { chat_id: chatId, text: chunk.text, ...thread });
+    return;
+  }
+  try {
+    await callApi(token, "sendMessage", {
+      chat_id: chatId,
+      text: chunk.text,
+      parse_mode: "HTML",
+      ...thread,
+    });
+  } catch (err) {
+    // Plain text only when Telegram rejected the HTML itself. A 429 or a
+    // network error rethrows: the outbox retries it on Telegram's schedule.
+    if (!isTelegramHtmlParseError(err)) throw err;
+    await callApi(token, "sendMessage", {
+      chat_id: chatId,
+      text: chunk.plain ?? chunk.text,
+      ...thread,
+    });
+  }
 }
 
 async function sendMessage(
@@ -391,25 +456,8 @@ async function sendMessage(
   text: string,
   threadId?: number,
 ): Promise<void> {
-  const normalized = normalizeTelegramText(text).replace(/\[react:[^\]\r\n]+\]/gi, "");
-  const html = markdownToTelegramHtml(normalized);
-  const MAX_LEN = 4096;
-  for (let i = 0; i < html.length; i += MAX_LEN) {
-    try {
-      await callApi(token, "sendMessage", {
-        chat_id: chatId,
-        text: html.slice(i, i + MAX_LEN),
-        parse_mode: "HTML",
-        ...(threadId ? { message_thread_id: threadId } : {}),
-      });
-    } catch {
-      // Fallback to plain text if HTML parsing fails
-      await callApi(token, "sendMessage", {
-        chat_id: chatId,
-        text: normalized.slice(i, i + MAX_LEN),
-        ...(threadId ? { message_thread_id: threadId } : {}),
-      });
-    }
+  for (const chunk of buildTelegramChunks(text)) {
+    await sendTelegramChunk(token, chatId, chunk, threadId);
   }
 }
 
@@ -2341,7 +2389,7 @@ export async function deliverGatewayReply(
 // --- Exports ---
 
 /** Send a message to a specific chat (used by heartbeat forwarding) */
-export { sendMessage };
+export { sendMessage, buildTelegramChunks, sendTelegramChunk };
 
 process.on("SIGTERM", () => {
   running = false;

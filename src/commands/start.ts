@@ -25,6 +25,7 @@ import {
   unregisterGatewayDelivery,
 } from "../event-processor";
 import { writeState, type StateData } from "../statusline";
+import { ensureStatuslineSetting, removeStatuslineSetting } from "../statusline-settings";
 import { nextCronMatch } from "../cron";
 import { busSchedulerJobs, createJobLoop } from "../job-loop";
 import { busJobRelay } from "../job-relay";
@@ -69,6 +70,8 @@ import { getMcpMultiplexerPlugin } from "../plugins/mcp-multiplexer/index.js";
 import { getMcpBridge } from "../plugins/mcp-bridge.js";
 import { getToolCallSink } from "../observability/tool-call-sink.js";
 import { injectMcpIdentityIssuer } from "../runner/pty-supervisor";
+import { defaultOutboxPath, getTelegramOutbox, type TelegramOutbox } from "../telegram-outbox";
+import { describeQuietHours, proactiveDeliver, quietHoursFrom } from "../quiet-hours";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
 const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
@@ -233,26 +236,14 @@ async function setupStatusline() {
   await mkdir(CLAUDE_DIR, { recursive: true });
   await writeFile(STATUSLINE_FILE, STATUSLINE_SCRIPT);
 
-  let settings: Record<string, unknown> = {};
-  try {
-    settings = await Bun.file(CLAUDE_SETTINGS_FILE).json();
-  } catch {
-    // file doesn't exist or isn't valid JSON
-  }
-  settings.statusLine = {
-    type: "command",
-    command: "node .claude/statusline.cjs",
-  };
-  await writeFile(CLAUDE_SETTINGS_FILE, JSON.stringify(settings, null, 2) + "\n");
+  await ensureStatuslineSetting(CLAUDE_SETTINGS_FILE);
 }
 
 async function teardownStatusline() {
   try {
-    const settings = await Bun.file(CLAUDE_SETTINGS_FILE).json();
-    delete settings.statusLine;
-    await writeFile(CLAUDE_SETTINGS_FILE, JSON.stringify(settings, null, 2) + "\n");
-  } catch {
-    // file doesn't exist, nothing to clean up
+    await removeStatuslineSetting(CLAUDE_SETTINGS_FILE);
+  } catch (err) {
+    console.warn("[statusline] teardown failed:", err);
   }
 
   try {
@@ -845,6 +836,7 @@ export async function start(args: string[] = []) {
   console.log(
     `  Heartbeat: ${settings.heartbeat.enabled ? `every ${settings.heartbeat.interval}m` : "disabled"}`,
   );
+  console.log(`  Quiet hours: ${describeQuietHours(quietHoursFrom(settings))}`);
   console.log(`  Web UI: ${webEnabled ? `http://${settings.web.host}:${webPort}` : "disabled"}`);
   if (debugFlag) console.log("  Debug: enabled");
   console.log(`  Jobs loaded: ${jobs.length}`);
@@ -861,14 +853,33 @@ export async function start(args: string[] = []) {
 
   // --- Telegram ---
   let telegramSend: ((chatId: number, text: string) => Promise<void>) | null = null;
+  // Proactive sends (heartbeat, job results, triggers) go through the durable
+  // outbox so a failed send is retried later instead of dropped.
+  let telegramOutbox: TelegramOutbox | null = null;
+  let telegramDeliver: ((chatId: number, text: string, label?: string) => Promise<boolean>) | null =
+    null;
   let telegramToken = "";
   let telegramReceiveEnabled = true;
 
   async function initTelegram(token: string, receiveEnabled = true) {
     if (token && token !== telegramToken) {
-      const { startPolling, sendMessage, deliverGatewayReply } = await import("./telegram");
+      const {
+        startPolling,
+        sendMessage,
+        buildTelegramChunks,
+        sendTelegramChunk,
+        deliverGatewayReply,
+      } = await import("./telegram");
       if (receiveEnabled) startPolling(debugFlag);
       telegramSend = (chatId, text) => sendMessage(token, chatId, text);
+      telegramOutbox = getTelegramOutbox(defaultOutboxPath(), (chatId, chunk, threadId) =>
+        sendTelegramChunk(token, chatId, chunk, threadId),
+      );
+      telegramOutbox.start();
+      // #512: held during quiet hours (all of it is proactive).
+      const deliver = proactiveDeliver(telegramOutbox, () => quietHoursFrom(currentSettings));
+      telegramDeliver = (chatId, text, label) =>
+        deliver({ chatId, chunks: buildTelegramChunks(text), label });
       telegramToken = token;
       telegramReceiveEnabled = receiveEnabled;
       // Register the outbound delivery hook so gateway-routed events get a reply.
@@ -888,6 +899,9 @@ export async function start(args: string[] = []) {
       telegramReceiveEnabled = receiveEnabled;
     } else if (!token && telegramToken) {
       telegramSend = null;
+      telegramOutbox?.stop();
+      telegramOutbox = null;
+      telegramDeliver = null;
       telegramToken = "";
       unregisterGatewayDelivery("telegram");
       console.log(`[${ts()}] Telegram: disabled`);
@@ -1111,6 +1125,8 @@ export async function start(args: string[] = []) {
         // #197: lets the Telegram adapter mount on a token alone by routing to
         // the bus's default agent when `telegram.busRouting` is unset.
         defaultAgentId: busRuntimeHandle.spawnedAgentIds[0],
+        // #512: read on every proactive send, so a settings reload applies.
+        quietHours: () => quietHoursFrom(currentSettings),
       });
       for (const [name, msg] of Object.entries(errors)) {
         console.warn(`[${ts()}] Bus adapter "${name}" failed to mount: ${msg}`);
@@ -1121,9 +1137,10 @@ export async function start(args: string[] = []) {
       // The job loop runs every job under the bus too, but the legacy
       // Telegram/Discord init was skipped above, so job results had nowhere to
       // go. Send-only senders: the bus adapters keep polling and the gateway.
-      ({ telegramSend, discordSendToUser } = await busJobRelay({
+      ({ telegramSend, telegramDeliver, discordSendToUser } = await busJobRelay({
         telegramToken: currentSettings.telegram.token,
         discordToken: currentSettings.discord.token,
+        quietHours: () => quietHoursFrom(currentSettings),
       }));
 
       const { wireBusScheduler } = await import("../bus/scheduler-wiring");
@@ -1493,15 +1510,14 @@ export async function start(args: string[] = []) {
     label: string,
     result: { exitCode: number; stdout: string; stderr: string },
   ) {
-    if (!telegramSend || currentSettings.telegram.allowedUserIds.length === 0) return;
+    if (!telegramDeliver || currentSettings.telegram.allowedUserIds.length === 0) return;
     const text =
       result.exitCode === 0
         ? `${label ? `[${label}]\n` : ""}${result.stdout || "(empty)"}`
         : `${label ? `[${label}] ` : ""}error (exit ${result.exitCode}): ${extractErrorDetail(result) || "Unknown"}`;
     for (const userId of currentSettings.telegram.allowedUserIds) {
-      telegramSend(userId, text).catch((err) =>
-        console.error(`[Telegram] Failed to forward to ${userId}: ${err}`),
-      );
+      // Never throws: a failed chunk and the ones after it are queued for retry.
+      void telegramDeliver(userId, text, label || undefined);
     }
   }
 

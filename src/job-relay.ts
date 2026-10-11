@@ -6,10 +6,23 @@
  * polling and the Discord gateway. That left `forwardToTelegram` /
  * `forwardToDiscord` with nothing to send through. These senders only send:
  * no polling, no gateway, no second consumer of either channel.
+ *
+ * Telegram job results also go through the durable outbox, as under the legacy
+ * runtime: a failed send is retried later, and quiet hours hold it.
  */
+
+import { proactiveDeliver, type QuietHoursState } from "./quiet-hours";
+import {
+  defaultOutboxPath,
+  findTelegramOutbox,
+  getTelegramOutbox,
+  type TelegramOutbox,
+} from "./telegram-outbox";
 
 export interface JobRelay {
   telegramSend: ((chatId: number, text: string) => Promise<void>) | null;
+  /** Proactive send through the outbox. Never throws; true when delivered now. */
+  telegramDeliver: ((chatId: number, text: string, label?: string) => Promise<boolean>) | null;
   discordSendToUser: ((userId: string, text: string) => Promise<void>) | null;
 }
 
@@ -18,16 +31,39 @@ export interface BusJobRelayOptions {
   discordToken: string;
   /** Defaults to the Telegram Bot API `sendMessage`. */
   telegramSend?: (token: string, chatId: number, text: string) => Promise<void>;
+  /**
+   * Defaults to the process-wide outbox at `outboxPath`. Tests pass their own.
+   */
+  outbox?: TelegramOutbox;
+  /** Defaults to the daemon's state dir. */
+  outboxPath?: string;
+  /** Quiet hours, read on every send so a settings reload applies. */
+  quietHours?: () => QuietHoursState | undefined;
   /** Defaults to the Discord REST DM send. */
   discordSend?: (token: string, userId: string, text: string) => Promise<void>;
 }
 
 export async function busJobRelay(opts: BusJobRelayOptions): Promise<JobRelay> {
   let telegramSend: JobRelay["telegramSend"] = null;
+  let telegramDeliver: JobRelay["telegramDeliver"] = null;
   if (opts.telegramToken) {
     const token = opts.telegramToken;
-    const send = opts.telegramSend ?? (await import("./commands/telegram")).sendMessage;
+    const telegram = await import("./commands/telegram");
+    const send = opts.telegramSend ?? telegram.sendMessage;
     telegramSend = (chatId, text) => send(token, chatId, text);
+    // The Telegram bus adapter mounts first and owns this outbox: keep its
+    // sender, which goes through its per-chat send chain and flood cooldown.
+    const path = opts.outboxPath ?? defaultOutboxPath();
+    const outbox =
+      opts.outbox ??
+      findTelegramOutbox(path) ??
+      getTelegramOutbox(path, (chatId, chunk, threadId) =>
+        telegram.sendTelegramChunk(token, chatId, chunk, threadId),
+      );
+    outbox.start();
+    const deliver = proactiveDeliver(outbox, opts.quietHours ?? (() => undefined));
+    telegramDeliver = (chatId, text, label) =>
+      deliver({ chatId, chunks: telegram.buildTelegramChunks(text), label });
   }
 
   let discordSendToUser: JobRelay["discordSendToUser"] = null;
@@ -37,5 +73,5 @@ export async function busJobRelay(opts: BusJobRelayOptions): Promise<JobRelay> {
     discordSendToUser = (userId, text) => send(token, userId, text);
   }
 
-  return { telegramSend, discordSendToUser };
+  return { telegramSend, telegramDeliver, discordSendToUser };
 }

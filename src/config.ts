@@ -268,6 +268,7 @@ const DEFAULT_SETTINGS: Settings = {
   // shared exported default.
   stallWatchdog: structuredClone(DEFAULT_STALL_CONFIG),
   agentJobs: structuredClone(DEFAULT_AGENT_JOB_CONFIG),
+  quietHours: { windows: [], urgentBypass: false },
   governance: { watchdog: {} },
   session: {
     autoRotate: false,
@@ -311,6 +312,19 @@ export interface HeartbeatExcludeWindow {
   days?: number[];
   start: string;
   end: string;
+}
+
+/**
+ * Quiet hours for proactive messages (#512): job results, heartbeat, trigger
+ * output, the usage-limit notice and operator alerts produced inside a window
+ * are held and delivered when it ends. Replies to a message the user sent are
+ * never held. Same window shape and semantics as `heartbeat.excludeWindows`.
+ * Empty `windows` (the default) = off.
+ */
+export interface QuietHoursConfig {
+  windows: HeartbeatExcludeWindow[];
+  /** A `critical` operator alert goes out anyway. Off: it waits like the rest. */
+  urgentBypass: boolean;
 }
 
 export interface HeartbeatConfig {
@@ -802,6 +816,8 @@ export interface Settings {
   stallWatchdog: StallWatchdogConfig;
   /** Agent-job primitive config (#296 PR 3): concurrency cap + per-job timeouts. */
   agentJobs: AgentJobConfig;
+  /** Quiet hours for proactive Telegram messages (#512). Off (no windows) by default. */
+  quietHours: QuietHoursConfig;
   governance: GovernanceConfig;
   plugins: Record<string, PluginEntry>;
   session: SessionConfig;
@@ -1254,6 +1270,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
     watchdog: parseWatchdogConfig(raw.watchdog),
     stallWatchdog: parseStallWatchdogConfig(raw.stallWatchdog),
     agentJobs: parseAgentJobConfig(raw.agentJobs),
+    quietHours: parseQuietHours(raw.quietHours),
     governance: parseGovernanceConfig(raw.governance),
     plugins: parsePlugins(raw.plugins),
     memorySearch: parseMemorySearchSettings(raw.memorySearch),
@@ -2037,6 +2054,14 @@ function parseExcludeWindows(value: unknown): HeartbeatExcludeWindow[] {
     });
   }
   return out;
+}
+
+function parseQuietHours(value: unknown): QuietHoursConfig {
+  const raw = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  return {
+    windows: parseExcludeWindows(raw.windows),
+    urgentBypass: raw.urgentBypass === true,
+  };
 }
 
 function parseTimezoneOffsetMinutes(value: unknown, timezoneFallback?: string): number {
