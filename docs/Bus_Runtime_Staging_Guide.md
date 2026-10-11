@@ -294,3 +294,27 @@ entry of `settings.agents`; when it names a bus agent with no such
 directory, the daemon logs a warning and the job runs on the default
 model. To run routine cron work on a cheap model, set `model:` in each
 job's frontmatter, e.g. `model: haiku`.
+
+## Allow-lists: an empty list now refuses everyone
+
+`telegram.allowedUserIds`, `discord.allowedUserIds` and `slack.allowedUserIds`
+used to mean "everyone" when left empty. A bot token plus a skipped optional
+field therefore exposed the agent, and every tool it has, to any user of the
+platform. An empty list now refuses every user, on the Bus runtime and on the
+legacy runtime alike.
+
+**Migration.** If your bot answered people while the list was empty, it stops
+answering them after this upgrade. The daemon says so at startup:
+
+```
+  WARNING: telegram.allowedUserIds is empty, so every telegram user is REFUSED (an empty list used to allow everyone). ...
+```
+
+Fix it one of two ways:
+
+- list the people who may talk to the bot (recommended):
+  `"telegram": { "allowedUserIds": [12345678] }`
+- or, for a bot that is meant to be public, opt in explicitly:
+  `"telegram": { "allowAllUsers": true }` (same key under `discord` / `slack`).
+
+Slack bot traffic admitted through `allowBots` is unaffected.

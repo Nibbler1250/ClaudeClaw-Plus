@@ -340,8 +340,15 @@ describe("buildPermissionBlocks", () => {
 /* ────────────────────────────────────────────────────────────────────── */
 
 describe("SlackAdapter — allow-list semantics", () => {
-  it("empty allowedUserIds = allow all (legacy parity)", async () => {
+  it("empty allowedUserIds = refuse everyone", async () => {
     adapter = await startAdapter({ allowedUserIds: [] });
+    socket.push(eventsEnvelope(msg({ user: "U-stranger", text: "anyone home?" })));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(bus.prompts).toHaveLength(0);
+  });
+
+  it("allowAllUsers = accept anyone, even with an empty list", async () => {
+    adapter = await startAdapter({ allowedUserIds: [], allowAllUsers: true });
     socket.push(eventsEnvelope(msg({ user: "U-stranger", text: "anyone home?" })));
     await flushMicrotasks();
     await waitFor(() => bus.prompts.length > 0);

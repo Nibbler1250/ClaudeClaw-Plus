@@ -1259,8 +1259,24 @@ describe("TelegramAdapter — pending-action buttons", () => {
 /* ────────────────────────────────────────────────────────────────────── */
 
 describe("TelegramAdapter — allow-list semantics (PR #113 review)", () => {
-  it("empty allowedUserIds = allow all (legacy parity)", async () => {
+  it("empty allowedUserIds = refuse everyone", async () => {
     adapter = await startAdapter({ allowedUserIds: [] });
+    api.enqueueUpdates([
+      {
+        message: {
+          message_id: 1,
+          from: { id: 9999 },
+          chat: { id: 100, type: "private" },
+          text: "anyone home?",
+        },
+      },
+    ]);
+    await waitFor(() => api.sendMessages.some((m) => m.text === "Unauthorized."));
+    expect(bus.prompts).toHaveLength(0);
+  });
+
+  it("allowAllUsers = accept anyone, even with an empty list", async () => {
+    adapter = await startAdapter({ allowedUserIds: [], allowAllUsers: true });
     api.enqueueUpdates([
       {
         message: {
@@ -1271,7 +1287,7 @@ describe("TelegramAdapter — allow-list semantics (PR #113 review)", () => {
         },
       },
     ]);
-    // Should reach the bus (allowed because list is empty), NOT bounce
+    // Should reach the bus (allowAllUsers), NOT bounce
     // with "Unauthorized.".
     await waitFor(() => bus.prompts.length > 0);
     expect(bus.prompts).toHaveLength(1);
