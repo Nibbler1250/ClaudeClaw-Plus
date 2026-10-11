@@ -278,6 +278,35 @@ describe("legacy Telegram chunk helpers", () => {
     expect(chunks[1].plain).toBe("a".repeat(904));
   });
 
+  const reply = (status: number, statusText: string, description: string) =>
+    new Response(JSON.stringify({ ok: false, description }), { status, statusText });
+
+  it("a 429 on the HTML send is not resent as plain text right away", async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    globalThis.fetch = (async (_url: string, init: RequestInit) => {
+      calls.push(JSON.parse(String(init.body)));
+      return reply(429, "Too Many Requests", "Too Many Requests: retry after 5");
+    }) as unknown as typeof fetch;
+    const chunk: OutboxChunk = { text: "<b>x</b>", parseMode: "HTML", plain: "x" };
+    await expect(sendTelegramChunk("t", 1, chunk)).rejects.toThrow("429");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("an HTML parse error is resent once as plain text", async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    globalThis.fetch = (async (_url: string, init: RequestInit) => {
+      calls.push(JSON.parse(String(init.body)));
+      return calls.length === 1
+        ? reply(400, "Bad Request", "Bad Request: can't parse entities: unclosed tag")
+        : new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 });
+    }) as unknown as typeof fetch;
+    await sendTelegramChunk("t", 1, { text: "<b>x", parseMode: "HTML", plain: "x" });
+    expect(calls.map((c) => [c.text, c.parse_mode])).toEqual([
+      ["<b>x", "HTML"],
+      ["x", undefined],
+    ]);
+  });
+
   it("a failed send keeps the HTTP status, description and retry_after", async () => {
     globalThis.fetch = (async () =>
       new Response(

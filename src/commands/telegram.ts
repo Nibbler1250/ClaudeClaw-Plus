@@ -29,7 +29,7 @@ import { fireJob, parseFireArgs } from "./fire";
 import { extname, join } from "node:path";
 import { submitTelegramToGateway } from "../gateway";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
-import { markdownToTelegramHtml } from "../adapters/telegram/format";
+import { isTelegramHtmlParseError, markdownToTelegramHtml } from "../adapters/telegram/format";
 import {
   ackForResolution,
   decisionStripsKeyboard,
@@ -438,8 +438,10 @@ async function sendTelegramChunk(
       parse_mode: "HTML",
       ...thread,
     });
-  } catch {
-    // Fallback to plain text if HTML parsing fails
+  } catch (err) {
+    // Plain text only when Telegram rejected the HTML itself. A 429 or a
+    // network error rethrows: the outbox retries it on Telegram's schedule.
+    if (!isTelegramHtmlParseError(err)) throw err;
     await callApi(token, "sendMessage", {
       chat_id: chatId,
       text: chunk.plain ?? chunk.text,
