@@ -123,7 +123,7 @@ export const BUS_MCP_TOOLS = [
   {
     name: "dispatch_job",
     description:
-      "Dispatch a background job to another agent (e.g. run `reg`/`suzy` on a long " +
+      "Dispatch a background job to an agent — yourself or another one (e.g. run a long " +
       "research/draft task). Fire-and-return: returns a `job_id` IMMEDIATELY and the " +
       "job runs headless in its own process — never blocks your turn. The result is " +
       "delivered back to you when it finishes, and is queryable via `job_status`. Use " +
