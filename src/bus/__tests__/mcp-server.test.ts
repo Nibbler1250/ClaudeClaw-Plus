@@ -788,3 +788,42 @@ describe("BusMcpServer — permission flow", () => {
     expect(REQUEST_ID_PATTERN.test("ab cd")).toBe(false); // whitespace
   });
 });
+
+describe("BusMcpServer — channel instructions", () => {
+  async function instructionsSeenByClaude(agentId: string): Promise<string> {
+    // The production path: no injected server, so the constructor builds it.
+    const bus = new BusMcpServer({ agentId, ipc: makeFakeIpc() });
+    const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
+    await Promise.all([bus.mcp.connect(serverTransport), client.connect(clientTransport)]);
+    const text = client.getInstructions() ?? "";
+    await client.close();
+    await bus.mcp.close();
+    return text;
+  }
+
+  it("tells the agent to hand long work to dispatch_job and still answer", async () => {
+    const text = await instructionsSeenByClaude("default");
+    expect(text).toContain("Long work");
+    expect(text).toContain("`dispatch_job` with a self-contained prompt");
+    expect(text).toContain("`reply` intent:'progress' with a one-line ack");
+    expect(text).toContain("End the turn with `reply` intent:'final'");
+    expect(text).toContain("Never end a turn");
+    expect(text).toContain("'Agent job … finished'");
+    expect(text).toContain("A job cannot use `reply`");
+  });
+
+  it("names the dispatcher's own agent id as a dispatch_job target", async () => {
+    expect(await instructionsSeenByClaude("default")).toContain('agent:"default"');
+    expect(await instructionsSeenByClaude("helper-2")).toContain('agent:"helper-2"');
+  });
+
+  it("names no self target for a bus id dispatch_job would refuse", async () => {
+    // Valid bus ids (`_`, leading digit) that `agentExists` rejects.
+    for (const id of ["helper_2", "2nd"]) {
+      const text = await instructionsSeenByClaude(id);
+      expect(text).toContain("`dispatch_job` with a self-contained prompt");
+      expect(text).not.toContain("as yourself");
+    }
+  });
+});
