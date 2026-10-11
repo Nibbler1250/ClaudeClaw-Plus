@@ -11,6 +11,7 @@ import { mkdir, readdir, readFile, writeFile, stat, unlink, rm } from "fs/promis
 import { ensureMemoryFile } from "./memory";
 import { cronMatches } from "./cron";
 import { validateModelString } from "./jobs";
+import { AGENT_NAME_RE } from "./agent-name";
 
 // Resolve dirs at call time (not module load) so tests and runtime
 // pick up the current working directory.
@@ -236,7 +237,7 @@ export function validateJobLabel(label: string): { valid: boolean; error?: strin
 
 // ─── Validation ──────────────────────────────────────────────────────────────
 
-const NAME_RE = /^[a-z]([a-z0-9-]*[a-z0-9])?$/;
+const NAME_RE = AGENT_NAME_RE;
 
 export function validateAgentName(name: string): { valid: boolean; error?: string } {
   if (!name || typeof name !== "string") {

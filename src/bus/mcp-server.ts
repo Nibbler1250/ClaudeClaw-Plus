@@ -45,6 +45,7 @@ import {
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
+import { isAgentName } from "../agent-name.js";
 import { BUS_MCP_TOOLS } from "./mcp-tools.js";
 import {
   REQUEST_ID_PATTERN,
@@ -459,7 +460,7 @@ export class BusMcpServer {
     this.agentId = opts.agentId;
     this.ipc = opts.ipc;
     this.permissionMode = opts.permissionMode;
-    this.mcp = opts.mcp ?? buildMcpServer();
+    this.mcp = opts.mcp ?? buildMcpServer(opts.agentId);
     this.wireMcp();
     this.wireIpc();
   }
@@ -922,11 +923,43 @@ export class BusMcpServer {
 /* ───────────────────────────────────────────────────────────────────── */
 
 /**
+ * The long-work rule of the channel instructions. These instructions are the
+ * only default text the bus runtime is guaranteed to put in front of every
+ * agent (prompts/*.md reach a session only through the project CLAUDE.md,
+ * written once), so this is where the agent learns to hand long work to
+ * `dispatch_job` instead of doing it inside the turn the user is waiting on.
+ * `agentId` names the dispatcher so it can dispatch to itself: a fresh install
+ * has a single agent. `dispatch_job` accepts a kebab-case name whose
+ * `agents/<id>/` exists; a bus agent's does (its session.json is written there
+ * before the spawn), so only the name is checked here. A bus id with `_` or a
+ * leading digit is refused by `dispatch_job`, so it gets no hint.
+ */
+export function longWorkInstructions(agentId?: string): string {
+  const id = agentId?.trim() ?? "";
+  const self = isAgentName(id) ? ` To run it as yourself, pass agent:${JSON.stringify(id)}.` : "";
+  return (
+    "Long work (more than ~30s, or several steps such as a build, a test run, research or a " +
+    "batch of edits): do not do it inside the turn the user is waiting on.\n" +
+    "  1. `reply` intent:'progress' with a one-line ack.\n" +
+    "  2. `dispatch_job` with a self-contained prompt: the job is a fresh headless run with " +
+    "none of this conversation, so say what to do, where, and what to return." +
+    self +
+    "\n" +
+    "  3. End the turn with `reply` intent:'final' saying what is running. Never end a turn " +
+    "on 'I'm waiting' or 'still working'.\n" +
+    "  4. When the 'Agent job … finished' message arrives, report the result with " +
+    "`reply` intent:'final' (or use `job_status`).\n" +
+    "A job cannot use `reply` or any tool only this session has; work that needs them " +
+    "stays in your turn."
+  );
+}
+
+/**
  * Build the underlying MCP Server with the §5.1 capabilities. Exported so
  * tests can construct a server, wire it to InMemoryTransport, and inject
  * into BusMcpServer without standing up a real stdio pipe.
  */
-export function buildMcpServer(): Server {
+export function buildMcpServer(agentId?: string): Server {
   return new Server(
     { name: "plus-bus", version: "0.1.0" },
     {
@@ -950,7 +983,8 @@ export function buildMcpServer(): Server {
         "    and finish with `reply` intent:'final' for the user-visible answer (this " +
         "    push-notifies).\n" +
         "Default to PROGRESSIVE whenever you use ANY tool; DIRECT only for pure chat. " +
-        "Use `ask` for non-blocking clarifying questions; `request_human` blocks the loop.",
+        "Use `ask` for non-blocking clarifying questions; `request_human` blocks the loop.\n\n" +
+        longWorkInstructions(agentId),
     },
   );
 }
