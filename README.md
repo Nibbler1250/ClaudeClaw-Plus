@@ -132,7 +132,7 @@ Set per-agent in `settings.agents[].permission_mode`. The wizard picks `bypassPe
 
 ### 4. Agents
 
-At least one agent is **required** under bus runtime — without it the daemon mounts the bus but spawns no processes. The minimal entry is just an `id`:
+Bus runtime needs at least one agent. A `settings.json` with no `agents` key (for example one carried over from the original claudeclaw) gets one `{ "id": "default" }`; an explicit `"agents": []` mounts the bus with no agent, and startup logs a warning. The minimal entry is just an `id`:
 
 ```json
 "agents": [
