@@ -18,6 +18,12 @@ import {
   isTailerOriginEvent,
   withSynthesizedNotice,
 } from "../../bus/types";
+import {
+  defaultOutboxPath,
+  getTelegramOutbox,
+  type OutboxChunk,
+  type TelegramOutbox,
+} from "../../telegram-outbox";
 import { createTelegramApi } from "./api";
 import { extractReactionDirectives } from "./directives";
 import { markdownToTelegramHtml, isTelegramHtmlParseError } from "./format";
@@ -71,6 +77,13 @@ export interface TelegramAdapterOptions {
   receiptStore?: ReceiptStore;
   /** Override the API client (tests inject a fake). */
   api?: TelegramApi;
+  /**
+   * Durable retry for lost proactive sends (final replies, operator alerts).
+   * Defaults to the process-wide outbox in the daemon's state dir when the
+   * real API client is used, and to none when `api` is injected, so tests
+   * never write to the working directory unless they pass one.
+   */
+  outbox?: TelegramOutbox | null;
   /** Optional structured logger; defaults to `console`. */
   logger?: Pick<Console, "warn" | "info" | "error">;
 }
@@ -117,6 +130,7 @@ function eventBelongsToTelegram(event: BusEvent): boolean {
 export class TelegramAdapter {
   private readonly bus: BusCore;
   private readonly api: TelegramApi;
+  private readonly outbox: TelegramOutbox | null;
   private readonly allowedUserIds: ReadonlySet<number>;
   private readonly routingChats: Record<string, string>;
   private readonly defaultAgentId: string | undefined;
@@ -221,6 +235,14 @@ export class TelegramAdapter {
 
     this.bus = opts.bus;
     this.api = opts.api ?? createTelegramApi(opts.token);
+    const outboxSender = (chatId: number, chunk: OutboxChunk, threadId?: number) =>
+      this.sendOutboxChunk(chatId, chunk, threadId);
+    if (opts.outbox !== undefined) {
+      this.outbox = opts.outbox;
+      this.outbox?.setSender(outboxSender);
+    } else {
+      this.outbox = opts.api ? null : getTelegramOutbox(defaultOutboxPath(), outboxSender);
+    }
     this.allowedUserIds = new Set(opts.allowedUserIds);
     this.routingChats = { ...opts.routing.chats };
     this.defaultAgentId = opts.routing.defaultAgentId;
@@ -237,6 +259,7 @@ export class TelegramAdapter {
     if (this.running) return;
     this.running = true;
     this.generation += 1;
+    this.outbox?.start();
 
     // Subscribe for every routed agent + the default, so fallback-only
     // agents still receive `response.text`.
@@ -266,6 +289,7 @@ export class TelegramAdapter {
     if (!this.running) return;
     this.running = false;
     this.generation += 1; // signal the loop to exit on next iteration
+    this.outbox?.stop();
 
     // Abort the long-poll so stop() returns promptly (legacy waits 30s).
     if (this.inflightAbort) {
@@ -555,16 +579,20 @@ export class TelegramAdapter {
     // degrade to unformatted text, not vanish. Dropping it here would
     // contradict the no-silent-drop rule enforced just above.
     const send = { chat_id: target.chat_id, text, message_thread_id: target.message_thread_id };
-    await this.safe("sendMessage", async () => {
+    try {
       try {
-        return await this.sendHtml(send);
+        await this.sendHtml(send);
       } catch (err) {
         // Only a malformed-HTML 400 warrants raw text; anything else (429,
-        // network, benign 400) rethrows to `safe`, which logs it.
+        // network, benign 400) rethrows to the outer catch.
         if (!isTelegramHtmlParseError(err)) throw err;
-        return await this.api.sendMessage(send);
+        await this.api.sendMessage(send);
       }
-    });
+    } catch (err) {
+      // Logged, then handed to the durable outbox instead of dropped.
+      this.logger.error("[telegram-adapter] sendMessage failed", err);
+      this.queueForRetry(send, err);
+    }
   }
 
   private async handleResponseText(agentId: string, event: BusEvent): Promise<void> {
@@ -799,6 +827,7 @@ export class TelegramAdapter {
       message_thread_id: target.message_thread_id,
     };
     let delivered = false;
+    let sendError: unknown;
     try {
       try {
         await this.sendHtml(send);
@@ -810,6 +839,7 @@ export class TelegramAdapter {
       }
       delivered = true;
     } catch (err) {
+      sendError = err;
       this.logger.error(
         live
           ? `[telegram-adapter] final sendMessage failed; falling back to editing the live turn message`
@@ -818,7 +848,12 @@ export class TelegramAdapter {
       );
     }
 
-    if (!live) return;
+    if (!live) {
+      // No live turn message to fall back on (cron / heartbeat reply, or a
+      // turn whose placeholder is gone): queue it for a later retry.
+      if (!delivered) this.queueForRetry(send, sendError);
+      return;
+    }
     if (delivered) {
       try {
         await this.api.deleteMessage({ chat_id: live.chat_id, message_id: live.message_id });
@@ -846,6 +881,7 @@ export class TelegramAdapter {
         `[telegram-adapter] final reply lost: send and edit fallback both failed`,
         err,
       );
+      this.queueForRetry(send, sendError ?? err);
     }
   }
 
@@ -1374,6 +1410,44 @@ export class TelegramAdapter {
       }
     }
     return null;
+  }
+
+  /**
+   * Hand a message whose send failed to the durable outbox (if any), so it is
+   * retried with backoff instead of dropped. The first attempt already ran.
+   */
+  private queueForRetry(
+    send: { chat_id: number; text: string; message_thread_id?: number },
+    err: unknown,
+  ): void {
+    if (!this.outbox) return;
+    this.outbox.enqueueFailed(
+      {
+        chatId: send.chat_id,
+        threadId: send.message_thread_id,
+        chunks: [{ text: markdownToTelegramHtml(send.text), parseMode: "HTML", plain: send.text }],
+      },
+      err,
+    );
+  }
+
+  /** Outbox sender: one chunk as HTML, raw text on a malformed-HTML 400. */
+  private async sendOutboxChunk(
+    chatId: number,
+    chunk: OutboxChunk,
+    threadId?: number,
+  ): Promise<void> {
+    const base = { chat_id: chatId, message_thread_id: threadId };
+    if (chunk.parseMode !== "HTML") {
+      await this.api.sendMessage({ ...base, text: chunk.text });
+      return;
+    }
+    try {
+      await this.api.sendMessage({ ...base, text: chunk.text, parse_mode: "HTML" });
+    } catch (err) {
+      if (!isTelegramHtmlParseError(err) || chunk.plain === undefined) throw err;
+      await this.api.sendMessage({ ...base, text: chunk.plain });
+    }
   }
 
   /** Best-effort API call — any throw is logged, never propagated. */

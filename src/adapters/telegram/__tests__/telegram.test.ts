@@ -15,6 +15,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { TelegramAdapter, extractReactionDirectives } from "../index";
+import { TelegramOutbox } from "../../../telegram-outbox";
 import type { BusCore, SendPromptRequest } from "../../../bus/core";
 import type {
   Subscription,
@@ -2320,5 +2321,68 @@ describe("TelegramAdapter — final reply is a new message (notifies), placehold
 
     expect(logs.warn.some((l) => l.includes("edit_message edit failed"))).toBe(true);
     expect(turnApi.sendMessages).toHaveLength(1);
+  });
+});
+
+describe("TelegramAdapter — lost proactive sends go to the durable outbox", () => {
+  let turnApi: TurnApi;
+  let outboxDir: string;
+  let outbox: TelegramOutbox;
+
+  beforeEach(() => {
+    turnApi = new TurnApi();
+    outboxDir = mkdtempSync(join(tmpdir(), "tg-adapter-outbox-"));
+    outbox = new TelegramOutbox({
+      path: join(outboxDir, "telegram-outbox.json"),
+      send: async () => {},
+      logger: SILENT_LOGGER,
+    });
+  });
+
+  afterEach(() => {
+    outbox.stop();
+    rmSync(outboxDir, { recursive: true, force: true });
+  });
+
+  const blocked = () =>
+    new Error("Telegram API sendMessage: 403 Forbidden: Forbidden: bot was blocked by the user");
+
+  it("a cron reply that fails is queued, then delivered by a drain", async () => {
+    turnApi.failSend = blocked;
+    adapter = await startAdapter({ api: turnApi, outbox });
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "job **done**", origin: "cron", origin_id: "nightly" },
+    });
+    await waitFor(() => outbox.list().length === 1);
+    const entry = outbox.list()[0];
+    expect(entry.chatId).toBe(100);
+    expect(entry.lastError).toContain("403");
+    expect(entry.chunks[0]).toMatchObject({ parseMode: "HTML", plain: "job **done**" });
+
+    turnApi.failSend = null;
+    await outbox.drain(Date.now() + 3 * 60_000);
+    expect(turnApi.sendMessages.at(-1)).toMatchObject({ chat_id: 100, parse_mode: "HTML" });
+    expect(turnApi.sendMessages.at(-1)?.text).toContain("<b>done</b>");
+    expect(outbox.list()).toHaveLength(0);
+  });
+
+  it("an operator alert that fails is queued", async () => {
+    turnApi.failSend = blocked;
+    adapter = await startAdapter({ api: turnApi, outbox });
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "critical", text: "watchdog: stalled", source: "stall-watchdog" },
+    });
+    await waitFor(() => outbox.list().length === 1);
+    expect(outbox.list()[0].chunks[0].plain).toBe("watchdog: stalled");
   });
 });
