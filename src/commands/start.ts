@@ -55,6 +55,7 @@ import {
   type Settings,
 } from "../config";
 import { DEFAULT_DRAIN_TURNS_MS, drainActiveTurns } from "../bus/shutdown-drain";
+import { defaultCredentialsPath, enforceCredentialReadiness } from "../bus/credential-readiness";
 import { getDayAndMinuteAtOffset, buildClockPromptPrefix } from "../timezone";
 import { isHeartbeatExcludedAt, isHeartbeatExcludedNow } from "../heartbeat-windows";
 import { startWebUi, type WebServerHandle } from "../web";
@@ -563,6 +564,24 @@ export async function start(args: string[] = []) {
   if (Object.keys(settings.plugins).length > 0) {
     await pluginManager.loadAll(settings.plugins);
     setPluginManager(pluginManager);
+  }
+
+  // #514: warn when a stored claude.ai login shadows a long-lived
+  // CLAUDE_CODE_OAUTH_TOKEN (interactive PTY agents use the stored login, not
+  // the env token), or when the store's refresh token is already dead. Runs for
+  // every runtime — legacy and bus both spawn the interactive `claude` REPL —
+  // and before any agent is spawned, so the warning is early in the log.
+  // Advisory only: it reads two timestamps, logs, and boot always continues.
+  // "ok" gets one line, because a check that leaves no trace at all is
+  // impossible to confirm from a log.
+  const credentialReadiness = enforceCredentialReadiness({
+    oauthTokenEnv: process.env.CLAUDE_CODE_OAUTH_TOKEN,
+    credentialsPath: defaultCredentialsPath(),
+  });
+  if (credentialReadiness.status === "ok") {
+    console.log(
+      `[${ts()}] Credential store: refresh token valid (access token expiry ${new Date(credentialReadiness.expiresAt).toISOString()})`,
+    );
   }
 
   // Bus runtime mount (Sprint 5.1 + 5.2a + 5.2b) — opt-in via `settings.runtime: "bus"`.

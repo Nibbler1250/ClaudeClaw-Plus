@@ -53,6 +53,35 @@ MemorySwapMax=1G
 WantedBy=multi-user.target
 ```
 
+## Credential store warnings at startup
+
+At startup, before any agent is spawned and for every runtime, the daemon reads
+two numbers from the Claude credential store — `claudeAiOauth.expiresAt` and
+`claudeAiOauth.refreshTokenExpiresAt` in `$CLAUDE_CONFIG_DIR/.credentials.json`,
+or `~/.claude/.credentials.json` when that is unset — and never a token value
+(`src/bus/credential-readiness.ts`). It warns in the daemon log in two cases,
+then keeps booting:
+
+- **A long-lived `CLAUDE_CODE_OAUTH_TOKEN` (`sk-ant-oat01-…`, from
+  `claude setup-token`) and a `claudeAiOauth` login in the store.** Agents run
+  the interactive `claude` REPL under a PTY, and the REPL uses the stored login
+  instead of the env token: agents run on that login's account, and once its
+  access token expires they 401 while `claude -p` with the same env token keeps
+  working. Fix: move the store aside (`mv <path> <path>.bak`, the warning names
+  the path it checked) and restart. Don't run `/login`, or `claude` as the
+  daemon user without the env token set, because either recreates it.
+- **No long-lived env token, and the store's refresh token has expired.**
+  Nothing can refresh it; spawned agents will 401. Fix: `claude setup-token` on
+  any machine with a browser, set `CLAUDE_CODE_OAUTH_TOKEN` to the result in
+  whatever populates the daemon's environment, and restart. If an
+  `ExecStartPre` rebuilds the env file from a secrets manager on every start,
+  edit the manager — a direct edit of the file is discarded on the next restart.
+
+Silent otherwise: a long-lived env token with no stored login, no store, an
+unreadable or malformed store, and an access token whose `expiresAt` is in the
+past (normal between lazy refreshes). A healthy store logs one line,
+`Credential store: refresh token valid (…)`.
+
 ## Why `MemorySwapMax` is not optional
 
 `MemoryHigh`/`MemoryMax` bound **RAM**, not swap. The gap between them is
