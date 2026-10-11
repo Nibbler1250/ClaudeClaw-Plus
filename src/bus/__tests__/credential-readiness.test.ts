@@ -319,6 +319,48 @@ describe("checkCredentialReadiness — env-token-shadowed", () => {
 
     expect(result.status).toBe("using-env-token");
   });
+
+  it("a claudeAiOauth ARRAY is not a login — using-env-token, not shadowed", () => {
+    writeFileSync(credPath, JSON.stringify({ claudeAiOauth: [] }));
+
+    const result = checkCredentialReadiness({
+      oauthTokenEnv: OAT01_TOKEN,
+      credentialsPath: credPath,
+      now: NOW,
+    });
+
+    expect(result.status).toBe("using-env-token");
+  });
+
+  it("a FIFO at the store path is not read (it would block boot forever)", () => {
+    const fifo = join(tempDir, "placeholder-fifo");
+    const made = Bun.spawnSync(["mkfifo", fifo]);
+    if (made.exitCode !== 0) return; // no mkfifo on this platform
+    // A blocking read would hang this test until the runner's timeout.
+    const result = checkCredentialReadiness({
+      oauthTokenEnv: OAT01_TOKEN,
+      credentialsPath: fifo,
+      now: NOW,
+    });
+
+    expect(result.status).toBe("using-env-token");
+  });
+
+  it("an oversized file is not treated as a store", () => {
+    const big = JSON.stringify({
+      claudeAiOauth: { expiresAt: FUTURE, refreshTokenExpiresAt: FUTURE },
+      pad: "x".repeat(2 * 1024 * 1024),
+    });
+    writeFileSync(credPath, big);
+
+    const result = checkCredentialReadiness({
+      oauthTokenEnv: OAT01_TOKEN,
+      credentialsPath: credPath,
+      now: NOW,
+    });
+
+    expect(result.status).toBe("using-env-token");
+  });
 });
 
 describe("defaultCredentialsPath", () => {
@@ -355,7 +397,7 @@ describe("formatDeadCredentialAlert", () => {
   const message = formatDeadCredentialAlert(ACCESS_EXPIRY, PAST);
 
   it("names the failure and the exact refresh-token expiry as an ISO timestamp", () => {
-    expect(message).toContain("[runner] no valid path to authenticate:");
+    expect(message).toContain("[credentials] no valid path to authenticate:");
     expect(message).toContain("CLAUDE_CODE_OAUTH_TOKEN is absent or short-lived");
     expect(message).toContain(`refresh token expired at ${new Date(PAST).toISOString()}`);
   });
@@ -496,7 +538,7 @@ describe("enforceCredentialReadiness — warn, never block", () => {
     );
 
     expect(warned).toHaveLength(1);
-    expect(warned[0]).toContain("[runner] no valid path to authenticate:");
+    expect(warned[0]).toContain("[credentials] no valid path to authenticate:");
     expect(warned[0]).toContain("The daemon is starting anyway");
     expect(warned[0]).toContain(new Date(PAST).toISOString());
   });
@@ -608,8 +650,7 @@ describe("start.ts call-site placement", () => {
   // would silence it for legacy-runtime daemons whose PTY agents are just as
   // affected (runtime test); reintroducing an exit on the dead path (negative
   // test). Named blind spot: static text cannot prove the call's result is
-  // used — the behaviour tests above do that. Same static-scan technique as
-  // src/__tests__/spawn-env-guard.test.ts.
+  // used — the behaviour tests above do that.
   const source = readFileSync(join(import.meta.dir, "..", "..", "commands", "start.ts"), "utf8");
 
   it("start.ts calls enforceCredentialReadiness", () => {
@@ -639,10 +680,13 @@ describe("start.ts call-site placement", () => {
     // `io.exit` — both caught. Comments are stripped first: this is an
     // assertion about control flow, and prose explaining WHY there is no
     // throw must not read as a throw.
+    // Bounded to the block itself: from the call to the bus branch it sits
+    // in front of, so unrelated code further down cannot trip it.
     const gateAt = source.indexOf("enforceCredentialReadiness(");
-    const resolveAt = source.indexOf("await resolveBusAgentConfigs(");
+    const blockEnd = source.indexOf('if (settings.runtime === "bus") {', gateAt);
+    expect(blockEnd).toBeGreaterThan(gateAt);
     const code = source
-      .slice(gateAt, resolveAt)
+      .slice(gateAt, blockEnd)
       .split("\n")
       .map((line) => line.replace(/\/\/.*$/, ""))
       .join("\n");

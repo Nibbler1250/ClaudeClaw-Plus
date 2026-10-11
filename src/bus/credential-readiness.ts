@@ -1,7 +1,7 @@
 /**
  * Boot-time credential readiness (#514).
  *
- * A runtime-neutral leaf in the shape of `src/runner/spawn-env.ts`: no `bun:*`
+ * A runtime-neutral leaf: no `bun:*`
  * imports, no `Bun.*` globals, no top-level side effects, and every input that
  * reaches the outside world (path, clock, env, io) injectable so the whole
  * module is testable without touching a real credential store. `DEFAULT_GATE_IO`
@@ -42,7 +42,7 @@
  * a long-lived env token (`env-token-shadowed`).
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -125,6 +125,9 @@ function isValidTimestamp(value: unknown): value is number {
   );
 }
 
+/** A real store is a few hundred bytes; anything far larger is not one. */
+const MAX_STORE_BYTES = 1024 * 1024;
+
 /**
  * Reads and parses the credential store's `claudeAiOauth` block. Returns
  * `undefined` for every "nothing usable here" case — missing file,
@@ -139,6 +142,10 @@ function readOauthBlock(
 ): { expiresAt?: unknown; refreshTokenExpiresAt?: unknown } | undefined {
   let raw: string;
   try {
+    // Only a regular file of plausible size is read: a FIFO at this path
+    // would block boot forever, and a huge file is not a credential store.
+    const st = statSync(credentialsPath);
+    if (!st.isFile() || st.size > MAX_STORE_BYTES) return undefined;
     raw = readFileSync(credentialsPath, "utf8");
   } catch {
     // Missing, unreadable, a directory — all "nothing to check".
@@ -153,7 +160,7 @@ function readOauthBlock(
   }
 
   const oauth = (parsed as { claudeAiOauth?: unknown } | null)?.claudeAiOauth;
-  if (!oauth || typeof oauth !== "object") return undefined;
+  if (!oauth || typeof oauth !== "object" || Array.isArray(oauth)) return undefined;
   return oauth as { expiresAt?: unknown; refreshTokenExpiresAt?: unknown };
 }
 
@@ -234,7 +241,7 @@ export function formatDeadCredentialAlert(
   const expiredAtIso = new Date(refreshTokenExpiresAt).toISOString();
   const accessTokenExpiryIso = new Date(expiresAt).toISOString();
   return [
-    "[runner] no valid path to authenticate: CLAUDE_CODE_OAUTH_TOKEN is absent or short-lived,",
+    "[credentials] no valid path to authenticate: CLAUDE_CODE_OAUTH_TOKEN is absent or short-lived,",
     `and the on-disk credential store's refresh token expired at ${expiredAtIso}.`,
     `(The access token's own expiry reads ${accessTokenExpiryIso}; that field alone is not the`,
     "trigger — it is expected to read as past mid-cycle.)",
@@ -273,7 +280,7 @@ export function formatShadowedEnvTokenAlert(
   refreshTokenExpiresAt?: number,
 ): string {
   const lines = [
-    "[runner] CLAUDE_CODE_OAUTH_TOKEN is set to a long-lived token, but the credential store at",
+    "[credentials] CLAUDE_CODE_OAUTH_TOKEN is set to a long-lived token, but the credential store at",
     `${credentialsPath} also holds a claude.ai login.`,
     "Interactive agents (the ones that run the `claude` REPL, as opposed to `claude -p`) use that",
     "stored login instead of CLAUDE_CODE_OAUTH_TOKEN — so they run on that login's account, and",
