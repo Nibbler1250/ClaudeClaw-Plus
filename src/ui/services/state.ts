@@ -277,7 +277,11 @@ function redactSettings(raw: unknown, inSecretContainer = false): unknown {
   if (!raw || typeof raw !== "object") return raw;
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
-    if (isSecretKey(key)) {
+    // An env map written as an object (`env: { DB_PASS: … }`) is judged like
+    // its `DB_PASS=…` string form. Objects keep the container rule below, so
+    // an `auth: { … }` block stays readable.
+    const scalar = value === null || typeof value !== "object";
+    if (isSecretKey(key) || (scalar && SECRET_NAME_PART.test(key))) {
       const len = typeof value === "string" ? value.length : 0;
       out[key] = `<redacted:${len} chars>`;
     } else {

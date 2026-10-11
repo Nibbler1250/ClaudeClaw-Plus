@@ -313,6 +313,26 @@ describe("secrets carried in values, under container keys, and in session/state 
     expect(env[1].startsWith("GITHUB_TOKEN=")).toBe(true);
   });
 
+  it("redacts an env map written as an object like its NAME=value form", async () => {
+    const redacted = (await redactViaTechnicalInfo({
+      mcpServers: {
+        db: {
+          env: { DB_PASS: ARG, MYSQL_PWD: QTOKEN, GH_PAT: PASS, DEBUG: "1" },
+          auth: { scheme: "custom" },
+        },
+      },
+    })) as { mcpServers: { db: { env: Record<string, string>; auth: { scheme: string } } } };
+    const { env, auth } = redacted.mcpServers.db;
+    expect(env.DB_PASS).toMatch(REDACTED);
+    expect(env.MYSQL_PWD).toMatch(REDACTED);
+    expect(env.GH_PAT).toMatch(REDACTED);
+    expect(env.DEBUG).toBe("1");
+    // An object under a name-part key is still a container, not a blob.
+    expect(auth.scheme).toMatch(REDACTED);
+    const out = JSON.stringify(redacted);
+    for (const raw of [ARG, QTOKEN, PASS]) expect(out).not.toContain(raw);
+  });
+
   it("redacts a bearer credential carried inside a string value", async () => {
     const redacted = (await redactViaTechnicalInfo({
       plugins: { http: { headerLine: `Bearer ${QTOKEN}`, note: "Bearer of good news" } },
