@@ -71,6 +71,7 @@ import { getMcpBridge } from "../plugins/mcp-bridge.js";
 import { getToolCallSink } from "../observability/tool-call-sink.js";
 import { injectMcpIdentityIssuer } from "../runner/pty-supervisor";
 import { defaultOutboxPath, getTelegramOutbox, type TelegramOutbox } from "../telegram-outbox";
+import { describeQuietHours, proactiveDeliver, quietHoursFrom } from "../quiet-hours";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
 const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
@@ -835,6 +836,7 @@ export async function start(args: string[] = []) {
   console.log(
     `  Heartbeat: ${settings.heartbeat.enabled ? `every ${settings.heartbeat.interval}m` : "disabled"}`,
   );
+  console.log(`  Quiet hours: ${describeQuietHours(quietHoursFrom(settings))}`);
   console.log(`  Web UI: ${webEnabled ? `http://${settings.web.host}:${webPort}` : "disabled"}`);
   if (debugFlag) console.log("  Debug: enabled");
   console.log(`  Jobs loaded: ${jobs.length}`);
@@ -874,9 +876,10 @@ export async function start(args: string[] = []) {
         sendTelegramChunk(token, chatId, chunk, threadId),
       );
       telegramOutbox.start();
-      const outbox = telegramOutbox;
+      // #512: held during quiet hours (all of it is proactive).
+      const deliver = proactiveDeliver(telegramOutbox, () => quietHoursFrom(currentSettings));
       telegramDeliver = (chatId, text, label) =>
-        outbox.deliver({ chatId, chunks: buildTelegramChunks(text), label });
+        deliver({ chatId, chunks: buildTelegramChunks(text), label });
       telegramToken = token;
       telegramReceiveEnabled = receiveEnabled;
       // Register the outbound delivery hook so gateway-routed events get a reply.
@@ -1122,6 +1125,8 @@ export async function start(args: string[] = []) {
         // #197: lets the Telegram adapter mount on a token alone by routing to
         // the bus's default agent when `telegram.busRouting` is unset.
         defaultAgentId: busRuntimeHandle.spawnedAgentIds[0],
+        // #512: read on every proactive send, so a settings reload applies.
+        quietHours: () => quietHoursFrom(currentSettings),
       });
       for (const [name, msg] of Object.entries(errors)) {
         console.warn(`[${ts()}] Bus adapter "${name}" failed to mount: ${msg}`);

@@ -1,5 +1,5 @@
 /**
- * Quiet hours for proactive messages (#286).
+ * Quiet hours for proactive messages (#512).
  *
  * `settings.quietHours.windows` holds proactive Telegram messages — job
  * results, heartbeat, trigger output, the usage-limit notice, operator

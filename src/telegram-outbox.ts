@@ -18,6 +18,12 @@
  *
  * A 400 that rejects the text itself (too long, empty) is abandoned at once.
  *
+ * Quiet hours (#512): a message marked `proactive` that is produced inside the
+ * user's quiet window is held — queued with its next attempt at the window's
+ * end, no send made, no attempt counted. A proactive entry that comes due while
+ * a window is open (a retry, or a daemon that was down across the end) is
+ * pushed to the end of that window. Unmarked messages are never held.
+ *
  * Single owner: one instance per file per process ({@link getTelegramOutbox}),
  * and only the process that owns the bot token drains it (the daemon). Both
  * Telegram runtimes register their sender on the same instance; whichever is
@@ -47,6 +53,10 @@ export interface OutboxEntry {
   nextAttemptAt: number;
   lastError: string;
   firstFailedAt: number;
+  /** Subject to quiet hours (#512): an unprompted message, never a reply. */
+  proactive?: true;
+  /** Epoch ms the entry was first held by quiet hours, for the delivery log. */
+  heldAt?: number;
 }
 
 export interface OutboxMessage {
@@ -60,6 +70,14 @@ export interface OutboxMessage {
 export type OutboxSender = (chatId: number, chunk: OutboxChunk, threadId?: number) => Promise<void>;
 
 type Logger = Pick<Console, "info" | "warn" | "error">;
+
+/** Epoch ms at which the current quiet window ends, or `null` when not quiet. */
+export type QuietUntil = (now: number) => number | null;
+
+export interface OutboxDeliverOptions {
+  /** Unprompted message (job result, alert…): held during quiet hours. */
+  proactive?: boolean;
+}
 
 export const OUTBOX_MAX_ATTEMPTS = 6;
 export const OUTBOX_MAX_ENTRIES = 200;
@@ -128,6 +146,7 @@ export interface TelegramOutboxOptions {
   maxEntries?: number;
   sendTimeoutMs?: number;
   logger?: Logger;
+  quietUntil?: QuietUntil | null;
 }
 
 export class TelegramOutbox {
@@ -142,6 +161,7 @@ export class TelegramOutbox {
   private draining: Promise<void> | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
   private firstDrain: ReturnType<typeof setTimeout> | null = null;
+  private quietUntil: QuietUntil | null;
 
   constructor(opts: TelegramOutboxOptions) {
     this.path = opts.path;
@@ -151,11 +171,79 @@ export class TelegramOutbox {
     this.maxEntries = opts.maxEntries ?? OUTBOX_MAX_ENTRIES;
     this.sendTimeoutMs = opts.sendTimeoutMs ?? OUTBOX_SEND_TIMEOUT_MS;
     this.logger = opts.logger ?? console;
+    this.quietUntil = opts.quietUntil ?? null;
     this.entries = this.load();
   }
 
   setSender(send: OutboxSender): void {
     this.send = send;
+  }
+
+  /** Quiet hours for proactive messages; `null` turns holding off. */
+  setQuietHours(quietUntil: QuietUntil | null): void {
+    this.quietUntil = quietUntil;
+  }
+
+  /** Epoch ms the current quiet window ends, or `null` when proactive messages may go out. */
+  quietEndsAt(): number | null {
+    if (!this.quietUntil) return null;
+    const until = this.quietUntil(this.now());
+    return until !== null && until > this.now() ? until : null;
+  }
+
+  /**
+   * Hold `msg` until the quiet window ends, when one is open. True when held
+   * (nothing sent; the drain delivers it then), false when not quiet now.
+   */
+  hold(msg: OutboxMessage): boolean {
+    const until = this.quietEndsAt();
+    if (until === null) return false;
+    const chunks = this.boundChunks(msg);
+    if (chunks.length === 0) return true;
+    const now = this.now();
+    const kept = this.push({
+      id: randomUUID(),
+      chatId: msg.chatId,
+      ...(msg.threadId !== undefined ? { threadId: msg.threadId } : {}),
+      ...(msg.label ? { label: msg.label } : {}),
+      chunks,
+      attempts: 0,
+      nextAttemptAt: until,
+      lastError: "",
+      firstFailedAt: now,
+      proactive: true,
+      heldAt: now,
+    });
+    if (!kept) return true;
+    this.logger.info(
+      `[telegram-outbox] quiet hours: held message to chat ${msg.chatId}${msg.label ? ` [${msg.label}]` : ""} until ${new Date(until).toISOString()}`,
+    );
+    this.persist();
+    return true;
+  }
+
+  /**
+   * Deliver the held messages for `chatId` whose window has ended, before a
+   * newer proactive message to that chat goes out: the drain only runs once a
+   * minute, and the newer one must not overtake them.
+   */
+  async releaseHeld(chatId: number): Promise<void> {
+    // Twice at most: a drain already in flight took its due list before these
+    // came due, so the first await may deliver none of them.
+    for (let pass = 0; pass < 2; pass++) {
+      const now = this.now();
+      if (!this.entries.some((e) => e.chatId === chatId && this.isReleasable(e, now))) return;
+      await this.drain(now);
+    }
+  }
+
+  /** Held and never sent, and its window has ended or quiet hours were switched off. */
+  private isReleasable(e: OutboxEntry, now: number): boolean {
+    return (
+      e.heldAt !== undefined &&
+      e.attempts === 0 &&
+      (e.nextAttemptAt <= now || this.quietEndsAt() === null)
+    );
   }
 
   list(): readonly OutboxEntry[] {
@@ -166,13 +254,17 @@ export class TelegramOutbox {
    * Send `msg` chunk by chunk. On the first failure, the chunks not yet
    * delivered are queued for retry. Never throws; true when fully delivered.
    */
-  async deliver(msg: OutboxMessage): Promise<boolean> {
+  async deliver(msg: OutboxMessage, opts: OutboxDeliverOptions = {}): Promise<boolean> {
+    if (opts.proactive) {
+      if (this.hold(msg)) return false;
+      await this.releaseHeld(msg.chatId);
+    }
     const chunks = msg.chunks.filter((c) => c.text.length > 0);
     for (let i = 0; i < chunks.length; i++) {
       try {
         await this.sendOnce(msg.chatId, chunks[i], msg.threadId);
       } catch (err) {
-        this.enqueueFailed({ ...msg, chunks: chunks.slice(i) }, err);
+        this.enqueueFailed({ ...msg, chunks: chunks.slice(i) }, err, opts);
         return false;
       }
     }
@@ -180,15 +272,9 @@ export class TelegramOutbox {
   }
 
   /** Queue a message whose first send attempt (made by the caller) failed with `err`. */
-  enqueueFailed(msg: OutboxMessage, err: unknown): void {
-    let chunks = msg.chunks.filter((c) => c.text.length > 0);
+  enqueueFailed(msg: OutboxMessage, err: unknown, opts: OutboxDeliverOptions = {}): void {
+    const chunks = this.boundChunks(msg);
     if (chunks.length === 0) return;
-    if (chunks.length > OUTBOX_MAX_CHUNKS) {
-      this.logger.warn(
-        `[telegram-outbox] message to chat ${msg.chatId} too long to queue whole; keeping ${OUTBOX_MAX_CHUNKS} of ${chunks.length} chunks`,
-      );
-      chunks = chunks.slice(0, OUTBOX_MAX_CHUNKS);
-    }
     const now = this.now();
     const entry: OutboxEntry = {
       id: randomUUID(),
@@ -200,21 +286,14 @@ export class TelegramOutbox {
       nextAttemptAt: now,
       lastError: describeError(err),
       firstFailedAt: now,
+      ...(opts.proactive ? { proactive: true as const } : {}),
     };
     if (entry.attempts >= this.maxAttempts || isPermanentSendError(err)) {
       this.logAbandoned(entry);
       return;
     }
     entry.nextAttemptAt = now + Math.max(backoffMs(entry.attempts), retryAfterMs(err));
-    while (this.entries.length >= this.maxEntries) {
-      const dropped = this.entries.shift();
-      if (dropped) {
-        this.logger.warn(
-          `[telegram-outbox] queue full (${this.maxEntries}); dropped oldest message for chat ${dropped.chatId}${dropped.label ? ` [${dropped.label}]` : ""}: ${dropped.lastError}`,
-        );
-      }
-    }
-    this.entries.push(entry);
+    if (!this.push(entry)) return;
     this.logger.warn(
       `[telegram-outbox] send to chat ${entry.chatId} failed, ${chunks.length} chunk(s) queued for retry in ${Math.round((entry.nextAttemptAt - now) / 1000)}s: ${entry.lastError}`,
     );
@@ -247,6 +326,38 @@ export class TelegramOutbox {
     this.firstDrain = null;
   }
 
+  private boundChunks(msg: OutboxMessage): OutboxChunk[] {
+    const chunks = msg.chunks.filter((c) => c.text.length > 0);
+    if (chunks.length <= OUTBOX_MAX_CHUNKS) return chunks;
+    this.logger.warn(
+      `[telegram-outbox] message to chat ${msg.chatId} too long to queue whole; keeping ${OUTBOX_MAX_CHUNKS} of ${chunks.length} chunks`,
+    );
+    return chunks.slice(0, OUTBOX_MAX_CHUNKS);
+  }
+
+  /** False when `entry` itself was dropped: a full queue of failed replies keeps them. */
+  private push(entry: OutboxEntry): boolean {
+    while (this.entries.length >= this.maxEntries) {
+      // A proactive message goes first: a full queue never costs a failed reply
+      // its place to a night of held job results.
+      const proactive = this.entries.findIndex((e) => e.proactive);
+      if (proactive < 0 && entry.proactive) {
+        this.logger.warn(
+          `[telegram-outbox] queue full (${this.maxEntries}) of failed replies; dropped new message for chat ${entry.chatId}${entry.label ? ` [${entry.label}]` : ""}`,
+        );
+        return false;
+      }
+      const [dropped] = this.entries.splice(proactive >= 0 ? proactive : 0, 1);
+      if (dropped) {
+        this.logger.warn(
+          `[telegram-outbox] queue full (${this.maxEntries}); dropped oldest message for chat ${dropped.chatId}${dropped.label ? ` [${dropped.label}]` : ""}: ${dropped.lastError || "held by quiet hours"}`,
+        );
+      }
+    }
+    this.entries.push(entry);
+    return true;
+  }
+
   private async sendOnce(chatId: number, chunk: OutboxChunk, threadId?: number): Promise<void> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
@@ -266,8 +377,16 @@ export class TelegramOutbox {
     // A chat that failed in this pass is skipped for the rest of it, so later
     // messages to that chat do not overtake an earlier one.
     const failedChats = new Set<number>();
-    for (const entry of this.entries.filter((e) => e.nextAttemptAt <= at)) {
+    const quietEnd = this.quietEndsAt();
+    const due = this.entries.filter((e) => e.nextAttemptAt <= at || this.isReleasable(e, at));
+    for (const entry of due) {
       if (failedChats.has(entry.chatId) || !this.entries.includes(entry)) continue;
+      if (entry.proactive && quietEnd !== null) {
+        // Due inside a quiet window: wait for its end, no attempt counted.
+        entry.nextAttemptAt = quietEnd;
+        this.persist();
+        continue;
+      }
       while (entry.chunks.length > 0) {
         try {
           await this.sendOnce(entry.chatId, entry.chunks[0], entry.threadId);
@@ -282,7 +401,9 @@ export class TelegramOutbox {
       if (entry.chunks.length === 0) {
         this.remove(entry);
         this.logger.info(
-          `[telegram-outbox] delivered queued message to chat ${entry.chatId}${entry.label ? ` [${entry.label}]` : ""} after ${entry.attempts + 1} attempt(s)`,
+          entry.attempts === 0 && entry.heldAt !== undefined
+            ? `[telegram-outbox] delivered message held by quiet hours to chat ${entry.chatId}${entry.label ? ` [${entry.label}]` : ""} (held since ${new Date(entry.heldAt).toISOString()})`
+            : `[telegram-outbox] delivered queued message to chat ${entry.chatId}${entry.label ? ` [${entry.label}]` : ""} after ${entry.attempts + 1} attempt(s)`,
         );
       }
     }

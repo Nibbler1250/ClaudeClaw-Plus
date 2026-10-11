@@ -223,7 +223,13 @@ describe("redactSettings matches secret-shaped key names, not only exact ones (#
     // here until it is classified, so a secret added later is redacted by
     // default or consciously listed as not secret.
     const SECRET = ["api", "apiToken", "appToken", "botToken", "signingSecret", "token"];
-    const NOT_SECRET = ["credentialProbe", "keywords", "provider_credentials_env"];
+    const NOT_SECRET = [
+      "credentialProbe",
+      "keywords",
+      "provider_credentials_env",
+      // quietHours.urgentBypass (#512): a boolean, "pass" as in bypass.
+      "urgentBypass",
+    ];
     // Matched by the regex below but not settings fields: parseSettingsText's
     // JSON reviver takes a `key` parameter.
     const NOT_A_FIELD = ["key"];

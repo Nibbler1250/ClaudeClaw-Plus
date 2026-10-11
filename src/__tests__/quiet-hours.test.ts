@@ -1,5 +1,5 @@
 /**
- * Quiet hours for proactive messages (#286): settings parsing, the window
+ * Quiet hours for proactive messages (#512): settings parsing, the window
  * clock, and the outbox holding proactive messages until the window ends.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
