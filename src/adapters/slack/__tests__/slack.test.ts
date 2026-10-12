@@ -374,6 +374,19 @@ describe("SlackAdapter — allow-list semantics", () => {
     expect(api.sent).toHaveLength(0);
   });
 
+  // #520: the Bus runtime passes a getter so a settings reload applies.
+  it("follows the allowlist getter: removal refuses, addition accepts, no restart", async () => {
+    const live = { allowedUserIds: ["U42"] };
+    adapter = await startAdapter({ allowlist: () => live });
+    live.allowedUserIds = ["U-new"];
+    socket.push(eventsEnvelope(msg({ user: "U42", text: "still here?" })));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(bus.prompts).toHaveLength(0);
+    socket.push(eventsEnvelope(msg({ user: "U-new", text: "hi" })));
+    await waitFor(() => bus.prompts.length > 0);
+    expect(bus.prompts[0]?.user_id).toBe("U-new");
+  });
+
   it("drops bot messages", async () => {
     adapter = await startAdapter();
     socket.push(eventsEnvelope(msg({ bot_id: "B-bot", user: undefined })));
