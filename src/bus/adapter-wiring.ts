@@ -32,6 +32,7 @@
 import type { BusCore } from "./core";
 import type { Settings, DiscordConfig, TelegramConfig, SlackConfig, WebConfig } from "../config";
 import type { QuietHoursState } from "../quiet-hours";
+import type { AllowlistState } from "../allowlist";
 
 /**
  * Each adapter exposes a similar surface: a constructor with options,
@@ -77,6 +78,12 @@ export interface WireBusAdaptersOptions {
    * a settings reload applies without a restart. Omit = nothing is held.
    */
   quietHours?: () => QuietHoursState | undefined;
+  /**
+   * Current settings, read by the Telegram / Discord / Slack allow-list gates
+   * on every inbound event so a settings reload adds or revokes access without
+   * a restart (#520). Omit = the lists in `settings`, fixed at mount.
+   */
+  liveSettings?: () => Pick<Settings, "discord" | "telegram" | "slack">;
   /** Logger override. Defaults to `console`. */
   logger?: Pick<Console, "warn" | "info" | "error">;
 }
@@ -110,11 +117,23 @@ export async function wireBusAdapters(
     }
   };
 
-  await tryMount("discord", () => mountDiscord(opts.bus, opts.settings.discord, logger));
-  await tryMount("telegram", () =>
-    mountTelegram(opts.bus, opts.settings.telegram, logger, opts.defaultAgentId, opts.quietHours),
+  const live = opts.liveSettings;
+  await tryMount("discord", () =>
+    mountDiscord(opts.bus, opts.settings.discord, logger, live && (() => live().discord)),
   );
-  await tryMount("slack", () => mountSlack(opts.bus, opts.settings.slack, logger));
+  await tryMount("telegram", () =>
+    mountTelegram(
+      opts.bus,
+      opts.settings.telegram,
+      logger,
+      opts.defaultAgentId,
+      opts.quietHours,
+      live && (() => live().telegram),
+    ),
+  );
+  await tryMount("slack", () =>
+    mountSlack(opts.bus, opts.settings.slack, logger, live && (() => live().slack)),
+  );
   await tryMount("webui", () => mountWebUi(opts.bus, opts.settings.web, logger));
 
   return { adapters, errors };
@@ -173,6 +192,7 @@ async function mountDiscord(
   bus: BusCore,
   cfg: DiscordConfig,
   logger: Pick<Console, "warn" | "info" | "error">,
+  allowlist?: () => AllowlistState<string>,
 ): Promise<MountedAdapter | null> {
   if (!cfg.token || !cfg.busRouting) return null;
   const { DiscordAdapter } = await import("../adapters/discord");
@@ -181,6 +201,7 @@ async function mountDiscord(
     token: cfg.token,
     allowedUserIds: cfg.allowedUserIds,
     ...(cfg.allowAllUsers ? { allowAllUsers: true } : {}),
+    ...(allowlist ? { allowlist } : {}),
     routing: cfg.busRouting,
     logger,
   });
@@ -199,6 +220,7 @@ async function mountTelegram(
   logger: Pick<Console, "warn" | "info" | "error">,
   defaultAgentId?: string,
   quietHours?: () => QuietHoursState | undefined,
+  allowlist?: () => AllowlistState<number>,
 ): Promise<MountedAdapter | null> {
   if (!cfg.token) return null;
   // #197: a fresh install sets `telegram.token` but never writes `busRouting`,
@@ -235,6 +257,7 @@ async function mountTelegram(
     token: cfg.token,
     allowedUserIds: cfg.allowedUserIds,
     ...(cfg.allowAllUsers ? { allowAllUsers: true } : {}),
+    ...(allowlist ? { allowlist } : {}),
     routing,
     // #201: honor send-only configs even with explicit busRouting — the
     // adapter wires outbound but skips the inbound long-poll. Default true.
@@ -255,6 +278,7 @@ async function mountSlack(
   bus: BusCore,
   cfg: SlackConfig,
   logger: Pick<Console, "warn" | "info" | "error">,
+  allowlist?: () => AllowlistState<string>,
 ): Promise<MountedAdapter | null> {
   if (!cfg.botToken || !cfg.busRouting) return null;
   // Signing secret resolution: explicit override on busRouting wins, else
@@ -273,6 +297,7 @@ async function mountSlack(
     signingSecret,
     allowedUserIds: cfg.allowedUserIds,
     ...(cfg.allowAllUsers ? { allowAllUsers: true } : {}),
+    ...(allowlist ? { allowlist } : {}),
     routing: {
       channels: cfg.busRouting.channels,
       ...(cfg.busRouting.threadAgentId ? { threadAgentId: cfg.busRouting.threadAgentId } : {}),

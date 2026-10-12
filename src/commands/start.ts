@@ -1148,6 +1148,8 @@ export async function start(args: string[] = []) {
         defaultAgentId: busRuntimeHandle.spawnedAgentIds[0],
         // #512: read on every proactive send, so a settings reload applies.
         quietHours: () => quietHoursFrom(currentSettings),
+        // #520: allow-list gates read the reloaded settings on every event.
+        liveSettings: () => currentSettings,
       });
       for (const [name, msg] of Object.entries(errors)) {
         console.warn(`[${ts()}] Bus adapter "${name}" failed to mount: ${msg}`);

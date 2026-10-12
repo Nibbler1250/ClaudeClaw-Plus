@@ -15,7 +15,7 @@
  * Sprint 4.5+ TODOs at end of file.
  */
 
-import { isUserAllowed } from "../../allowlist";
+import { type AllowlistState, isAllowedBy } from "../../allowlist";
 import type { BusCore, Subscription } from "../../bus/core";
 import {
   CHANNEL_DRIVEN_ORIGINS,
@@ -136,8 +136,8 @@ export class SlackAdapter {
   private readonly signingSecret: string;
   private readonly api: SlackApi;
   private readonly socket: SlackSocketLike | null;
-  private readonly allowedUserIds: ReadonlySet<string>;
-  private readonly allowAllUsers: boolean;
+  /** Read on every inbound event so a settings reload applies (#520). */
+  private readonly allowlist: () => AllowlistState<string>;
   /** Issue #121 port of upstream PR #210: per-channel bot pass-through. */
   private readonly allowBots: ReadonlySet<string>;
   private readonly allowBotIds: ReadonlySet<string>;
@@ -207,8 +207,8 @@ export class SlackAdapter {
     this.signingSecret = opts.signingSecret;
     this.api = opts.api ?? createSlackApi(opts.token);
     this.socket = opts.socket ?? null;
-    this.allowedUserIds = new Set(opts.allowedUserIds);
-    this.allowAllUsers = opts.allowAllUsers === true;
+    const mounted = { allowedUserIds: opts.allowedUserIds, allowAllUsers: opts.allowAllUsers };
+    this.allowlist = opts.allowlist ?? (() => mounted);
     this.allowBots = new Set(opts.allowBots ?? []);
     this.allowBotIds = new Set(opts.allowBotIds ?? []);
     this.selfBotId = opts.selfBotId ?? null;
@@ -479,7 +479,7 @@ export class SlackAdapter {
     // Allow-list (src/allowlist.ts): empty list = nobody unless
     // `allowAllUsers`. Bot-allowed traffic bypasses this gate per upstream
     // PR #210 — bots don't have a human userId to check.
-    if (!isBotAllowed && !isUserAllowed(this.allowedUserIds, userId, this.allowAllUsers)) {
+    if (!isBotAllowed && !isAllowedBy(this.allowlist(), userId)) {
       return;
     }
 
@@ -579,7 +579,7 @@ export class SlackAdapter {
     if (!userId) return;
 
     // Allow-list — same rule as the message path (src/allowlist.ts).
-    if (!isUserAllowed(this.allowedUserIds, userId, this.allowAllUsers)) {
+    if (!isAllowedBy(this.allowlist(), userId)) {
       return;
     }
 

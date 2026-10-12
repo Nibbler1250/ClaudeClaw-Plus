@@ -188,6 +188,9 @@ don't waste time investigating:
   a daemon restart. The scheduler reloads on heartbeat / jobs changes
   (PR #126), but adapter reload would invalidate pending permission /
   ask maps — deferred until a session-migration story exists.
+  Allow-lists are the exception: `allowedUserIds` and `allowAllUsers`
+  are read on every inbound event, so an edit applies to incoming messages
+  and button taps within 30 s (#520).
 - **Jobs run outside the bus agents' sessions.** Under Bus the 60 s job
   loop still runs each job as its own `claude -p`, so per-job
   `model:`, `timeoutSeconds`, `retry` / `retryDelay` and `notify` apply
@@ -318,3 +321,9 @@ Fix it one of two ways:
   `"telegram": { "allowAllUsers": true }` (same key under `discord` / `slack`).
 
 Slack bot traffic admitted through `allowBots` is unaffected.
+
+Both keys are hot-reloaded on both runtimes: removing an id, or switching
+`allowAllUsers` back off, refuses that user's next message or button tap
+within 30 s, without a restart (#520). It does not reroute replies: on the
+Bus runtime, output that is not tied to a chat (cron, heartbeat, alerts) goes
+to the last chat that wrote to the agent until someone else writes.

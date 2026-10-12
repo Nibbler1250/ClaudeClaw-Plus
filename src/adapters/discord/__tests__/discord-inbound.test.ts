@@ -151,6 +151,29 @@ describe("DiscordAdapter — allow-list", () => {
     expect(unauth).toHaveLength(0);
   });
 
+  // #520: the Bus runtime passes a getter so a settings reload applies.
+  it("follows the allowlist getter: removal refuses, addition accepts, no restart", async () => {
+    const live = { allowedUserIds: ["user-1"] };
+    adapter = await startAdapter(h, { allowlist: () => live });
+    const push = (author: string) =>
+      h.gateway.push({
+        type: "MESSAGE_CREATE",
+        message: makeMessage({
+          channel_id: "dm-1",
+          guild_id: undefined,
+          author: { id: author, username: author },
+          content: "hi",
+        }),
+      });
+    live.allowedUserIds = ["newcomer"];
+    push("user-1");
+    await flushMicrotasks();
+    expect(h.rest.sent.filter((s) => s.text === "Unauthorized.")).toHaveLength(1);
+    push("newcomer");
+    await flushMicrotasks();
+    expect(h.bus.prompts).toHaveLength(1);
+  });
+
   it("drops bot author messages", async () => {
     adapter = await startAdapter(h);
     h.gateway.push({
