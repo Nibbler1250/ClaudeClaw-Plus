@@ -324,8 +324,12 @@ Slack bot traffic admitted through `allowBots` is unaffected.
 
 Both keys are hot-reloaded on both runtimes: removing an id, or switching
 `allowAllUsers` back off, refuses that user's next message or button tap
-within 30 s, without a restart (#520). It does not reroute replies: on the
-Bus runtime, Telegram output that is not tied to a chat (cron, heartbeat,
-alerts) goes to the last chat that wrote to the agent until someone else
-writes (#521). Discord and Slack send such output to their configured
-channels, not to the last sender.
+within 30 s, without a restart (#520). On the Bus runtime, Telegram output
+that is not tied to a chat (heartbeat, alerts, scheduled tasks) goes to the
+last chat that wrote to the agent; that chat is re-checked against the
+current list before each such send, so a removed user stops receiving it
+too, and it falls back to the `telegram.busRouting.chats` entries (#521). A
+group is treated the same way: its cache entry belongs to the user who last
+wrote there. A chat listed in `busRouting.chats` is configuration and keeps
+receiving: remove a revoked user's DM from it too. Discord and Slack send
+such output to their configured channels, not to the last sender.
