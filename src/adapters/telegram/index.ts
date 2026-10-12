@@ -114,6 +114,11 @@ interface PendingPrompt {
   source_message_id: number;
   /** Optional forum-topic thread id, propagated to outbound sends. */
   message_thread_id?: number;
+  /**
+   * Sender of the inbound that set this entry. Re-checked against the live
+   * allow-list before chat-less output reuses the entry (#521).
+   */
+  user_id?: number;
 }
 
 /** In-flight `system.request_human` correlation; next chat reply answers it. */
@@ -495,6 +500,7 @@ export class TelegramAdapter {
       chat_id: chatId,
       source_message_id: message.message_id,
       message_thread_id: message.message_thread_id,
+      user_id: userId,
     };
     this.lastChatPerAgent.set(agentId, pending);
     this.lastTopicPerChat.set(chatId, message.message_thread_id);
@@ -1456,10 +1462,26 @@ export class TelegramAdapter {
    * which prefers `origin_id` over this fan-out cache, so two chats
    * routed to the same agent no longer cross-wire on interleaved
    * prompts.
+   *
+   * #521: the cached last chat is only reused while the user who set it is
+   * still allowed by the live allow-list. A user removed from
+   * `telegram.allowedUserIds` (or an `allowAllUsers` switched off) would
+   * otherwise keep reading cron / heartbeat / alert output until someone
+   * else wrote. The entry is dropped and routing falls back to the
+   * configured chats. In a group the entry is dropped the same way: the
+   * group was only targeted because that user wrote there, while a group
+   * the operator maps in `routing.chats` is still reached below.
    */
   private targetForAgent(agentId: string): PendingPrompt | null {
     const last = this.lastChatPerAgent.get(agentId);
-    if (last) return last;
+    if (last) {
+      if (isAllowedBy(this.allowlist(), last.user_id)) return last;
+      this.lastChatPerAgent.delete(agentId);
+      this.logger.warn(
+        `[telegram-adapter] dropped last chat ${last.chat_id} of agent ${agentId}: ` +
+          `user ${last.user_id} is no longer in telegram.allowedUserIds`,
+      );
+    }
     for (const [chatIdStr, mappedAgent] of Object.entries(this.routingChats)) {
       if (mappedAgent === agentId) {
         const chatId = Number(chatIdStr);
