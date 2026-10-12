@@ -9,6 +9,7 @@ import {
 import { extractErrorDetail } from "../messaging";
 import { loadPendingResume } from "../pending-resume";
 import { getSettings, loadSettings, DEFAULT_IMAGE_OUTPUT_ROOT } from "../config";
+import { describeAllowlist, isUserAllowed } from "../allowlist";
 import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession } from "../sessionManager";
 import { readFile } from "node:fs/promises";
@@ -972,7 +973,7 @@ async function handleMessageCreate(
   }
 
   // Authorization check
-  if (config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(userId)) {
+  if (!isUserAllowed(config.allowedUserIds, userId, config.allowAllUsers)) {
     if (isDM) {
       await sendMessage(config.token, channelId, "Unauthorized.");
     } else {
@@ -1478,7 +1479,7 @@ async function handleInteractionCreate(
   const config = getSettings().discord;
   const actorId = interaction.member?.user?.id ?? interaction.user?.id;
 
-  if (config.allowedUserIds.length > 0 && (!actorId || !config.allowedUserIds.includes(actorId))) {
+  if (!isUserAllowed(config.allowedUserIds, actorId, config.allowAllUsers)) {
     await respondToInteraction(interaction, { content: "Unauthorized.", flags: 64 });
     return;
   }
@@ -1695,10 +1696,7 @@ export async function handleGuildCreate(
   if (!channelId) return;
 
   const guildName = JSON.stringify(String(guild.name ?? "").slice(0, 200));
-  if (
-    config.allowedUserIds.length > 0 &&
-    (!guild.owner_id || !config.allowedUserIds.includes(guild.owner_id))
-  ) {
+  if (!isUserAllowed(config.allowedUserIds, guild.owner_id, config.allowAllUsers)) {
     console.log(
       `[Discord] Joined guild ${guildName} (${guild.id}) owned by unauthorized user ${guild.owner_id ?? "unknown"} — not greeting`,
     );
@@ -2144,9 +2142,7 @@ export function startGateway(debug = false): void {
   if (ws) stopGateway();
   running = true;
   console.log("Discord bot started (gateway)");
-  console.log(
-    `  Allowed users: ${config.allowedUserIds.length === 0 ? "all" : config.allowedUserIds.join(", ")}`,
-  );
+  console.log(`  Allowed users: ${describeAllowlist(config.allowedUserIds, config.allowAllUsers)}`);
   if (config.listenChannels.length > 0) {
     console.log(`  Listen channels: ${config.listenChannels.join(", ")}`);
   }
@@ -2177,9 +2173,7 @@ export async function discord() {
   }
 
   console.log("Discord bot started (gateway, standalone)");
-  console.log(
-    `  Allowed users: ${config.allowedUserIds.length === 0 ? "all" : config.allowedUserIds.join(", ")}`,
-  );
+  console.log(`  Allowed users: ${describeAllowlist(config.allowedUserIds, config.allowAllUsers)}`);
   if (discordDebug) console.log("  Debug: enabled");
 
   connectGateway(config.token);

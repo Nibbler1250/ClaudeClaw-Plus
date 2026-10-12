@@ -8,6 +8,7 @@
  */
 
 import type { BusCore, Subscription } from "../../bus/core";
+import { isUserAllowed } from "../../allowlist";
 import { openInboundReceipt } from "../../bus/receipt-wiring";
 import { getDefaultReceiptStore, type OpenReceipt, type ReceiptStore } from "../../bus/receipt";
 import {
@@ -50,10 +51,12 @@ export interface TelegramAdapterOptions {
   /** Bot token (`123:abc…`). Used for the default HTTP API client. */
   token: string;
   /**
-   * Numeric user IDs allowed to talk to the bot. Empty list rejects all —
-   * explicit allow-listing is a precondition under the Bus runtime.
+   * Numeric user IDs allowed to talk to the bot. Empty list rejects all
+   * unless `allowAllUsers` is set — see `src/allowlist.ts`.
    */
   allowedUserIds: number[];
+  /** Accept every user regardless of `allowedUserIds`. Default false. */
+  allowAllUsers?: boolean;
   /** chat-id → agent_id routing. `defaultAgentId` covers fall-through. */
   routing: {
     chats: Record<string, string>;
@@ -147,6 +150,7 @@ export class TelegramAdapter {
   private readonly api: TelegramApi;
   private readonly outbox: TelegramOutbox | null;
   private readonly allowedUserIds: ReadonlySet<number>;
+  private readonly allowAllUsers: boolean;
   private readonly routingChats: Record<string, string>;
   private readonly defaultAgentId: string | undefined;
   private readonly pollIntervalMs: number;
@@ -260,6 +264,7 @@ export class TelegramAdapter {
       this.outbox = opts.api ? null : getTelegramOutbox(defaultOutboxPath(), outboxSender);
     }
     this.allowedUserIds = new Set(opts.allowedUserIds);
+    this.allowAllUsers = opts.allowAllUsers === true;
     this.routingChats = { ...opts.routing.chats };
     this.defaultAgentId = opts.routing.defaultAgentId;
     this.pollIntervalMs = opts.pollIntervalMs ?? 1000;
@@ -411,16 +416,11 @@ export class TelegramAdapter {
     // Drop bot-to-bot echoes (legacy gating + spec allow-list semantics).
     if (message.from?.is_bot) return;
 
-    // Allow-list — telegram.ts:1131 semantics: empty list = "allow all"
-    // (preserved for default-config parity per PR #113 review); non-empty
-    // list with no match = named rejection in private chats / silent skip
-    // in group chats. The earlier "empty = deny all" behaviour was a
-    // silent regression for operators running default configs.
+    // Allow-list (src/allowlist.ts): empty list = nobody unless
+    // `allowAllUsers`; no match = named rejection in private chats / silent
+    // skip in group chats.
     const isPrivate = message.chat.type === "private";
-    if (
-      userId === undefined ||
-      (this.allowedUserIds.size > 0 && !this.allowedUserIds.has(userId))
-    ) {
+    if (!isUserAllowed(this.allowedUserIds, userId, this.allowAllUsers)) {
       if (isPrivate) {
         await this.safeSendMessage({
           chat_id: chatId,
@@ -1262,11 +1262,8 @@ export class TelegramAdapter {
   private async handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> {
     const data = query.data ?? "";
     const userId = query.from?.id;
-    // Allow-list — empty = "allow all" (legacy parity, PR #113 review).
-    if (
-      userId === undefined ||
-      (this.allowedUserIds.size > 0 && !this.allowedUserIds.has(userId))
-    ) {
+    // Allow-list — same rule as the message path (src/allowlist.ts).
+    if (!isUserAllowed(this.allowedUserIds, userId, this.allowAllUsers)) {
       await this.safeAnswerCallback({
         callback_query_id: query.id,
         text: "Unauthorized.",

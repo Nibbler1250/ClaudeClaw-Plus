@@ -42,10 +42,14 @@ afterAll(async () => {
   }
 });
 
-async function withAllowlists(telegram: number[], discord: string[]): Promise<void> {
+async function withAllowlists(
+  telegram: number[],
+  discord: string[],
+  allowAllUsers = false,
+): Promise<void> {
   const body = {
-    telegram: { token: "tg-test", allowedUserIds: telegram },
-    discord: { token: "dc-test", allowedUserIds: discord },
+    telegram: { token: "tg-test", allowedUserIds: telegram, allowAllUsers },
+    discord: { token: "dc-test", allowedUserIds: discord, allowAllUsers },
   };
   await writeFile(SETTINGS_FILE, `${JSON.stringify(body, null, 2)}\n`);
   await reloadSettings();
@@ -123,5 +127,35 @@ describe("Discord: bot added to a server", () => {
     await handleGuildCreate("dc-test", joinedGuild("222222222222222222"), r.deps);
     expect(r.runs).toHaveLength(0);
     expect(r.sent).toHaveLength(0);
+  });
+});
+
+describe("empty allowlist (fails closed, like every other gate)", () => {
+  it("Telegram: stays silent when allowedUserIds is empty", async () => {
+    await withAllowlists([], []);
+    const r = recorder();
+    await handleMyChatMember(addedToGroup(42), r.deps);
+    expect(r.runs).toHaveLength(0);
+    expect(r.sent).toHaveLength(0);
+  });
+
+  it("Discord: stays silent when allowedUserIds is empty", async () => {
+    await withAllowlists([], []);
+    const r = recorder();
+    await handleGuildCreate("dc-test", joinedGuild("111111111111111111"), r.deps);
+    expect(r.runs).toHaveLength(0);
+    expect(r.sent).toHaveLength(0);
+  });
+
+  it("greets anyone with allowAllUsers: true, still without a model turn", async () => {
+    await withAllowlists([], [], true);
+    const r = recorder();
+    await handleMyChatMember(addedToGroup(7), r.deps);
+    await handleGuildCreate("dc-test", joinedGuild("222222222222222222"), r.deps);
+    expect(r.runs).toHaveLength(0);
+    expect(r.sent).toEqual([
+      { to: -100123, text: GROUP_ADDED_GREETING },
+      { to: "c-1", text: GUILD_ADDED_GREETING },
+    ]);
   });
 });

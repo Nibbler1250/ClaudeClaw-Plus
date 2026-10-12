@@ -1,4 +1,5 @@
 import { writeFile, unlink, mkdir } from "fs/promises";
+import { allowlistStartupWarnings } from "../allowlist";
 import { existsSync } from "fs";
 import { randomBytes } from "crypto";
 import { homedir } from "os";
@@ -848,6 +849,7 @@ export async function start(args: string[] = []) {
     console.log(`  Runtime: ${settings.runtime}`);
   }
   console.log(`  Security: ${settings.security.level}`);
+  for (const line of allowlistStartupWarnings(settings)) console.warn(`  WARNING: ${line}`);
   if (settings.security.allowedTools.length > 0)
     console.log(`    + allowed: ${settings.security.allowedTools.join(", ")}`);
   if (settings.security.disallowedTools.length > 0)
