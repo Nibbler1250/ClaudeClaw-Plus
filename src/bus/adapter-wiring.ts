@@ -180,6 +180,7 @@ async function mountDiscord(
     bus,
     token: cfg.token,
     allowedUserIds: cfg.allowedUserIds,
+    ...(cfg.allowAllUsers ? { allowAllUsers: true } : {}),
     routing: cfg.busRouting,
     logger,
   });
@@ -221,25 +222,19 @@ async function mountTelegram(
       return null;
     }
     routing = { chats: {}, defaultAgentId };
-    // Surface the derive. When allowedUserIds is empty the adapter accepts
-    // inbound from ANY Telegram user (empty allow-list = allow-all, a
-    // pre-existing policy — see adapters/telegram allow-list gate), so a
-    // token-only mount is open by default; warn so the operator can lock it down.
-    if (cfg.allowedUserIds.length === 0) {
-      logger.warn(
-        `[bus-adapters] telegram: no busRouting configured — routing all inbound chats to default agent "${defaultAgentId}". telegram.allowedUserIds is empty, so ANY Telegram user can reach it; set telegram.allowedUserIds to restrict access.`,
-      );
-    } else {
-      logger.info(
-        `[bus-adapters] telegram: no busRouting configured; routing all inbound chats to default agent "${defaultAgentId}"`,
-      );
-    }
+    // Surface the derive. Who may reach the agent is the allow-list's call
+    // (src/allowlist.ts) — an empty list refuses everyone, and the daemon
+    // warns about that once at startup.
+    logger.info(
+      `[bus-adapters] telegram: no busRouting configured; routing all inbound chats to default agent "${defaultAgentId}"`,
+    );
   }
   const { TelegramAdapter } = await import("../adapters/telegram");
   const adapter = new TelegramAdapter({
     bus,
     token: cfg.token,
     allowedUserIds: cfg.allowedUserIds,
+    ...(cfg.allowAllUsers ? { allowAllUsers: true } : {}),
     routing,
     // #201: honor send-only configs even with explicit busRouting — the
     // adapter wires outbound but skips the inbound long-poll. Default true.
@@ -277,6 +272,7 @@ async function mountSlack(
     token: cfg.botToken,
     signingSecret,
     allowedUserIds: cfg.allowedUserIds,
+    ...(cfg.allowAllUsers ? { allowAllUsers: true } : {}),
     routing: {
       channels: cfg.busRouting.channels,
       ...(cfg.busRouting.threadAgentId ? { threadAgentId: cfg.busRouting.threadAgentId } : {}),

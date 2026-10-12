@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { isUserAllowed } from "../allowlist";
 import {
   _resetChatUserIdsWarningsForTests,
   _setSettingsFileForTests,
@@ -12,20 +13,14 @@ import {
  * `slack.allowedUserIds` and `discord.allowedUserIds` through the REAL settings
  * loader (raw text included: Discord ids are also read from it, for precision).
  *
- * An empty list means "allow everyone" on every Slack and Discord runtime, so a
- * present value that is not a list (a single id written as a string or a
- * number) must not collapse to `[]`: it has to allow nobody, with a warning.
+ * A present value that is not a list (a single id written as a string or a
+ * number) must not collapse to `[]`: it becomes `["0"]`, which allows nobody,
+ * with a warning that names the real problem.
  */
 
-// The allow checks of both runtimes: `src/commands/{slack,discord}.ts`
-// (`length > 0 && !includes(id)` → reject) and `src/adapters/{slack,discord}/index.ts`
-// (same rule on a Set built from the list). They must agree.
+// The allow check every gate of both runtimes uses (`src/allowlist.ts`).
 function allows(ids: string[], userId: string): boolean {
-  const legacy = !(ids.length > 0 && !ids.includes(userId));
-  const set = new Set(ids);
-  const bus = !(set.size > 0 && !set.has(userId));
-  expect(bus).toBe(legacy);
-  return legacy;
+  return isUserAllowed(ids, userId);
 }
 
 type Platform = "slack" | "discord";
@@ -102,10 +97,11 @@ describe("settings loader — slack/discord allowedUserIds", () => {
         expect(warnings.filter((w) => w.includes(`${platform}.allowedUserIds`))).toEqual([]);
       });
 
-      it("absent, null or an explicit empty list → empty (allow-all, unchanged), no warning", async () => {
+      it("absent, null or an explicit empty list → empty, which refuses everyone, no warning", async () => {
         for (const value of [undefined, null, []]) {
           const { ids, warnings } = await loadWith(platform, value);
           expect(ids).toEqual([]);
+          expect(allows(ids, id)).toBe(false);
           expect(warnings.filter((w) => w.includes(`${platform}.allowedUserIds`))).toEqual([]);
         }
       });

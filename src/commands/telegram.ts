@@ -16,6 +16,7 @@ import {
 import { extractErrorDetail } from "../messaging";
 import { loadPendingResume } from "../pending-resume";
 import { getSettings, loadSettings } from "../config";
+import { describeAllowlist, isUserAllowed } from "../allowlist";
 import { transcribeAudioToText } from "../whisper";
 import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { peekThreadSession, removeThreadSession } from "../sessionManager";
@@ -1056,7 +1057,7 @@ export async function handleMyChatMember(
   if (!isGroup || !wasOut || !isIn) return;
 
   const chatName = JSON.stringify((chat.title ?? String(chat.id)).slice(0, 200));
-  if (config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(update.from.id)) {
+  if (!isUserAllowed(config.allowedUserIds, update.from.id, config.allowAllUsers)) {
     console.log(
       `[Telegram] Added to ${chat.type} ${chatName} (${chat.id}) by unauthorized user ${update.from.id} — not greeting`,
     );
@@ -1147,14 +1148,17 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
-  if (userId && config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(userId)) {
+  // No `from` = no identity to check: refused like an unlisted user.
+  if (!isUserAllowed(config.allowedUserIds, userId, config.allowAllUsers)) {
     if (isPrivate) {
       await sendMessage(config.token, chatId, "Unauthorized.");
     } else {
       console.log(
-        `[Telegram] Ignored group message from unauthorized user ${userId} in chat ${chatId}`,
+        `[Telegram] Ignored group message from unauthorized user ${userId ?? "unknown"} in chat ${chatId}`,
       );
-      debugLog(`Skip group message chat=${chatId} from=${userId} reason=unauthorized_user`);
+      debugLog(
+        `Skip group message chat=${chatId} from=${userId ?? "unknown"} reason=unauthorized_user`,
+      );
     }
     return;
   }
@@ -1929,7 +1933,7 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
 
   // Enforce allowlist on callback queries (same policy as regular messages)
   const callbackUserId = query.from.id;
-  if (config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(callbackUserId)) {
+  if (!isUserAllowed(config.allowedUserIds, callbackUserId, config.allowAllUsers)) {
     await callApi(config.token, "answerCallbackQuery", {
       callback_query_id: query.id,
       text: "Unauthorized.",
@@ -2225,9 +2229,7 @@ async function poll(generation: number): Promise<void> {
   }
 
   console.log("Telegram bot started (long polling)");
-  console.log(
-    `  Allowed users: ${config.allowedUserIds.length === 0 ? "all" : config.allowedUserIds.join(", ")}`,
-  );
+  console.log(`  Allowed users: ${describeAllowlist(config.allowedUserIds, config.allowAllUsers)}`);
   if (telegramDebug) console.log("  Debug: enabled");
 
   // Register available skills as bot command menu (non-blocking)

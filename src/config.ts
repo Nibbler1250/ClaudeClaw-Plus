@@ -403,6 +403,8 @@ export interface WebBusConfig {
 export interface TelegramConfig {
   token: string;
   allowedUserIds: number[];
+  /** Accept every Telegram user. Without it an empty `allowedUserIds` refuses everyone. */
+  allowAllUsers?: boolean;
   listenChats: number[];
   /** When false, skip Telegram polling (incoming messages). Useful for send-only instances. Default: true */
   receiveEnabled: boolean;
@@ -423,6 +425,8 @@ export interface TelegramConfig {
 export interface DiscordConfig {
   token: string;
   allowedUserIds: string[]; // Discord snowflake IDs exceed Number.MAX_SAFE_INTEGER
+  /** Accept every Discord user. Without it an empty `allowedUserIds` refuses everyone. */
+  allowAllUsers?: boolean;
   listenChannels: string[]; // Channel IDs where bot responds to all messages (no mention needed)
   listenGuilds: string[]; // Guild IDs where bot responds to all messages in any channel/thread
   channelNames?: Record<string, string>; // channelId -> friendly name for system prompt context
@@ -438,6 +442,8 @@ export interface SlackConfig {
   /** Slack app signing secret for Events API HTTP verification. Required for Bus runtime HTTP mode. */
   signingSecret?: string;
   allowedUserIds: string[];
+  /** Accept every Slack user. Without it an empty `allowedUserIds` refuses everyone. */
+  allowAllUsers?: boolean;
   listenChannels: string[]; // Channel IDs where bot responds without @mention
   allowBots: string[]; // Channel IDs where bot-posted messages are passed through
   allowBotIds: string[]; // Optional: Slack app/bot IDs (B...) that may post; empty = any bot in allowBots channel
@@ -1069,6 +1075,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
         process.env.TELEGRAM_TOKEN?.trim() ||
         (typeof raw.telegram?.token === "string" ? raw.telegram.token.trim() : ""),
       allowedUserIds: parseTelegramUserIds(raw.telegram?.allowedUserIds),
+      ...(raw.telegram?.allowAllUsers === true ? { allowAllUsers: true } : {}),
       listenChats: Array.isArray(raw.telegram?.listenChats)
         ? raw.telegram.listenChats.map(Number)
         : [],
@@ -1086,6 +1093,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
         process.env.DISCORD_TOKEN?.trim() ||
         (typeof raw.discord?.token === "string" ? raw.discord.token.trim() : ""),
       allowedUserIds: parseChatUserIds("discord", raw.discord?.allowedUserIds, discordUserIds),
+      ...(raw.discord?.allowAllUsers === true ? { allowAllUsers: true } : {}),
       listenChannels: Array.isArray(raw.discord?.listenChannels)
         ? raw.discord.listenChannels.map(String)
         : [],
@@ -1119,6 +1127,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
         process.env.SLACK_APP_TOKEN?.trim() ||
         (typeof raw.slack?.appToken === "string" ? raw.slack.appToken.trim() : ""),
       allowedUserIds: parseChatUserIds("slack", raw.slack?.allowedUserIds),
+      ...(raw.slack?.allowAllUsers === true ? { allowAllUsers: true } : {}),
       listenChannels: Array.isArray(raw.slack?.listenChannels)
         ? raw.slack.listenChannels.map(String)
         : [],
@@ -1898,10 +1907,11 @@ export function _resetTelegramIdsWarningsForTests(): void {
  * string reached `includes` in the allow check and matched any user whose id
  * is a substring of it.
  *
- * An empty list means "allow everyone", so a value that is present but holds
- * no valid id (a lone string or number written by mistake, a list of junk)
- * must not collapse to `[]`. It becomes `[0]`: no Telegram user has id 0, so
- * both runtimes' allow checks refuse every sender. Outbound forwards that walk
+ * A value that is present but holds no valid id (a lone string or number
+ * written by mistake, a list of junk) becomes `[0]`, not `[]`: no Telegram user
+ * has id 0, so both runtimes' allow checks refuse every sender, and the startup
+ * check (`allowlistStartupWarnings`) does not report the value as "empty" when
+ * the warning above already names the real problem. Outbound forwards that walk
  * the list then target chat 0 and log a send error until the value is fixed.
  */
 function parseTelegramUserIds(value: unknown): number[] {
@@ -1956,10 +1966,9 @@ export function _resetChatUserIdsWarningsForTests(): void {
  * numbers lose precision on snowflakes) only when they spell the parsed list
  * entry for entry.
  *
- * An empty list means "allow everyone", so a value that is present but is not
- * a list (a single id written as a string or a number by mistake) must not
- * collapse to `[]`. It becomes `["0"]`: no Slack or Discord user has id "0",
- * so every allow check refuses every sender. Outbound DMs that walk the list
+ * A value that is present but is not a list (a single id written as a string
+ * or a number by mistake) becomes `["0"]`, not `[]`: no Slack or Discord user
+ * has id "0", so every allow check refuses every sender. Outbound DMs that walk the list
  * then target "0" and log a send error until the value is fixed. Same rule as
  * `telegram.allowedUserIds`.
  */

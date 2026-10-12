@@ -27,8 +27,10 @@ export interface DiscordAdapterOptions {
   bus: BusCore;
   /** Bot token (same source as `settings.discord.token` in legacy). */
   token: string;
-  /** Discord user ID allow-list. Empty → silent-deny everything. */
+  /** Discord user ID allow-list. Empty → deny everyone unless `allowAllUsers`. */
   allowedUserIds: string[];
+  /** Accept every user regardless of `allowedUserIds`. Default false. */
+  allowAllUsers?: boolean;
   /**
    * Routing: which agent owns each Discord channel / thread / DM.
    *
