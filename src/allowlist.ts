@@ -20,6 +20,20 @@ export function isUserAllowed<T>(
   return allowed instanceof Set ? allowed.has(userId) : (allowed as readonly T[]).includes(userId);
 }
 
+/**
+ * The allow-list as a gate reads it. Bus adapters take a getter returning
+ * this, so a settings reload applies to the next message without a restart
+ * (#520) — the legacy runtime already reads `getSettings()` per event.
+ */
+export interface AllowlistState<T> {
+  allowedUserIds: readonly T[];
+  allowAllUsers?: boolean;
+}
+
+export function isAllowedBy<T>(state: AllowlistState<T>, userId: T | undefined | null): boolean {
+  return isUserAllowed(state.allowedUserIds, userId, state.allowAllUsers === true);
+}
+
 /** One-line summary for startup banners and status commands. */
 export function describeAllowlist(allowed: readonly unknown[], allowAllUsers = false): string {
   if (allowAllUsers) return "all (allowAllUsers: true)";

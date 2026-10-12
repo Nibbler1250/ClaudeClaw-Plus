@@ -1329,6 +1329,58 @@ describe("TelegramAdapter — allow-list semantics (PR #113 review)", () => {
   });
 });
 
+describe("TelegramAdapter — allow-list follows a settings reload (#520)", () => {
+  const dm = (message_id: number, from: number) => ({
+    message: { message_id, from: { id: from }, chat: { id: 100, type: "private" }, text: "hi" },
+  });
+
+  it("refuses a user removed from the list after mount, without a restart", async () => {
+    const live = { allowedUserIds: [42, 7], allowAllUsers: false };
+    adapter = await startAdapter({ allowedUserIds: [42, 7], allowlist: () => live });
+    api.enqueueUpdates([dm(1, 7)]);
+    await waitFor(() => bus.prompts.length === 1);
+
+    live.allowedUserIds = [42];
+    api.enqueueUpdates([dm(2, 7)]);
+    await waitFor(() => api.sendMessages.some((m) => m.text === "Unauthorized."));
+    expect(bus.prompts).toHaveLength(1);
+  });
+
+  it("accepts a user added to the list after mount, without a restart", async () => {
+    const live = { allowedUserIds: [42] };
+    adapter = await startAdapter({ allowedUserIds: [42], allowlist: () => live });
+    live.allowedUserIds = [42, 7];
+    api.enqueueUpdates([dm(1, 7)]);
+    await waitFor(() => bus.prompts.length === 1);
+    expect(api.sendMessages.filter((m) => m.text === "Unauthorized.")).toHaveLength(0);
+  });
+
+  it("refuses everyone once allowAllUsers is switched back off", async () => {
+    const live = { allowedUserIds: [] as number[], allowAllUsers: true };
+    adapter = await startAdapter({
+      allowedUserIds: [],
+      allowAllUsers: true,
+      allowlist: () => live,
+    });
+    live.allowAllUsers = false;
+    api.enqueueUpdates([dm(1, 9999)]);
+    await waitFor(() => api.sendMessages.some((m) => m.text === "Unauthorized."));
+    expect(bus.prompts).toHaveLength(0);
+  });
+
+  it("refuses a permission button from a user removed after mount", async () => {
+    const live = { allowedUserIds: [42] };
+    adapter = await startAdapter({ allowlist: () => live });
+    live.allowedUserIds = [];
+    api.enqueueUpdates([
+      { callback_query: { id: "cb4", from: { id: 42 }, data: "perm:allow:qwert" } },
+    ]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
+    expect(bus.permissionDecisions).toHaveLength(0);
+  });
+});
+
 describe("TelegramAdapter — request_human keying (PR #113 review)", () => {
   it("uses composite (agent_id, chat_id) key so multi-agent doesn't collide", async () => {
     // Two agents routed to two different chats. Each agent gets its own

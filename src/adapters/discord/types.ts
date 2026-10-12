@@ -18,6 +18,7 @@
 
 import type { BusCore } from "../../bus/core";
 import type { AttachmentsConfig } from "../../config";
+import type { AllowlistState } from "../../allowlist";
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* Public adapter options                                                 */
@@ -31,6 +32,12 @@ export interface DiscordAdapterOptions {
   allowedUserIds: string[];
   /** Accept every user regardless of `allowedUserIds`. Default false. */
   allowAllUsers?: boolean;
+  /**
+   * Current allow-list, read on every inbound event so a settings reload
+   * applies without a restart (#520). Absent = `allowedUserIds` /
+   * `allowAllUsers` above, fixed at construction.
+   */
+  allowlist?: () => AllowlistState<string>;
   /**
    * Routing: which agent owns each Discord channel / thread / DM.
    *

@@ -8,7 +8,7 @@
  */
 
 import type { BusCore, Subscription } from "../../bus/core";
-import { isUserAllowed } from "../../allowlist";
+import { type AllowlistState, isAllowedBy } from "../../allowlist";
 import { openInboundReceipt } from "../../bus/receipt-wiring";
 import { getDefaultReceiptStore, type OpenReceipt, type ReceiptStore } from "../../bus/receipt";
 import {
@@ -57,6 +57,12 @@ export interface TelegramAdapterOptions {
   allowedUserIds: number[];
   /** Accept every user regardless of `allowedUserIds`. Default false. */
   allowAllUsers?: boolean;
+  /**
+   * Current allow-list, read on every inbound event so a settings reload
+   * applies without a restart (#520). Absent = `allowedUserIds` /
+   * `allowAllUsers` above, fixed at construction.
+   */
+  allowlist?: () => AllowlistState<number>;
   /** chat-id → agent_id routing. `defaultAgentId` covers fall-through. */
   routing: {
     chats: Record<string, string>;
@@ -149,8 +155,8 @@ export class TelegramAdapter {
   private readonly bus: BusCore;
   private readonly api: TelegramApi;
   private readonly outbox: TelegramOutbox | null;
-  private readonly allowedUserIds: ReadonlySet<number>;
-  private readonly allowAllUsers: boolean;
+  /** Read on every inbound event so a settings reload applies (#520). */
+  private readonly allowlist: () => AllowlistState<number>;
   private readonly routingChats: Record<string, string>;
   private readonly defaultAgentId: string | undefined;
   private readonly pollIntervalMs: number;
@@ -263,8 +269,8 @@ export class TelegramAdapter {
     } else {
       this.outbox = opts.api ? null : getTelegramOutbox(defaultOutboxPath(), outboxSender);
     }
-    this.allowedUserIds = new Set(opts.allowedUserIds);
-    this.allowAllUsers = opts.allowAllUsers === true;
+    const mounted = { allowedUserIds: opts.allowedUserIds, allowAllUsers: opts.allowAllUsers };
+    this.allowlist = opts.allowlist ?? (() => mounted);
     this.routingChats = { ...opts.routing.chats };
     this.defaultAgentId = opts.routing.defaultAgentId;
     this.pollIntervalMs = opts.pollIntervalMs ?? 1000;
@@ -420,7 +426,7 @@ export class TelegramAdapter {
     // `allowAllUsers`; no match = named rejection in private chats / silent
     // skip in group chats.
     const isPrivate = message.chat.type === "private";
-    if (!isUserAllowed(this.allowedUserIds, userId, this.allowAllUsers)) {
+    if (!isAllowedBy(this.allowlist(), userId)) {
       if (isPrivate) {
         await this.safeSendMessage({
           chat_id: chatId,
@@ -1263,7 +1269,7 @@ export class TelegramAdapter {
     const data = query.data ?? "";
     const userId = query.from?.id;
     // Allow-list — same rule as the message path (src/allowlist.ts).
-    if (!isUserAllowed(this.allowedUserIds, userId, this.allowAllUsers)) {
+    if (!isAllowedBy(this.allowlist(), userId)) {
       await this.safeAnswerCallback({
         callback_query_id: query.id,
         text: "Unauthorized.",
