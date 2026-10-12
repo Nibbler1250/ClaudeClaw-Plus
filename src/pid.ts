@@ -56,8 +56,10 @@ export async function checkExistingDaemon(): Promise<number | null> {
       // #420: EPERM means alive-but-not-ours — never treat it as stale, or a
       // `start` by another user removes a live daemon's file and starts over it.
       // Positive integers only: kill(-1, 0) succeeds and would name everyone.
-      if (Number.isInteger(pid) && pid > 0 && isPidAlive(pid)) return pid;
-      // Corrupt, or the process is dead: remove the file — still the one read.
+      // #526: our own PID is a leftover, not a daemon — in a container the
+      // daemon is PID 1 on every start, so the file from the last run names us.
+      if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && isPidAlive(pid)) return pid;
+      // Corrupt, ours, or the process is dead: remove the file — still the one read.
       if ((await compareAndUnlink(pid, PID_FILE)) !== "foreign") return null;
     }
     throw new DaemonStateUnknownError(`${PID_FILE} kept changing while it was checked`);
