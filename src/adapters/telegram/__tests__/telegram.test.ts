@@ -1381,6 +1381,95 @@ describe("TelegramAdapter — allow-list follows a settings reload (#520)", () =
   });
 });
 
+describe("TelegramAdapter — chat-less output re-checks the allow-list (#521)", () => {
+  // Chat 500 is not in routing.chats: it reaches "triage" through
+  // defaultAgentId, so only the last-chat cache can send there. Chat 100 is
+  // the configured fallback.
+  const routing = { chats: { "100": "triage" }, defaultAgentId: "triage" };
+  const msg = (from: number, chat: { id: number; type: string }) => ({
+    message: { message_id: 1, from: { id: from }, chat, text: "hi" },
+  });
+  const cronReply = (text: string) =>
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text, origin: "cron", origin_id: "nightly" },
+    });
+  const sentTo = (chatId: number, text: string) =>
+    api.sendMessages.some((m) => m.chat_id === chatId && m.text.includes(text)) ||
+    api.editMessages.some((m) => m.chat_id === chatId && m.text.includes(text));
+
+  it("stops sending cron output to the last chat once its user is removed", async () => {
+    const warnings: string[] = [];
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({
+      routing,
+      allowlist: () => live,
+      logger: { ...SILENT_LOGGER, warn: (m: string) => warnings.push(m) },
+    });
+    const dropLogs = () =>
+      warnings.filter((w) => w.includes("no longer in telegram.allowedUserIds")).length;
+    api.enqueueUpdates([msg(7, { id: 500, type: "private" })]);
+    await waitFor(() => bus.prompts.length === 1);
+
+    live.allowedUserIds = [42];
+    cronReply("tick one");
+    await waitFor(() => sentTo(100, "tick one"));
+    expect(sentTo(500, "tick one")).toBe(false);
+    expect(dropLogs()).toBe(1);
+
+    // The entry is purged: re-adding the user does not bring the chat back
+    // until they write again, and the drop is logged once.
+    live.allowedUserIds = [42, 7];
+    cronReply("tick two");
+    await waitFor(() => sentTo(100, "tick two"));
+    expect(sentTo(500, "tick two")).toBe(false);
+    expect(dropLogs()).toBe(1);
+  });
+
+  it("keeps sending cron output to the last chat while its user is allowed", async () => {
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({ routing, allowlist: () => live });
+    api.enqueueUpdates([msg(7, { id: 500, type: "private" })]);
+    await waitFor(() => bus.prompts.length === 1);
+    cronReply("tick kept");
+    await waitFor(() => sentTo(500, "tick kept"));
+    expect(sentTo(100, "tick kept")).toBe(false);
+  });
+
+  it("stops once allowAllUsers is switched off (operator alert)", async () => {
+    const live = { allowedUserIds: [42], allowAllUsers: true };
+    adapter = await startAdapter({ routing, allowlist: () => live });
+    api.enqueueUpdates([msg(9999, { id: 500, type: "private" })]);
+    await waitFor(() => bus.prompts.length === 1);
+
+    live.allowAllUsers = false;
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "critical", text: "watchdog: stalled", source: "stall-watchdog" },
+    });
+    await waitFor(() => sentTo(100, "stalled"));
+    expect(sentTo(500, "stalled")).toBe(false);
+  });
+
+  it("drops a group cached by a removed user, falling back to routed chats", async () => {
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({ routing, allowlist: () => live });
+    api.enqueueUpdates([msg(7, { id: -300, type: "group" })]);
+    await waitFor(() => bus.prompts.length === 1);
+
+    live.allowedUserIds = [42];
+    cronReply("group tick");
+    await waitFor(() => sentTo(100, "group tick"));
+    expect(sentTo(-300, "group tick")).toBe(false);
+  });
+});
+
 describe("TelegramAdapter — request_human keying (PR #113 review)", () => {
   it("uses composite (agent_id, chat_id) key so multi-agent doesn't collide", async () => {
     // Two agents routed to two different chats. Each agent gets its own
