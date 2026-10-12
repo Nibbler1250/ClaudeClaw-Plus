@@ -1093,6 +1093,22 @@ describe("TelegramAdapter — permission flow", () => {
     expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
     expect(bus.permissionDecisions).toHaveLength(0);
   });
+
+  it("rejects a permission button from anyone when allowedUserIds is empty", async () => {
+    adapter = await startAdapter({ allowedUserIds: [] });
+    api.enqueueUpdates([
+      {
+        callback_query: {
+          id: "cb3",
+          from: { id: 42 },
+          data: "perm:allow:qwert",
+        },
+      },
+    ]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
+    expect(bus.permissionDecisions).toHaveLength(0);
+  });
 });
 
 /* ────────────────────────────────────────────────────────────────────── */

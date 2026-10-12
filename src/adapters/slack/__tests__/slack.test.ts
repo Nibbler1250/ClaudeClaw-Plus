@@ -15,8 +15,8 @@
  *     inbound envelopes deterministically.
  *
  * Coverage targets (spec §5.5.3):
- *   - allow-list: empty = allow all; populated + match = allow; populated
- *     + miss = silent skip
+ *   - allow-list: empty = refuse all; populated + match = allow; populated
+ *     + miss = silent skip; allowAllUsers = allow all
  *   - Channel routing → correct agent_id
  *   - Thread routing
  *   - bus.sendPrompt shape correct

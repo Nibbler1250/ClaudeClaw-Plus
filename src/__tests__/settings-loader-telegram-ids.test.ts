@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { isUserAllowed } from "../allowlist";
 import {
   _resetTelegramIdsWarningsForTests,
   _setSettingsFileForTests,
@@ -13,19 +14,13 @@ import {
  * string written by mistake reached the legacy runtime's `includes` check and
  * allowed any user whose id is a substring of it; a bare number threw there.
  *
- * An empty list means "allow everyone" on both runtimes, so a malformed value
- * must not collapse to `[]`: it has to allow nobody.
+ * A malformed value must not collapse to `[]`: it becomes `[0]`, which allows
+ * nobody and is not reported as an empty list at startup.
  */
 
-// The allow checks of both Telegram runtimes: `src/commands/telegram.ts`
-// (`length > 0 && !includes(id)` → reject) and `src/adapters/telegram/index.ts`
-// (same rule on a Set built from the list). They must agree.
+// The allow check every gate of both runtimes uses (`src/allowlist.ts`).
 function allows(ids: number[], userId: number): boolean {
-  const legacy = !(ids.length > 0 && !ids.includes(userId));
-  const set = new Set(ids);
-  const bus = !(set.size > 0 && !set.has(userId));
-  expect(bus).toBe(legacy);
-  return legacy;
+  return isUserAllowed(ids, userId);
 }
 
 describe("settings loader — telegram.allowedUserIds", () => {
@@ -116,10 +111,11 @@ describe("settings loader — telegram.allowedUserIds", () => {
     expect(warnings.filter((w) => w.includes("telegram.allowedUserIds"))).toEqual([]);
   });
 
-  it("absent or an explicit empty list → empty (allow-all, unchanged), no warning", async () => {
+  it("absent or an explicit empty list → empty, which refuses everyone, no warning", async () => {
     for (const value of [undefined, []]) {
       const { ids, warnings } = await loadWith(value);
       expect(ids).toEqual([]);
+      expect(allows(ids, 111)).toBe(false);
       expect(warnings.filter((w) => w.includes("telegram.allowedUserIds"))).toEqual([]);
     }
   });
