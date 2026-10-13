@@ -319,6 +319,56 @@ describe("PID lock (#435)", () => {
   });
 });
 
+describe("daemon.pid naming the caller (#526)", () => {
+  let proj: string;
+  let home: string;
+  let pidPath: string;
+
+  beforeEach(() => {
+    proj = mkdtempSync(join(tmpdir(), "ccplus-pidself-"));
+    home = mkdtempSync(join(tmpdir(), "ccplus-pidself-home-"));
+    mkdirSync(join(proj, ".claude", "claudeclaw"), { recursive: true });
+    pidPath = join(proj, ".claude", "claudeclaw", "daemon.pid");
+  });
+
+  afterEach(() => {
+    rmSync(proj, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  /** checkExistingDaemon() in a child whose cwd is the temp project; `pidExpr` is written to daemon.pid first. */
+  async function check(pidExpr: string) {
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        "-e",
+        `
+          import { writeFileSync } from "node:fs";
+          import { checkExistingDaemon } from ${JSON.stringify(PID_MODULE)};
+          writeFileSync(${JSON.stringify(pidPath)}, String(${pidExpr}) + "\\n");
+          console.log(String(await checkExistingDaemon()));
+        `,
+      ],
+      { cwd: proj, env: { HOME: home, PATH: "/nonexistent" }, stdout: "pipe", stderr: "inherit" },
+    );
+    const timer = setTimeout(() => child.kill("SIGKILL"), 15_000);
+    const out = await new Response(child.stdout).text();
+    await child.exited;
+    clearTimeout(timer);
+    return out.trim();
+  }
+
+  it("a file left with the caller's own PID (container restart, PID 1) is stale: no daemon, file removed", async () => {
+    expect(await check("process.pid")).toBe("null");
+    expect(existsSync(pidPath)).toBe(false);
+  }, 20_000);
+
+  it("another live PID is still reported as a running daemon", async () => {
+    expect(await check(String(process.pid))).toBe(String(process.pid));
+    expect(existsSync(pidPath)).toBe(true);
+  }, 20_000);
+});
+
 /**
  * A lock that can be neither taken nor judged stale leaves the daemon's state
  * unknown. That must not read as "no daemon": `clear` and the one-shot
