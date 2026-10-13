@@ -23,7 +23,7 @@ export class DaemonStateUnknownError extends Error {
 
 /**
  * Check if a daemon is already running in this directory.
- * If a stale PID file exists (process dead), it gets cleaned up.
+ * A stale PID file (process dead, or naming this very process) is cleaned up.
  * Returns the running PID if alive, or null when there is none.
  * Throws `DaemonStateUnknownError` when that cannot be determined.
  */
