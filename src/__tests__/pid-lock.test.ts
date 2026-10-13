@@ -319,13 +319,6 @@ describe("PID lock (#435)", () => {
   });
 });
 
-/**
- * A lock that can be neither taken nor judged stale leaves the daemon's state
- * unknown. That must not read as "no daemon": `clear` and the one-shot
- * `start` act on it. The project's `daemon.lock` is made a fresh directory —
- * it exists (busy), holds no PID and is not old, so every attempt fails with
- * no holder — while `daemon.pid` names a live process (this test runner).
- */
 describe("daemon.pid naming the caller (#526)", () => {
   let proj: string;
   let home: string;
@@ -376,6 +369,13 @@ describe("daemon.pid naming the caller (#526)", () => {
   }, 20_000);
 });
 
+/**
+ * A lock that can be neither taken nor judged stale leaves the daemon's state
+ * unknown. That must not read as "no daemon": `clear` and the one-shot
+ * `start` act on it. The project's `daemon.lock` is made a fresh directory —
+ * it exists (busy), holds no PID and is not old, so every attempt fails with
+ * no holder — while `daemon.pid` names a live process (this test runner).
+ */
 describe("PID lock state unknown (#435)", () => {
   let proj: string;
   let home: string;
