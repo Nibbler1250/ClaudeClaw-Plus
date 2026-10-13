@@ -9,6 +9,7 @@ import {
   chmodSync,
   existsSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -230,6 +231,20 @@ describe("ensureTrustAccepted", () => {
     const res = await ensureTrustAccepted(cwd, { homedir: () => tmpHome });
     expect(res.ok).toBe(true);
     expect(lstatSync(configPath).isSymbolicLink()).toBe(true);
+    const raw = JSON.parse(readFileSync(real, "utf-8")) as {
+      projects: Record<string, { hasTrustDialogAccepted: boolean }>;
+    };
+    expect(raw.projects[cwd]?.hasTrustDialogAccepted).toBe(true);
+    expect(statSync(real).mode & 0o777).toBe(0o600);
+  });
+  test("a dangling symlink (link into a fresh volume) gets its target created, link kept", async () => {
+    symlinkSync("volume/claude.json", configPath); // relative, target dir exists, file not yet
+    mkdirSync(join(tmpHome, "volume"));
+    const cwd = "/home/test/project";
+    const res = await ensureTrustAccepted(cwd, { homedir: () => tmpHome });
+    expect(res.ok).toBe(true);
+    expect(lstatSync(configPath).isSymbolicLink()).toBe(true);
+    const real = join(tmpHome, "volume", "claude.json");
     const raw = JSON.parse(readFileSync(real, "utf-8")) as {
       projects: Record<string, { hasTrustDialogAccepted: boolean }>;
     };
