@@ -295,6 +295,47 @@ describe("OutcomeRecorder — baseline → maturation → verdict", () => {
     expect(results[0]?.verdict).toBe("regressed");
   });
 
+  it("a flat target is neutral and not reverted when a guardrail drifts (low tier)", async () => {
+    const registry = new Registry();
+    const provider: TelemetryProvider = {
+      contractVersion: () => "1.0.0",
+      capabilities: () => [
+        { stream: "session_cost", schemaVersion: "1.0.0", available: true },
+        { stream: "cron_run", schemaVersion: "1.0.0", available: true },
+      ],
+      query: async () => [],
+    };
+    // cost unchanged 100→100 (no effect) while guardrail drifts 1.0→0.4
+    const subj = new ScriptedSubject(
+      "cron",
+      "low",
+      [cost, guardrail],
+      [
+        { cron_cost: 100, critical_fire_success: 1.0 },
+        { cron_cost: 100, critical_fire_success: 0.4 },
+      ],
+    );
+    registry.registerSubject(subj);
+    const audit = new AuditLog();
+    let t = new Date("2026-05-01T00:00:00Z");
+    const rec = new OutcomeRecorder(registry, db, provider, audit, () => t);
+    await rec.snapshotBaseline(proposal(5, "cron"));
+    t = new Date("2026-05-10T00:00:00Z");
+    const reverts: string[] = [];
+    const results = await rec.runMaturation({
+      revert: async (id) => {
+        reverts.push(id);
+        return true;
+      },
+    });
+    expect(results[0]?.verdict).toBe("neutral");
+    expect(reverts).toEqual([]);
+    // The drift is not attributed to the change, but it stays visible.
+    const v = audit.all().find((r) => r.event === "verdict");
+    expect(v?.detail?.reason).toBe("target_flat");
+    expect(v?.detail?.regressed_guardrails).toEqual(["critical_fire_success"]);
+  });
+
   it("does not mature rows before their window_end", async () => {
     const registry = new Registry();
     const provider: TelemetryProvider = {
