@@ -249,6 +249,27 @@ describe("pty-stdin supervision", () => {
     await waitFor(() => !mgr._list().includes("pty-exit"), 5000);
     expect(mgr._list()).not.toContain("pty-exit");
   }, 10000);
+
+  // Issue #528: a container recreate resets ~/.claude.json, so the agent cwd
+  // is untrusted and an interactive claude sits on the trust dialog forever.
+  it("pre-accepts the trust dialog for the agent cwd before spawning", async () => {
+    const prev = process.env.PLUS_CLAUDE_CONFIG_PATH;
+    const cfgDir = mkdtempSync(join(tmpdir(), "ccaw-trust-"));
+    const cfgPath = join(cfgDir, "claude.json");
+    writeFileSync(cfgPath, JSON.stringify({ projects: {} }));
+    process.env.PLUS_CLAUDE_CONFIG_PATH = cfgPath;
+    try {
+      const agent = mkAgent({ id: "pty-trust" });
+      const proc = await mgr.spawnAgent(agent, "discord");
+      spawned.push(proc);
+      const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
+      expect(cfg.projects[realpathSync(agent.cwd)]?.hasTrustDialogAccepted).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.PLUS_CLAUDE_CONFIG_PATH;
+      else process.env.PLUS_CLAUDE_CONFIG_PATH = prev;
+      rmSync(cfgDir, { recursive: true, force: true });
+    }
+  });
 });
 
 /* ───────────────────────────────────────────────────────────────────── */

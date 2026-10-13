@@ -46,6 +46,7 @@ import { JsonlTailer } from "./jsonl-tailer";
 import { confirmTurnReceipt } from "./receipt-wiring";
 import { capturePostMortem, type PostMortemOptions } from "./post-mortem";
 import type { ReceiptRecord } from "./receipt";
+import { ensureTrustAccepted } from "../runner/pty-trust-prompt";
 import {
   type AgentProcess,
   ChildAgentProcess,
@@ -809,6 +810,19 @@ export class SessionManager {
     // revoked and its file never deleted. Clean up then re-throw.
     let proc: PtyAgentProcess | ChildAgentProcess;
     try {
+      // Issue #528: an interactive claude stalls on the trust dialog ("No,
+      // exit" preselected) the first time it runs in a cwd. The legacy PTY
+      // supervisor pre-accepts it; the bus spawn path must too, or a fresh
+      // ~/.claude.json (container recreate) leaves the agent never connecting.
+      // Best-effort: a failure is logged and the spawn proceeds.
+      if (mode === "pty-stdin" || mode === "tmux") {
+        const heal = await ensureTrustAccepted(realCwd);
+        if (!heal.ok) {
+          (this.options.logger ?? console).warn(
+            `[bus-session] agent=${agent.id} trust self-heal failed for ${realCwd}: ${heal.reason ?? "unknown"}`,
+          );
+        }
+      }
       if (mode === "pty-stdin") {
         proc = await this.spawnPty(agent, args, env, realCwd);
       } else if (mode === "process-stream-json" || mode === "process") {
