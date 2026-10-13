@@ -23,7 +23,7 @@ import type { RiskTier, TunableSubject } from "../../skills-tuner/core/interface
 import type { DateRange, Metric, TelemetryProvider } from "../../skills-tuner/core/telemetry.js";
 import { isMetricActive } from "../../skills-tuner/core/fitness.js";
 import {
-  decideVerdict,
+  decideVerdictDetailed,
   guardrailMetricsFor,
   type MetricDelta,
   type Verdict,
@@ -232,11 +232,12 @@ export class OutcomeRecorder {
       const guardrailDeltas = guardrailMetricsFor(target, declared)
         .filter((g) => postByMetric.has(g.name))
         .map((g) => this.toDelta(g, rows, postByMetric, counts));
-      const verdict = decideVerdict(
+      const decision = decideVerdictDetailed(
         this.toDelta(target, rows, postByMetric, counts),
         guardrailDeltas,
         { minSamples: this.minSamples },
       );
+      const verdict = decision.verdict;
 
       // Persist final verdict on the target row.
       const targetRow = rows.find((r) => r.metric === target.name)!;
@@ -260,9 +261,11 @@ export class OutcomeRecorder {
         ...(targetRow.commit_sha ? { commit_sha: targetRow.commit_sha } : {}),
         detail: {
           verdict,
+          reason: decision.reason,
           baseline: targetRow.baseline,
           post: postByMetric.get(target.name),
           guardrails: target.guardrails ?? [],
+          regressed_guardrails: decision.regressedGuardrails,
           risk_tier: subject.risk_tier,
         },
       });
