@@ -5,7 +5,17 @@
  * `projects[<cwd>].hasTrustDialogAccepted: true` in ~/.claude.json.
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ensureTrustAccepted } from "../runner/pty-trust-prompt";
@@ -196,5 +206,34 @@ describe("ensureTrustAccepted", () => {
     for (const cwd of cwds) {
       expect(raw.projects[cwd]?.hasTrustDialogAccepted).toBe(true);
     }
+  });
+  // Issue #528: the bus spawn path heals the operator's real ~/.claude.json.
+  test("keeps the file's 0600 mode when rewriting it", async () => {
+    writeFileSync(configPath, JSON.stringify({ projects: {} }));
+    chmodSync(configPath, 0o600);
+    const res = await ensureTrustAccepted("/home/test/project", { homedir: () => tmpHome });
+    expect(res.changed).toBe(true);
+    expect(statSync(configPath).mode & 0o777).toBe(0o600);
+  });
+
+  test("creates a missing file 0600", async () => {
+    await ensureTrustAccepted("/home/test/project", { homedir: () => tmpHome });
+    expect(statSync(configPath).mode & 0o777).toBe(0o600);
+  });
+
+  test("writes through a symlinked ~/.claude.json and leaves the link in place", async () => {
+    const real = join(tmpHome, "volume-claude.json");
+    writeFileSync(real, JSON.stringify({ projects: {} }));
+    chmodSync(real, 0o600);
+    symlinkSync(real, configPath);
+    const cwd = "/home/test/project";
+    const res = await ensureTrustAccepted(cwd, { homedir: () => tmpHome });
+    expect(res.ok).toBe(true);
+    expect(lstatSync(configPath).isSymbolicLink()).toBe(true);
+    const raw = JSON.parse(readFileSync(real, "utf-8")) as {
+      projects: Record<string, { hasTrustDialogAccepted: boolean }>;
+    };
+    expect(raw.projects[cwd]?.hasTrustDialogAccepted).toBe(true);
+    expect(statSync(real).mode & 0o777).toBe(0o600);
   });
 });

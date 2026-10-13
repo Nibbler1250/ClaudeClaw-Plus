@@ -23,7 +23,8 @@
  * without breaking PTY startup. A failing self-heal still lets the runtime
  * try (it just means the trust prompt may stall the first invocation).
  */
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { chmod, rename, writeFile } from "node:fs/promises";
 import { homedir as defaultHomedir } from "node:os";
 import { resolve as resolvePath } from "node:path";
 
@@ -148,12 +149,17 @@ async function _doEnsureTrustAccepted(
     const updated = { ...raw, projects: next };
     const payload = `${JSON.stringify(updated, null, 2)}\n`;
 
-    // Atomic-ish write: write a temp file then rename. Bun.write handles
-    // the write side; we do a 2-step move to avoid leaving the file in a
-    // partially-written state if the process dies mid-write.
-    const tmpPath = `${configPath}.tmp-${process.pid}-${Date.now()}`;
-    await Bun.write(tmpPath, payload);
-    await Bun.$`mv ${tmpPath} ${configPath}`.quiet();
+    // Atomic-ish write: write a temp file then rename, so a process dying
+    // mid-write never leaves the file half-written. The rename lands on the
+    // symlink's target (a ~/.claude.json linked into a persisted volume stays
+    // a link) and the temp file carries the original mode: the file holds
+    // account state and is 0600, a fresh one is created 0600 too.
+    const target = existsSync(configPath) ? realpathSync(configPath) : configPath;
+    const mode = existsSync(target) ? statSync(target).mode & 0o777 : 0o600;
+    const tmpPath = `${target}.tmp-${process.pid}-${Date.now()}`;
+    await writeFile(tmpPath, payload, { mode });
+    await chmod(tmpPath, mode); // `mode` above is filtered by the umask
+    await rename(tmpPath, target);
 
     return { ok: true, changed: true, configPath };
   } catch (err) {
