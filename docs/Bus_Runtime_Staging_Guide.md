@@ -322,14 +322,12 @@ Fix it one of two ways:
 
 Slack bot traffic admitted through `allowBots` is unaffected.
 
-Both keys are hot-reloaded on both runtimes: removing an id, or switching
-`allowAllUsers` back off, refuses that user's next message or button tap
-within 30 s, without a restart (#520). On the Bus runtime, Telegram output
-that is not tied to a chat (heartbeat, alerts, scheduled tasks) goes to the
-last chat that wrote to the agent; that chat is re-checked against the
-current list before each such send, so a removed user stops receiving it
-too, and it falls back to the `telegram.busRouting.chats` entries (#521). A
-group is treated the same way: its cache entry belongs to the user who last
-wrote there. A chat listed in `busRouting.chats` is configuration and keeps
-receiving: remove a revoked user's DM from it too. Discord and Slack send
-such output to their configured channels, not to the last sender.
+**Buttons follow the same rule.** A Telegram button press — a tool permission
+prompt (`perm:allow|deny`, Bus runtime), a pending action
+(`pending:<id>:<value>`, both runtimes), a reply button (`btn:`, legacy
+runtime) — is accepted only from a user the list accepts, in a private chat
+and in a group alike; anyone else gets "Unauthorized." and the press has no
+effect. With `allowAllUsers: true`, anyone who can reach the bot — in a DM or
+in any group it is in — can approve a tool permission request: on a bot that
+sits in a group, list the people who should answer the agent's prompts
+instead.

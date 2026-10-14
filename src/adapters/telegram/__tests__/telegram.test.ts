@@ -2722,3 +2722,145 @@ describe("TelegramAdapter — quiet hours hold proactive messages (#512)", () =>
     expect(outbox.list()).toHaveLength(0);
   });
 });
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* Who may press a button (#442): one allow-list rule for every kind       */
+/* ────────────────────────────────────────────────────────────────────── */
+
+describe("TelegramAdapter — callback authorization on every button kind (#442)", () => {
+  const OPERATOR = 42;
+  const GROUP_MEMBER = 7;
+  const GROUP = { id: 100, type: "supergroup" };
+  let libDir: string;
+  let savedLibPath: string | undefined;
+
+  beforeEach(() => {
+    savedLibPath = process.env.CLAUDECLAW_PENDING_LIB_PATH;
+    libDir = mkdtempSync(join(tmpdir(), "cc-cb-auth-"));
+    writeFileSync(
+      join(libDir, "pending.py"),
+      [
+        "import os",
+        "def resolve_pending_ex(action_id, decision):",
+        "    with open(os.path.join(os.path.dirname(__file__), 'calls.txt'), 'a') as f:",
+        "        f.write(f'{action_id} {decision}\\n')",
+        "    return 'ok'",
+        "",
+      ].join("\n"),
+    );
+    process.env.CLAUDECLAW_PENDING_LIB_PATH = libDir;
+  });
+
+  afterEach(() => {
+    if (savedLibPath === undefined) delete process.env.CLAUDECLAW_PENDING_LIB_PATH;
+    else process.env.CLAUDECLAW_PENDING_LIB_PATH = savedLibPath;
+    rmSync(libDir, { recursive: true, force: true });
+  });
+
+  const resolverCalls = (): string => {
+    const f = join(libDir, "calls.txt");
+    return existsSync(f) ? readFileSync(f, "utf8").trim() : "";
+  };
+
+  const tap = (id: string, from: number, data: string, chat = GROUP) => ({
+    callback_query: { id, from: { id: from }, data, message: { message_id: 5, chat } },
+  });
+
+  /** A live permission request in the group, posted while the operator was listed. */
+  async function armPermission(live: {
+    allowedUserIds: number[];
+    allowAllUsers?: boolean;
+  }): Promise<void> {
+    adapter = await startAdapter({ allowlist: () => live });
+    api.enqueueUpdates([
+      { message: { message_id: 1, from: { id: OPERATOR }, chat: GROUP, text: "ping" } },
+    ]);
+    await waitFor(() => bus.prompts.length > 0);
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "channel.permission_request",
+      payload: { request_id: "r442", tool_name: "bash", description: "", input_preview: "" },
+    });
+    await waitFor(() => api.sendMessages.length >= 1);
+  }
+
+  it("empty list, group chat: a perm: tap is refused and the request stays open", async () => {
+    const live = { allowedUserIds: [OPERATOR] };
+    await armPermission(live);
+    live.allowedUserIds = [];
+    api.enqueueUpdates([tap("cb-g", GROUP_MEMBER, "perm:allow:r442")]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
+    expect(bus.permissionDecisions).toHaveLength(0);
+
+    // Not consumed: once the operator is listed again, their tap decides it.
+    live.allowedUserIds = [OPERATOR];
+    api.enqueueUpdates([tap("cb-op", OPERATOR, "perm:deny:r442")]);
+    await waitFor(() => bus.permissionDecisions.length > 0);
+    expect(bus.permissionDecisions[0]?.behavior).toBe("deny");
+  });
+
+  it("empty list, private chat (sender = chat): a perm: tap is still refused", async () => {
+    const live = { allowedUserIds: [OPERATOR] };
+    await armPermission(live);
+    live.allowedUserIds = [];
+    api.enqueueUpdates([
+      tap("cb-p", OPERATOR, "perm:allow:r442", { id: OPERATOR, type: "private" }),
+    ]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
+    expect(bus.permissionDecisions).toHaveLength(0);
+  });
+
+  it("listed operator, group chat: an unlisted member's perm: tap is refused", async () => {
+    await armPermission({ allowedUserIds: [OPERATOR] });
+    api.enqueueUpdates([tap("cb-m", GROUP_MEMBER, "perm:allow:r442")]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
+    expect(bus.permissionDecisions).toHaveLength(0);
+  });
+
+  it("empty list, group chat: a pending: tap is refused and the resolver never runs", async () => {
+    adapter = await startAdapter({ allowedUserIds: [] });
+    api.enqueueUpdates([tap("cb-pg", GROUP_MEMBER, "pending:2623:pay")]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
+    expect(resolverCalls()).toBe("");
+    expect(api.editMessages).toHaveLength(0);
+  });
+
+  it("empty list, private chat (sender = chat): a pending: tap is still refused", async () => {
+    adapter = await startAdapter({ allowedUserIds: [] });
+    api.enqueueUpdates([
+      tap("cb-pp", OPERATOR, "pending:2623:pay", { id: OPERATOR, type: "private" }),
+    ]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
+    expect(resolverCalls()).toBe("");
+  });
+
+  it("listed operator, group chat: pending: from the operator resolves, from a member is refused", async () => {
+    adapter = await startAdapter({ allowedUserIds: [OPERATOR] });
+    api.enqueueUpdates([tap("cb-pm", GROUP_MEMBER, "pending:2623:pay")]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
+    expect(resolverCalls()).toBe("");
+
+    api.enqueueUpdates([tap("cb-po", OPERATOR, "pending:2623:pay")]);
+    await waitFor(() => api.callbackAcks.length > 1);
+    expect(resolverCalls()).toBe("2623 pay");
+    expect(api.callbackAcks[1]?.text).not.toBe("Unauthorized.");
+  });
+
+  it("allowAllUsers: true, group chat: any member's perm: tap decides (documented)", async () => {
+    const live = { allowedUserIds: [OPERATOR], allowAllUsers: false };
+    await armPermission(live);
+    live.allowedUserIds = [];
+    live.allowAllUsers = true;
+    api.enqueueUpdates([tap("cb-all", GROUP_MEMBER, "perm:allow:r442")]);
+    await waitFor(() => bus.permissionDecisions.length > 0);
+    expect(bus.permissionDecisions[0]?.behavior).toBe("allow");
+  });
+});
