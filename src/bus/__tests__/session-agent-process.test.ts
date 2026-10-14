@@ -1489,7 +1489,10 @@ describe("PtyAgentProcess enqueue-confirmed delivery (issue #363)", () => {
     for (const at of [stamp, stamp + 1]) {
       const p = proc.send_prompt_stream(text);
       const iv = setInterval(() => emit("streaming\n"), 5);
-      setTimeout(() => proc.notePromptIngested(enqueued(text, { ingestedAtMs: Date.now() + (at - stamp) })), 25);
+      setTimeout(
+        () => proc.notePromptIngested(enqueued(text, { ingestedAtMs: Date.now() + (at - stamp) })),
+        25,
+      );
       await p;
       clearInterval(iv);
     }
