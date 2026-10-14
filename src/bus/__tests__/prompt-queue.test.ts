@@ -864,6 +864,30 @@ describe("one active turn per agent (#239)", () => {
       expect(texts(delivered)).toEqual(["from A", "from B", "from C"]);
     });
 
+    it("a re-delivery's own line recorded as a paste still un-parks the gate", async () => {
+      // Same sequence as above, but B is long enough that the CLI records it
+      // wrapped in `<pasted_content id="…">` (CLI 2.1.28x and later). That line is still
+      // B's own: missing it leaves C parked behind a turn that already ran.
+      const { bus, delivered } = makeBus({ turnDeadlineMs: 40 });
+      await send(bus, "a", "from A", "telegram", "chat-A");
+      bus.ingestSessionEvent(tailer("a", "prompt", { text: delivered[0] }));
+      await send(bus, "a", "from B", "telegram", "chat-B");
+      await sleep(70);
+      const b = bus as unknown as {
+        currentOperation: Map<string, string>;
+        noteRedelivered(agent: string, wrapped: string): void;
+      };
+      b.currentOperation.delete("a");
+      b.noteRedelivered("a", delivered[1] as string);
+      await send(bus, "a", "from C", "telegram", "chat-C");
+      turnEnd(bus, "a"); // A's late end: stale
+      expect(texts(delivered)).toEqual(["from A", "from B"]);
+      const pasted = `<pasted_content id="c678">\n${delivered[1]}\n</pasted_content id="c678">`;
+      bus.ingestSessionEvent(tailer("a", "prompt", { text: pasted })); // B's own line
+      turnEnd(bus, "a"); // B's end
+      expect(texts(delivered)).toEqual(["from A", "from B", "from C"]);
+    });
+
     describe("the early-release window belongs to the released turn (CodeRabbit)", () => {
       it("an unanswered released turn ending with text is synthesised to its chat — no nudge into the newcomer's REPL, newcomer's flags untouched", async () => {
         const { bus, events, delivered } = makeBus({ turnDeadlineMs: 40, replyNudge: true });
