@@ -1927,7 +1927,7 @@ export {
 
 // --- Callback query handler ---
 
-async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> {
+export async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> {
   const config = getSettings().telegram;
   const data = query.data ?? "";
 
