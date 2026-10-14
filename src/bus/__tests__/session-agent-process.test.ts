@@ -962,6 +962,56 @@ describe("PtyAgentProcess transcript-confirmed delivery (issue #362)", () => {
 
     expect(writes).not.toContain("\x15");
   });
+
+  describe("a long prompt the CLI recorded as a paste", () => {
+    // A long write into the PTY arrives as a paste. The CLI (2.1.28x and later) records
+    // that submission wrapped in `<pasted_content id="…">` … `</pasted_content
+    // id="…">`, sometimes split into two such blocks. Shapes copied from a
+    // production transcript (message bodies shortened).
+    const typed =
+      '<channel source="telegram" chat_id="1" user_id="1" ts="2026-09-29T16:14:15.552Z">' +
+      "# Prompting Realtime models  &gt; For the complete documentation index, see the docs." +
+      "</channel>";
+    const recordedAsPaste = `\n\n<pasted_content id="c678">\n${typed}\n</pasted_content id="c678">\n`;
+    const recordedAsTwoPastes =
+      `<pasted_content id="c678">\n${typed.slice(0, 90)}\n</pasted_content id="c678">\n\n\n` +
+      `<pasted_content id="c678">\n${typed.slice(90)}\n</pasted_content id="c678">`;
+
+    async function deliverWhileStreaming(recorded: string) {
+      const { handle, writes, emit } = bootPty();
+      const proc = new PtyAgentProcess("paste", handle, {
+        submitConfirmMs: 20,
+        maxSubmitNudges: 2,
+        transcriptGraceMs: 60,
+      });
+      proc.enableTranscriptConfirmation();
+      const p = proc.send_prompt_stream(typed);
+      const iv = setInterval(() => emit("assistant is streaming a response\n"), 5);
+      setTimeout(() => proc.notePromptIngested(ingestion(recorded)), 30);
+      const outcome = await p;
+      clearInterval(iv);
+      return { outcome, writes };
+    }
+
+    it("confirms the delivery from the wrapped user line", async () => {
+      // Unconfirmed here is what re-typed every long Telegram message a second
+      // time: the bus re-delivers any prompt whose delivery is not confirmed.
+      const { outcome, writes } = await deliverWhileStreaming(recordedAsPaste);
+      expect(outcome).toBe("turn-started");
+      expect(writes).not.toContain("\x15");
+    });
+
+    it("confirms it when the CLI split the paste into two blocks", async () => {
+      const { outcome } = await deliverWhileStreaming(recordedAsTwoPastes);
+      expect(outcome).toBe("turn-started");
+    });
+
+    it("still refuses a wrapped record of a DIFFERENT prompt", async () => {
+      const other = recordedAsPaste.replace("Prompting Realtime", "Prompting Batch");
+      const { outcome } = await deliverWhileStreaming(other);
+      expect(outcome).toBe("unconfirmed-live");
+    });
+  });
 });
 
 describe("PtyAgentProcess.send_prompt_stream resolves with its verdict (issue #361)", () => {

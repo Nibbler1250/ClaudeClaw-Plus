@@ -130,9 +130,18 @@ type QueuedPrompt = { req: SendPromptRequest; promise_id: string; queuedAt: numb
  *  PTY is fed `sanitizePtyPromptText` output (a TAB survives it) while the CLI
  *  records what its input box parsed (a pasted TAB becomes spaces, a typed one
  *  is a completion key and vanishes) — the same disagreement the PTY layer's
- *  own matcher drops whitespace for (issue #362). */
+ *  own matcher drops whitespace for (issue #362). A prompt the TUI took as a
+ *  paste is recorded wrapped in `<pasted_content id="…">…</pasted_content
+ *  id="…">` (every long prompt on CLI 2.1.296); the tags are the CLI's, so
+ *  they go too, as in the PTY layer's `normalizePromptForMatch` — otherwise a
+ *  long prompt's own transcript line never matches (#428). */
 function promptLineKey(text: string): string {
-  return sanitizePtyPromptText(text).replace(/\s+/g, "");
+  return stripPasteTags(sanitizePtyPromptText(text)).replace(/\s+/g, "");
+}
+
+/** #428: drop the CLI's `<pasted_content …>` wrapper from a recorded line. */
+function stripPasteTags(text: string): string {
+  return text.replace(/<\/?pasted_content\b[^>]*>/g, "");
 }
 
 /** #239: thrown by `sendPrompt` when an origin already has `promptQueueCapPerOrigin`
@@ -2349,7 +2358,11 @@ export class BusCoreImpl implements BusCore {
     // pasted TAB becomes spaces), so an exact miss falls back to the
     // whitespace-agnostic shape both surfaces agree on — else a verify for a
     // prompt the CLI already ran would re-deliver it after the next turn.
-    const key = this.matchPromptKey(agent_id, sanitizePtyPromptText(ingestedText));
+    // #428: a long prompt is recorded inside the CLI's paste wrapper; its tags
+    // go first. The newlines around them leave padding the exact lookup
+    // misses; `matchPromptKey`'s whitespace fallback then finds the key armed
+    // for what was typed.
+    const key = this.matchPromptKey(agent_id, sanitizePtyPromptText(stripPasteTags(ingestedText)));
     // Proof for a delivery whose handler is still deciding (#361): remember
     // it, so a later give-up verdict for that same prompt arms nothing.
     const proofs = this.inFlightProof.get(agent_id);

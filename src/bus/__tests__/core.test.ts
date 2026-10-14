@@ -4723,6 +4723,21 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
       expect(delivered).toHaveLength(1);
     });
 
+    it("does NOT re-deliver when the CLI recorded the prompt as a paste", async () => {
+      // A long prompt typed into the PTY lands as a paste, and CLI 2.1.28x
+      // records it wrapped in `<pasted_content id="…">` (shape from a
+      // production transcript). That record is the proof the CLI took THIS
+      // prompt; missing it re-typed every long Telegram message a second time.
+      const delivered = verdictBus(["unconfirmed-live"]);
+      await prompt("alpha", "a long message the CLI collapsed into a paste");
+      expect(delivered).toHaveLength(1);
+      const recorded = `\n\n<pasted_content id="c678">\n${delivered[0]}\n</pasted_content id="c678">\n`;
+      bus.ingestSessionEvent(turnEvt("alpha", recorded));
+      bus.ingestSessionEvent(turnEndEvt("alpha"));
+      await new Promise((r) => setTimeout(r, 120));
+      expect(delivered).toHaveLength(1);
+    });
+
     it("does NOT re-deliver when the proof landed while the handler was still deciding", async () => {
       // The verdict is read after the handler resolves. The transcript can
       // prove the prompt (user line, or an absorption into the running turn)
@@ -4866,6 +4881,13 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
 
     it("the `queued_command` attachment cancels the verify", async () => {
       const delivered = await absorbedScenario((d) => [queuedCommandEvt("alpha", d)]);
+      expect(delivered).toHaveLength(1);
+    });
+
+    it("the `queued_command` attachment of a pasted prompt cancels the verify", async () => {
+      const delivered = await absorbedScenario((d) => [
+        queuedCommandEvt("alpha", `<pasted_content id="c678">\n${d}\n</pasted_content id="c678">`),
+      ]);
       expect(delivered).toHaveLength(1);
     });
 

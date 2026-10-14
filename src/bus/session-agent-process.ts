@@ -57,7 +57,13 @@ function normalizePromptForMatch(text: string): string {
   // This is only safe because identity no longer rests on the text: `promptId`
   // and the transcript timestamp are what decide which delivery an ingestion
   // belongs to. The text is a sanity check, not the key.
-  return text.replace(/\s+/g, "");
+  //
+  // A prompt the TUI took as a paste is recorded wrapped:
+  // `<pasted_content id="4c50">\n…\n</pasted_content id="4c50">` (every long
+  // prompt on CLI 2.1.296). The tags are the CLI's, not the prompt's, so they
+  // go before the comparison — on both sides, so the match stays symmetric
+  // (#428).
+  return text.replace(/<\/?pasted_content\b[^>]*>/g, "").replace(/\s+/g, "");
 }
 
 /** Tolerance for CLI-vs-daemon clock skew when ordering an ingestion against
