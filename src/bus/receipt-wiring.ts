@@ -8,7 +8,7 @@
  */
 import { getDefaultReceiptStore, hashPrompt, type OpenReceipt, type ReceiptStore } from "./receipt";
 import type { TurnObservation } from "./jsonl-line-types";
-import type { BusOrigin, PromptDeliveryOutcome } from "./types";
+import type { BusOrigin, PromptDeliveryOutcome, SupervisionMode } from "./types";
 
 /**
  * Recover the original prompt text from the `<channel source=... chat_id=...
@@ -88,7 +88,42 @@ export function confirmTurnReceipt(
 
 export interface AgentProcessLike {
   readonly pid: number;
+  /** Both real `AgentProcess` classes set it; fakes may omit it (treated as streamable). */
+  readonly supervision?: SupervisionMode;
   send_prompt_stream?(line: string): Promise<PromptDeliveryOutcome | void>;
+}
+
+/**
+ * Supervision modes whose `send_prompt_stream` does not reject.
+ * `ChildAgentProcess` exposes the method in every mode but rejects it unless
+ * the mode is `process-stream-json` (`session-agent-process.ts`), so a
+ * `process` / `tmux` agent is NOT streamable: the IPC `prompt` frame is its
+ * only delivery (#428).
+ */
+const STREAMABLE_SUPERVISION: ReadonlySet<SupervisionMode> = new Set([
+  "pty-stdin",
+  "process-stream-json",
+]);
+
+/**
+ * Build the `PtyReachableCheck` (`core.ts`) the bus consults before it skips
+ * the IPC `prompt` frame (#428: deliver each prompt once). Reachable means
+ * registered, exposing `send_prompt_stream`, and in a supervision mode that
+ * method serves. The daemon wires it with
+ * `bus.setPtyReachableHandler(canStreamToAgent(getAgent))` alongside
+ * `setStreamPromptHandler`.
+ */
+export function canStreamToAgent(
+  getAgent: (agent_id: string) => AgentProcessLike | undefined,
+): (agent_id: string) => boolean {
+  return (agent_id) => {
+    const proc = getAgent(agent_id);
+    return (
+      !!proc &&
+      typeof proc.send_prompt_stream === "function" &&
+      (proc.supervision === undefined || STREAMABLE_SUPERVISION.has(proc.supervision))
+    );
+  };
 }
 
 /** Resolves with the process's delivery verdict when it reports one (issue
