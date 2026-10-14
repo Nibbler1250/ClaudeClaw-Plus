@@ -199,10 +199,11 @@ export type SlashCommandHandler = (agent_id: string, cmd: string) => Promise<voi
 /**
  * Delivers an inbound prompt to an agent process as REPL input (PTY-stdin
  * supervision). Wired by the Session Manager. When set, `sendPrompt` invokes
- * it in addition to the `notifications/claude/channel` IPC notification, so
- * headless (daemon-spawned) claudes — which can't be relied on to start a turn
- * from the MCP notification alone (older builds never did; current ones usually
- * do) — receive the prompt as typed input and reliably respond.
+ * it so headless (daemon-spawned) claudes — which can't be relied on to start a
+ * turn from the MCP notification alone (older builds never did; current ones
+ * usually do) — receive the prompt as typed input and reliably respond. An
+ * agent this leg reaches (see {@link PtyReachableCheck}) gets no
+ * `notifications/claude/channel` copy of the same prompt (#428).
  *
  * May resolve with the process's delivery verdict (issue #361). A handler
  * that resolves `void` is taken at its word, as before.
@@ -211,6 +212,15 @@ export type StreamPromptHandler = (
   agent_id: string,
   text: string,
 ) => Promise<PromptDeliveryOutcome | void>;
+
+/**
+ * Whether the PTY leg can currently deliver to this agent (#428). When it can,
+ * `sendPrompt` sends no IPC `prompt` frame: the MCP server would turn it into
+ * a channel notification that starts a turn of its own, and the agent got the
+ * prompt twice. Wired by the daemon to `canStreamToAgent` (`receipt-wiring.ts`).
+ * Defaults to `streamPromptHandler !== null` until wired.
+ */
+export type PtyReachableCheck = (agent_id: string) => boolean;
 
 export interface BusCoreOptions {
   /** Path to bind the UDS server. If omitted, no IPC server is started. */
@@ -272,6 +282,8 @@ export interface BusCoreOptions {
   slashCommandHandler?: SlashCommandHandler;
   /** REPL prompt delegate for PTY-stdin agents. Wired by the Session Manager. */
   streamPromptHandler?: StreamPromptHandler;
+  /** See {@link PtyReachableCheck}. Also settable via `setPtyReachableHandler`. */
+  ptyReachable?: PtyReachableCheck;
   /** Logger; defaults to console.error. */
   onError?: (err: unknown, ctx?: Record<string, unknown>) => void;
   /**
@@ -316,7 +328,8 @@ export interface BusCoreOptions {
 
 export interface BusCore {
   /**
-   * Resolves once the prompt is published and handed to both delivery legs.
+   * Resolves once the prompt is published and handed to its delivery leg —
+   * the PTY when it reaches the agent, else the IPC `prompt` frame (#428).
    * `ipc_sent` reports the IPC leg (#390): `false` means the bus has no MCP
    * connection for the agent, so the prompt reached the PTY only and the
    * agent's `reply` tool has no channel back — a caller that awaits the
@@ -353,6 +366,11 @@ export interface BusCore {
    */
   setSlashCommandHandler(handler: SlashCommandHandler | null): void;
   setStreamPromptHandler(handler: StreamPromptHandler | null): void;
+  /**
+   * Install or replace the {@link PtyReachableCheck}. Pass `null` to reset to
+   * the default. Optional: mocks need not implement it.
+   */
+  setPtyReachableHandler?(handler: PtyReachableCheck | null): void;
   /**
    * Install or replace the agent-job handler (#296 PR 3). The daemon wires
    * this once the `AgentJobRunner` is constructed (which needs `sendPrompt`,
@@ -419,6 +437,8 @@ export class BusCoreImpl implements BusCore {
   private readonly eventLogAppend: EventLogAppendFn;
   private slashCommandHandler: SlashCommandHandler | null;
   private streamPromptHandler: StreamPromptHandler | null;
+  private readonly defaultPtyReachable: PtyReachableCheck = () => this.streamPromptHandler !== null;
+  private ptyReachable: PtyReachableCheck;
   // Settable post-hoc (like streamPromptHandler): the AgentJobRunner needs
   // `sendPrompt` for result delivery, so the daemon constructs it after the
   // bus and wires it via setJobHandler (#296 PR 3).
@@ -941,6 +961,7 @@ export class BusCoreImpl implements BusCore {
     this.eventLogAppend = opts.eventLogAppend ?? eventLogAppend;
     this.slashCommandHandler = opts.slashCommandHandler ?? null;
     this.streamPromptHandler = opts.streamPromptHandler ?? null;
+    this.ptyReachable = opts.ptyReachable ?? this.defaultPtyReachable;
     this.jobHandler = opts.jobHandler ?? null;
     this.onError = opts.onError ?? ((err, ctx) => console.error("[bus]", err, ctx));
     this.evaluatePolicy = opts.evaluatePolicy ?? evaluate;
@@ -1608,7 +1629,17 @@ export class BusCoreImpl implements BusCore {
     };
     let ipcSendFailed = false;
     if (this.ipcServer) {
-      const sent = this.ipcServer.send(req.agent_id, ipcMsg);
+      // #428: deliver each prompt once. An agent the PTY leg below delivers to
+      // gets NO `prompt` frame — the MCP server would turn it into a channel
+      // notification that opens a turn of its own, so the agent received the
+      // prompt twice, and a long prompt's typed copy, absorbed into that turn,
+      // was then re-delivered by the turn-start verify as a second turn. Its
+      // MCP liveness (#222) is still checked, without sending, and everything
+      // that hangs off a failure below is unchanged.
+      const ptyDelivers = this.streamPromptHandler !== null && this.ptyReachable(req.agent_id);
+      const sent = ptyDelivers
+        ? this.ipcServer.hasConnection(req.agent_id)
+        : this.ipcServer.send(req.agent_id, ipcMsg);
       if (!sent) {
         ipcSendFailed = true;
         this.onError(new Error(`No MCP connection for agent_id=${req.agent_id}`), {
@@ -2437,6 +2468,10 @@ export class BusCoreImpl implements BusCore {
 
   setStreamPromptHandler(handler: StreamPromptHandler | null): void {
     this.streamPromptHandler = handler;
+  }
+
+  setPtyReachableHandler(handler: PtyReachableCheck | null): void {
+    this.ptyReachable = handler ?? this.defaultPtyReachable;
   }
 
   setJobHandler(handler: AgentJobHandler | null): void {
