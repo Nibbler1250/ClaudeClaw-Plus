@@ -1192,8 +1192,12 @@ export class PtyAgentProcess implements AgentProcess {
     // Issue #9: a submission the CLI folded into the running turn leaves the
     // queue without ever writing a `user` line. Unpaid, its debt sat for the
     // full TTL and swallowed the next same-text delivery's OWN `user` line —
-    // unconfirmed, re-delivered, run twice. The queue is FIFO, so no epoch or
-    // guess is needed: closing every exit from the queue keeps the count true.
+    // unconfirmed, re-delivered, run twice. No arming epoch is needed: the
+    // count is per text, copies of one text are interchangeable, so all the
+    // ledger requires is that every `enqueue` leaves exactly once — by its
+    // `user` line or by this absorption. It never confirms what is armed: it
+    // is the absorbed copy's record, and that copy was confirmed (or not) by
+    // its own `enqueue`.
     // The attachment carries the enqueue's own timestamp, so it shares no key
     // with it (different source prefix) but dedupes against its own re-read.
     if (ingestion.source === "absorbed") {
