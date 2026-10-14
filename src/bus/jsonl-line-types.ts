@@ -349,8 +349,14 @@ export interface PromptIngestion {
    * the RUNNER. Treating it as a cancellation un-confirms every delivery it
    * touches. It also carries no `content`, so it cannot be attributed to a
    * text even if one wanted to.
+   *
+   * `"absorbed"` is the `queued_command` attachment the CLI writes when it
+   * folds a queued prompt into the running turn instead of starting one
+   * (fixture `04-absorbed-mid-turn.jsonl`). That submission never gets a
+   * `user` line, so this record is the only one that closes its `enqueue`.
+   * It pays the queue ledger and confirms nothing (issue #9).
    */
-  source: "user" | "enqueue";
+  source: "user" | "enqueue" | "absorbed";
   /** CLI-assigned id. Present on `user` lines only, and it identifies a
    *  submission rather than a record — a compaction cluster shares one. */
   promptId?: string;

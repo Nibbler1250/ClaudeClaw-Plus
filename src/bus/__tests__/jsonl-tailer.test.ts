@@ -1127,7 +1127,7 @@ describe("JsonlTailer — prompt absorbed mid-turn (issue #389)", () => {
    * the same text, and NO `user` line ever. The core cancels that prompt's
    * flush-verify on either of the last two; this pins that both reach it with
    * the text intact, and that the tailer's own delivery-confirm channel (#363)
-   * still counts the enqueue only.
+   * sees the enqueue and then the absorption that closes it (#9).
    */
   it("forwards the remove (with reason and content) and the attachment (with prompt) to the bus", async () => {
     const fs = await import("node:fs/promises");
@@ -1163,7 +1163,11 @@ describe("JsonlTailer — prompt absorbed mid-turn (issue #389)", () => {
     expect((attachment?.payload as { prompt?: string }).prompt).toBe(text);
 
     expect(events.some((e) => e.topic === "prompt")).toBe(false);
-    expect(ingested.map((i) => i.source)).toEqual(["enqueue"]);
+    // The enqueue books the queue debt; the attachment pays it (issue #9) —
+    // no `user` line will. Neither is a `prompt`.
+    expect(ingested.map((i) => i.source)).toEqual(["enqueue", "absorbed"]);
+    expect(ingested[1]?.text).toBe(text);
+    expect(ingested[1]?.ingestedAtMs).toBeGreaterThan(0);
   });
 });
 
