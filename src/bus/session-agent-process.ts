@@ -1141,8 +1141,8 @@ export class PtyAgentProcess implements AgentProcess {
     // check below refuses that record anyway.
     const key = ingestion.promptId
       ? `${ingestion.promptId}\u0000${normalizePromptForMatch(ingestion.text)}`
-      : ingestion.source === "enqueue" && ingestion.ingestedAtMs > 0
-        ? `enqueue\u0000${ingestion.ingestedAtMs}\u0000${normalizePromptForMatch(ingestion.text)}`
+      : ingestion.source !== "user" && ingestion.ingestedAtMs > 0
+        ? `${ingestion.source}\u0000${ingestion.ingestedAtMs}\u0000${normalizePromptForMatch(ingestion.text)}`
         : null;
     const alreadySeen = key ? this.consumedPromptIds.has(key) : false;
     // Record the id FIRST, before any early return.
@@ -1176,7 +1176,7 @@ export class PtyAgentProcess implements AgentProcess {
     //
     // What the transcript actually tells us is a count: how many submissions
     // of this text the CLI has accepted but not yet run. `enqueue` increments
-    // it, `user` and a withdrawal decrement it. Whether any of them confirms
+    // it, `user` and an absorption decrement it. Whether any of them confirms
     // one of OUR deliveries is a separate question, asked afterwards.
     // Gated on `alreadySeen`: the count is a ledger, and a record presented
     // twice must not be counted twice in either direction. This is what makes
@@ -1187,6 +1187,17 @@ export class PtyAgentProcess implements AgentProcess {
     if (!alreadySeen && ingestion.source === "user" && this.consumeOutstandingEnqueue(normalised)) {
       // This `user` line belongs to a submission accepted earlier and only now
       // running. It is evidence about that one, not about whatever is armed.
+      return;
+    }
+    // Issue #9: a submission the CLI folded into the running turn leaves the
+    // queue without ever writing a `user` line. Unpaid, its debt sat for the
+    // full TTL and swallowed the next same-text delivery's OWN `user` line —
+    // unconfirmed, re-delivered, run twice. The queue is FIFO, so no epoch or
+    // guess is needed: closing every exit from the queue keeps the count true.
+    // The attachment carries the enqueue's own timestamp, so it shares no key
+    // with it (different source prefix) but dedupes against its own re-read.
+    if (ingestion.source === "absorbed") {
+      if (!alreadySeen) this.consumeOutstandingEnqueue(normalised);
       return;
     }
 
