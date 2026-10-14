@@ -1377,11 +1377,10 @@ describe("PtyAgentProcess enqueue-confirmed delivery (issue #363)", () => {
    * `user` line absorbed as that debt's payment. Unconfirmed, then
    * re-delivered: the agent runs it twice.
    *
-   * The CLI queue is FIFO (350 of 350 enqueues paid in order across 15 live
-   * transcripts), so an idle CLI has an empty queue: by the time an unqueued
-   * delivery's `user` line lands, every earlier submission has already left
-   * the queue as a `user` line or an absorption. Paying on the absorption is
-   * what keeps the count true; nothing has to guess whose line it is.
+   * Across 15 live transcripts, 350 enqueues left the queue as 345 `user`
+   * lines and 5 absorptions, none twice and none never. The ledger is a count
+   * per text, so that conservation is all it needs: paying on the absorption
+   * keeps the count true, and nothing has to guess whose line it is.
    */
   it("lets a delivery's own user record confirm it after an earlier copy was absorbed mid-turn", async () => {
     const { handle, writes, emit } = bootPty();
@@ -1422,6 +1421,37 @@ describe("PtyAgentProcess enqueue-confirmed delivery (issue #363)", () => {
     clearInterval(iv2);
 
     expect(writes.slice(before)).not.toContain("\x15");
+  });
+
+  it("does not let an earlier copy's absorption confirm the delivery now armed", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("absorbed-armed", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+    const text = "heartbeat: any new messages?";
+
+    const first = proc.send_prompt_stream(text);
+    const iv1 = setInterval(() => emit("streaming\n"), 5);
+    setTimeout(() => proc.notePromptIngested(enqueued(text)), 25);
+    await first;
+    clearInterval(iv1);
+
+    // The first copy is folded into the running turn while the second is
+    // armed: that record is the first copy's, not proof of the second.
+    const before = writes.length;
+    const second = proc.send_prompt_stream(text);
+    const iv2 = setInterval(() => emit("streaming\n"), 5);
+    setTimeout(
+      () => proc.notePromptIngested({ text, source: "absorbed", ingestedAtMs: Date.now() }),
+      30,
+    );
+    await second;
+    clearInterval(iv2);
+
+    expect(writes.slice(before)).toContain("\x15");
   });
 
   it("counts an absorption once even when the record is presented twice", async () => {
