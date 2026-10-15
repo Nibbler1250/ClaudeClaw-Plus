@@ -1365,9 +1365,15 @@ export class ChildAgentProcess implements AgentProcess {
       );
       return Promise.resolve();
     }
-    // process-stream-json: Probe 0.6 Q5 confirms slash commands work via stdin.
+    // process-stream-json: slash commands go in as a user message.
     if (!this.child.stdin || this.child.stdin.destroyed) {
       return Promise.reject(new Error(`stdin unavailable for agent ${this.agent_id}`));
+    }
+    if (cmd === "quit") {
+      // `-p` answers "/quit isn't available in this environment" and keeps
+      // running; end of input is what makes it exit (code 0).
+      this.child.stdin.end();
+      return Promise.resolve();
     }
     this.child.stdin.write(streamJsonUserLine(`/${cmd}`));
     return Promise.resolve();

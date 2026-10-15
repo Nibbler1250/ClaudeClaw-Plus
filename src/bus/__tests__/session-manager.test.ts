@@ -382,6 +382,21 @@ describe("process-stream-json supervision", () => {
     ]);
   });
 
+  it("stop() ends the agent through /quit, not the 2 s SIGTERM fallback", async () => {
+    // `-p` refuses "/quit" and keeps running; /bin/cat, like the CLI, exits on EOF.
+    const agent = mkAgent({ id: "psj-quit" });
+    const proc = await mgr.spawnAgent(agent, "cron");
+    spawned.push(proc);
+    let exitCode: number | undefined;
+    proc.onExit((code) => {
+      exitCode = code;
+    });
+    const started = Date.now();
+    await mgr.stop(agent.id);
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(exitCode).toBe(0);
+  });
+
   it("propagates CCAW_AGENT_ID and CCAW_BUS_SOCK to child env", async () => {
     // Use `/usr/bin/env` (no args) to introspect the child env.
     // #304: `env` alone exits before `onData` below is attached, so on a

@@ -254,7 +254,7 @@ describe("wireSlashCommands — real SessionManager + pty-stdin", () => {
     expect(captured).toContain("/compact");
   });
 
-  it("process-stream-json path: bus.invokeSlashCommand writes /<cmd> to stdin", async () => {
+  it("process-stream-json path: bus.invokeSlashCommand writes /<cmd> to stdin as a user message", async () => {
     const bus = makeBus();
     wireSlashCommands(bus, sm);
 
