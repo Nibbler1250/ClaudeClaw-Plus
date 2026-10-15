@@ -271,7 +271,11 @@ describe("wireSlashCommands — real SessionManager + pty-stdin", () => {
 
     await bus.invokeSlashCommand("wire-psj", "compact");
     await waitFor(() => captured.includes("/compact"));
-    expect(captured).toContain("/compact\n");
+    // stream-json stdin: the slash command travels as a user message.
+    expect(JSON.parse(captured.trim())).toEqual({
+      type: "user",
+      message: { role: "user", content: "/compact" },
+    });
   });
 
   it("unknown agent id surfaces a clear error", async () => {

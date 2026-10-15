@@ -109,7 +109,9 @@ export interface AgentProcess {
   /** Relay a slash command (e.g. `compact`, `clear`, `quit`). No leading slash. */
   send_slash(cmd: string): Promise<void>;
   /**
-   * Send a stream-json line. Only valid in `process-stream-json` mode.
+   * Deliver a prompt. Takes the prompt text in every mode: the PTY types it,
+   * `process-stream-json` encodes it as a stream-json user message; other
+   * child modes reject it.
    *
    * Resolves with how the delivery ended when the implementation can tell
    * (the PTY confirm loop, issue #361); `void` from one that cannot. A
@@ -1288,6 +1290,15 @@ export class PtyAgentProcess implements AgentProcess {
   }
 }
 
+/**
+ * One stdin line for `claude -p --input-format=stream-json`: the CLI parses
+ * every line as JSON and rejects bare text ("Error parsing streaming input
+ * line"), so prompts and slash commands are sent as a user message.
+ */
+function streamJsonUserLine(content: string): string {
+  return `${JSON.stringify({ type: "user", message: { role: "user", content } })}\n`;
+}
+
 export class ChildAgentProcess implements AgentProcess {
   readonly agent_id: string;
   readonly supervision: SupervisionMode;
@@ -1358,7 +1369,7 @@ export class ChildAgentProcess implements AgentProcess {
     if (!this.child.stdin || this.child.stdin.destroyed) {
       return Promise.reject(new Error(`stdin unavailable for agent ${this.agent_id}`));
     }
-    this.child.stdin.write(`/${cmd}\n`);
+    this.child.stdin.write(streamJsonUserLine(`/${cmd}`));
     return Promise.resolve();
   }
 
@@ -1375,8 +1386,7 @@ export class ChildAgentProcess implements AgentProcess {
     if (!this.child.stdin || this.child.stdin.destroyed) {
       return Promise.reject(new Error(`stdin unavailable for agent ${this.agent_id}`));
     }
-    const out = line.endsWith("\n") ? line : `${line}\n`;
-    this.child.stdin.write(out);
+    this.child.stdin.write(streamJsonUserLine(line));
     return Promise.resolve();
   }
 

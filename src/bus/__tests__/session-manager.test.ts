@@ -37,6 +37,7 @@ import {
 } from "../session-manager";
 import type { AgentConfig, BusOrigin } from "../types";
 import { createBusCore, type BusCore } from "../core";
+import { createPromptStreamHandler } from "../receipt-wiring";
 
 const IS_DARWIN = process.platform === "darwin";
 const IS_UNIX = process.platform !== "win32";
@@ -306,7 +307,16 @@ describe("process-stream-json supervision", () => {
     expect(proc.supervision).toBe("process-stream-json");
   });
 
-  it("accepts JSON-line stdin and crash-data observer sees it via /bin/cat echo", async () => {
+  // `claude -p --input-format=stream-json` parses every stdin line as JSON and
+  // rejects anything else ("Error parsing streaming input line"). /bin/cat
+  // echoes stdin back, so each echoed line is what the CLI would have parsed.
+  const stdinLines = (captured: string) =>
+    captured
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as { type: string; message: { role: string; content: string } });
+
+  it("send_prompt_stream writes the prompt as one stream-json user message", async () => {
     const agent = mkAgent({ id: "psj-stream" });
     const proc = await mgr.spawnAgent(agent, "cron");
     spawned.push(proc);
@@ -314,10 +324,47 @@ describe("process-stream-json supervision", () => {
     proc.onData((chunk) => {
       captured += chunk;
     });
-    const turn = JSON.stringify({ type: "user", content: "hi" });
-    await proc.send_prompt_stream(turn);
-    await waitFor(() => captured.includes('"content":"hi"'));
-    expect(captured).toContain(turn);
+    const prompt = 'line one\nline "two" <tag>';
+    await proc.send_prompt_stream(prompt);
+    await waitFor(() => captured.endsWith("\n"));
+    expect(stdinLines(captured)).toEqual([
+      { type: "user", message: { role: "user", content: prompt } },
+    ]);
+  });
+
+  it("a bus prompt reaches a process-stream-json agent as a parseable user message", async () => {
+    const bus = createBusCore({ eventLogAppend: (async () => ({})) as never, replyNudge: false });
+    const busMgr = new SessionManager({
+      commandOverride: "/bin/cat",
+      argsOverride: [],
+      busSocketPath: "/tmp/test-bus.sock",
+      bus,
+    });
+    bus.setStreamPromptHandler(createPromptStreamHandler((id) => busMgr.getAgent(id)));
+    const proc = await busMgr.spawnAgent(mkAgent({ id: "psj-bus" }), "cron");
+    try {
+      let captured = "";
+      proc.onData((chunk) => {
+        captured += chunk;
+      });
+      await bus.sendPrompt({
+        agent_id: "psj-bus",
+        origin: "cron",
+        origin_id: "job-1",
+        user_id: "u1",
+        text: "run the nightly report",
+      });
+      await waitFor(() => captured.endsWith("\n"));
+      const lines = stdinLines(captured);
+      expect(lines).toHaveLength(1);
+      expect(lines[0].type).toBe("user");
+      expect(lines[0].message.role).toBe("user");
+      expect(lines[0].message.content).toMatch(
+        /^<channel source="cron" chat_id="job-1"[^>]*>run the nightly report<\/channel>$/,
+      );
+    } finally {
+      await busMgr.stop("psj-bus");
+    }
   });
 
   it("slash commands are written to stdin (Probe 0.6 Q5)", async () => {
@@ -329,8 +376,10 @@ describe("process-stream-json supervision", () => {
       captured += chunk;
     });
     await proc.send_slash("compact");
-    await waitFor(() => captured.includes("/compact"));
-    expect(captured).toContain("/compact\n");
+    await waitFor(() => captured.endsWith("\n"));
+    expect(stdinLines(captured)).toEqual([
+      { type: "user", message: { role: "user", content: "/compact" } },
+    ]);
   });
 
   it("propagates CCAW_AGENT_ID and CCAW_BUS_SOCK to child env", async () => {
