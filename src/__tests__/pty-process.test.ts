@@ -428,6 +428,166 @@ describe("PtyProcess — Bypass Permissions boot dialog (issue #460)", () => {
   });
 });
 
+// ─── Project MCP server approval dialog (issue #469) ───────────────────────
+//
+// A cwd whose project carries a `.mcp.json` that the user has not approved
+// opens "New MCP server found in this project" before the Bypass Permissions
+// dialog (#460). It goes quiet like a painted REPL, so pre-fix settle resolved
+// on it, the first prompt's CR dismissed it, the bypass dialog came up with
+// "No, exit" preselected, and the turn sat out its full timeout — ~130 s and
+// the #177 escape hatch on every cold nightly. With two or more servers the
+// dialog is a multi-select with every server PRE-CHECKED, so an Enter there
+// enables them all. Esc is "continue without" in the single variant and
+// "reject all" in the multi-select, and never exits. The fake CLI reads one
+// raw byte: anything but Esc exits 1, so the key has to come from settle. It
+// discards input received in its first 150 ms, as claude 2.1.300 does with
+// keys sent while the dialog paints.
+// Echo stays off until the next screen paints: a prompt typed too early
+// must not come back as the reply.
+
+function fakeMcpDialogCli(dialog: string, gapAfterAnswer = ""): string {
+  return [
+    `printf '${dialog}'`,
+    "stty raw -echo",
+    // Like the real CLI, drop what arrives while the dialog is painting.
+    "sleep 0.15",
+    "stty min 0 time 0",
+    "dd bs=4096 count=1 >/dev/null 2>&1",
+    "stty min 1",
+    "key=$(dd bs=1 count=1 2>/dev/null)",
+    "stty sane -echo",
+    '[ "$key" = "$(printf "\\033")" ] || exit 1',
+    gapAfterAnswer,
+    "stty echo",
+    FAKE_BYPASS_DIALOG_CLI,
+  ]
+    .filter(Boolean)
+    .join("; ");
+}
+
+// Words separated by CHA moves, as the real CLI renders them.
+const MCP_DIALOG_SINGLE =
+  "New\\033[5GMCP\\033[9Gserver\\033[16Gfound\\033[22Gin\\033[25Gthis\\033[30Gproject:\\033[39Gplus-bus\\r\\n" +
+  "  Use this MCP server\\r\\n  Use this and all future MCP servers in this project\\r\\n" +
+  "\\342\\235\\257 Continue without using this MCP server\\r\\n\\r\\nEnter to confirm \\302\\267 Esc to cancel\\r\\n";
+const MCP_DIALOG_MULTI =
+  "2\\033[3Gnew\\033[7GMCP\\033[11Gservers\\033[19Gfound\\033[25Gin\\033[28Gthis\\033[33Gproject\\r\\n" +
+  "Select any you wish to enable.\\r\\n\\342\\235\\257 [\\342\\234\\224] srv0\\r\\n  [\\342\\234\\224] srv1\\r\\n" +
+  "  Enable selected\\r\\nSpace to select \\302\\267 Esc to reject all\\r\\n";
+
+describe("PtyProcess — project MCP server approval dialog (issue #469)", () => {
+  for (const [variant, dialog] of [
+    ["single server", MCP_DIALOG_SINGLE],
+    ["multi-select, all pre-checked", MCP_DIALOG_MULTI],
+  ] as const) {
+    test(`${variant}: rejected with Esc during settle, then the bypass dialog is answered and the first turn reaches the REPL`, async () => {
+      const proc = await spawnPty(
+        baseOpts({
+          _commandOverride: "/bin/sh",
+          _argsOverride: ["-c", fakeMcpDialogCli(dialog)],
+          _skipReadySettle: false,
+          quietWindowMs: 200,
+          sentinelMaxWaitMs: 5000,
+        }),
+      );
+      expect(proc.isAlive()).toBe(true);
+      const result = await proc.runTurn("✻ after-mcp-dialog shift+tab to cycle", {
+        timeoutMs: 5000,
+      });
+      expect(proc.isAlive()).toBe(true);
+      expect(result.text).toContain("after-mcp-dialog");
+      await proc.dispose();
+    });
+  }
+
+  test("after rejecting, settle waits for the next screen instead of the next quiet gap", async () => {
+    // The bypass dialog paints 600ms after the Esc — three quiet windows
+    // later. Resolving on that gap would type the first prompt into it.
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", fakeMcpDialogCli(MCP_DIALOG_SINGLE, "sleep 0.6")],
+        _skipReadySettle: false,
+        quietWindowMs: 200,
+        sentinelMaxWaitMs: 5000,
+      }),
+    );
+    const result = await proc.runTurn("✻ slow-next-screen shift+tab to cycle", {
+      timeoutMs: 5000,
+    });
+    expect(proc.isAlive()).toBe(true);
+    expect(result.text).toContain("slow-next-screen");
+    await proc.dispose();
+  });
+
+  test("a dialog that paints late gets a fresh hard-timeout window for the screen behind it", async () => {
+    // Boot output streams for ~2.5s (never a quiet window), so the dialog
+    // lands near the end of the 3s hard timeout; the bypass dialog follows
+    // 1s after the Esc. Without a fresh window, settle resolves at 3s and
+    // the first prompt lands in the bypass dialog.
+    const lateDialog =
+      "i=0; while [ $i -lt 25 ]; do printf .; sleep 0.1; i=$((i+1)); done; " +
+      fakeMcpDialogCli(MCP_DIALOG_SINGLE, "sleep 1");
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", lateDialog],
+        _skipReadySettle: false,
+        quietWindowMs: 200,
+        sentinelMaxWaitMs: 5000,
+      }),
+    );
+    const result = await proc.runTurn("✻ late-dialog shift+tab to cycle", { timeoutMs: 5000 });
+    expect(proc.isAlive()).toBe(true);
+    expect(result.text).toContain("late-dialog");
+    await proc.dispose();
+  }, 15_000);
+
+  test("a dialog the CLI leaves on its own before the Esc is due gets no key", async () => {
+    // Dialog, then the REPL 50ms later; any byte that reaches the CLI in the
+    // next second (no prompt is sent) exits it.
+    const leavesEarly = [
+      `printf '${MCP_DIALOG_SINGLE}'`,
+      "sleep 0.05",
+      "printf 'bypass permissions on (shift+tab to cycle)\\r\\n'",
+      "stty raw -echo",
+      "sleep 1",
+      "stty min 0 time 0",
+      "got=$(dd bs=4096 count=1 2>/dev/null | od -An -c)",
+      '[ -z "$got" ] || exit 1',
+      "sleep 30",
+    ].join("; ");
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", leavesEarly],
+        _skipReadySettle: false,
+        // The production default: the REPL footer is followed by a full
+        // quiet window, so settle ends after the Esc would be due.
+        quietWindowMs: 500,
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 1500));
+    expect(proc.isAlive()).toBe(true);
+    await proc.dispose();
+  }, 10_000);
+
+  test("a CLI that never paints the screen after the dialog still settles within the fresh window", async () => {
+    const t0 = Date.now();
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", fakeMcpDialogCli(MCP_DIALOG_SINGLE, "sleep 30")],
+        _skipReadySettle: false,
+        quietWindowMs: 200,
+      }),
+    );
+    // One fresh 3s hard-timeout window from the Esc, not an open-ended wait.
+    expect(Date.now() - t0).toBeLessThan(4500);
+    await proc.dispose();
+  }, 15_000);
+});
+
 // ─── runTurn: sentinel-echo round-trip against /bin/cat ─────────────────────
 //
 // /bin/cat is the simplest live test for the sentinel flow: it echoes
