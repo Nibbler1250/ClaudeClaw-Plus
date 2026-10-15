@@ -43,6 +43,7 @@ import {
 import { createSession } from "../sessions";
 import type { BusCore } from "./core";
 import { JsonlTailer } from "./jsonl-tailer";
+import { BUS_MCP_TOOLS } from "./mcp-tools";
 import { confirmTurnReceipt } from "./receipt-wiring";
 import { capturePostMortem, type PostMortemOptions } from "./post-mortem";
 import type { ReceiptRecord } from "./receipt";
@@ -439,19 +440,54 @@ export const CLAUDECLAW_PLUGIN_NAME = "claudeclaw-plus";
 const PLUGIN_MARKETPLACE_TAG = "inline";
 
 /**
- * MCP tools exposed by the plus-bus channel. Auto-allowed at spawn time
- * via `--allowedTools` so claude doesn't prompt the user before sending
- * an outbound message through the bus — these tools are safe by design
- * (they only call back through the IPC channel, no filesystem / network
- * effects outside the daemon).
+ * Bus tools pre-allowed for every bus agent via `--allowedTools`, so claude
+ * doesn't prompt the user before the agent sends an outbound message
+ * through the bus or reads schedule state. These only call back through the
+ * IPC channel.
  */
-const PLUS_BUS_TOOL_NAMES = [
-  "mcp__plugin_claudeclaw-plus_plus-bus__reply",
-  "mcp__plugin_claudeclaw-plus_plus-bus__edit_message",
-  "mcp__plugin_claudeclaw-plus_plus-bus__ask",
-  "mcp__plugin_claudeclaw-plus_plus-bus__cancel",
-  "mcp__plugin_claudeclaw-plus_plus-bus__request_human",
-];
+const PLUS_BUS_TOOLS_ALLOWED: ReadonlySet<string> = new Set([
+  "reply",
+  "edit_message",
+  "ask",
+  "cancel",
+  "request_human",
+  "list_scheduled_tasks",
+]);
+
+/**
+ * Bus tools pre-allowed only for an agent that runs without approvals
+ * (`bypassPermissions`, the default). `dispatch_job` and `schedule_task`
+ * start work that runs headless under the daemon-wide permission mode
+ * (`buildSecurityArgs`), not this agent's; `delete_scheduled_task` can remove
+ * a task from the shared jobs directory when the agent has no directory of
+ * its own; `job_status`, `list_jobs` and `cancel_job` reach every agent's
+ * jobs, not only the caller's. For an agent under approvals the permission
+ * flow is the only gate in front of that, so it stays.
+ */
+const PLUS_BUS_TOOLS_ALLOWED_WITHOUT_APPROVALS: ReadonlySet<string> = new Set([
+  "dispatch_job",
+  "schedule_task",
+  "delete_scheduled_task",
+  "job_status",
+  "list_jobs",
+  "cancel_job",
+]);
+
+/**
+ * The `--allowedTools` entries for the plus-bus tools, built from
+ * `BUS_MCP_TOOLS` (what the server answers `tools/list` with) so the names
+ * match what claude sees. A tool in neither set above is never pre-allowed:
+ * classify each new bus tool here. The hand-kept list this replaces had
+ * drifted, leaving the job and schedule tools out (#523).
+ */
+function plusBusAllowedTools(permissionMode: AgentConfig["permission_mode"]): string[] {
+  const approvals = (permissionMode ?? "bypassPermissions") !== "bypassPermissions";
+  return BUS_MCP_TOOLS.filter(
+    (tool) =>
+      PLUS_BUS_TOOLS_ALLOWED.has(tool.name) ||
+      (!approvals && PLUS_BUS_TOOLS_ALLOWED_WITHOUT_APPROVALS.has(tool.name)),
+  ).map((tool) => `mcp__plugin_${CLAUDECLAW_PLUGIN_NAME}_${PLUS_BUS_CHANNEL}__${tool.name}`);
+}
 
 /**
  * Resolve the absolute path to the ClaudeClaw+ plugin root — the
@@ -633,9 +669,9 @@ export function buildClaudeArgs(agent: AgentConfig, mode: SupervisionMode): stri
     args.push("-p", "--input-format=stream-json", "--output-format=stream-json", "--verbose");
   }
   args.push("--plugin-dir", resolveClaudeclawPluginRoot());
-  args.push("--allowedTools", PLUS_BUS_TOOL_NAMES.join(","));
+  args.push("--allowedTools", plusBusAllowedTools(agent.permission_mode).join(","));
   // Block Claude Code's native session-scoped scheduling tools so the agent
-  // is funnelled to the durable `schedule_job` bus tool instead. See the
+  // is funnelled to the durable `schedule_task` bus tool instead. See the
   // NATIVE_SCHEDULING_TOOLS_BLOCKLIST comment for why (the #342 lost-reminder
   // incident). Comma-joined to match `--allowedTools` above and the value
   // `claude` parses for `--disallowedTools`.
