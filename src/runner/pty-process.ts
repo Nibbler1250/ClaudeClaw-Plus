@@ -265,6 +265,9 @@ const DEFAULT_QUIET_TICK_MS = 50;
 const DEFAULT_COLS = 100;
 const DEFAULT_ROWS = 30;
 const DEFAULT_PERMISSION_MODE_ARGS = ["--dangerously-skip-permissions"];
+
+/** Delay between the project MCP server dialog showing and its Esc (#469). */
+const MCP_DIALOG_ANSWER_DELAY_MS = 500;
 /**
  * Hard cap on the tail ring buffer that captures pre-settle PTY output for
  * the issue #176 diagnostic snapshot. 8 KiB is enough to hold a typical
@@ -924,6 +927,15 @@ class PtyProcessImpl implements PtyProcess {
    * cycle") instead of the first quiet gap, with a fresh hard-timeout window
    * — so a spawn that hits the dialog can take up to 2 × `timeoutMs`. Only a
    * dialog painted inside the settle window is answered.
+   *
+   * Issue #469: a cwd whose project has an unapproved `.mcp.json` opens "New
+   * MCP server found in this project" before that warning. Pre-fix, settle
+   * resolved on it and the first prompt's CR dismissed it, so the prompt was
+   * lost to the bypass dialog behind it and the turn timed out. Reject it with
+   * Esc, once: "continue without" in the single-server dialog and "reject all"
+   * in the multi-select, whose servers are all pre-checked (an Enter there
+   * would enable every one), 500 ms after it shows. Then wait for the REPL
+   * as above, in a fresh hard-timeout window opened when the dialog showed.
    */
   _waitForReadySettle(timeoutMs: number): Promise<void> {
     return new Promise<void>((resolve) => {
@@ -932,6 +944,7 @@ class PtyProcessImpl implements PtyProcess {
       const originalHandler = this._handleData.bind(this);
       let bootRaw = "";
       let answeredBypass = false;
+      let mcpTimer: ReturnType<typeof setTimeout> | null = null;
       let awaitingRepl = false;
 
       const done = () => {
@@ -974,6 +987,11 @@ class PtyProcessImpl implements PtyProcess {
         }
       };
 
+      const rejectMcp = () => {
+        dumpPtyTrace(`>> pid=${this._pid} reject project MCP server dialog`, "Esc");
+        sendKey("\x1b");
+      };
+
       // Patch _handleData to reset the quiet timer on every incoming
       // chunk. The quiet timer only starts firing after the first chunk
       // (paint started) and only resolves once a full quietWindowMs has
@@ -988,6 +1006,16 @@ class PtyProcessImpl implements PtyProcess {
         // REPL footer first, so a key is never injected into a live REPL.
         if (/tab\s*to\s*cycle/.test(bootText)) {
           awaitingRepl = false;
+          // The REPL is up: an Esc still pending would land in it. The timer
+          // stays set so the dialog is never answered after this.
+          if (mcpTimer) this._clearTimeout(mcpTimer);
+        } else if (!mcpTimer && /MCP\s*servers?\s*found\s*in\s*this\s*project/.test(bootText)) {
+          // Not straight away: claude 2.1.300 swallows an Esc sent while the
+          // dialog paints (lost at 100 ms, taken from 200 ms).
+          awaitingRepl = true;
+          mcpTimer = this._setTimeout(rejectMcp, MCP_DIALOG_ANSWER_DELAY_MS);
+          this._clearTimeout(hardTimer);
+          hardTimer = this._setTimeout(done, timeoutMs);
         } else if (!answeredBypass && /Yes,\s*I\s*accept/.test(bootText)) {
           answeredBypass = true;
           awaitingRepl = true;
