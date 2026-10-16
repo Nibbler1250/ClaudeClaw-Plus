@@ -23,7 +23,7 @@ import type {
   SubscriptionFilter,
   SubscriptionHandler,
 } from "../../../bus/core-subscription";
-import { type BusEvent, TAILER_EVENT_SOURCE } from "../../../bus/types";
+import { type BusEvent, type BusEventTopic, TAILER_EVENT_SOURCE } from "../../../bus/types";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -2720,6 +2720,168 @@ describe("TelegramAdapter — quiet hours hold proactive messages (#512)", () =>
     await waitFor(() => turnApi.sendMessages.length > before);
     expect(turnApi.sendMessages.at(-1)?.text).toContain("turn stalled");
     expect(outbox.list()).toHaveLength(0);
+  });
+});
+
+describe("TelegramAdapter — queued output re-checks the allow-list at drain (#525)", () => {
+  // Wednesday 2026-10-07 23:00 UTC, inside a 22:00-07:00 window that ends Thursday 07:00.
+  const NIGHT = Date.UTC(2026, 9, 7, 23, 0);
+  const REMOVAL = Date.UTC(2026, 9, 8, 2, 0);
+  const MORNING = Date.UTC(2026, 9, 8, 7, 0);
+  // Chat 500 is not in routing.chats: only the last-chat cache sends there.
+  const routing = { chats: { "100": "triage" }, defaultAgentId: "triage" };
+  let turnApi: TurnApi;
+  let outboxDir: string;
+  let outbox: TelegramOutbox;
+  let clock: number;
+  let quiet: QuietHoursState;
+  let warnings: string[];
+  const logger = { ...SILENT_LOGGER, warn: (m: string) => void warnings.push(m) };
+
+  beforeEach(() => {
+    turnApi = new TurnApi();
+    clock = NIGHT;
+    warnings = [];
+    quiet = {
+      windows: [{ start: "22:00", end: "07:00" }],
+      urgentBypass: false,
+      timezoneOffsetMinutes: 0,
+    };
+    outboxDir = mkdtempSync(join(tmpdir(), "tg-adapter-525-"));
+    outbox = new TelegramOutbox({
+      path: join(outboxDir, "telegram-outbox.json"),
+      send: async () => {},
+      now: () => clock,
+      logger,
+    });
+  });
+
+  afterEach(() => {
+    outbox.stop();
+    rmSync(outboxDir, { recursive: true, force: true });
+  });
+
+  const sentTo = (chatId: number, text: string) =>
+    turnApi.sendMessages.some((m) => m.chat_id === chatId && m.text.includes(text));
+  const emit = (topic: BusEventTopic, payload: Record<string, unknown>) =>
+    bus.emit({ ts: Date.now(), agent_id: "triage", session_id: "s1", topic, payload });
+  const cronReply = (text: string) =>
+    emit("response.text", { text, origin: "cron", origin_id: "nightly" });
+
+  /** User `from` writes in private chat 500 and gets their answer: the cache now points there. */
+  const userTalks = async (from: number) => {
+    turnApi.enqueueUpdates([
+      {
+        message: {
+          message_id: 1,
+          from: { id: from, is_bot: false },
+          chat: { id: 500, type: "private" },
+          text: "hi",
+        },
+      },
+    ]);
+    await waitFor(() => bus.prompts.length === 1);
+    emit("response.text", { text: "answer", origin: "telegram", origin_id: "500" });
+    await waitFor(() => sentTo(500, "answer"));
+  };
+
+  it("a cron reply held at 23:00 is not delivered at 07:00 to a user removed at 02:00", async () => {
+    // Replaced, not mutated: a settings reload hands the getter a new object.
+    let live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({
+      api: turnApi,
+      outbox,
+      routing,
+      allowlist: () => live,
+      quietHours: () => quiet,
+    });
+    await userTalks(7);
+    cronReply("night report");
+    await waitFor(() => outbox.list().length === 1);
+    expect(outbox.list()[0]).toMatchObject({ chatId: 500 });
+
+    clock = REMOVAL;
+    live = { allowedUserIds: [42] };
+    clock = MORNING;
+    await outbox.drain();
+    expect(sentTo(500, "night report")).toBe(false);
+    expect(outbox.list()).toHaveLength(0);
+    expect(warnings.filter((w) => w.includes("user 7 is no longer allowed"))).toHaveLength(1);
+  });
+
+  it("a held cron reply is delivered at 07:00 while its user is still allowed", async () => {
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({
+      api: turnApi,
+      outbox,
+      routing,
+      allowlist: () => live,
+      quietHours: () => quiet,
+    });
+    await userTalks(7);
+    cronReply("night report");
+    await waitFor(() => outbox.list().length === 1);
+
+    clock = MORNING;
+    await outbox.drain();
+    expect(sentTo(500, "night report")).toBe(true);
+    expect(outbox.list()).toHaveLength(0);
+  });
+
+  it("a held operator alert is dropped once allowAllUsers is switched off", async () => {
+    const live = { allowedUserIds: [42], allowAllUsers: true };
+    adapter = await startAdapter({
+      api: turnApi,
+      outbox,
+      routing,
+      allowlist: () => live,
+      quietHours: () => quiet,
+    });
+    await userTalks(9999);
+    emit("system.operator_alert", { level: "warn", text: "slow turn", source: "stall-watchdog" });
+    await waitFor(() => outbox.list().length === 1);
+
+    live.allowAllUsers = false;
+    clock = MORNING;
+    await outbox.drain();
+    expect(sentTo(500, "slow turn")).toBe(false);
+    expect(outbox.list()).toHaveLength(0);
+  });
+
+  it("a failed cron reply queued for retry is not delivered to a user removed meanwhile", async () => {
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({ api: turnApi, outbox, routing, allowlist: () => live });
+    await userTalks(7);
+    turnApi.failSend = () => new Error("Telegram API sendMessage: 502 Bad Gateway: Bad Gateway");
+    cronReply("job result");
+    await waitFor(() => outbox.list().length === 1);
+    expect(outbox.list()[0]).toMatchObject({ chatId: 500, attempts: 1 });
+
+    turnApi.failSend = null;
+    live.allowedUserIds = [42];
+    await outbox.drain(clock + 3 * 60_000);
+    expect(sentTo(500, "job result")).toBe(false);
+    expect(outbox.list()).toHaveLength(0);
+  });
+
+  it("output held for a chat from routing.chats carries no sender and is delivered", async () => {
+    const live = { allowedUserIds: [42] };
+    adapter = await startAdapter({
+      api: turnApi,
+      outbox,
+      routing,
+      allowlist: () => live,
+      quietHours: () => quiet,
+    });
+    cronReply("routed report");
+    await waitFor(() => outbox.list().length === 1);
+    expect(outbox.list()[0].chatId).toBe(100);
+    expect(outbox.list()[0].userId).toBeUndefined();
+
+    live.allowedUserIds = [];
+    clock = MORNING;
+    await outbox.drain();
+    expect(sentTo(100, "routed report")).toBe(true);
   });
 });
 

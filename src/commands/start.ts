@@ -1164,6 +1164,8 @@ export async function start(args: string[] = []) {
         telegramToken: currentSettings.telegram.token,
         discordToken: currentSettings.discord.token,
         quietHours: () => quietHoursFrom(currentSettings),
+        // #525: held job results are re-checked against the reloaded list.
+        telegramAllowlist: () => currentSettings.telegram,
       }));
 
       const { wireBusScheduler } = await import("../bus/scheduler-wiring");
