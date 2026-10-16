@@ -276,6 +276,9 @@ export class TelegramAdapter {
     }
     const mounted = { allowedUserIds: opts.allowedUserIds, allowAllUsers: opts.allowAllUsers };
     this.allowlist = opts.allowlist ?? (() => mounted);
+    // #525: output held or queued for retry is re-checked when it drains, with
+    // the same live list as targetForAgent (#521) and the inbound gates (#520).
+    this.outbox?.setRecipientCheck((userId) => isAllowedBy(this.allowlist(), userId));
     this.routingChats = { ...opts.routing.chats };
     this.defaultAgentId = opts.routing.defaultAgentId;
     this.pollIntervalMs = opts.pollIntervalMs ?? 1000;
@@ -618,7 +621,7 @@ export class TelegramAdapter {
         this.quietHours?.()?.urgentBypass === true) ||
       this.openReceipts.has(this.convKey(agentId, target.chat_id));
     if (!urgent) {
-      if (this.holdForQuietHours(send)) return;
+      if (this.holdForQuietHours(send, target.user_id)) return;
       await this.outbox?.releaseHeld(send.chat_id);
     }
     try {
@@ -633,7 +636,7 @@ export class TelegramAdapter {
     } catch (err) {
       // Logged, then handed to the durable outbox instead of dropped.
       this.logger.error("[telegram-adapter] sendMessage failed", err);
-      this.queueForRetry(send, err, !urgent);
+      this.queueForRetry(send, err, !urgent, target.user_id);
     }
   }
 
@@ -884,7 +887,7 @@ export class TelegramAdapter {
     // end. A progress message left from before the window is removed, as after
     // a delivered final (a delete never notifies).
     if (proactive) {
-      if (this.holdForQuietHours(send)) {
+      if (this.holdForQuietHours(send, target.user_id)) {
         if (live) await this.deleteLiveMessage(live);
         return;
       }
@@ -915,7 +918,7 @@ export class TelegramAdapter {
     if (!live) {
       // No live turn message to fall back on (cron / heartbeat reply, or a
       // turn whose placeholder is gone): queue it for a later retry.
-      if (!delivered) this.queueForRetry(send, sendError, proactive);
+      if (!delivered) this.queueForRetry(send, sendError, proactive, target.user_id);
       return;
     }
     if (delivered) {
@@ -938,7 +941,7 @@ export class TelegramAdapter {
         `[telegram-adapter] final reply lost: send and edit fallback both failed`,
         err,
       );
-      this.queueForRetry(send, sendError ?? err, proactive);
+      this.queueForRetry(send, sendError ?? err, proactive, target.user_id);
     }
   }
 
@@ -1496,32 +1499,41 @@ export class TelegramAdapter {
   /**
    * Hand a message whose send failed to the durable outbox (if any), so it is
    * retried with backoff instead of dropped. The first attempt already ran.
+   *
+   * `userId` is the sender of the cached last chat when that cache picked the
+   * target (`PendingPrompt.user_id`); the drain re-checks it (#525). Configured
+   * chats and origin-bound replies carry none and drain as before.
    */
   private queueForRetry(
     send: { chat_id: number; text: string; message_thread_id?: number },
     err: unknown,
     proactive = false,
+    userId?: number,
   ): void {
     if (!this.outbox) return;
-    this.outbox.enqueueFailed(this.outboxMessage(send), err, { proactive });
+    this.outbox.enqueueFailed(this.outboxMessage(send, userId), err, { proactive });
   }
 
   /**
    * #512: hold an unprompted message in the outbox while a quiet window is
    * open. True when held; false when not quiet (or no outbox), send it now.
+   * `userId` as in {@link queueForRetry}.
    */
-  private holdForQuietHours(send: {
-    chat_id: number;
-    text: string;
-    message_thread_id?: number;
-  }): boolean {
-    return this.outbox?.hold(this.outboxMessage(send)) ?? false;
+  private holdForQuietHours(
+    send: { chat_id: number; text: string; message_thread_id?: number },
+    userId?: number,
+  ): boolean {
+    return this.outbox?.hold(this.outboxMessage(send, userId)) ?? false;
   }
 
-  private outboxMessage(send: { chat_id: number; text: string; message_thread_id?: number }) {
+  private outboxMessage(
+    send: { chat_id: number; text: string; message_thread_id?: number },
+    userId?: number,
+  ) {
     return {
       chatId: send.chat_id,
       threadId: send.message_thread_id,
+      ...(userId !== undefined ? { userId } : {}),
       chunks: [
         { text: markdownToTelegramHtml(send.text), parseMode: "HTML" as const, plain: send.text },
       ],

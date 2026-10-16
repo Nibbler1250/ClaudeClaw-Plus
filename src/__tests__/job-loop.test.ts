@@ -370,6 +370,41 @@ describe("job results reach Telegram/Discord under the bus runtime", () => {
       rmSync(dir, { recursive: true, force: true });
     });
 
+    it("a held job result is not delivered to a user removed meanwhile (#525)", async () => {
+      const sent: string[] = [];
+      const outbox = make(async (chatId, chunk) => void sent.push(`${chatId}|${chunk.text}`));
+      // Replaced, not mutated: a settings reload hands the getter a new object.
+      let live = { allowedUserIds: [42, 7] };
+      const relay = await busJobRelay({
+        telegramToken: "tg",
+        discordToken: "",
+        telegramSend: async () => {},
+        outbox,
+        quietHours: () => ({ ...quietAllDay, timezoneOffsetMinutes: 0 }),
+        telegramAllowlist: () => live,
+      });
+      expect(await relay.telegramDeliver?.(42, "for 42", "daily")).toBe(false);
+      expect(await relay.telegramDeliver?.(7, "for 7", "daily")).toBe(false);
+      expect(outbox.list().map((e) => [e.chatId, e.userId])).toEqual([
+        [42, 42],
+        [7, 7],
+      ]);
+
+      live = { allowedUserIds: [7] };
+      outbox.setQuietHours(null);
+      await outbox.drain(START);
+      expect(sent).toEqual(["7|for 7"]);
+      expect(outbox.list()).toHaveLength(0);
+      outbox.stop();
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("start.ts hands busJobRelay the live Telegram allow-list (#525)", () => {
+      expect(START_TS).toMatch(
+        /await busJobRelay\(\{[^}]*telegramAllowlist: \(\) => currentSettings\.telegram,/,
+      );
+    });
+
     it("keeps the sender of the outbox the Telegram adapter already opened", async () => {
       dir = mkdtempSync(join(tmpdir(), "job-relay-"));
       const path = join(dir, "outbox.json");

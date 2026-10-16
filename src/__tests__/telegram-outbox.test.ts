@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -36,7 +36,9 @@ function make(opts: { maxEntries?: number } = {}): TelegramOutbox {
   return new TelegramOutbox({ path, send, now: () => clock, logger, ...opts });
 }
 
-function onDisk(): { entries: Array<{ chunks: OutboxChunk[]; attempts: number }> } {
+function onDisk(): {
+  entries: Array<{ chatId: number; userId?: number; chunks: OutboxChunk[]; attempts: number }>;
+} {
   return JSON.parse(readFileSync(path, "utf8"));
 }
 
@@ -261,6 +263,145 @@ describe("TelegramOutbox", () => {
     expect(
       describeError(new Error("fetch https://api.telegram.org/bot123:AbC-d_e/sendMessage failed")),
     ).not.toContain("AbC");
+  });
+});
+
+describe("TelegramOutbox — recipient re-check at drain (#525)", () => {
+  it("persists the sender with held and retried entries, and reads it back", async () => {
+    const ob = make();
+    ob.setQuietHours(() => clock + 60 * MIN);
+    expect(ob.hold({ chatId: 500, userId: 7, chunks: [{ text: "held" }] })).toBe(true);
+    failWith = forbidden;
+    ob.setQuietHours(null);
+    await ob.deliver({ chatId: 501, userId: 8, chunks: [{ text: "retried" }] });
+
+    expect(onDisk().entries.map((e) => [e.chatId, e.userId])).toEqual([
+      [500, 7],
+      [501, 8],
+    ]);
+    expect(
+      make()
+        .list()
+        .map((e) => e.userId),
+    ).toEqual([7, 8]);
+  });
+
+  it("drops an entry whose sender is no longer allowed, with one log line", async () => {
+    failWith = forbidden;
+    const ob = make();
+    const allowed = new Set([7, 8]);
+    ob.setRecipientCheck((id) => allowed.has(id));
+    await ob.deliver({ chatId: 500, userId: 7, label: "job", chunks: [{ text: "a" }] });
+    await ob.deliver({ chatId: 501, userId: 8, chunks: [{ text: "b" }] });
+    failWith = null;
+
+    allowed.delete(7);
+    await ob.drain(clock + 3 * MIN);
+    expect(sent).toEqual([{ chatId: 501, text: "b", threadId: undefined }]);
+    expect(ob.list()).toHaveLength(0);
+    expect(onDisk().entries).toHaveLength(0);
+    expect(logs.warn.filter((w) => w.includes("user 7 is no longer allowed"))).toHaveLength(1);
+    expect(logs.warn.some((w) => w.includes("chat 500 [job]"))).toBe(true);
+  });
+
+  it("an entry written before the sender was persisted still loads and is delivered", async () => {
+    mkdirSync(join(dir, "retry"), { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify({
+        version: 1,
+        entries: [
+          {
+            id: "old-1",
+            chatId: 500,
+            chunks: [{ text: "from before the upgrade", parseMode: "HTML" }],
+            attempts: 0,
+            nextAttemptAt: clock,
+            lastError: "",
+            firstFailedAt: clock - MIN,
+            proactive: true,
+            heldAt: clock - MIN,
+          },
+        ],
+      }),
+    );
+    const ob = make();
+    ob.setRecipientCheck(() => false);
+    expect(ob.list()).toHaveLength(1);
+    await ob.drain(clock);
+    expect(sent.map((m) => [m.chatId, m.text])).toEqual([[500, "from before the upgrade"]]);
+    expect(ob.list()).toHaveLength(0);
+  });
+
+  it("an entry whose sender is not an integer is refused at load", () => {
+    mkdirSync(join(dir, "retry"), { recursive: true });
+    const base = { chunks: [{ text: "x" }], attempts: 1, nextAttemptAt: clock, lastError: "" };
+    writeFileSync(
+      path,
+      JSON.stringify({
+        version: 1,
+        entries: [
+          { ...base, id: "bad", chatId: 500, userId: "7" },
+          { ...base, id: "ok", chatId: 501, userId: 8 },
+        ],
+      }),
+    );
+    expect(
+      make()
+        .list()
+        .map((e) => e.id),
+    ).toEqual(["ok"]);
+  });
+
+  it("a user removed while a long message drains gets no further chunk", async () => {
+    failWith = forbidden;
+    const ob = make();
+    const allowed = new Set([7]);
+    ob.setRecipientCheck((id) => allowed.has(id));
+    await ob.deliver({ chatId: 500, userId: 7, chunks: [{ text: "c1" }, { text: "c2" }] });
+    failWith = (chunk) => {
+      if (chunk.text === "c1") allowed.delete(7);
+      return undefined;
+    };
+
+    await ob.drain(clock + 3 * MIN);
+    expect(sent.map((m) => m.text)).toEqual(["c1"]);
+    expect(ob.list()).toHaveLength(0);
+    expect(logs.warn.filter((w) => w.includes("user 7 is no longer allowed"))).toHaveLength(1);
+  });
+
+  it("a recipient check that throws neither sends nor drops; the next pass asks again", async () => {
+    failWith = forbidden;
+    const ob = make();
+    await ob.deliver({ chatId: 500, userId: 7, chunks: [{ text: "a" }] });
+    await ob.deliver({ chatId: 500, chunks: [{ text: "a2" }] });
+    await ob.deliver({ chatId: 501, chunks: [{ text: "b" }] });
+    failWith = null;
+    let broken = true;
+    ob.setRecipientCheck(() => {
+      if (broken) throw new Error("settings unreadable");
+      return true;
+    });
+
+    // The kept entry also holds back the later message to its chat.
+    await ob.drain(clock + 3 * MIN);
+    expect(sent.map((m) => m.text)).toEqual(["b"]);
+    expect(ob.list().map((e) => e.chunks[0].text)).toEqual(["a", "a2"]);
+    expect(logs.error.some((e) => e.includes("recipient check failed for chat 500"))).toBe(true);
+
+    broken = false;
+    await ob.drain(clock + 3 * MIN);
+    expect(sent.map((m) => m.text)).toEqual(["b", "a", "a2"]);
+    expect(ob.list()).toHaveLength(0);
+  });
+
+  it("without a recipient check, an entry with a sender is delivered", async () => {
+    failWith = forbidden;
+    const ob = make();
+    await ob.deliver({ chatId: 500, userId: 7, chunks: [{ text: "a" }] });
+    failWith = null;
+    await ob.drain(clock + 3 * MIN);
+    expect(sent.map((m) => m.chatId)).toEqual([500]);
   });
 });
 

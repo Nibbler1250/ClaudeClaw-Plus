@@ -24,6 +24,13 @@
  * a window is open (a retry, or a daemon that was down across the end) is
  * pushed to the end of that window. Unmarked messages are never held.
  *
+ * Revoked recipients (#525): a message routed to a chat only because a user
+ * wrote there last carries that user's id (`userId`). The drain asks the
+ * recipient check before each send; a user no longer allowed loses the entry,
+ * with one log line, instead of receiving output held or retried after their
+ * removal. Entries without `userId` (configured chats, files written before
+ * the field existed) are delivered as before.
+ *
  * Single owner: one instance per file per process ({@link getTelegramOutbox}),
  * and only the process that owns the bot token drains it (the daemon). Both
  * Telegram runtimes register their sender on the same instance; whichever is
@@ -57,6 +64,8 @@ export interface OutboxEntry {
   proactive?: true;
   /** Epoch ms the entry was first held by quiet hours, for the delivery log. */
   heldAt?: number;
+  /** User whose message made `chatId` the target; re-checked before each send (#525). */
+  userId?: number;
 }
 
 export interface OutboxMessage {
@@ -64,10 +73,15 @@ export interface OutboxMessage {
   threadId?: number;
   label?: string;
   chunks: OutboxChunk[];
+  /** See {@link OutboxEntry.userId}. */
+  userId?: number;
 }
 
 /** Sends one chunk; must throw on failure (message carrying the HTTP status / description). */
 export type OutboxSender = (chatId: number, chunk: OutboxChunk, threadId?: number) => Promise<void>;
+
+/** False when `userId` may no longer receive messages (live allow-list, #525). */
+export type RecipientCheck = (userId: number) => boolean;
 
 type Logger = Pick<Console, "info" | "warn" | "error">;
 
@@ -134,7 +148,8 @@ function isEntry(v: unknown): v is OutboxEntry {
     Array.isArray(e.chunks) &&
     e.chunks.every((c) => c && typeof c.text === "string") &&
     typeof e.attempts === "number" &&
-    typeof e.nextAttemptAt === "number"
+    typeof e.nextAttemptAt === "number" &&
+    (e.userId === undefined || Number.isInteger(e.userId))
   );
 }
 
@@ -162,6 +177,7 @@ export class TelegramOutbox {
   private timer: ReturnType<typeof setInterval> | null = null;
   private firstDrain: ReturnType<typeof setTimeout> | null = null;
   private quietUntil: QuietUntil | null;
+  private recipientAllowed: RecipientCheck | null = null;
 
   constructor(opts: TelegramOutboxOptions) {
     this.path = opts.path;
@@ -177,6 +193,11 @@ export class TelegramOutbox {
 
   setSender(send: OutboxSender): void {
     this.send = send;
+  }
+
+  /** Re-check of an entry's `userId` before each send; `null` sends every entry. */
+  setRecipientCheck(check: RecipientCheck | null): void {
+    this.recipientAllowed = check;
   }
 
   /** Quiet hours for proactive messages; `null` turns holding off. */
@@ -206,6 +227,7 @@ export class TelegramOutbox {
       chatId: msg.chatId,
       ...(msg.threadId !== undefined ? { threadId: msg.threadId } : {}),
       ...(msg.label ? { label: msg.label } : {}),
+      ...(msg.userId !== undefined ? { userId: msg.userId } : {}),
       chunks,
       attempts: 0,
       nextAttemptAt: until,
@@ -281,6 +303,7 @@ export class TelegramOutbox {
       chatId: msg.chatId,
       ...(msg.threadId !== undefined ? { threadId: msg.threadId } : {}),
       ...(msg.label ? { label: msg.label } : {}),
+      ...(msg.userId !== undefined ? { userId: msg.userId } : {}),
       chunks,
       attempts: 1,
       nextAttemptAt: now,
@@ -388,6 +411,20 @@ export class TelegramOutbox {
         continue;
       }
       while (entry.chunks.length > 0) {
+        // Asked before every chunk: a removal during a long message stops it.
+        const recipient = this.recipientStatus(entry);
+        if (recipient === "unknown") {
+          // Kept in place: later messages to that chat wait behind it.
+          failedChats.add(entry.chatId);
+          break;
+        }
+        if (recipient === "revoked") {
+          this.remove(entry);
+          this.logger.warn(
+            `[telegram-outbox] dropped message to chat ${entry.chatId}${entry.label ? ` [${entry.label}]` : ""}: user ${entry.userId} is no longer allowed (telegram.allowedUserIds)`,
+          );
+          break;
+        }
         try {
           await this.sendOnce(entry.chatId, entry.chunks[0], entry.threadId);
         } catch (err) {
@@ -406,6 +443,24 @@ export class TelegramOutbox {
             : `[telegram-outbox] delivered queued message to chat ${entry.chatId}${entry.label ? ` [${entry.label}]` : ""} after ${entry.attempts + 1} attempt(s)`,
         );
       }
+    }
+  }
+
+  /**
+   * #525: may `entry` still go to its recipient? Entries without `userId`, or
+   * no check installed: yes. A check that throws (a settings reload gone
+   * wrong) neither sends nor drops: `unknown`, and the next pass asks again.
+   */
+  private recipientStatus(entry: OutboxEntry): "allowed" | "revoked" | "unknown" {
+    if (entry.userId === undefined || !this.recipientAllowed) return "allowed";
+    try {
+      return this.recipientAllowed(entry.userId) ? "allowed" : "revoked";
+    } catch (err) {
+      this.logger.error(
+        `[telegram-outbox] recipient check failed for chat ${entry.chatId}; kept for the next pass`,
+        err,
+      );
+      return "unknown";
     }
   }
 

@@ -322,6 +322,24 @@ Fix it one of two ways:
 
 Slack bot traffic admitted through `allowBots` is unaffected.
 
+Both keys are hot-reloaded on both runtimes: removing an id, or switching
+`allowAllUsers` back off, refuses that user's next message or button tap
+within 30 s, without a restart (#520). On the Bus runtime, Telegram output
+that is not tied to a chat (heartbeat, alerts, scheduled tasks) goes to the
+last chat that wrote to the agent; that chat is re-checked against the
+current list before each such send, so a removed user stops receiving it
+too, and it falls back to the `telegram.busRouting.chats` entries (#521). A
+group is treated the same way: its cache entry belongs to the user who last
+wrote there. A chat listed in `busRouting.chats` is configuration and keeps
+receiving: remove a revoked user's DM from it too. Output already waiting in
+the outbox (held by quiet hours, or a failed send queued for retry) is
+re-checked the same way when it drains (Bus runtime): a message sent to the
+last chat, or a job result sent to a listed user, is dropped with a `[telegram-outbox]
+dropped message to chat …` warning if that user was removed meanwhile
+(#525). Entries queued before this check existed carry no user and drain as
+before. Discord and Slack send such output to their configured channels,
+not to the last sender.
+
 **Buttons follow the same rule.** A Telegram button press — a tool permission
 prompt (`perm:allow|deny`, Bus runtime), a pending action
 (`pending:<id>:<value>`, both runtimes), a reply button (`btn:`, legacy
