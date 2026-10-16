@@ -11,6 +11,7 @@
  * runtime: a failed send is retried later, and quiet hours hold it.
  */
 
+import { type AllowlistState, isAllowedBy } from "./allowlist";
 import { proactiveDeliver, type QuietHoursState } from "./quiet-hours";
 import {
   defaultOutboxPath,
@@ -21,7 +22,12 @@ import {
 
 export interface JobRelay {
   telegramSend: ((chatId: number, text: string) => Promise<void>) | null;
-  /** Proactive send through the outbox. Never throws; true when delivered now. */
+  /**
+   * Proactive send through the outbox. Never throws; true when delivered now.
+   * `chatId` is an allowed user's private chat (`forwardToTelegram` sends one
+   * per `telegram.allowedUserIds` entry), so it is recorded as the recipient:
+   * a result held or retried is dropped if that user is removed meanwhile (#525).
+   */
   telegramDeliver: ((chatId: number, text: string, label?: string) => Promise<boolean>) | null;
   discordSendToUser: ((userId: string, text: string) => Promise<void>) | null;
 }
@@ -39,6 +45,12 @@ export interface BusJobRelayOptions {
   outboxPath?: string;
   /** Quiet hours, read on every send so a settings reload applies. */
   quietHours?: () => QuietHoursState | undefined;
+  /**
+   * Telegram allow-list, read when a held or retried result drains (#525). Set
+   * here too because the Telegram adapter, which installs the same check, does
+   * not mount in send-only setups.
+   */
+  telegramAllowlist?: () => AllowlistState<number>;
   /** Defaults to the Discord REST DM send. */
   discordSend?: (token: string, userId: string, text: string) => Promise<void>;
 }
@@ -60,10 +72,12 @@ export async function busJobRelay(opts: BusJobRelayOptions): Promise<JobRelay> {
       getTelegramOutbox(path, (chatId, chunk, threadId) =>
         telegram.sendTelegramChunk(token, chatId, chunk, threadId),
       );
+    const allowlist = opts.telegramAllowlist;
+    if (allowlist) outbox.setRecipientCheck((userId) => isAllowedBy(allowlist(), userId));
     outbox.start();
     const deliver = proactiveDeliver(outbox, opts.quietHours ?? (() => undefined));
     telegramDeliver = (chatId, text, label) =>
-      deliver({ chatId, chunks: telegram.buildTelegramChunks(text), label });
+      deliver({ chatId, userId: chatId, chunks: telegram.buildTelegramChunks(text), label });
   }
 
   let discordSendToUser: JobRelay["discordSendToUser"] = null;
