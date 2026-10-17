@@ -336,7 +336,8 @@ the outbox (held by quiet hours, or a failed send queued for retry) is
 re-checked the same way when it drains (Bus runtime): a message sent to the
 last chat, or a job result sent to a listed user, is dropped with a `[telegram-outbox]
 dropped message to chat …` warning if that user was removed meanwhile
-(#525). Entries queued before this check existed carry no user and drain as
+(#525). Output for a chat listed in `busRouting.chats` is not tied to its
+last writer and is delivered (#542). Entries queued before this check existed carry no user and drain as
 before. Discord and Slack send such output to their configured channels,
 not to the last sender.
 

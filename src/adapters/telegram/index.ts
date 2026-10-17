@@ -621,7 +621,7 @@ export class TelegramAdapter {
         this.quietHours?.()?.urgentBypass === true) ||
       this.openReceipts.has(this.convKey(agentId, target.chat_id));
     if (!urgent) {
-      if (this.holdForQuietHours(send, target.user_id)) return;
+      if (this.holdForQuietHours(send, this.recipientOf(target))) return;
       await this.outbox?.releaseHeld(send.chat_id);
     }
     try {
@@ -636,7 +636,7 @@ export class TelegramAdapter {
     } catch (err) {
       // Logged, then handed to the durable outbox instead of dropped.
       this.logger.error("[telegram-adapter] sendMessage failed", err);
-      this.queueForRetry(send, err, !urgent, target.user_id);
+      this.queueForRetry(send, err, !urgent, this.recipientOf(target));
     }
   }
 
@@ -887,7 +887,7 @@ export class TelegramAdapter {
     // end. A progress message left from before the window is removed, as after
     // a delivered final (a delete never notifies).
     if (proactive) {
-      if (this.holdForQuietHours(send, target.user_id)) {
+      if (this.holdForQuietHours(send, this.recipientOf(target))) {
         if (live) await this.deleteLiveMessage(live);
         return;
       }
@@ -918,7 +918,7 @@ export class TelegramAdapter {
     if (!live) {
       // No live turn message to fall back on (cron / heartbeat reply, or a
       // turn whose placeholder is gone): queue it for a later retry.
-      if (!delivered) this.queueForRetry(send, sendError, proactive, target.user_id);
+      if (!delivered) this.queueForRetry(send, sendError, proactive, this.recipientOf(target));
       return;
     }
     if (delivered) {
@@ -941,7 +941,7 @@ export class TelegramAdapter {
         `[telegram-adapter] final reply lost: send and edit fallback both failed`,
         err,
       );
-      this.queueForRetry(send, sendError ?? err, proactive, target.user_id);
+      this.queueForRetry(send, sendError ?? err, proactive, this.recipientOf(target));
     }
   }
 
@@ -1497,12 +1497,22 @@ export class TelegramAdapter {
   }
 
   /**
+   * #525: the user a queued message to `target` is re-checked against when it
+   * drains: the sender of the cached last chat, unless that chat is listed in
+   * `routing.chats` — configuration, which keeps receiving after its last
+   * writer is removed, as in {@link targetForAgent} (#542). Origin-bound
+   * targets carry no `user_id`.
+   */
+  private recipientOf(target: PendingPrompt): number | undefined {
+    return Object.hasOwn(this.routingChats, String(target.chat_id)) ? undefined : target.user_id;
+  }
+
+  /**
    * Hand a message whose send failed to the durable outbox (if any), so it is
    * retried with backoff instead of dropped. The first attempt already ran.
    *
-   * `userId` is the sender of the cached last chat when that cache picked the
-   * target (`PendingPrompt.user_id`); the drain re-checks it (#525). Configured
-   * chats and origin-bound replies carry none and drain as before.
+   * `userId` comes from {@link recipientOf}; the drain re-checks it (#525).
+   * Configured chats and origin-bound replies carry none and drain as before.
    */
   private queueForRetry(
     send: { chat_id: number; text: string; message_thread_id?: number },

@@ -2883,6 +2883,130 @@ describe("TelegramAdapter — queued output re-checks the allow-list at drain (#
     await outbox.drain();
     expect(sentTo(100, "routed report")).toBe(true);
   });
+
+  /** User `from` writes in group 100, listed in routing.chats: the cache now points there too. */
+  const userTalksInRoutedGroup = async (from: number) => {
+    turnApi.enqueueUpdates([
+      {
+        message: {
+          message_id: 1,
+          from: { id: from, is_bot: false },
+          chat: { id: 100, type: "group" },
+          text: "hi",
+        },
+      },
+    ]);
+    await waitFor(() => bus.prompts.length === 1);
+    emit("response.text", { text: "answer", origin: "telegram", origin_id: "100" });
+    await waitFor(() => sentTo(100, "answer"));
+  };
+
+  it("a group listed in routing.chats keeps its held output after its last writer is removed", async () => {
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({
+      api: turnApi,
+      outbox,
+      routing,
+      allowlist: () => live,
+      quietHours: () => quiet,
+    });
+    await userTalksInRoutedGroup(7);
+    cronReply("group report");
+    await waitFor(() => outbox.list().length === 1);
+    expect(outbox.list()[0].chatId).toBe(100);
+    expect(outbox.list()[0].userId).toBeUndefined();
+
+    live.allowedUserIds = [42];
+    clock = MORNING;
+    await outbox.drain();
+    expect(sentTo(100, "group report")).toBe(true);
+  });
+
+  it("a held operator alert for a group listed in routing.chats survives its last writer's removal", async () => {
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({
+      api: turnApi,
+      outbox,
+      routing,
+      allowlist: () => live,
+      quietHours: () => quiet,
+    });
+    await userTalksInRoutedGroup(7);
+    emit("system.operator_alert", { level: "warn", text: "slow turn", source: "stall-watchdog" });
+    await waitFor(() => outbox.list().length === 1);
+    expect(outbox.list()[0].chatId).toBe(100);
+    expect(outbox.list()[0].userId).toBeUndefined();
+
+    live.allowedUserIds = [42];
+    clock = MORNING;
+    await outbox.drain();
+    expect(sentTo(100, "slow turn")).toBe(true);
+  });
+
+  it("a failed operator alert to a group listed in routing.chats is retried after its last writer is removed", async () => {
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({ api: turnApi, outbox, routing, allowlist: () => live });
+    await userTalksInRoutedGroup(7);
+    turnApi.failSend = () => new Error("Telegram API sendMessage: 502 Bad Gateway: Bad Gateway");
+    emit("system.operator_alert", { level: "warn", text: "slow turn", source: "stall-watchdog" });
+    await waitFor(() => outbox.list().length === 1);
+    expect(outbox.list()[0]).toMatchObject({ chatId: 100, attempts: 1 });
+    expect(outbox.list()[0].userId).toBeUndefined();
+
+    turnApi.failSend = null;
+    live.allowedUserIds = [42];
+    await outbox.drain(clock + 3 * 60_000);
+    expect(sentTo(100, "slow turn")).toBe(true);
+  });
+
+  it("a reply to a routed group whose send and edit fallback both fail carries no sender", async () => {
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({ api: turnApi, outbox, routing, allowlist: () => live });
+    // User 7's turn is still open in group 100: its placeholder is the live message.
+    turnApi.enqueueUpdates([
+      {
+        message: {
+          message_id: 1,
+          from: { id: 7, is_bot: false },
+          chat: { id: 100, type: "group" },
+          text: "hi",
+        },
+      },
+    ]);
+    await waitFor(() => bus.prompts.length === 1);
+    await waitFor(() => turnApi.sendMessages.some((m) => m.chat_id === 100));
+    turnApi.failSend = (p) =>
+      p.text.includes("late report")
+        ? new Error("Telegram API sendMessage: 502 Bad Gateway")
+        : undefined;
+    turnApi.failEdit = () => new Error("Telegram API editMessageText: 502 Bad Gateway");
+    cronReply("late report");
+    await waitFor(() => outbox.list().length === 1);
+    expect(outbox.list()[0].chatId).toBe(100);
+    expect(outbox.list()[0].userId).toBeUndefined();
+
+    turnApi.failSend = null;
+    turnApi.failEdit = null;
+    live.allowedUserIds = [42];
+    await outbox.drain(clock + 3 * 60_000);
+    expect(sentTo(100, "late report")).toBe(true);
+  });
+
+  it("a failed reply to a group listed in routing.chats is retried after its last writer is removed", async () => {
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({ api: turnApi, outbox, routing, allowlist: () => live });
+    await userTalksInRoutedGroup(7);
+    turnApi.failSend = () => new Error("Telegram API sendMessage: 502 Bad Gateway: Bad Gateway");
+    cronReply("group job result");
+    await waitFor(() => outbox.list().length === 1);
+    expect(outbox.list()[0]).toMatchObject({ chatId: 100, attempts: 1 });
+    expect(outbox.list()[0].userId).toBeUndefined();
+
+    turnApi.failSend = null;
+    live.allowedUserIds = [42];
+    await outbox.drain(clock + 3 * 60_000);
+    expect(sentTo(100, "group job result")).toBe(true);
+  });
 });
 
 /* ────────────────────────────────────────────────────────────────────── */
