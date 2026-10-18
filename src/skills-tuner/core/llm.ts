@@ -1,4 +1,8 @@
 import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { cleanSpawnEnv } from "../../runner/spawn-env.js";
 import type { TunerConfig } from "./config.js";
 
 export type Role = "intent_classifier" | "detector" | "proposer" | "proposer_high_stakes" | "judge";
@@ -23,16 +27,26 @@ function buildPrompt(system: string, messages: Message[]): string {
 
 /**
  * Arguments for a one-shot `claude -p` call. The prompt carries untrusted text
- * (conversation turns, skill bodies), so the call runs with no built-in tools
- * and no MCP servers. With no configured model, or the env-routed "glm"
- * alias, --model is left out and the CLI's default applies (same rule as the
- * runner's spawn sites).
+ * (conversation turns, skill bodies), so the call runs with no built-in tools,
+ * no MCP servers, no settings file (`--setting-sources ""`: no hooks, no user
+ * plugins), no saved session and no slash commands — the same set as the
+ * Discord classifier's `CLASSIFIER_ARGS`. With no configured model, or the
+ * env-routed "glm" alias, --model is left out and the CLI's default applies
+ * (same rule as the runner's spawn sites).
  */
 export function cliArgs(prompt: string, model: string | undefined): string[] {
   const args = ["-p", prompt];
   const m = model?.trim();
   if (m && m.toLowerCase() !== "glm") args.push("--model", m);
-  args.push("--tools", "", "--strict-mcp-config");
+  args.push(
+    "--tools",
+    "",
+    "--strict-mcp-config",
+    "--setting-sources",
+    "",
+    "--no-session-persistence",
+    "--disable-slash-commands",
+  );
   return args;
 }
 
@@ -68,9 +82,22 @@ export class ClaudeCliBackend implements LLMClient {
     _maxTokens?: number,
   ): Promise<string> {
     const prompt = buildPrompt(system, messages);
-    return new Promise((resolve, reject) => {
+    // Empty cwd, so no project dir is ever in reach of the call. Removed once
+    // the child is done, whatever the outcome; a failed removal (Windows file
+    // lock) must not replace the result.
+    const cwd = mkdtempSync(join(tmpdir(), "claudeclaw-tuner-"));
+    const cleanup = () => {
+      try {
+        rmSync(cwd, { recursive: true, force: true });
+      } catch {
+        // best effort
+      }
+    };
+    return new Promise<string>((resolve, reject) => {
       const child = this.spawnFn("claude", cliArgs(prompt, this.modelFor(role)), {
         stdio: ["ignore", "pipe", "pipe"],
+        env: cleanSpawnEnv(),
+        cwd,
       });
       let out = "";
       let err = "";
@@ -85,7 +112,7 @@ export class ClaudeCliBackend implements LLMClient {
         else resolve(out.trim());
       });
       child.on("error", reject);
-    });
+    }).finally(cleanup);
   }
 }
 
