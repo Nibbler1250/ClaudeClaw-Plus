@@ -963,7 +963,8 @@ export async function runAgentJobHeadless(input: {
         modelOverride: model,
         api: settings.api,
         securityArgs: buildSecurityArgs(settings.security),
-        appendSystemPrompt: persona || undefined,
+        // The reply is read off the rendered TUI: plain prose only (see execClaude).
+        appendSystemPrompt: [persona, PTY_OUTPUT_FORMAT_CONSTRAINT].filter(Boolean).join("\n\n"),
         // The bus owns the job's MCP config, absent included: the supervisor
         // must not synthesize one the `-p` job would not have had.
         mcpConfig: { path: input.mcpConfigPath },
@@ -2716,6 +2717,44 @@ async function streamClaude(
   onUnblock: () => void,
   onAgentEvent?: (ev: AgentStreamEvent) => void,
 ): Promise<void> {
+  if (resolveAgentTurnRoute(name) === "pty") {
+    // #546: on PTY the chat is a turn on the shared global PTY, so it goes
+    // through execClaude — the same prompt assembly (identity, memory, the
+    // PTY output-format constraint), rotation and session handling as every
+    // other global turn. A chat that spawned the global PTY with this
+    // function's shorter prompt would fix it for all later turns. The PTY has
+    // no structured Agent tool events, so onAgentEvent stays silent here.
+    let unblocked = false;
+    const unblock = (): void => {
+      if (!unblocked) {
+        unblocked = true;
+        onUnblock();
+      }
+    };
+    let textEmitted = false;
+    try {
+      const result = await execClaude(
+        name,
+        prompt,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        (text) => {
+          textEmitted = true;
+          onChunk(text);
+          unblock();
+        },
+        () => unblock(),
+      );
+      if (!textEmitted && result.stdout) onChunk(result.stdout);
+    } finally {
+      unblock();
+    }
+    return;
+  }
+
   await mkdir(LOGS_DIR, { recursive: true });
 
   // Rotate the global session if thresholds are exceeded (mirrors the check in execClaude).
@@ -2771,42 +2810,6 @@ async function streamClaude(
   if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
   if (appendParts.length > 0) {
     args.push("--append-system-prompt", appendParts.join("\n\n"));
-  }
-
-  if (resolveAgentTurnRoute(name) === "pty") {
-    // #546: same global session and prompt assembly as the `-p` branch below.
-    // The PTY streams text through onChunk and tool lines through onToolEvent;
-    // it has no structured Agent tool events, so onAgentEvent stays silent.
-    let unblocked = false;
-    const unblock = (): void => {
-      if (!unblocked) {
-        unblocked = true;
-        onUnblock();
-      }
-    };
-    let textEmitted = false;
-    const exec = await runOnPty("global", prompt, {
-      timeoutMs: resolveTimeoutMs(name),
-      modelOverride: model,
-      api,
-      securityArgs,
-      appendSystemPrompt: appendParts.join("\n\n"),
-      onChunk: (text) => {
-        textEmitted = true;
-        onChunk(text);
-        unblock();
-      },
-      onToolEvent: () => unblock(),
-    });
-    if (!textEmitted && exec.rawStdout) onChunk(exec.rawStdout);
-    if (exec.exitCode !== 0) {
-      console.error(`[${new Date().toLocaleTimeString()}] ${name} (pty) failed: ${exec.stderr}`);
-    }
-    unblock();
-    if (streamPm) streamPm.emitAsync("agent_end", { messages: [] }, streamCtx);
-    await incrementMessageCount();
-    console.log(`[${new Date().toLocaleTimeString()}] Done: ${name}`);
-    return;
   }
 
   const normalizedModel = model.trim().toLowerCase();
@@ -3084,7 +3087,7 @@ export async function runFork(prompt: string): Promise<RunResult> {
       modelOverride: FORK_MODEL,
       api,
       securityArgs,
-      appendSystemPrompt: FORK_SYSTEM_PROMPT,
+      appendSystemPrompt: `${FORK_SYSTEM_PROMPT}\n\n${PTY_OUTPUT_FORMAT_CONSTRAINT}`,
       survivesKill: true,
     });
     if (exec.timedOut) {

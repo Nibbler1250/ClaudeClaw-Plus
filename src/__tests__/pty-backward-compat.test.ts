@@ -173,6 +173,6 @@ describe("execClaude routing — flag and bootstrap (source-pinned)", () => {
     const streamFn = src.match(/async function streamClaude\([\s\S]*?\n\}\n/);
     expect(streamFn).not.toBeNull();
     expect(streamFn![0]).toMatch(/resolveAgentTurnRoute\(name\)\s*===\s*["']pty["']/);
-    expect(streamFn![0]).toMatch(/runOnPty\(/);
+    expect(streamFn![0]).toMatch(/execClaude\(/);
   });
 });

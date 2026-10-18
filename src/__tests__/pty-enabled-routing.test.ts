@@ -211,6 +211,7 @@ describe("#546 runFork", () => {
     expect(legacyArgv).toHaveLength(0);
     expect(ptySpawns).toHaveLength(1);
     expect(ptySpawns[0].modelOverride).toBe("claude-haiku-4-5-20251001");
+    expect(ptySpawns[0].appendSystemPrompt).toContain("OUTPUT FORMAT CONSTRAINT");
     expect(ptySpawns[0].sessionId).toBe(""); // never resumes anything
     expect(r).toEqual({ stdout: "pty-ok", stderr: "", exitCode: 0 });
     expect(ptys[0].disposed).toBe(true);
@@ -268,6 +269,9 @@ describe("#546 dashboard chat (streamUserMessage)", () => {
     expect(snapshotSupervisor().ptys.map((p) => p.sessionKey)).toEqual(["global"]);
     expect(chunks).toEqual(["one ", "two ", "three"]);
     expect(unblocked).toBe(1);
+    // The chat may be the turn that spawns the shared global PTY: it must carry
+    // the full global prompt, not a chat-only one.
+    expect(ptySpawns[0].appendSystemPrompt).toContain("OUTPUT FORMAT CONSTRAINT");
   });
 
   it("pty.enabled: false → claude -p", async () => {
@@ -299,6 +303,8 @@ describe("#546 agent jobs (runAgentJobHeadless)", () => {
     expect(legacyArgv).toHaveLength(0);
     expect(ptySpawns).toHaveLength(1);
     expect(ptySpawns[0].cwd).toBe(AGENT_DIR);
+    expect(ptySpawns[0].appendSystemPrompt).toContain("test agent for #546");
+    expect(ptySpawns[0].appendSystemPrompt).toContain("OUTPUT FORMAT CONSTRAINT");
     expect(ptySpawns[0].sessionId).toBe("");
     // The bus mints and releases the job's MCP config; the PTY uses it as is.
     expect(ptySpawns[0].mcpConfigPath).toBe("/tmp/t546-job-mcp.json");
