@@ -771,6 +771,8 @@ export async function runOnPty(
     /** #546: aborting retires the entry — the PTY is disposed mid-turn and the
      *  call returns an error result. */
     signal?: AbortSignal;
+    /** Bootstrap may opt out of all turn/respawn retries. */
+    retry?: boolean;
   } & PtyRunScope,
 ): Promise<RunOnPtyResult> {
   if (opts.signal?.aborted) return errorResult(`[pty-supervisor] ${sessionKey} aborted`);
@@ -810,7 +812,10 @@ export async function runOnPty(
     // concurrent admissions can both see "under cap" and both add entries —
     // exceeding the cap. Serialize through `_admissionLock`.
     const e = await admitEntry(sessionKey, opts);
-    return { entry: e, supervisorOpts: so };
+    return {
+      entry: e,
+      supervisorOpts: opts.retry === false ? { ...so, maxRetries: 0, respawnRetries: 1 } : so,
+    };
   })();
   try {
     ({ entry, supervisorOpts } = await withDeadline(admission, opts.timeoutMs));
@@ -1907,6 +1912,7 @@ async function runTurnWithRetries(
 
   return errorResult(
     `[pty-supervisor] max retries (${supervisorOpts.maxRetries}) exhausted for ${entry.sessionKey}: ${(lastErr as Error)?.message ?? "unknown"}`,
+    lastErr instanceof PtyTurnTimeoutError ? 124 : 1,
   );
 }
 
@@ -1916,11 +1922,11 @@ function pickBackoff(backoffMs: number[], attempt: number): number {
   return Math.max(0, backoffMs[idx] ?? 0);
 }
 
-function errorResult(message: string): RunOnPtyResult {
+function errorResult(message: string, exitCode = 1): RunOnPtyResult {
   return {
     rawStdout: "",
     stderr: message,
-    exitCode: 1,
+    exitCode,
     sessionId: undefined,
   };
 }

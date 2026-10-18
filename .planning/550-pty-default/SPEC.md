@@ -30,3 +30,12 @@ src/config.ts; src/bus/types.ts; src/bus/session-manager.ts; src/bus/session-age
 # Out of scope
 
 #559 fresh-input bug; #548/#549 utility migrations; README rewrite; HTTP engines; production rollout and live 48-hour soak; PR creation/merge.
+
+# Review-fix pass (task_016cc3fe4f34)
+
+- Preserve final PtyTurnTimeoutError as exit 124; retire the timed-out PTY before memory save/compact. Drive the compact fixture using the real supervisor result, not invented PTY exit codes.
+- Detect an API signature error rendered by a successful PTY result, or identify any print-only recovery condition.
+- Background bootstrap through the serial runner queue, bounded to one attempt and a finite startup-specific timeout. Startup continuation and engine logging get behavioural tests.
+- Align retry model fallback and stream callbacks; deduplicate invalid enabled warnings by distinct bad value; correct hot-reload and resolver-origin migration wording.
+- Replace source assertions with behaviour and verify actual SessionManager cron default selection.
+- Add commits without force-pushing. Both manifest versions must exceed 2.2.338. README/#559 and live soak remain out of scope.

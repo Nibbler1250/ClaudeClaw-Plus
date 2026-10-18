@@ -1042,9 +1042,14 @@ function parseAgenticConfig(raw: any): AgenticConfig {
   };
 }
 
+const invalidPtyEnabledWarned = new Set<string>();
 function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Settings {
   if (raw.pty?.enabled !== undefined && typeof raw.pty.enabled !== "boolean") {
-    console.warn("pty.enabled must be a boolean; using default true");
+    const key = JSON.stringify(raw.pty.enabled);
+    if (!invalidPtyEnabledWarned.has(key)) {
+      invalidPtyEnabledWarned.add(key);
+      console.warn("pty.enabled must be a boolean; using default true");
+    }
   }
   const rawLevel = raw.security?.level;
   const level: SecurityLevel =

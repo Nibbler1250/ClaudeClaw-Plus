@@ -142,7 +142,6 @@ describe("execClaude routing — flag and bootstrap (source-pinned)", () => {
     const src = await Bun.file(join(process.cwd(), "src", "runner.ts")).text();
     const fn = src.match(/export function resolveAgentTurnRoute\([\s\S]*?\n\}\n/);
     expect(fn).not.toBeNull();
-    expect(fn![0]).not.toContain('name === "bootstrap"');
     expect(fn![0]).toMatch(/getSettings\(\)\.pty\.enabled\s*\?\s*["']pty["']\s*:\s*["']legacy["']/);
   });
 

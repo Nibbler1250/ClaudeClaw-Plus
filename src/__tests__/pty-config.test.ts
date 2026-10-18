@@ -45,6 +45,25 @@ afterAll(async () => {
 });
 
 describe("parseSettings — pty defaults", () => {
+  it("warns once per distinct invalid enabled value across reloads", async () => {
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const value of [
+        "review-550-invalid-a",
+        "review-550-invalid-a",
+        "review-550-invalid-b",
+        "review-550-invalid-a",
+      ]) {
+        await writeRawSettings({ pty: { enabled: value } });
+        await reloadSettings();
+      }
+      expect(
+        warning.mock.calls.filter(([line]) => String(line).includes("pty.enabled")),
+      ).toHaveLength(2);
+    } finally {
+      warning.mockRestore();
+    }
+  });
   it("applies all defaults when pty block is missing", async () => {
     await writeRawSettings({});
     await reloadSettings();

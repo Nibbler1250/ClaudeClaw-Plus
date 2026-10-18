@@ -399,7 +399,9 @@ export interface AgentStreamEvent {
 
 const RATE_LIMIT_PATTERN = /you(?:'|')ve hit your limit|out of extra usage/i;
 const RATE_LIMIT_RESET_PATTERN = /resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*\(?\s*UTC\s*\)?/i;
-const SIGNATURE_ERROR = /Invalid.*signature.*thinking block/i;
+const SIGNATURE_ERROR = /Invalid.*signature.*thinking.*block/i;
+const RENDERED_SIGNATURE_ERROR =
+  /(?:^|\n)\s*API Error:[^\n]*Invalid[^\n]*signature[^\n]*thinking[^\n]*block/i;
 
 // Claude Code prints this when --resume references a session it no longer
 // has on disk (cleared, expired, compacted away, or moved to another machine).
@@ -2099,6 +2101,7 @@ async function execClaude(
       // Kimi configuration silently drop on the PTY path.
       exec = await runOnPty(ptySessionKey, prompt, {
         timeoutMs,
+        retry: name !== "bootstrap",
         threadId,
         agentName,
         modelOverride: primaryConfig.model || (modelOverride ?? undefined),
@@ -2119,7 +2122,7 @@ async function execClaude(
         timeoutMs,
         threadId,
         agentName,
-        modelOverride: config.model,
+        modelOverride: config.model || modelOverride,
         api: config.api,
         securityArgs,
         appendSystemPrompt,
@@ -2142,6 +2145,7 @@ async function execClaude(
     let fallbackSessionId: string | undefined;
 
     if (
+      name !== "bootstrap" &&
       primaryRateLimit &&
       hasModelConfig(fallbackConfig) &&
       !sameModelConfig(primaryConfig, fallbackConfig)
@@ -2193,6 +2197,8 @@ async function execClaude(
               securityArgs,
               appendSystemPrompt,
               sessionStore: fallbackStore,
+              onChunk,
+              onToolEvent,
             });
       exec = await execFallback(fallbackArgs);
       usedFallback = true;
@@ -2202,7 +2208,8 @@ async function execClaude(
       if (
         !fallbackRateLimit &&
         fallbackSession &&
-        exec.exitCode !== 0 &&
+        (exec.exitCode !== 0 ||
+          (!useLegacyPath && RENDERED_SIGNATURE_ERROR.test(exec.rawStdout))) &&
         SIGNATURE_ERROR.test(exec.rawStdout + exec.stderr)
       ) {
         await resetFallbackSession(agentName, threadId);
@@ -2253,7 +2260,16 @@ async function execClaude(
 
     // Auto-detect corrupted primary session from thinking block signature mismatch.
     // Gated on !usedFallback — fallback corruption is handled inside the fallback block above.
-    if (exitCode !== 0 && !isNew && !usedFallback && SIGNATURE_ERROR.test(rawStdout + stderr)) {
+    // The interactive REPL may render an API error and return to its input
+    // prompt without exiting. Recognise that specific error line as well as
+    // the non-zero print result; ordinary quoted signature text is not enough.
+    const renderedSignatureError = !useLegacyPath && RENDERED_SIGNATURE_ERROR.test(rawStdout);
+    if (
+      (exitCode !== 0 || renderedSignatureError) &&
+      !isNew &&
+      !usedFallback &&
+      SIGNATURE_ERROR.test(rawStdout + stderr)
+    ) {
       if (threadId) {
         await removeThreadSession(threadId);
       } else if (agentName) {
@@ -2542,6 +2558,8 @@ async function execClaude(
 
     // --- Auto-compact on timeout (exit 124) ---
     if (COMPACT_TIMEOUT_ENABLED && exitCode === 124 && !isNew && existing && !recoveredFromStale) {
+      // Utility --resume must not race a wedged live writer of this transcript.
+      if (!useLegacyPath) await retirePtySession(ptySessionKey);
       // Save memory before compact wipes context
       try {
         const memPath = getMemoryPath(agentName);
@@ -3158,17 +3176,32 @@ export async function runFork(prompt: string): Promise<RunResult> {
  * session is created immediately. No-op if a session already exists.
  */
 export async function bootstrap(): Promise<void> {
-  const existing = await getSession();
-  if (existing) return;
+  // Reserve the same serial queue used by global chat before doing any I/O.
+  // A channel turn arriving during startup waits behind this one attempt;
+  // a session already created by an earlier turn makes bootstrap a no-op.
+  return enqueue(async () => {
+    const existing = await getSession();
+    if (existing) return;
 
-  console.log(`[${new Date().toLocaleTimeString()}] Bootstrapping new session...`);
-  const { session: sessionConfig } = getSettings();
-  const summary = sessionConfig.summaryPath
-    ? await loadLatestSummary(sessionConfig.summaryPath)
-    : null;
-  const wakeupPrompt = summary
-    ? `Wakeup, my friend!\n\nContext from the previous session:\n\n${summary}`
-    : "Wakeup, my friend!";
-  await execClaude("bootstrap", wakeupPrompt);
-  console.log(`[${new Date().toLocaleTimeString()}] Bootstrap complete — session is live.`);
+    console.log(`[${new Date().toLocaleTimeString()}] Bootstrapping new session...`);
+    const { session: sessionConfig } = getSettings();
+    const summary = sessionConfig.summaryPath
+      ? await loadLatestSummary(sessionConfig.summaryPath)
+      : null;
+    const wakeupPrompt = summary
+      ? `Wakeup, my friend!\n\nContext from the previous session:\n\n${summary}`
+      : "Wakeup, my friend!";
+    const result = await execClaude(
+      "bootstrap",
+      wakeupPrompt,
+      undefined,
+      undefined,
+      Math.min(resolveTimeoutMs("bootstrap"), 30_000),
+    );
+    if (result.exitCode !== 0) {
+      if (resolveAgentTurnRoute("bootstrap") === "pty") await retirePtySession("global");
+      throw new Error(`Bootstrap exited ${result.exitCode}`);
+    }
+    console.log(`[${new Date().toLocaleTimeString()}] Bootstrap complete — session is live.`);
+  });
 }

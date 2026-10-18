@@ -6,7 +6,8 @@ import { homedir } from "os";
 import { extractErrorDetail } from "../messaging";
 import { join } from "path";
 import { fileURLToPath } from "url";
-import { executionEngineSummary } from "../execution-engines.js";
+import { logExecutionEngineSummary } from "../execution-engines.js";
+import { beginStartupInitialization } from "../startup-initialization.js";
 import {
   run,
   runUserMessage,
@@ -809,7 +810,7 @@ export async function start(args: string[] = []) {
   process.on("SIGINT", shutdown);
 
   console.log("ClaudeClaw+ daemon started");
-  console.log(`  ${executionEngineSummary(settings)}`);
+  logExecutionEngineSummary(settings, console);
   console.log(`  PID: ${process.pid}`);
   // Probe and log the Claude CLI version so operators see which `claude`
   // the daemon is invoking. Mismatch against the parser's known-good list
@@ -1676,14 +1677,15 @@ export async function start(args: string[] = []) {
         `[${ts()}] Startup trigger failed (exit ${triggerResult.exitCode}). Daemon will continue running.`,
       );
     }
-  } else {
-    // Bootstrap the session first so system prompt is initial context
-    // and session.json is created immediately.
-    await bootstrap();
   }
 
-  // Install plugins without blocking daemon startup.
-  startPreflightInBackground(process.cwd());
+  // Bootstrap reserves its global queue slot before preflight/job wiring,
+  // but a model turn must never hold up the rest of daemon startup.
+  await beginStartupInitialization({
+    bootstrap: hasTriggerFlag ? undefined : bootstrap,
+    next: () => startPreflightInBackground(process.cwd()),
+    logger: console,
+  });
 
   // Sprint 5.2c: when the Bus runtime is mounted, the legacy heartbeat
   // tick is skipped — `wireBusScheduler` already registered the

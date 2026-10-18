@@ -199,3 +199,126 @@ Do not start this soak until #559 is merged and verified and the #548/#549 depen
 Reviewed the diff for isolation and session-store boundaries: no critical or high security issue found. Recovery preserves model/API/security/system context and selects the fallback store when appropriate. No credential values, user prompts or environment dumps were added to startup logging.
 
 No Ultra code was reused; the provided prior-art check found the same defaultSupervisionFor and no alternative implementation needed for this default change. README.md was not edited; the coordinator should add the migration-guide link and new defaults after #558 merges. No PR, merge or GitHub comment was created. The unrelated untracked #559 investigation SPEC and local memory/Serena scaffolding are excluded from task commits.
+
+## Review-fix pass — task_016cc3fe4f34
+
+This section supersedes the initial report where behavior changed. Applied the supplied Opus review (no CRITICAL/HIGH findings) as additional work on top of 451c9359, without rewriting branch history.
+
+### Fixes and evidence
+
+- M1: exhausted final PtyTurnTimeoutError now produces exit 124; unrelated errors remain exit 1. The compact fixture delegates to the real supervisor with a PTY double throwing the real timeout error, rather than fabricating a supervisor 124 result. Runner retirement and disposal precede the precompact memory-save and compact print utilities, eliminating the concurrent transcript writer. Its ordinary postcompact recovery retirement remains idempotent.
+- Corrupted-session recovery now recognizes a line beginning API Error containing the thinking signature error even when the REPL returns exit 0. Primary and fallback-session paths both reset and retire their own stores/process keys. Tests use HTTP400 JSON with backticks around signature and thinking. This is executable PTY recovery, not a print-only exception; ordinary signature prose without the API-error line is not newly treated as failure.
+- M2: normal startup schedules bootstrap in the background, logs success/failure, and proceeds to preflight, hot reload and job wiring. Bootstrap synchronously reserves the global runner queue before asynchronous session lookup, preserving context ordering with later global chat. It gets one turn attempt, no supervisor retries/respawns or rate-limit fallback, and a turn deadline of min(configured timeout, 30 seconds). Supervisor admission/serialization stages retain their existing individual deadlines; this is not a claim that every stage shares one total 30-second wall-clock budget. A never-settling bootstrap cannot block the next startup step, proved with a 40ms rejection bound. The runner fixture also proves the single timed-out attempt releases a later queued chat.
+- M3/M4: recovery uses config.model || modelOverride, matching primary model choice; PTY rate-limit fallback forwards both chunk and tool-event callbacks.
+- M5: invalid pty.enabled warnings are deduplicated for each distinct JSON value for the life of the process, including repeated reloads. The bad value itself is never logged.
+- M6: migration guidance now states runner engine flips apply after the approximately 30-second settings reload; bus-agent supervision/runtime changes require restart. It narrows the origin fallback change to agents spawned without resolver-selected supervision, since resolved declared agents already defaulted to PTY.
+- M7: startup logging is exercised through the actual logger helper called by start, replacing source-string inspection. Removed the bootstrap source prohibition covered by routing behavior. Added actual SessionManager.spawnAgent cron selection with no declared supervision, alongside the explicit print control.
+- Both bump scripts ran twice, moving plugin and marketplace plugin entries from 2.2.337 through 2.2.338 to **2.2.339**. Read-back asserted both equal 2.2.339.
+
+### Final review validation
+
+Tests ran with Bun directly, using absolute test paths and --preload <repo>/scripts/test-preload.ts in isolated temporary working directories with a src symlink. This protects state from the known routing/supervisor test cleanup behavior. No test output was piped into head/tail.
+
+| Scope | Result |
+| --- | --- |
+| bun test pty-config, pty-default-runner, startup-initialization, execution-engines and job-loop | 114 pass, 0 fail |
+| bun test pty-supervisor | 78 pass, 0 fail |
+| bun test pty-integration, pty-enabled-routing and pty-backward-compat | 34 pass, 0 fail |
+| bun test bus agent-resolver, pty-default-delivery, wiring and scheduler-wiring | 34 pass, 0 fail |
+| bun test bus session-manager --test-name-pattern 'without declared supervision\|explicit process-stream-json' | 2 pass, 0 fail |
+| Total scoped final tests | **262 pass, 0 fail** |
+| bun run lint --reporter=json, whole repository | exit 0; 0 errors, 1235 advisory warnings, 323 informational diagnostics |
+| bun run typecheck, repository ratchet | exit 0; 149 diagnostics, baseline 149, unchanged |
+| git diff --check | clean |
+
+Before implementing the review fixes, the new timeout test returned 1 instead of 124, the actual compact test showed retirement after utility invocation, rendered-error tests did not recover, model override was empty, callbacks were absent, and four reloads warned four times instead of twice. The new startup test initially failed to import the not-yet-created module. After implementation, **14 single-site fault injections** independently made the tests below go RED; each injection was reverted in a finally block before proceeding. All final results above were obtained after restoring the production code.
+
+### timeout-status
+
+```text
+(fail) pty-supervisor retry and backoff > returns 124 when its final turn failure is a timeout [80.67ms]
+```
+
+### no-retries
+
+```text
+(fail) pty-supervisor retry and backoff > retry false permits exactly one turn and no respawn despite global retry settings [17.80ms]
+```
+
+### retire-before-utility
+
+```text
+(fail) #550 default runner routing > retires the actual timed-out PTY before memory save or compact can resume it [366.77ms]
+```
+
+### rendered-primary
+
+```text
+(fail) #550 default runner routing > recovers signature errors rendered by a PTY that returned exit zero [270.71ms]
+```
+
+### rendered-fallback
+
+```text
+(fail) #550 default runner routing > recovers a signature error rendered by the fallback PTY [269.26ms]
+```
+
+### recovery-model
+
+```text
+(fail) #550 default runner routing > keeps the model override when retrying a fallback whose configured model is empty [941.94ms]
+```
+
+### fallback-chunks
+
+```text
+(fail) #550 default runner routing > streams chunk and tool events during a rate-limit fallback [164.91ms]
+```
+
+### fallback-tools
+
+```text
+(fail) #550 default runner routing > streams chunk and tool events during a rate-limit fallback [159.94ms]
+```
+
+### dedup-warning
+
+```text
+(fail) parseSettings — pty defaults > warns once per distinct invalid enabled value across reloads [43.36ms]
+```
+
+### background-bootstrap
+
+```text
+(fail) background startup initialization > a never-completing bootstrap does not delay the next startup step [46.04ms]
+```
+
+### bootstrap-one-attempt
+
+```text
+(fail) #550 default runner routing > bootstrap reserves the queue, uses one bounded attempt, and releases a later chat [501.80ms]
+```
+
+### bootstrap-deadline
+
+```text
+(fail) #550 default runner routing > bootstrap reserves the queue, uses one bounded attempt, and releases a later chat [1881.51ms]
+```
+
+### startup-log
+
+```text
+(fail) #550 startup engine summary > startup actually emits the summary [16.49ms]
+```
+
+### spawn-origin-default
+
+```text
+(fail) pty-stdin supervision > spawnAgent selects PTY for cron without declared supervision [291.71ms]
+```
+
+### Remaining scope and manual checks
+
+No requested review fix remains undone. README.md and issue #559 were not changed. No new Ultra code was reused: this pass adapts the existing Plus supervisor and runner rather than copying the diverged Ultra runner. The original remaining-print inventory and exact 48-hour operator soak checklist above remain applicable; trusted utility calls still await #549 integration. No live Claude or production-daemon verification was performed in this pass, and no fix for #559 is claimed. Keep the independent #559 and #548/#549 integration checks and the operator soak as rollout gates.
+
+Security review of this follow-up found no CRITICAL/HIGH issue: retirement respects session keys, recovery separates primary/fallback stores, and logging adds no prompt, credential or environment values. Local memory checkpoint was appended by the memory worker; Graphiti ingestion was queued but not confirmed by immediate read-back.

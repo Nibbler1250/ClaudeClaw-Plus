@@ -201,6 +201,12 @@ describe("pty-stdin supervision", () => {
     expect(proc.supervision).toBe("pty-stdin");
     expect(proc.pid).toBeGreaterThan(0);
   });
+  it("spawnAgent selects PTY for cron without declared supervision", async () => {
+    const proc = await mgr.spawnAgent(mkAgent({ id: "cron-default" }), "cron");
+    spawned.push(proc);
+    expect(proc.supervision).toBe("pty-stdin");
+    expect(proc.pid).toBeGreaterThan(0);
+  });
 
   it("propagates CCAW_AGENT_ID and CCAW_BUS_SOCK via the env", async () => {
     // We can't introspect a foreign process's env directly, but we can

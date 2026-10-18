@@ -6,9 +6,10 @@ stale or corrupted session recovery and post-compaction retries follow that
 setting too. An existing literal `false` is preserved. Invalid values such as
 `"false"` warn and use the default `true`.
 
-Bus agents now default to `pty-stdin` for every origin, including cron, heartbeat,
-CLI and REST. Declared agents already defaulted to PTY; agents that previously
-relied on a non-channel origin to select print now use PTY too. Non-channel
+Agents spawned without the settings resolver now default to `pty-stdin` for
+every origin, including cron, heartbeat, CLI and REST. Declared agents processed
+by `resolveBusAgentConfig` already defaulted to PTY; this change affects agents
+that relied on the origin fallback to select print. Non-channel
 deliveries use the existing delivery-confirmation loop: typing Enter alone does
 not count as successful delivery. Dispatched-job results use the `cron` origin
 and an `agent-job:` identifier and pass through the same loop.
@@ -32,9 +33,11 @@ for every bus agent you want on print. `pty.enabled` controls runner turns and
 cron jobs; each bus agent's `supervision` controls that bus agent independently.
 Changing one does not change the other.
 
-Restart the daemon after changing engine settings. Bus supervision is selected
-when agents start; changing settings on disk does not replace an existing
-process. A restart also gives a fresh startup summary for the effective choices.
+Runner paths read `pty.enabled` on each turn. The daemon reloads settings about
+every 30 seconds, so a flip applies to subsequent runner turns and cron jobs
+after that reload. Bus-agent supervision and runtime selection require a
+restart: changing settings on disk does not replace their existing processes.
+Restarting also produces a fresh startup summary of the engine choices.
 
 ## Verify the switch
 

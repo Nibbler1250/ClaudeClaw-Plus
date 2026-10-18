@@ -1,6 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
-import { executionEngineSummary } from "../execution-engines.js";
+import { executionEngineSummary, logExecutionEngineSummary } from "../execution-engines.js";
 
 describe("#550 startup engine summary", () => {
   it("names the runner, cron and bus default engines", () => {
@@ -18,7 +17,13 @@ describe("#550 startup engine summary", () => {
     expect(summary).toContain("reporter=process-stream-json, default=pty-stdin");
   });
   it("startup actually emits the summary", () => {
-    const source = readFileSync(new URL("../commands/start.ts", import.meta.url), "utf8");
-    expect(source.includes("console.log(`  ${executionEngineSummary(settings)}`)")).toBe(true);
+    const lines: string[] = [];
+    logExecutionEngineSummary(
+      { pty: { enabled: true }, agents: [] },
+      { log: (line) => lines.push(line) },
+    );
+    expect(lines).toEqual([
+      "  Engines: agent turns=pty; cron jobs=pty; bus non-channel default=pty-stdin; bus agents=none",
+    ]);
   });
 });

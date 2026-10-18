@@ -478,6 +478,39 @@ describe("pty-supervisor retry and backoff", () => {
     expect(sleeps).toEqual([1000]);
   });
 
+  it("returns 124 when its final turn failure is a timeout", async () => {
+    injectMaxRetriesForTests(0);
+    injectSpawnPty(async () =>
+      makeFakePty("timeout", {
+        onTurn: async () => {
+          throw new PtyTurnTimeoutError("timeout", 10);
+        },
+      }),
+    );
+    const result = await runOnPty("global", "p", { timeoutMs: 1000 });
+    expect(result.exitCode).toBe(124);
+  });
+
+  it("retry false permits exactly one turn and no respawn despite global retry settings", async () => {
+    injectMaxRetriesForTests(5);
+    const { spawn, spawned } = makeSpawnTracker(() =>
+      makeFakePty("bootstrap", {
+        onTurn: async () => {
+          throw new PtyTurnTimeoutError("bootstrap", 10);
+        },
+      }),
+    );
+    injectSpawnPty(spawn);
+    injectSleep(async () => {});
+    const result = await runOnPty("global", "bootstrap", {
+      timeoutMs: 1000,
+      retry: false,
+    } as Parameters<typeof runOnPty>[2]);
+    expect(result.exitCode).toBe(124);
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]?.turnCount).toBe(1);
+  });
+
   it("uses exponential backoff array, reusing last value past array length", async () => {
     const sleeps: number[] = [];
     injectSleep(async (ms) => {
