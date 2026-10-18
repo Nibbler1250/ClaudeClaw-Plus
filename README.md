@@ -267,6 +267,19 @@ Hot-reload picks up `settings.json` changes within 30 seconds — no daemon rest
 - Phase D audit reports: [`.planning/pty-migration/`](.planning/pty-migration/)
 - Bus runtime spec (the recommended path): [`docs/ClaudeClaw_Plus_Bus_Architecture_Spec.md`](docs/ClaudeClaw_Plus_Bus_Architecture_Spec.md)
 
+#### One-shot calls (`oneShot`)
+
+Short utility calls — the Discord thread classifier, the skills tuner — go through one module, `src/oneshot/`, instead of spawning `claude -p` each in their own way. Calls that read untrusted text always run with the same isolation flags (no tools, no MCP server, no settings or hooks, no saved session, no slash commands) from an empty temp dir. The engine is chosen per route; absent block = every route on `print` (`claude -p`):
+
+```json
+"oneShot": {
+  "default": "print",
+  "routes": { "tuner.judge": "print" }
+}
+```
+
+Routes in use: `discord.classifier`, `tuner.classify`, `tuner.detect`, `tuner.propose`, `tuner.judge`. `pty` runs a call on an ephemeral interactive PTY; it cannot take untrusted routes yet. The session routes (`compact`, `memory.save.*`, `rotation.summary`) are reserved and do not go through this module yet. A mapping the engine cannot honour (an untrusted route on `pty`, an unknown route or engine) fails the settings load with an explicit error.
+
 ---
 
 ### MCP multiplexer — shared MCP-server processes across PTYs

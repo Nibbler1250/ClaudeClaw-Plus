@@ -82,7 +82,8 @@ const StorageConfigSchema = z.object({
 });
 
 const LLMConfigSchema = z.object({
-  backend: z.enum(["anthropic_api", "claude_cli"]).default("anthropic_api"),
+  // `claude_cli` is the old name of `oneshot` (#548): same backend.
+  backend: z.enum(["anthropic_api", "oneshot", "claude_cli"]).default("anthropic_api"),
   api_key: z.string().optional(),
 });
 

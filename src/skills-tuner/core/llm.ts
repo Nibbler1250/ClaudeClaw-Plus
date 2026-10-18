@@ -1,8 +1,5 @@
-import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { cleanSpawnEnv } from "../../runner/spawn-env.js";
+import type { spawn } from "node:child_process";
+import { runOneShot } from "../../oneshot/engine.js";
 import type { TunerConfig } from "./config.js";
 
 export type Role = "intent_classifier" | "detector" | "proposer" | "proposer_high_stakes" | "judge";
@@ -25,37 +22,33 @@ function buildPrompt(system: string, messages: Message[]): string {
   return lines.join("\n");
 }
 
-/**
- * Arguments for a one-shot `claude -p` call. The prompt carries untrusted text
- * (conversation turns, skill bodies), so the call runs with no built-in tools,
- * no MCP servers, no settings file (`--setting-sources ""`: no hooks, no user
- * plugins), no saved session and no slash commands — the same set as the
- * Discord classifier's `CLASSIFIER_ARGS`. With no configured model, or the
- * env-routed "glm" alias, --model is left out and the CLI's default applies
- * (same rule as the runner's spawn sites).
- */
-export function cliArgs(prompt: string, model: string | undefined): string[] {
-  const args = ["-p", prompt];
-  const m = model?.trim();
-  if (m && m.toLowerCase() !== "glm") args.push("--model", m);
-  args.push(
-    "--tools",
-    "",
-    "--strict-mcp-config",
-    "--setting-sources",
-    "",
-    "--no-session-persistence",
-    "--disable-slash-commands",
-  );
-  return args;
-}
+/** The one-shot route of each tuner role (#548). */
+const ROUTE_OF_ROLE: Record<Role, string> = {
+  intent_classifier: "tuner.classify",
+  detector: "tuner.detect",
+  proposer: "tuner.propose",
+  proposer_high_stakes: "tuner.propose",
+  judge: "tuner.judge",
+};
 
-export class ClaudeCliBackend implements LLMClient {
+/** Bounds a tuner call; the CLI backend used to wait for ever. */
+const TUNER_CALL_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * The tuner's calls through `runOneShot` (#548). The prompt carries untrusted
+ * text (conversation turns, skill bodies), so every call runs `untrusted`: no
+ * built-in tools, no MCP servers, no settings file, no saved session, no slash
+ * commands, from an empty temp cwd. With no configured model, or an env-routed
+ * alias, --model is left out and the CLI's default applies. The engine is the
+ * route's (`print` unless `oneShot.routes` says otherwise); the child env is
+ * `cleanSpawnEnv()`.
+ */
+export class OneShotBackend implements LLMClient {
   private readonly models: TunerConfig["models"];
 
   constructor(
     config: TunerConfig,
-    private readonly spawnFn: typeof spawn = spawn,
+    private readonly spawnFn?: typeof spawn,
   ) {
     this.models = config.models;
   }
@@ -73,48 +66,33 @@ export class ClaudeCliBackend implements LLMClient {
     )[role];
   }
 
-  // The claude CLI has no output-length flag, so maxTokens is accepted for
-  // interface compatibility but not forwarded.
+  // The claude engines have no output-length flag, so maxTokens is accepted
+  // for interface compatibility but not forwarded.
   async call(
     role: Role,
     system: string,
     messages: Message[],
     _maxTokens?: number,
   ): Promise<string> {
-    const prompt = buildPrompt(system, messages);
-    // Empty cwd, so no project dir is ever in reach of the call. Removed once
-    // the child is done, whatever the outcome; a failed removal (Windows file
-    // lock) must not replace the result.
-    const cwd = mkdtempSync(join(tmpdir(), "claudeclaw-tuner-"));
-    const cleanup = () => {
-      try {
-        rmSync(cwd, { recursive: true, force: true });
-      } catch {
-        // best effort
-      }
-    };
-    return new Promise<string>((resolve, reject) => {
-      const child = this.spawnFn("claude", cliArgs(prompt, this.modelFor(role)), {
-        stdio: ["ignore", "pipe", "pipe"],
-        env: cleanSpawnEnv(),
-        cwd,
-      });
-      let out = "";
-      let err = "";
-      child.stdout.on("data", (d: Buffer) => {
-        out += d.toString();
-      });
-      child.stderr.on("data", (d: Buffer) => {
-        err += d.toString();
-      });
-      child.on("close", (code) => {
-        if (code !== 0) reject(new Error("claude CLI exited " + code + ": " + err.slice(0, 200)));
-        else resolve(out.trim());
-      });
-      child.on("error", reject);
-    }).finally(cleanup);
+    const res = await runOneShot(
+      {
+        route: ROUTE_OF_ROLE[role],
+        prompt: buildPrompt(system, messages),
+        model: this.modelFor(role),
+        isolation: "untrusted",
+        timeoutMs: TUNER_CALL_TIMEOUT_MS,
+      },
+      this.spawnFn ? { spawn: this.spawnFn } : {},
+    );
+    if (res.exitCode !== 0) {
+      throw new Error("claude CLI exited " + res.exitCode + ": " + res.stderr.slice(0, 200));
+    }
+    return res.text;
   }
 }
+
+/** `claude_cli`: the `oneshot` backend under its old name. */
+export class ClaudeCliBackend extends OneShotBackend {}
 
 export class AnthropicApiBackend implements LLMClient {
   private readonly models: TunerConfig["models"];
@@ -165,5 +143,5 @@ export class AnthropicApiBackend implements LLMClient {
 
 export function makeLLMClient(config: TunerConfig): LLMClient {
   if (config.llm.backend === "anthropic_api") return new AnthropicApiBackend(config);
-  return new ClaudeCliBackend(config);
+  return new OneShotBackend(config);
 }

@@ -51,6 +51,7 @@ import {
 // loading bun-pty just to get the helper.
 import { sanitizePtyPromptText } from "./pty-prompt-sanitizer";
 import { appendFileSync } from "node:fs";
+import { UNTRUSTED_CLAUDE_ARGS } from "../oneshot/isolation";
 
 /**
  * Raw PTY trace, off unless `CLAUDECLAW_PTY_DUMP=<file>` is set. Every chunk
@@ -117,6 +118,10 @@ export interface PtyProcessOptions {
    * `--mcp-config <path>` to claude's argv.
    */
   mcpConfigPath?: string;
+  /** One-shot on untrusted text (#548): the argv is the session id, the model
+   *  and `UNTRUSTED_CLAUDE_ARGS`, nothing else — no security, permission,
+   *  system-prompt, resume or MCP args. */
+  untrusted?: boolean;
   /** Initial PTY columns. Default 100. */
   cols?: number;
   /** Initial PTY rows. Default 30. */
@@ -316,6 +321,15 @@ function redactSecretsInTail(text: string): string {
 function buildClaudeArgs(opts: PtyProcessOptions): string[] {
   if (opts._argsOverride) return opts._argsOverride;
   if (opts._skipClaudeArgs) return [];
+
+  if (opts.untrusted) {
+    const args: string[] = [];
+    if (opts.newSessionId) args.push("--session-id", opts.newSessionId);
+    const m = (opts.modelOverride ?? "").trim();
+    if (m.length > 0 && m.toLowerCase() !== "glm") args.push("--model", m);
+    args.push(...UNTRUSTED_CLAUDE_ARGS);
+    return args;
+  }
 
   const args: string[] = [];
 

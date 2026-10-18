@@ -13,8 +13,8 @@ import { describeAllowlist, isUserAllowed } from "../allowlist";
 import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession } from "../sessionManager";
 import { readFile } from "node:fs/promises";
-import { existsSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
 import { cacheSkillOverlayFromContent } from "../policy/skill-overlays";
@@ -31,6 +31,7 @@ import type { EventRecord } from "../event-log";
 import { type GatewayRunResult, gatewayCommandSessionKey } from "../event-processor";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
 import { encodeCwdForProjectsDir } from "../bus/jsonl-line-types";
+import { runOneShot, type OneShotRequest } from "../oneshot";
 
 // --- Discord API constants ---
 
@@ -577,29 +578,8 @@ interface ThreadIntent {
   names: string[];
 }
 
-/**
- * The classifier reads a message from any allowed guild member. It only has
- * to answer with JSON, so it runs with no tools at all (`--tools ""`), no MCP
- * server (`--strict-mcp-config` with no `--mcp-config`) and no saved session:
- * an instruction hidden in the message has nothing to act with. It also loads
- * no settings file (`--setting-sources ""`: no hooks, no user plugins) and no
- * skills, and runs from an empty temp dir so no CLAUDE.md is in its context —
- * otherwise a message can ask for that context back as "thread names".
- */
-export const CLASSIFIER_ARGS = [
-  "--model",
-  "claude-sonnet-4-20250514",
-  "--print",
-  "--output-format",
-  "text",
-  "--tools",
-  "",
-  "--strict-mcp-config",
-  "--no-session-persistence",
-  "--setting-sources",
-  "",
-  "--disable-slash-commands",
-];
+/** Model of the thread-intent classifier. */
+export const CLASSIFIER_MODEL = "claude-sonnet-4-20250514";
 
 /** Exact keys the classifier's `claude` keeps from the daemon env. */
 const CLASSIFIER_ENV_KEYS = new Set([
@@ -644,6 +624,23 @@ export function classifierSpawnEnv(
   return out;
 }
 
+/**
+ * The classifier reads a message from any allowed guild member and only has to
+ * answer with JSON, so it runs `untrusted` (#548): no tools, no MCP server, no
+ * settings, hooks, skills or saved session, from an empty temp dir with no
+ * CLAUDE.md in reach — and with an allowlisted env.
+ */
+export function classifierRequest(input: string): OneShotRequest {
+  return {
+    route: "discord.classifier",
+    prompt: input,
+    model: CLASSIFIER_MODEL,
+    isolation: "untrusted",
+    timeoutMs: 15000,
+    env: classifierSpawnEnv(),
+  };
+}
+
 async function classifyThreadIntent(text: string): Promise<ThreadIntent | null> {
   const systemPrompt = `You classify user messages into thread management intents.
 
@@ -661,23 +658,16 @@ Rules:
 - Return ONLY valid JSON or the word null. No explanation.`;
 
   try {
-    const { execFileSync } = await import("node:child_process");
-    const input = `${systemPrompt}\n\n---\nUser message: ${text}`;
-    // Empty cwd: no project CLAUDE.md for the classifier to read back.
-    const cwd = mkdtempSync(join(tmpdir(), "claudeclaw-classify-"));
-    let result: string;
-    try {
-      result = execFileSync("claude", CLASSIFIER_ARGS, {
-        input,
-        encoding: "utf-8",
-        timeout: 15000,
-        env: classifierSpawnEnv(),
-        cwd,
-      }).trim();
-    } finally {
-      rmSync(cwd, { recursive: true, force: true });
+    const res = await runOneShot(
+      classifierRequest(`${systemPrompt}\n\n---\nUser message: ${text}`),
+    );
+    if (res.exitCode !== 0) {
+      console.error(
+        `[Discord] Intent classifier exited ${res.exitCode}: ${res.stderr.slice(0, 200)}`,
+      );
+      return null;
     }
-
+    const result = res.text;
     if (!result || result === "null") return null;
     // Extract JSON from response (in case there's extra text)
     const jsonMatch = result.match(/\{[\s\S]*\}/);

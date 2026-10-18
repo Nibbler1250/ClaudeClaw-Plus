@@ -15,6 +15,11 @@ import {
 } from "./bus/agent-jobs";
 import { parsePlugins, type PluginEntry } from "./plugins";
 import { parseMemorySearchSettings, type MemorySearchSettings } from "./memory";
+import {
+  DEFAULT_ONESHOT_SETTINGS,
+  parseOneShotSettings,
+  type OneShotSettings,
+} from "./oneshot/settings";
 import type { AuditPolicy } from "./observability/tool-call";
 
 /** Re-exported under the name used in the Settings interface. */
@@ -218,6 +223,7 @@ const DEFAULT_SETTINGS: Settings = {
   // stopping (0 = stop at once, the pre-#315 behaviour). Keep it below your
   // service manager's stop timeout (systemd TimeoutStopSec defaults to 90s).
   shutdown: { drainTurnsMs: 30_000 },
+  oneShot: DEFAULT_ONESHOT_SETTINGS,
   pty: {
     // Opt-in by default. Operators flip this to true ONLY after the MCP
     // multiplexer follow-up lands and they've validated OAuth refresh on a
@@ -817,6 +823,8 @@ export interface Settings {
    */
   agents: BusAgentSettings[];
   pty: PtyConfig;
+  /** One-shot `claude` calls (#548): engine per route. Absent: all on `print`. */
+  oneShot: OneShotSettings;
   mcp: McpConfig;
   watchdog: WatchdogSettings;
   stallWatchdog: StallWatchdogConfig;
@@ -1284,6 +1292,8 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
     plugins: parsePlugins(raw.plugins),
     memorySearch: parseMemorySearchSettings(raw.memorySearch),
     llmRouter: parseLlmRouterConfig(raw.llmRouter),
+    // Throws on a mapping it cannot honour, so it fails at load, not on a call.
+    oneShot: parseOneShotSettings(raw.oneShot),
     session: {
       autoRotate: raw.session?.autoRotate ?? false,
       maxMessages: Number.isFinite(raw.session?.maxMessages) ? Number(raw.session.maxMessages) : 50,

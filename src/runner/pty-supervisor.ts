@@ -256,6 +256,12 @@ export interface PtyRunScope {
    *  (or, undefined, no flag at all) — never synthesized, rotated or released
    *  by the supervisor. */
   mcpConfig?: { path: string | undefined };
+  /** One-shot on untrusted text (#548): `ephemeral` only. The argv carries the
+   *  isolation flags and no security, permission, system-prompt or MCP args. */
+  untrusted?: boolean;
+  /** One-shot continuing a saved session (#548): `ephemeral` only, never with
+   *  `untrusted`. Nothing is written back to any session store. */
+  resumeSessionId?: string;
 }
 
 export interface SupervisorSnapshot {
@@ -850,6 +856,54 @@ export async function runOnPty(
   }
 }
 
+/**
+ * One turn on an ephemeral PTY for the `pty` one-shot engine (#548): fresh
+ * `--session-id` or `--resume`, prompt, end of turn by the usual detection,
+ * PTY retired. Never enters the LRU or the `maxConcurrent` cap (`runOnPty`
+ * stays for keyed, persistent sessions). `timeoutMs` bounds the whole call,
+ * not each stage.
+ */
+export async function runOnceOnPty(req: {
+  prompt: string;
+  timeoutMs: number;
+  modelOverride?: string;
+  signal?: AbortSignal;
+  cwd?: string;
+  untrusted: boolean;
+  resumeSessionId?: string;
+}): Promise<RunOnPtyResult> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, req.timeoutMs);
+  const onAbort = (): void => controller.abort();
+  if (req.signal?.aborted) controller.abort();
+  else req.signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    const exec = await runOnPty(`oneshot:${crypto.randomUUID()}`, req.prompt, {
+      timeoutMs: req.timeoutMs,
+      modelOverride: req.modelOverride,
+      signal: controller.signal,
+      ephemeral: true,
+      cwd: req.cwd,
+      untrusted: req.untrusted,
+      ...(req.untrusted ? { mcpConfig: { path: undefined } } : {}),
+      ...(req.resumeSessionId && !req.untrusted ? { resumeSessionId: req.resumeSessionId } : {}),
+    });
+    // A turn that produced its result stands, even if the timer or a cancel
+    // fired while the PTY was being torn down. Otherwise 124 / 130, as `print`.
+    if (exec.exitCode !== 0 && controller.signal.aborted) {
+      return { ...exec, exitCode: timedOut ? 124 : 130 };
+    }
+    return exec;
+  } finally {
+    clearTimeout(timer);
+    req.signal?.removeEventListener("abort", onAbort);
+  }
+}
+
 async function runOnAdmittedEntry(
   entry: PtyEntry,
   sessionKey: string,
@@ -961,6 +1015,8 @@ function getOrCreateEntry(
       survivesKill: opts.survivesKill,
       cwd: opts.cwd,
       mcpConfig: opts.mcpConfig,
+      untrusted: opts.ephemeral ? opts.untrusted : undefined,
+      resumeSessionId: opts.ephemeral && !opts.untrusted ? opts.resumeSessionId : undefined,
     },
   };
   state.ptys.set(sessionKey, entry);
@@ -1136,7 +1192,7 @@ async function buildSpawnOptions(
   // resumes; a caller-supplied store (#546) replaces the id-based lookup.
   let sessionId = "";
   if (entry.scope.ephemeral) {
-    sessionId = "";
+    sessionId = entry.scope.resumeSessionId ?? "";
   } else if (entry.scope.sessionStore) {
     sessionId = (await entry.scope.sessionStore.load()) ?? "";
   } else if (entry.threadId) {
@@ -1203,7 +1259,10 @@ async function buildSpawnOptions(
   const childEnv = runnerHelpers.buildChildEnv(cleanEnv, modelOverride ?? "", api ?? "");
 
   let resolvedSecurityArgs = securityArgs;
-  if (!resolvedSecurityArgs) {
+  if (entry.scope.untrusted) {
+    // #548: buildClaudeArgs emits the isolation flags instead.
+    resolvedSecurityArgs = undefined;
+  } else if (!resolvedSecurityArgs) {
     try {
       resolvedSecurityArgs = runnerHelpers.buildSecurityArgs(security);
     } catch {
@@ -1231,9 +1290,12 @@ async function buildSpawnOptions(
       "not synthesizing MCP config for a retired entry",
     );
   }
-  const mcpConfigPath = entry.scope.mcpConfig
-    ? entry.scope.mcpConfig.path
-    : synthesizeMcpConfigIfActive(entry.sessionKey, cwd, settings);
+  // #548: an untrusted one-shot never gets an MCP config.
+  const mcpConfigPath = entry.scope.untrusted
+    ? undefined
+    : entry.scope.mcpConfig
+      ? entry.scope.mcpConfig.path
+      : synthesizeMcpConfigIfActive(entry.sessionKey, cwd, settings);
 
   const opts: PtyProcessOptions = {
     sessionId,
@@ -1251,6 +1313,7 @@ async function buildSpawnOptions(
     quietWindowMs: settings.pty.quietWindowMs,
     sentinelMaxWaitMs: settings.pty.sentinelMaxWaitMs,
     ...(mcpConfigPath ? { mcpConfigPath } : {}),
+    ...(entry.scope.untrusted ? { untrusted: true } : {}),
   };
   // Recorded on the entry in the same synchronous step as the synthesis, so a
   // retirement that starts before `spawnEntry` resumes still sees the config
