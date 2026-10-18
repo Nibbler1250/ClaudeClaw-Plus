@@ -219,10 +219,9 @@ const DEFAULT_SETTINGS: Settings = {
   // service manager's stop timeout (systemd TimeoutStopSec defaults to 90s).
   shutdown: { drainTurnsMs: 30_000 },
   pty: {
-    // Opt-in by default. Operators flip this to true ONLY after the MCP
-    // multiplexer follow-up lands and they've validated OAuth refresh on a
-    // test deployment. See README "PTY runner mode" + PR #62 rollout notes.
-    enabled: false,
+    // Official engine for agent turns and cron jobs (#550). The MCP
+    // multiplexer and OAuth validation have shipped; false keeps print.
+    enabled: true,
     idleReapMinutes: 30,
     maxRetries: 5,
     respawnRetries: 3,
@@ -1044,6 +1043,9 @@ function parseAgenticConfig(raw: any): AgenticConfig {
 }
 
 function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Settings {
+  if (raw.pty?.enabled !== undefined && typeof raw.pty.enabled !== "boolean") {
+    console.warn("pty.enabled must be a boolean; using default true");
+  }
   const rawLevel = raw.security?.level;
   const level: SecurityLevel =
     typeof rawLevel === "string" && VALID_LEVELS.has(rawLevel as SecurityLevel)
@@ -1224,7 +1226,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
           : 30_000,
     },
     pty: {
-      enabled: raw.pty?.enabled === true, // default false — opt-in (see DEFAULT_SETTINGS.pty)
+      enabled: raw.pty?.enabled !== false, // only explicit false selects print (#550)
       idleReapMinutes:
         Number.isFinite(raw.pty?.idleReapMinutes) && Number(raw.pty.idleReapMinutes) > 0
           ? Number(raw.pty.idleReapMinutes)

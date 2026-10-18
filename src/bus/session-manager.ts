@@ -4,9 +4,9 @@
  * Spec: `docs/ClaudeClaw_Plus_Bus_Architecture_Spec.md` §5.3
  *
  * Responsibility: spawn + supervise one `claude` process per Plus agent.
- * Picks a `SupervisionMode` based on origin (channel-driven origins need the
- * PTY-backed REPL; non-channel origins use the lighter `process-stream-json`
- * runner). Provides a stable per-agent handle (`AgentProcess`) with
+ * Uses the PTY-backed REPL for every origin unless the agent explicitly
+ * selects another `SupervisionMode`, including `process-stream-json`.
+ * Provides a stable per-agent handle (`AgentProcess`) with
  * lifecycle methods and slash-command relay.
  *
  * Empirical foundations:

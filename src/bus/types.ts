@@ -31,9 +31,8 @@ export type BusOrigin =
   | "rest";
 
 /**
- * Channel-driven origins need the REPL (Channels can't reach `-p` mode
- * per Probe 0.6). Non-channel origins can use the lighter
- * `process-stream-json` runner.
+ * Channel origins require the REPL for notifications. All origins now use
+ * PTY by default (#550); this set still controls channel-specific delivery.
  */
 export const CHANNEL_DRIVEN_ORIGINS: ReadonlySet<BusOrigin> = new Set([
   "discord",
@@ -46,13 +45,13 @@ export const CHANNEL_DRIVEN_ORIGINS: ReadonlySet<BusOrigin> = new Set([
  * Supervision mode per §5.3.
  */
 export type SupervisionMode =
-  | "pty-stdin" // default for channel-driven; bun-pty for TTY, stdout ignored
-  | "process-stream-json" // default for non-channel; `claude -p --input-format=stream-json`
+  | "pty-stdin" // default for every origin; bun-pty for TTY, stdout ignored
+  | "process-stream-json" // explicit override; `claude -p --input-format=stream-json`
   | "tmux" // opt-in: detached tmux for pane-attach inspection
   | "process"; // Windows fallback only — slash commands won't work
 
-export function defaultSupervisionFor(origin: BusOrigin): SupervisionMode {
-  return CHANNEL_DRIVEN_ORIGINS.has(origin) ? "pty-stdin" : "process-stream-json";
+export function defaultSupervisionFor(_origin: BusOrigin): SupervisionMode {
+  return "pty-stdin";
 }
 
 /**

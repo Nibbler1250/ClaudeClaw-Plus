@@ -6,6 +6,7 @@ import { homedir } from "os";
 import { extractErrorDetail } from "../messaging";
 import { join } from "path";
 import { fileURLToPath } from "url";
+import { executionEngineSummary } from "../execution-engines.js";
 import {
   run,
   runUserMessage,
@@ -808,6 +809,7 @@ export async function start(args: string[] = []) {
   process.on("SIGINT", shutdown);
 
   console.log("ClaudeClaw+ daemon started");
+  console.log(`  ${executionEngineSummary(settings)}`);
   console.log(`  PID: ${process.pid}`);
   // Probe and log the Claude CLI version so operators see which `claude`
   // the daemon is invoking. Mismatch against the parser's known-good list

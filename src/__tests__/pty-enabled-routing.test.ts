@@ -193,11 +193,11 @@ afterEach(() => {
 });
 
 describe("#546 resolveAgentTurnRoute", () => {
-  it("follows pty.enabled; bootstrap stays legacy", () => {
+  it("follows pty.enabled for bootstrap too", () => {
     stubSettings(true);
     expect(runnerMod.resolveAgentTurnRoute("chat")).toBe("pty");
     expect(runnerMod.resolveAgentTurnRoute()).toBe("pty");
-    expect(runnerMod.resolveAgentTurnRoute("bootstrap")).toBe("legacy");
+    expect(runnerMod.resolveAgentTurnRoute("bootstrap")).toBe("pty");
     (configMod.getSettings as unknown as { mockRestore: () => void }).mockRestore();
     stubSettings(false);
     expect(runnerMod.resolveAgentTurnRoute("chat")).toBe("legacy");

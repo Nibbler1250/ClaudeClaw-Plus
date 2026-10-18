@@ -1,23 +1,18 @@
 /**
  * Backward-compatibility regression gate (SPEC §5.4).
  *
- * Verifies the two operator-locked routing rules in execClaude:
+ * Verifies configured-engine routing in execClaude:
  *
  *   1. settings.pty.enabled === false  → supervisor is bypassed entirely.
- *   2. name === "bootstrap"            → supervisor is bypassed even when
- *                                        pty.enabled === true (SPEC §7.1).
+ *   2. bootstrap follows the same setting as other turns (#550).
  *
  * We can't easily invoke execClaude end-to-end without spawning a real claude
  * subprocess (Phase C territory), so this file verifies the routing logic by
  * driving the supervisor directly under both flag positions and asserting
  * which path executes.
  *
- * The "no regressions" guarantee for existing tests is provided structurally:
- *   - No existing test in src/__tests__/ invokes execClaude.
- *   - All existing tests continue to pass under the default (pty.enabled=true)
- *     config — verified by `bun test` on this branch.
- *   - With pty.enabled=false, runner.ts skips the supervisor entirely so its
- *     behaviour is byte-identical to pre-migration code.
+ * pty-default-runner.test.ts separately drives the runner in isolated
+ * subprocesses, including bootstrap and recovery under both engine settings.
  */
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { join } from "path";
@@ -88,12 +83,12 @@ afterEach(async () => {
 });
 
 describe("pty.enabled flag — config-level", () => {
-  it("default is false (opt-in) — supervisor only reachable when explicitly enabled", async () => {
+  it("default is true — print requires an explicit opt-out", async () => {
     await writeRawSettings({});
     await initConfig();
     await loadSettings();
     await reloadSettings();
-    expect(getSettings().pty.enabled).toBe(false);
+    expect(getSettings().pty.enabled).toBe(true);
   });
 
   it("enabled=true permits supervisor calls", async () => {
@@ -140,14 +135,14 @@ describe("pty.enabled flag — config-level", () => {
 describe("execClaude routing — flag and bootstrap (source-pinned)", () => {
   // We can't import execClaude (it's not exported), so we verify the
   // source-level routing rule by reading the runner.ts file and asserting
-  // the bootstrap bypass + flag check exist exactly as the spec requires.
+  // the shared flag check exists, including bootstrap (#550).
   // #546: the decision lives in `resolveAgentTurnRoute`, shared by every
   // agent-turn call site (behaviour pinned in pty-enabled-routing.test.ts).
-  it("resolveAgentTurnRoute keeps bootstrap on legacy and otherwise follows pty.enabled", async () => {
+  it("resolveAgentTurnRoute follows pty.enabled without a bootstrap bypass", async () => {
     const src = await Bun.file(join(process.cwd(), "src", "runner.ts")).text();
     const fn = src.match(/export function resolveAgentTurnRoute\([\s\S]*?\n\}\n/);
     expect(fn).not.toBeNull();
-    expect(fn![0]).toMatch(/name\s*===\s*["']bootstrap["']\)\s*return\s*["']legacy["']/);
+    expect(fn![0]).not.toContain('name === "bootstrap"');
     expect(fn![0]).toMatch(/getSettings\(\)\.pty\.enabled\s*\?\s*["']pty["']\s*:\s*["']legacy["']/);
   });
 

@@ -1,7 +1,7 @@
 /**
  * The 60 s cron loop that runs jobs (moved out of `commands/start.ts`).
  *
- * Each due job runs as a one-shot `claude -p` through `run()`, with the job's
+ * Each due job runs through `run()` on the configured engine (PTY by default), with the job's
  * own model, timeout, retry/retryDelay and notify, and its result forwarded
  * to Telegram/Discord. Under `runtime: "bus"` it is still the only job runner:
  * `busSchedulerJobs()` keeps the jobs off the bus scheduler, so a job never runs
@@ -81,7 +81,7 @@ export function createJobLoop(deps: JobLoopDeps): JobLoop {
   /**
    * `job.agent` names a legacy agent (`agents/<name>/`): its persona and model
    * marker. A bus agent id (`settings.agents`) is not one, and this loop does
-   * not send jobs to bus agents, so such a job runs as a plain `claude -p` —
+   * not send jobs to bus agents, so such a job runs on the configured runner —
    * say so instead of dropping the routing silently.
    */
   async function warnIfBusOnlyAgent(job: Job, model: string | undefined): Promise<void> {
@@ -93,7 +93,7 @@ export function createJobLoop(deps: JobLoopDeps): JobLoop {
     warnedBusAgent.add(key);
     const modelText = model ? `model ${JSON.stringify(model)}` : "the default model";
     warn(
-      `[${ts()}] Job ${JSON.stringify(job.name)}: agent ${JSON.stringify(agent)} is a bus agent (settings.agents) with no legacy persona in agents/${agent}/. Jobs do not run in bus agent sessions; this one runs as a plain claude -p on ${modelText}. Set model: in the job's frontmatter to choose its model.`,
+      `[${ts()}] Job ${JSON.stringify(job.name)}: agent ${JSON.stringify(agent)} is a bus agent (settings.agents) with no legacy persona in agents/${agent}/. Jobs do not run in bus agent sessions; this one runs on the configured runner on ${modelText}. Set model: in the job's frontmatter to choose its model.`,
     );
   }
 

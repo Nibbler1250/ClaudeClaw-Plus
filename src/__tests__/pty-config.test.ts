@@ -6,7 +6,7 @@
  * already exists in this worktree from a previous test run / init step,
  * so we mutate it for each scenario and call reloadSettings().
  */
-import { describe, it, expect, beforeAll, afterAll } from "bun:test";
+import { describe, it, expect, beforeAll, afterAll, spyOn } from "bun:test";
 import { join } from "path";
 import { mkdir, copyFile, unlink } from "fs/promises";
 import { existsSync } from "fs";
@@ -49,7 +49,7 @@ describe("parseSettings — pty defaults", () => {
     await writeRawSettings({});
     await reloadSettings();
     const { pty } = getSettings();
-    expect(pty.enabled).toBe(false); // opt-in default — operators must explicitly enable
+    expect(pty.enabled).toBe(true);
     expect(pty.idleReapMinutes).toBe(30);
     expect(pty.maxRetries).toBe(5);
     expect(pty.backoffMs).toEqual([1000, 2000, 4000, 8000, 16000]);
@@ -89,11 +89,27 @@ describe("parseSettings — pty defaults", () => {
     expect(getSettings().pty.enabled).toBe(false);
   });
 
-  it("treats a missing pty.enabled (object present, key absent) as false", async () => {
+  it("treats a missing pty.enabled (object present, key absent) as true", async () => {
     await writeRawSettings({ pty: { idleReapMinutes: 7 } });
     await reloadSettings();
-    expect(getSettings().pty.enabled).toBe(false);
+    expect(getSettings().pty.enabled).toBe(true);
   });
+
+  for (const value of ["false", 0, null, {}, []]) {
+    it(`warns and uses the default for invalid enabled=${JSON.stringify(value)}`, async () => {
+      const warning = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        await writeRawSettings({ pty: { enabled: value } });
+        await reloadSettings();
+        expect(getSettings().pty.enabled).toBe(true);
+        expect(
+          warning.mock.calls.some(([line]) => /pty.enabled.*boolean.*true/.test(String(line))),
+        ).toBe(true);
+      } finally {
+        warning.mockRestore();
+      }
+    });
+  }
 
   it("honours user-supplied numeric values", async () => {
     await writeRawSettings({

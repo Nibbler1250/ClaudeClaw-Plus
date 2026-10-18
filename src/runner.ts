@@ -730,15 +730,12 @@ export interface RunOptions {
  * Which engine runs an agent turn (#546). The single decision the agent-turn
  * call sites go through — primary turn, rate-limit fallback, dashboard chat,
  * fork, agent job — so a new call site cannot quietly skip `pty.enabled`.
- * The recovery retries (stale session, corrupted primary session, post-compact)
- * stay on `claude -p` by SPEC §5.3 and do not consult it.
+ * Bootstrap and recovery retries also follow this setting (#550).
  *
- *   - `name === "bootstrap"` → legacy `claude -p` (SPEC §7.1).
  *   - `settings.pty.enabled === false` → legacy `claude -p` (SPEC §5.2).
  *   - otherwise → the PTY supervisor.
  */
 export function resolveAgentTurnRoute(name?: string): "legacy" | "pty" {
-  if (name === "bootstrap") return "legacy";
   return getSettings().pty.enabled ? "pty" : "legacy";
 }
 
@@ -921,7 +918,7 @@ export function buildAgentJobArgs(input: {
 
 /**
  * Run a named agent as a one-shot headless job (for the bus AgentJobRunner). Loads
- * the agent's persona (IDENTITY/SOUL/CLAUDE.md), runs `claude -p <prompt>` in the
+ * the agent's persona (IDENTITY/SOUL/CLAUDE.md), runs on the configured engine in the
  * agent's dir with plain-text output, and returns the final text. Honours the
  * AbortSignal (cancel → kill) and the timeout via `runClaudeOnce`. This is the
  * supported replacement for the hand-rolled `/tmp` fire-scripts that caused #295.
@@ -2054,19 +2051,9 @@ async function execClaude(
     } catch {}
 
     // ──────────────────────────────────────────────────────────────────────────
-    // PTY routing decision (SPEC §5.2 + §7.1).
-    //
-    // Order of precedence:
-    //   1. `name === "bootstrap"` → ALWAYS legacy `runClaudeStream` (§7.1).
-    //      The bootstrap call seeds a fresh global session and is low-volume;
-    //      keeping it on the legacy path simplifies the supervisor.
-    //   2. `settings.pty.enabled === false` → legacy `runClaudeStream` (§5.2).
-    //   3. Otherwise → `runOnPty(sessionKey, …)` against the supervisor.
-    //
-    // Downstream logic (rate-limit fallback, corruption recovery, stale-session
-    // recovery) is unchanged — it consumes `exec` with the same shape regardless.
-    // Per §5.3 the stale-session retry path explicitly uses runClaudeStream
-    // directly, so we don't compound supervisor recovery with downstream recovery.
+    // #550: every agent turn, including bootstrap and recovery, follows the
+    // configured engine. Recovery retires the old PTY before retrying so a
+    // reset store or compacted transcript is actually loaded by a fresh CLI.
     const useLegacyPath = resolveAgentTurnRoute(name) === "legacy";
     const ptySessionKey = threadId
       ? `thread:${threadId}`
@@ -2122,6 +2109,32 @@ async function execClaude(
         onToolEvent,
       });
     }
+    const execRecovery = async (legacyArgs: string[], config: ModelConfig, fallback = false) => {
+      if (useLegacyPath) {
+        return runClaudeStream(legacyArgs, config.model, config.api, baseEnv, timeoutMs, spawnCwd);
+      }
+      const key = fallback ? `fallback:${ptySessionKey}` : ptySessionKey;
+      await retirePtySession(key);
+      return runOnPty(key, prompt, {
+        timeoutMs,
+        threadId,
+        agentName,
+        modelOverride: config.model,
+        api: config.api,
+        securityArgs,
+        appendSystemPrompt,
+        onChunk,
+        onToolEvent,
+        ...(fallback
+          ? {
+              sessionStore: {
+                load: async () => (await getFallbackSession(agentName, threadId))?.sessionId,
+                save: (id: string) => createFallbackSession(id, agentName, threadId),
+              },
+            }
+          : {}),
+      });
+    };
     const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
     let usedFallback = false;
     // The fallback session the response came from, when the stream carried no
@@ -2259,14 +2272,7 @@ async function execClaude(
       const freshArgs = args.filter((a) => a !== "--resume" && a !== existing?.sessionId);
       const fmtIdx = freshArgs.indexOf("--output-format");
       if (fmtIdx !== -1 && fmtIdx + 1 < freshArgs.length) freshArgs[fmtIdx + 1] = "stream-json";
-      exec = await runClaudeStream(
-        freshArgs,
-        primaryConfig.model,
-        primaryConfig.api,
-        baseEnv,
-        timeoutMs,
-        spawnCwd,
-      );
+      exec = await execRecovery(freshArgs, primaryConfig);
       rawStdout = exec.rawStdout;
       stderr = exec.stderr;
       exitCode = exec.exitCode;
@@ -2315,14 +2321,7 @@ async function execClaude(
 
       const retryArgs = withOutputFormat(stripResume(args), "stream-json");
       const retryConfig = usedFallback ? fallbackConfig : primaryConfig;
-      exec = await runClaudeStream(
-        retryArgs,
-        retryConfig.model,
-        retryConfig.api,
-        baseEnv,
-        timeoutMs,
-        spawnCwd,
-      );
+      exec = await execRecovery(retryArgs, retryConfig, usedFallback);
 
       rawStdout = exec.rawStdout;
       stderr = exec.stderr;
@@ -2584,14 +2583,7 @@ async function execClaude(
 
       if (compactOk) {
         console.log(`[${new Date().toLocaleTimeString()}] Retrying ${name} after compact...`);
-        const retryExec = await runClaudeStream(
-          args,
-          primaryConfig.model,
-          primaryConfig.api,
-          baseEnv,
-          timeoutMs,
-          spawnCwd,
-        );
+        const retryExec = await execRecovery(args, primaryConfig);
         const retryResult: RunResult = {
           stdout: retryExec.rawStdout,
           stderr: retryExec.stderr,
