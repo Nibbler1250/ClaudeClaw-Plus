@@ -383,11 +383,12 @@ export interface RunResult {
    */
   sessionId?: string;
   /**
-   * #546: set when the response came from the rate-limit fallback. The
-   * fallback turn runs without onChunk, so a caller that streamed the
-   * primary's output must still deliver this stdout.
+   * #546: set when the response came from the rate-limit fallback. Primary
+   * text may only be a rate-limit notice; fallback delivery is tracked separately.
    */
   usedFallback?: true;
+  /** Whether the final fallback attempt delivered nonempty text via onChunk. */
+  fallbackStreamedText?: boolean;
 }
 
 export interface AgentStreamEvent {
@@ -2112,12 +2113,20 @@ async function execClaude(
         onToolEvent,
       });
     }
+    let fallbackStreamedText = false;
+    const onFallbackChunk = onChunk
+      ? (text: string) => {
+          if (text.length > 0) fallbackStreamedText = true;
+          onChunk(text);
+        }
+      : undefined;
     const execRecovery = async (legacyArgs: string[], config: ModelConfig, fallback = false) => {
       if (useLegacyPath) {
         return runClaudeStream(legacyArgs, config.model, config.api, baseEnv, timeoutMs, spawnCwd);
       }
       const key = fallback ? `fallback:${ptySessionKey}` : ptySessionKey;
       await retirePtySession(key);
+      if (fallback) fallbackStreamedText = false;
       return runOnPty(key, prompt, {
         timeoutMs,
         threadId,
@@ -2126,7 +2135,7 @@ async function execClaude(
         api: config.api,
         securityArgs,
         appendSystemPrompt,
-        onChunk,
+        onChunk: fallback ? onFallbackChunk : onChunk,
         onToolEvent,
         ...(fallback
           ? {
@@ -2178,8 +2187,9 @@ async function execClaude(
         load: async () => (await getFallbackSession(agentName, threadId))?.sessionId,
         save: (id) => createFallbackSession(id, agentName, threadId),
       };
-      const execFallback = (legacyArgs: string[]) =>
-        useLegacyPath
+      const execFallback = (legacyArgs: string[]) => {
+        fallbackStreamedText = false;
+        return useLegacyPath
           ? runClaudeStream(
               legacyArgs,
               fallbackConfig.model,
@@ -2197,9 +2207,10 @@ async function execClaude(
               securityArgs,
               appendSystemPrompt,
               sessionStore: fallbackStore,
-              onChunk,
+              onChunk: onFallbackChunk,
               onToolEvent,
             });
+      };
       exec = await execFallback(fallbackArgs);
       usedFallback = true;
       let fallbackRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
@@ -2405,7 +2416,7 @@ async function execClaude(
         const reported = usedFallback ? (exec.sessionId ?? fallbackSessionId) : sessionId;
         return reported && reported !== "unknown" ? { sessionId: reported } : {};
       })(),
-      ...(usedFallback ? { usedFallback: true as const } : {}),
+      ...(usedFallback ? { usedFallback: true as const, fallbackStreamedText } : {}),
     };
 
     // Record successful completion WITH the real token usage + cost so the
@@ -2765,9 +2776,10 @@ async function streamClaude(
         },
         () => unblock(),
       );
-      // The fallback turn streams nothing: what the primary streamed (the
-      // rate-limit notice) is not the answer, so deliver the fallback's stdout.
-      if ((!textEmitted || result.usedFallback) && result.stdout) onChunk(result.stdout);
+      // A primary rate-limit notice says nothing about fallback delivery.
+      // Emit buffered stdout only if this response's engine streamed no text.
+      const needsFinalText = result.usedFallback ? !result.fallbackStreamedText : !textEmitted;
+      if (needsFinalText && result.stdout) onChunk(result.stdout);
     } finally {
       unblock();
     }

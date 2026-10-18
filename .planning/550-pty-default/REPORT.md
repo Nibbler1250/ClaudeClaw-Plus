@@ -322,3 +322,40 @@ Before implementing the review fixes, the new timeout test returned 1 instead of
 No requested review fix remains undone. README.md and issue #559 were not changed. No new Ultra code was reused: this pass adapts the existing Plus supervisor and runner rather than copying the diverged Ultra runner. The original remaining-print inventory and exact 48-hour operator soak checklist above remain applicable; trusted utility calls still await #549 integration. No live Claude or production-daemon verification was performed in this pass, and no fix for #559 is claimed. Keep the independent #559 and #548/#549 integration checks and the operator soak as rollout gates.
 
 Security review of this follow-up found no CRITICAL/HIGH issue: retirement respects session keys, recovery separates primary/fallback stores, and logging adds no prompt, credential or environment values. Local memory checkpoint was appended by the memory worker; Graphiti ingestion was queued but not confirmed by immediate read-back.
+
+## PR 562 Codex fallback-stream finding — task_d6cfe1f8b211
+
+Fixed duplicate dashboard fallback replies. PTY fallback chunks were forwarded to the dashboard, then streamClaude unconditionally emitted the complete fallback stdout again because usedFallback was true. RunResult now tracks fallbackStreamedText independently of primary text; only a fallback that emitted no nonempty text gets its buffered stdout emitted at completion. Tracking resets for each fallback/recovery attempt. Empty chunks do not count as text. Non-streaming stdout and legacy print execution are unchanged.
+
+The new isolated fixture drives the actual streamUserMessage("chat") path: its primary PTY streams a rate-limit notice, then its fallback PTY streams two reply chunks or emits only an empty chunk. The streamed-answer test failed before implementation:
+
+```text
+(fail) #550 default runner routing > dashboard emits a PTY fallback reply exactly once when it streams chunks [255.89ms]
+```
+
+Two independent single-site mutations of the final-emission decision proved both guards; each mutation was restored in a finally block before final validation:
+
+1. Force final stdout emission despite streamed fallback chunks:
+
+```text
+(fail) #550 default runner routing > dashboard emits a PTY fallback reply exactly once when it streams chunks [148.10ms]
+```
+
+2. Suppress final stdout emission for a silent fallback after the primary notice:
+
+```text
+(fail) #550 default runner routing > dashboard emits silent fallback stdout once after the primary streamed its notice [288.89ms]
+```
+
+Final validation used Bun with --preload <repo>/scripts/test-preload.ts and absolute test paths in isolated temporary working directories with a src symlink. No runner output was piped into head/tail and no full suite was run.
+
+| Command/scope | Result |
+| --- | --- |
+| bun test runner.test.ts pty-default-runner.test.ts | 50 pass, 0 fail |
+| bun test pty-enabled-routing.test.ts pty-backward-compat.test.ts | 26 pass, 0 fail; includes PTY and legacy print fallback controls |
+| Total | **76 pass, 0 fail** |
+| bun run lint --reporter=json over whole repository | exit 0, 0 errors, 1235 warnings, 323 informational diagnostics |
+| bun run typecheck ratchet | exit 0, 149 diagnostics against baseline 149, unchanged |
+| git diff --check | clean |
+
+No requested fix remains undone. Version 2.2.339 is deliberately unchanged under the explicit no-bump dispatch instruction. No new Ultra code was reused. No live Claude, browser or production SSE check was performed; dashboard delivery is proved at its runner stream callback boundary. README and issue 559 remain untouched, existing external integration/operator soak gates remain applicable, and no GitHub comment or thread resolution was posted.

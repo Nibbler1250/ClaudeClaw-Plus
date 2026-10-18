@@ -20,7 +20,7 @@ if (scenario === "compact" && !rawScenario.startsWith("legacy-")) {
   settings.pty.maxRetries = 0;
   await writeFile(settingsPath, JSON.stringify(settings));
 }
-if (scenario.startsWith("fallback-")) {
+if (scenario.startsWith("fallback-") || scenario.startsWith("dashboard-fallback-")) {
   const settings = JSON.parse(await readFile(settingsPath, "utf8"));
   settings.fallback = { model: "", api: "test-routing-only" };
   await writeFile(settingsPath, JSON.stringify(settings));
@@ -66,6 +66,21 @@ let agentPrintCalls = 0;
 let utilityPrintCalls = 0;
 spyOn(supervisor, "runOnPty").mockImplementation(async (key, _prompt, opts) => {
   ptyCalls.push(key);
+  if (scenario.startsWith("dashboard-fallback-")) {
+    if (key === "global") {
+      const notice = "You've hit your limit · resets 5pm (UTC)";
+      opts.onChunk?.(notice);
+      return { rawStdout: notice, stderr: "", exitCode: 1 };
+    }
+    if (scenario === "dashboard-fallback-chunks") {
+      opts.onChunk?.("fallback-");
+      opts.onChunk?.("reply");
+    } else {
+      // An empty callback is not streamed answer text.
+      opts.onChunk?.("");
+    }
+    return { rawStdout: "fallback-reply", stderr: "", exitCode: 0, sessionId: "fallback-sid" };
+  }
   if (scenario === "bootstrap-attempt" && ptyCalls.length === 1) {
     bootstrapTimeoutMs = opts.timeoutMs;
     return realRunOnPty(key, _prompt, opts);
@@ -155,7 +170,22 @@ if (
   });
 }
 let exitCode: number;
-if (scenario === "bootstrap-attempt") {
+let resultStdout = "";
+if (scenario.startsWith("dashboard-fallback-")) {
+  if (scenario === "dashboard-fallback-buffered") {
+    const result = await runner.run("chat", "dashboard prompt");
+    exitCode = result.exitCode;
+    resultStdout = result.stdout;
+  } else {
+    await runner.streamUserMessage(
+      "chat",
+      "dashboard prompt",
+      (text) => chunks.push(text),
+      () => {},
+    );
+    exitCode = 0;
+  }
+} else if (scenario === "bootstrap-attempt") {
   const boot = runner.bootstrap().catch((error) => {
     bootstrapError = error.message;
   });
@@ -207,5 +237,5 @@ if (scenario === "bootstrap-attempt") {
   ).exitCode;
 }
 console.log(
-  `FIXTURE_RESULT ${JSON.stringify({ enabled: config.getSettings().pty.enabled, exitCode, primaryRoute, ptyCalls, retired, agentPrintCalls, utilityPrintCalls, events, modelOverrides, chunks, tools, bootstrapTimeoutMs, bootstrapError })}`,
+  `FIXTURE_RESULT ${JSON.stringify({ enabled: config.getSettings().pty.enabled, exitCode, primaryRoute, ptyCalls, retired, agentPrintCalls, utilityPrintCalls, events, modelOverrides, chunks, tools, bootstrapTimeoutMs, bootstrapError, resultStdout })}`,
 );

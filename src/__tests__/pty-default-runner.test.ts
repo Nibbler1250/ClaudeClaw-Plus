@@ -104,4 +104,28 @@ describe("#550 default runner routing", () => {
     expect(result.ptyCalls).toEqual(["global", "global"]);
     expect(result.exitCode).toBe(0);
   });
+  it("dashboard emits a PTY fallback reply exactly once when it streams chunks", async () => {
+    const result = await fixture("dashboard-fallback-chunks");
+    expect(result.ptyCalls).toEqual(["global", "fallback:global"]);
+    expect(result.chunks).toEqual([
+      "You've hit your limit · resets 5pm (UTC)",
+      "fallback-",
+      "reply",
+    ]);
+    expect(result.chunks.join("").split("fallback-reply")).toHaveLength(2);
+  });
+  it("dashboard emits silent fallback stdout once after the primary streamed its notice", async () => {
+    const result = await fixture("dashboard-fallback-silent");
+    expect(result.ptyCalls).toEqual(["global", "fallback:global"]);
+    expect(result.chunks.filter(Boolean)).toEqual([
+      "You've hit your limit · resets 5pm (UTC)",
+      "fallback-reply",
+    ]);
+  });
+  it("non-streaming fallback still returns its buffered stdout", async () => {
+    const result = await fixture("dashboard-fallback-buffered");
+    expect(result.exitCode).toBe(0);
+    expect(result.resultStdout).toBe("fallback-reply");
+    expect(result.chunks).toEqual([]);
+  });
 });
