@@ -227,6 +227,37 @@ export interface RunOnPtyResult {
   sessionId?: string;
 }
 
+/**
+ * Where a PTY resumes its conversation id from and saves it to (#546). The
+ * default store is picked from the entry's ids (thread / agent / global); the
+ * rate-limit fallback passes its own so it never resumes the primary transcript.
+ */
+export interface PtySessionStore {
+  load(): Promise<string | undefined>;
+  save(sessionId: string): Promise<void>;
+}
+
+/**
+ * How a `runOnPty` call owns its PTY (#546). Read when the entry for the key is
+ * created; a later call on the same key reuses the entry as it is.
+ */
+export interface PtyRunScope {
+  /** Session store override. Default: thread / agent / global, from the ids. */
+  sessionStore?: PtySessionStore;
+  /** One-shot run: fresh session, nothing persisted, no turn retry, PTY retired
+   *  when the call returns. Outside the `maxConcurrent` cap, LRU eviction and
+   *  the idle reaper — the call itself bounds its life. */
+  ephemeral?: boolean;
+  /** Not reached by `/kill` (`killAllPtys`, `supervisorEntryCount`). */
+  survivesKill?: boolean;
+  /** Working directory. Default: the agent dir, else `process.cwd()`. */
+  cwd?: string;
+  /** Caller-owned MCP config: when set, `path` is passed as `--mcp-config`
+   *  (or, undefined, no flag at all) — never synthesized, rotated or released
+   *  by the supervisor. */
+  mcpConfig?: { path: string | undefined };
+}
+
 export interface SupervisorSnapshot {
   ptys: Array<{
     sessionKey: string;
@@ -453,6 +484,8 @@ interface PtyEntry {
    *  creation time would incorrectly evict it (Codex P1 on PR #149).
    *  Stays 0 until the first successful spawn completes. */
   lastSpawnedAt: number;
+  /** #546: see `PtyRunScope`. Fixed at entry creation. */
+  scope: PtyRunScope;
 }
 
 interface SupervisorState {
@@ -613,11 +646,21 @@ export async function shutdownSupervisor(): Promise<void> {
  * `dispose()` are swallowed.
  */
 export async function killAllPtys(): Promise<number> {
-  const entries = [...state.ptys.values()];
+  const entries = [...state.ptys.values()].filter((e) => !e.scope.survivesKill);
   if (entries.length === 0) return 0;
   const killed = entries.filter((e) => e.pty).length;
   await Promise.allSettled(entries.map(retireEntry));
   return killed;
+}
+
+/**
+ * Retire the entry on `sessionKey`, if any (#546): dispose its PTY and drop
+ * the entry, so the next call on the key spawns fresh from its session store.
+ * Used when the caller has just reset that store (corrupted fallback session).
+ */
+export async function retirePtySession(sessionKey: string): Promise<void> {
+  const entry = state.ptys.get(sessionKey);
+  if (entry) await retireEntry(entry);
 }
 
 /**
@@ -632,7 +675,10 @@ export async function killAllPtys(): Promise<number> {
  * landed on an entry nothing had asked to retire. Gate `/kill` on this instead.
  */
 export function supervisorEntryCount(): number {
-  return state.ptys.size;
+  // #546: entries `/kill` does not reach (forks) are not counted either.
+  let n = 0;
+  for (const entry of state.ptys.values()) if (!entry.scope.survivesKill) n += 1;
+  return n;
 }
 
 export function snapshotSupervisor(): SupervisorSnapshot {
@@ -722,8 +768,12 @@ export async function runOnPty(
     appendSystemPrompt?: string;
     onChunk?: (text: string) => void;
     onToolEvent?: (line: string) => void;
-  },
+    /** #546: aborting retires the entry — the PTY is disposed mid-turn and the
+     *  call returns an error result. */
+    signal?: AbortSignal;
+  } & PtyRunScope,
 ): Promise<RunOnPtyResult> {
+  if (opts.signal?.aborted) return errorResult(`[pty-supervisor] ${sessionKey} aborted`);
   // Phase D fix #3 (Codex HIGH #3): lazily start the reaper interval. The
   // daemon runtime enters PTY mode through `runOnPty` directly and never
   // calls `initSupervisor`, so without this `settings.pty.idleReapMinutes`
@@ -746,28 +796,32 @@ export async function runOnPty(
   // hang forever.
   let entry: PtyEntry;
   let supervisorOpts: ReturnType<typeof readSupervisorOptions>;
+  const admission = (async () => {
+    await ensureSupervisorInitialised();
+    // Read settings before admission, as before: never cached across calls,
+    // so hot-reload keeps working.
+    const so = readSupervisorOptions();
+    // Phase D fix #5: enforce maxConcurrent cap with LRU eviction BEFORE
+    // allocating a new entry. Named agents are exempt — they're always-alive
+    // by design.
+    //
+    // Issue #65 item 2: enforce + create must be a single critical section.
+    // `enforceMaxConcurrent` awaits on `dispose()`, opening a window where two
+    // concurrent admissions can both see "under cap" and both add entries —
+    // exceeding the cap. Serialize through `_admissionLock`.
+    const e = await admitEntry(sessionKey, opts);
+    return { entry: e, supervisorOpts: so };
+  })();
   try {
-    ({ entry, supervisorOpts } = await withDeadline(
-      (async () => {
-        await ensureSupervisorInitialised();
-        // Read settings before admission, as before: never cached across calls,
-        // so hot-reload keeps working.
-        const so = readSupervisorOptions();
-        // Phase D fix #5: enforce maxConcurrent cap with LRU eviction BEFORE
-        // allocating a new entry. Named agents are exempt — they're always-alive
-        // by design.
-        //
-        // Issue #65 item 2: enforce + create must be a single critical section.
-        // `enforceMaxConcurrent` awaits on `dispose()`, opening a window where two
-        // concurrent admissions can both see "under cap" and both add entries —
-        // exceeding the cap. Serialize through `_admissionLock`.
-        const e = await admitEntry(sessionKey, opts);
-        return { entry: e, supervisorOpts: so };
-      })(),
-      opts.timeoutMs,
-    ));
+    ({ entry, supervisorOpts } = await withDeadline(admission, opts.timeoutMs));
   } catch (err) {
     if (err instanceof DeadlineExceeded) {
+      // #546: nothing else will ever retire a one-shot entry admitted late.
+      if (opts.ephemeral)
+        void admission.then(
+          ({ entry: e }) => retireEntry(e),
+          () => {},
+        );
       return errorResult(
         `[pty-supervisor] admission stage exceeded ${opts.timeoutMs}ms for ${sessionKey} — supervisor init, concurrency admission, or PTY spawn did not settle`,
       );
@@ -777,6 +831,32 @@ export async function runOnPty(
   }
 
   entry.lastAccessedAt = _clock();
+  // #546: abort and one-shot runs both end by retiring the entry. Retiring
+  // disposes the PTY (a turn in flight fails with PtyClosedError) and fences
+  // any spawn still landing, so nothing outlives the call.
+  const onAbort = (): void => {
+    void retireEntry(entry);
+  };
+  opts.signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    if (opts.signal?.aborted) {
+      await retireEntry(entry);
+      return errorResult(`[pty-supervisor] ${sessionKey} aborted`);
+    }
+    return await runOnAdmittedEntry(entry, sessionKey, prompt, opts, supervisorOpts);
+  } finally {
+    opts.signal?.removeEventListener("abort", onAbort);
+    if (entry.scope.ephemeral) await retireEntry(entry);
+  }
+}
+
+async function runOnAdmittedEntry(
+  entry: PtyEntry,
+  sessionKey: string,
+  prompt: string,
+  opts: Parameters<typeof runOnPty>[2],
+  supervisorOpts: SupervisorOptions,
+): Promise<RunOnPtyResult> {
   const previousLock = entry.lock;
   let release: () => void = () => {};
   entry.lock = new Promise<void>((resolve) => {
@@ -839,6 +919,9 @@ function readSupervisorOptions(): SupervisorOptions {
 
 function classifyKey(sessionKey: string, threadId?: string, agentName?: string): SessionKind {
   // Match the conventions in SPEC §3.2 + §5.2.
+  // #546: a rate-limit fallback PTY is reapable and evictable whatever it
+  // stands in for — a named agent's fallback must not stay alive for good.
+  if (sessionKey.startsWith("fallback:")) return "adhoc";
   if (sessionKey.startsWith("thread:") || threadId) return "adhoc";
   if (sessionKey.startsWith("agent:") || agentName) return "named";
   return "global";
@@ -850,7 +933,7 @@ function getOrCreateEntry(
     threadId?: string;
     agentName?: string;
     modelOverride?: string;
-  },
+  } & PtyRunScope,
 ): PtyEntry {
   // A retiring entry is waited for in `admitEntry`, outside the global lock.
   // One that started retiring during `enforceMaxConcurrent` is returned as is:
@@ -872,6 +955,13 @@ function getOrCreateEntry(
     // Stamped at every (re)spawn site below. 0 until the first spawn lands —
     // `reapIdle` treats that as "still admitting, leave alone".
     lastSpawnedAt: 0,
+    scope: {
+      sessionStore: opts.sessionStore,
+      ephemeral: opts.ephemeral,
+      survivesKill: opts.survivesKill,
+      cwd: opts.cwd,
+      mcpConfig: opts.mcpConfig,
+    },
   };
   state.ptys.set(sessionKey, entry);
   return entry;
@@ -917,7 +1007,7 @@ async function admitEntry(
     threadId?: string;
     agentName?: string;
     modelOverride?: string;
-  },
+  } & PtyRunScope,
 ): Promise<PtyEntry> {
   // A shutdown that starts AND finishes while this caller is parked on a
   // retirement (or on the lock) has already cleared `shuttingDown` by the
@@ -954,7 +1044,8 @@ async function admitEntry(
       // lock; go back to waiting for it without holding the lock.
       if (state.ptys.get(sessionKey)?.retiring) continue;
       refuseIfShuttingDown();
-      await enforceMaxConcurrent(sessionKey);
+      // #546: a one-shot run neither counts against the cap nor evicts.
+      if (!opts.ephemeral) await enforceMaxConcurrent(sessionKey);
       // The eviction above awaits a dispose; a shutdown can start AND finish
       // inside that wait (it joins the same retirement), leaving the flag
       // already cleared — the epoch is what still refuses this admission.
@@ -996,13 +1087,15 @@ async function enforceMaxConcurrent(incomingKey: string): Promise<void> {
   // the cap nor is an eviction candidate — awaiting its retirement here would
   // hold the global admission lock on a removal already in progress.
   let live = 0;
-  for (const entry of state.ptys.values()) if (!entry.retiring) live += 1;
+  for (const entry of state.ptys.values()) {
+    if (!entry.retiring && !entry.scope.ephemeral) live += 1;
+  }
   if (live < cap) return; // headroom available
 
   // Find LRU candidate among adhoc entries (skip named + global + retiring).
   let lruEntry: PtyEntry | null = null;
   for (const entry of state.ptys.values()) {
-    if (entry.kind !== "adhoc" || entry.retiring) continue;
+    if (entry.kind !== "adhoc" || entry.retiring || entry.scope.ephemeral) continue;
     if (!lruEntry || entry.lastAccessedAt < lruEntry.lastAccessedAt) {
       lruEntry = entry;
     }
@@ -1035,11 +1128,18 @@ async function buildSpawnOptions(
   //   - agent  → agents/<name> (created if needed)
   //   - thread → repo root (process.cwd())
   //   - global → repo root
-  const cwd = entry.agentName ? await ensureAgentDirLazy(entry.agentName) : process.cwd();
+  const cwd =
+    entry.scope.cwd ??
+    (entry.agentName ? await ensureAgentDirLazy(entry.agentName) : process.cwd());
 
-  // Resume from stored session ID where available.
+  // Resume from stored session ID where available. A one-shot run never
+  // resumes; a caller-supplied store (#546) replaces the id-based lookup.
   let sessionId = "";
-  if (entry.threadId) {
+  if (entry.scope.ephemeral) {
+    sessionId = "";
+  } else if (entry.scope.sessionStore) {
+    sessionId = (await entry.scope.sessionStore.load()) ?? "";
+  } else if (entry.threadId) {
     const t = await getThreadSession(entry.threadId);
     sessionId = t?.sessionId ?? "";
   } else if (entry.agentName) {
@@ -1131,7 +1231,9 @@ async function buildSpawnOptions(
       "not synthesizing MCP config for a retired entry",
     );
   }
-  const mcpConfigPath = synthesizeMcpConfigIfActive(entry.sessionKey, cwd, settings);
+  const mcpConfigPath = entry.scope.mcpConfig
+    ? entry.scope.mcpConfig.path
+    : synthesizeMcpConfigIfActive(entry.sessionKey, cwd, settings);
 
   const opts: PtyProcessOptions = {
     sessionId,
@@ -1225,6 +1327,8 @@ function synthesizeMcpConfigIfActive(
  * via the next `writeConfigForPty` call on the same path. SPEC §4.5.
  */
 async function releaseMcpIdentityFor(entry: PtyEntry): Promise<void> {
+  // #546: a caller-owned config was never issued under this key; its owner releases it.
+  if (entry.scope.mcpConfig) return;
   const cfgPath = entry.spawnOpts?.mcpConfigPath;
   const cwd = entry.spawnOpts?.cwd;
 
@@ -1536,7 +1640,7 @@ async function respawnEntry(
   // (this is a respawn, not a permanent dispose). `issueIdentity(ptyId)` is
   // expected to either return the cached identity OR rotate (W1's choice).
   // The writer just embeds whatever the issuer hands back into the new file.
-  if (entry.spawnOpts.mcpConfigPath) {
+  if (entry.spawnOpts.mcpConfigPath && !entry.scope.mcpConfig) {
     const settings = getSettings();
     const refreshedPath = synthesizeMcpConfigIfActive(
       entry.sessionKey,
@@ -1696,6 +1800,7 @@ async function runTurnWithRetries(
     appendSystemPrompt?: string;
     onChunk?: (text: string) => void;
     onToolEvent?: (line: string) => void;
+    signal?: AbortSignal;
   },
   supervisorOpts: SupervisorOptions,
 ): Promise<RunOnPtyResult> {
@@ -1779,8 +1884,13 @@ async function runTurnWithRetries(
           `[pty-supervisor] non-retryable error on ${entry.sessionKey}: ${(err as Error).message}`,
         );
       }
-      // Exhausted?
-      if (attempt >= supervisorOpts.maxRetries) break;
+      // #546: an aborted call does not respawn what the abort just retired.
+      if (callOpts.signal?.aborted) {
+        return errorResult(`[pty-supervisor] ${entry.sessionKey} aborted`);
+      }
+      // Exhausted? A one-shot run gets no turn retry: it holds no conversation
+      // to recover, and a retry would double its caller's wall-clock budget.
+      if (entry.scope.ephemeral || attempt >= supervisorOpts.maxRetries) break;
 
       const delay = pickBackoff(supervisorOpts.backoffMs, attempt);
       attempt += 1;
@@ -1816,7 +1926,7 @@ function errorResult(message: string): RunOnPtyResult {
 }
 
 async function persistSessionId(entry: PtyEntry, sessionId: string): Promise<void> {
-  if (!sessionId) return;
+  if (!sessionId || entry.scope.ephemeral) return;
   // Did we already know this ID? Then nothing to do.
   if (entry.spawnOpts?.sessionId && entry.spawnOpts.sessionId === sessionId) {
     return;
@@ -1829,7 +1939,11 @@ async function persistSessionId(entry: PtyEntry, sessionId: string): Promise<voi
   // the on-disk sessionId pinned to the stale value across all subsequent
   // messages, breaking conversation continuity even though the runtime
   // recovered cleanly.
-  if (entry.threadId) {
+  if (entry.scope.sessionStore) {
+    if ((await entry.scope.sessionStore.load()) !== sessionId) {
+      await entry.scope.sessionStore.save(sessionId);
+    }
+  } else if (entry.threadId) {
     const existing = await getThreadSession(entry.threadId);
     if (!existing || existing.sessionId !== sessionId) {
       await createThreadSession(entry.threadId, sessionId);
@@ -1858,7 +1972,7 @@ async function reapIdle(opts: SupervisorOptions): Promise<void> {
   const spawnGraceCutoff = now - opts.idleReapMinutes * 60_000 * 3;
   const toReap: PtyEntry[] = [];
   for (const entry of state.ptys.values()) {
-    if (!entry.pty) continue;
+    if (!entry.pty || entry.scope.ephemeral) continue;
     // Named agents stay alive forever when the flag is on.
     if (entry.kind === "named" && opts.namedAgentsAlwaysAlive) continue;
     const last = entry.pty.lastTurnEndedAt();
