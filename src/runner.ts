@@ -382,6 +382,12 @@ export interface RunResult {
    * `init`). The gateway records it so `--resume` can be emitted.
    */
   sessionId?: string;
+  /**
+   * #546: set when the response came from the rate-limit fallback. The
+   * fallback turn runs without onChunk, so a caller that streamed the
+   * primary's output must still deliver this stdout.
+   */
+  usedFallback?: true;
 }
 
 export interface AgentStreamEvent {
@@ -2384,6 +2390,7 @@ async function execClaude(
         const reported = usedFallback ? (exec.sessionId ?? fallbackSessionId) : sessionId;
         return reported && reported !== "unknown" ? { sessionId: reported } : {};
       })(),
+      ...(usedFallback ? { usedFallback: true as const } : {}),
     };
 
     // Record successful completion WITH the real token usage + cost so the
@@ -2748,7 +2755,9 @@ async function streamClaude(
         },
         () => unblock(),
       );
-      if (!textEmitted && result.stdout) onChunk(result.stdout);
+      // The fallback turn streams nothing: what the primary streamed (the
+      // rate-limit notice) is not the answer, so deliver the fallback's stdout.
+      if ((!textEmitted || result.usedFallback) && result.stdout) onChunk(result.stdout);
     } finally {
       unblock();
     }

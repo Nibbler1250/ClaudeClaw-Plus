@@ -274,6 +274,49 @@ describe("#546 dashboard chat (streamUserMessage)", () => {
     expect(ptySpawns[0].appendSystemPrompt).toContain("OUTPUT FORMAT CONSTRAINT");
   });
 
+  it("pty.enabled: true, primary streams a rate-limit notice → the fallback's answer reaches onChunk", async () => {
+    stubSettings(true);
+    const limit = "You've hit your limit · resets 5pm (UTC)";
+    turnScript = async (_p, opts, pty) => {
+      if (ptySpawns[ptys.indexOf(pty)].modelOverride === "fallback-model") return "fallback answer";
+      opts.onChunk?.(limit);
+      return limit;
+    };
+    const chunks: string[] = [];
+    try {
+      await runnerMod.streamUserMessage(
+        "chat",
+        "hello",
+        (t) => chunks.push(t),
+        () => {},
+      );
+    } finally {
+      await resetFallbackSession();
+    }
+    expect(
+      snapshotSupervisor()
+        .ptys.map((p) => p.sessionKey)
+        .sort(),
+    ).toEqual(["fallback:global", "global"]);
+    expect(chunks).toEqual([limit, "fallback answer"]);
+  });
+
+  it("pty.enabled: true, no fallback → the streamed answer is not delivered twice", async () => {
+    stubSettings(true);
+    turnScript = async (_p, opts) => {
+      opts.onChunk?.("answer");
+      return "answer";
+    };
+    const chunks: string[] = [];
+    await runnerMod.streamUserMessage(
+      "chat",
+      "hello",
+      (t) => chunks.push(t),
+      () => {},
+    );
+    expect(chunks).toEqual(["answer"]);
+  });
+
   it("pty.enabled: false → claude -p", async () => {
     stubSettings(false);
     const chunks: string[] = [];
