@@ -57,6 +57,13 @@
 import type { PtyProcess, PtyProcessOptions, SpawnPty } from "./pty-process.js";
 import { PtyClosedError, PtyTurnTimeoutError } from "./pty-process.js";
 import { ensureTrustAccepted } from "./pty-trust-prompt.js";
+import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";
+import { validateIsolation } from "../oneshot/isolation.js";
+import { validateRouteEngine } from "../oneshot/config.js";
+import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { getSettings, type SecurityConfig } from "../config.js";
 import { getSession, createSession } from "../sessions.js";
 import { getThreadSession, createThreadSession } from "../sessionManager.js";
@@ -207,6 +214,12 @@ export function injectCleanSpawnEnv(fn: CleanSpawnEnvFn | null): void {
   _cleanSpawnEnv = fn;
 }
 
+let ensureTrust: (cwd: string) => Promise<unknown> = ensureTrustAccepted;
+/** Keep unit tests from changing the operator's Claude trust configuration. */
+export function injectOneShotTrustForTests(fn: ((cwd: string) => Promise<unknown>) | null): void {
+  ensureTrust = fn ?? ensureTrustAccepted;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Types — frozen by SPEC §3.2.
 
@@ -256,6 +269,13 @@ export interface PtyRunScope {
    *  (or, undefined, no flag at all) — never synthesized, rotated or released
    *  by the supervisor. */
   mcpConfig?: { path: string | undefined };
+  /** Ephemeral runs only: resume this conversation (`oneShot` `resumeSessionId`).
+   *  Used as given, without the resumability probe: a conversation that does not
+   *  exist must fail the call, not quietly start a different one. */
+  resumeSessionId?: string;
+  /** One-shot isolation, forwarded to the spawned PTY. `untrusted` also skips
+   *  trust self-healing (the cwd is a throwaway directory). */
+  isolation?: "untrusted" | "trusted-session";
 }
 
 export interface SupervisorSnapshot {
@@ -961,6 +981,8 @@ function getOrCreateEntry(
       survivesKill: opts.survivesKill,
       cwd: opts.cwd,
       mcpConfig: opts.mcpConfig,
+      resumeSessionId: opts.resumeSessionId,
+      isolation: opts.isolation,
     },
   };
   state.ptys.set(sessionKey, entry);
@@ -1136,7 +1158,7 @@ async function buildSpawnOptions(
   // resumes; a caller-supplied store (#546) replaces the id-based lookup.
   let sessionId = "";
   if (entry.scope.ephemeral) {
-    sessionId = "";
+    sessionId = entry.scope.resumeSessionId ?? "";
   } else if (entry.scope.sessionStore) {
     sessionId = (await entry.scope.sessionStore.load()) ?? "";
   } else if (entry.threadId) {
@@ -1167,7 +1189,7 @@ async function buildSpawnOptions(
   // least one turn). Fail-closed: if we can't confirm, treat as phantom
   // and allocate a fresh session. Worst case we lose continuity for one
   // bad record; far better than user-visible "max retries exhausted".
-  if (sessionId && !(await _isSessionResumable(cwd, sessionId))) {
+  if (sessionId && !entry.scope.resumeSessionId && !(await _isSessionResumable(cwd, sessionId))) {
     sessionId = "";
   }
 
@@ -1238,6 +1260,7 @@ async function buildSpawnOptions(
   const opts: PtyProcessOptions = {
     sessionId,
     newSessionId,
+    ...(entry.scope.isolation ? { isolation: entry.scope.isolation } : {}),
     cwd,
     agentName: entry.agentName,
     modelOverride: modelOverride ?? undefined,
@@ -1369,6 +1392,131 @@ function cloneSecurity(security: SecurityConfig): SecurityConfig {
 // `ANTHROPIC_API_KEY`), which silently re-introduced API-credit billing on
 // every PTY spawn. Don't add a local copy — always go through
 // `getCleanSpawnEnv()`.
+
+/**
+ * A utility turn on its own PTY, through the same spawn path as keyed sessions
+ * (`buildSpawnOptions`, trust self-heal, multiplexer config) with the #546
+ * ephemeral scope: registered in `state.ptys` so shutdown and `/kill` reach it,
+ * never reused, outside the LRU and the `maxConcurrent` cap, retired on return.
+ *
+ * Exit contract matches the `print` engine: timeout and abort resolve with
+ * exitCode 124, a failed spawn or turn with a non-zero code. Never throws on
+ * those; a request that is invalid or already aborted still throws.
+ */
+export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> {
+  validateIsolation(req);
+  validateRouteEngine(
+    "pty",
+    req.route,
+    req.isolation === "untrusted",
+    req.resumeSessionId !== undefined,
+  );
+  req.signal?.throwIfAborted();
+  const settings = getSettings();
+  const untrusted = req.isolation === "untrusted";
+  const model = req.model ?? settings.model;
+  const result = (exitCode: number, text = "", sessionId?: string): OneShotResult => ({
+    text,
+    engine: "pty",
+    model,
+    exitCode,
+    ...(sessionId ? { sessionId } : {}),
+  });
+  // Created inside the try and removed in the finally, so it never depends on
+  // the turn settling (a hung turn or a spawn that never lands).
+  let tempCwd: string | undefined;
+  try {
+    if (untrusted) tempCwd = mkdtempSync(join(tmpdir(), "claudeclaw-oneshot-pty-"));
+    const helpers = await getRunnerHelpers();
+    const { PTY_OUTPUT_FORMAT_CONSTRAINT } = await import("./pty-output-format.js");
+    const exec = await runEphemeralWithDeadline(
+      `oneshot:${req.route}:${randomUUID()}`,
+      req.prompt,
+      {
+        timeoutMs: req.timeoutMs,
+        modelOverride: model,
+        api: settings.api,
+        ...(untrusted
+          ? { mcpConfig: { path: undefined } }
+          : {
+              securityArgs: req.allowedTools
+                ? [
+                    // dontAsk denies a tool outside the list; the default mode
+                    // would leave the TUI waiting at a permission prompt.
+                    "--permission-mode",
+                    "dontAsk",
+                    "--tools",
+                    req.allowedTools.join(","),
+                    "--allowedTools",
+                    req.allowedTools.join(","),
+                  ]
+                : helpers.buildSecurityArgs(settings.security),
+              appendSystemPrompt: [req.system, PTY_OUTPUT_FORMAT_CONSTRAINT]
+                .filter(Boolean)
+                .join("\n\n"),
+            }),
+        isolation: req.isolation,
+        cwd: tempCwd ?? req.cwd ?? process.cwd(),
+        resumeSessionId: req.resumeSessionId,
+      },
+      req.signal,
+    );
+    if (exec.timedOut || exec.aborted) return result(124);
+    if (exec.exitCode !== 0) {
+      console.warn(`[pty-supervisor] one-shot ${req.route} failed: ${exec.stderr}`);
+      return result(exec.exitCode);
+    }
+    return result(0, exec.rawStdout, exec.sessionId);
+  } finally {
+    if (tempCwd) {
+      try {
+        rmSync(tempCwd, { recursive: true, force: true });
+      } catch {
+        /* best effort */
+      }
+    }
+  }
+}
+
+/**
+ * `runOnPty` on an ephemeral entry with one wall-clock deadline over admission,
+ * spawn and turn (the supervisor bounds each stage separately). The deadline and
+ * `signal` abort the same controller, which retires the entry mid-turn.
+ */
+export async function runEphemeralWithDeadline(
+  sessionKey: string,
+  prompt: string,
+  opts: Omit<Parameters<typeof runOnPty>[2], "signal" | "ephemeral">,
+  signal?: AbortSignal,
+): Promise<RunOnPtyResult & { timedOut: boolean; aborted: boolean }> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, opts.timeoutMs);
+  const onAbort = (): void => controller.abort();
+  if (signal?.aborted) controller.abort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    const exec = await runOnPty(sessionKey, prompt, {
+      ...opts,
+      ephemeral: true,
+      signal: controller.signal,
+    });
+    // A turn that produced its result stands, even if the timer or a cancel
+    // fired while the PTY was being torn down afterwards.
+    const failed = exec.exitCode !== 0;
+    return {
+      ...exec,
+      timedOut: failed && timedOut,
+      aborted: failed && !timedOut && controller.signal.aborted,
+    };
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
 
 async function ensureSpawnPty(): Promise<SpawnPty> {
   if (_spawnPty) return _spawnPty;
@@ -1503,16 +1651,21 @@ async function spawnEntry(
   // = true` to ~/.claude.json so the prompt is skipped. Best-effort — a
   // failure here doesn't block spawn; if trust isn't acked, the supervisor's
   // existing idle-timeout / sentinel-max-wait paths will surface the stall.
-  try {
-    const heal = await ensureTrustAccepted(spawnOpts.cwd);
-    if (!heal.ok && heal.reason) {
-      // Surface to stderr-equivalent for operator visibility. Don't fail the
-      // spawn — the user can still recover by manually accepting the prompt.
-      console.warn(`[pty-supervisor] trust self-heal failed: ${heal.reason}`);
+  // An untrusted one-shot runs in a throwaway directory: nothing to remember.
+  if (entry.scope.isolation !== "untrusted") {
+    try {
+      const heal = (await ensureTrust(spawnOpts.cwd)) as
+        | { ok?: boolean; reason?: string }
+        | undefined;
+      if (heal && !heal.ok && heal.reason) {
+        // Surface to stderr-equivalent for operator visibility. Don't fail the
+        // spawn — the user can still recover by manually accepting the prompt.
+        console.warn(`[pty-supervisor] trust self-heal failed: ${heal.reason}`);
+      }
+    } catch {
+      // Defensive — the function is meant to never throw, but if it does we
+      // proceed anyway.
     }
-  } catch {
-    // Defensive — the function is meant to never throw, but if it does we
-    // proceed anyway.
   }
 
   try {
