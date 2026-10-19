@@ -315,37 +315,69 @@ const TAIL_REDACTION_PATTERNS: ReadonlyArray<RegExp> = [
   /\b[A-Za-z0-9]{32}\.[A-Za-z0-9]{16,}/g,
 ];
 
-/** Child-env names whose values are credentials, beyond any `*_API_KEY` / `*_TOKEN` / `*_SECRET`. */
+/** Child-env names whose values are credentials, beyond the suffix rule below. */
 const CREDENTIAL_ENV_NAMES: ReadonlySet<string> = new Set([
   "ANTHROPIC_AUTH_TOKEN",
   "ANTHROPIC_API_KEY",
   "KIMI_API_KEY",
   "CLAUDE_CODE_OAUTH_TOKEN",
 ]);
-const CREDENTIAL_ENV_SUFFIX = /(?:_API_KEY|_TOKEN|_SECRET)$/i;
+/** A name ending like a credential: `FOO_API_KEY`, `DB_PASSWORD`, `GCP_CREDENTIALS`, … */
+const CREDENTIAL_ENV_SUFFIX = /(?:KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE|CREDENTIALS?)$/i;
+/** A URL-valued name whose value may embed `scheme://user:password@host`. */
+const URL_ENV_SUFFIX = /(?:URL|URI|DSN)$/i;
+const URL_PASSWORD = /^[a-z][a-z0-9+.-]*:\/\/[^\s/:@]*:([^\s/@]+)@/i;
 /** Shorter values are not worth redacting: they would mangle ordinary words. */
 const MIN_REDACTED_SECRET_LENGTH = 8;
 
 /**
- * The exact credential values in the child's env. The prefix patterns above only know
- * a few token shapes; the child gets `ANTHROPIC_AUTH_TOKEN` / `KIMI_API_KEY` values of
- * any shape, and one printed in an auth failure must not reach the log or a chat reply.
+ * The credential values in the child's env. The prefix patterns above only know a few
+ * token shapes; the child gets `ANTHROPIC_AUTH_TOKEN` / `KIMI_API_KEY` values of any
+ * shape, and one printed in an auth failure must not reach the log or a chat reply.
+ * For a `*_URL` / `*_URI` / `*_DSN` value with `scheme://user:pass@host`, the password.
  * Longest first, so a value that contains another is replaced whole.
  */
 export function collectSecretValues(env: Record<string, string | undefined> | undefined): string[] {
   const values = new Set<string>();
   for (const [name, value] of Object.entries(env ?? {})) {
-    if (!value || value.length < MIN_REDACTED_SECRET_LENGTH) continue;
-    if (CREDENTIAL_ENV_NAMES.has(name) || CREDENTIAL_ENV_SUFFIX.test(name)) values.add(value);
+    if (!value) continue;
+    if (CREDENTIAL_ENV_NAMES.has(name) || CREDENTIAL_ENV_SUFFIX.test(name)) {
+      if (value.length >= MIN_REDACTED_SECRET_LENGTH) values.add(value);
+    } else if (URL_ENV_SUFFIX.test(name)) {
+      const password = URL_PASSWORD.exec(value)?.[1];
+      if (password && password.length >= MIN_REDACTED_SECRET_LENGTH) values.add(password);
+    }
   }
   return [...values].sort((a, b) => b.length - a.length);
 }
 
-/** Replace matches of any `TAIL_REDACTION_PATTERNS` with `<redacted>` so
- *  the tail can be safely logged without leaking credentials. */
+/**
+ * A regex matching `value` with optional whitespace between any two characters, because
+ * the TUI hard-wraps at `pty.cols` and a token printed in a banner comes back as two
+ * halves split by a newline and the indent of the next row. Every part is one escaped
+ * literal followed by `\s*`; literals are never whitespace (a value containing
+ * whitespace is matched exactly instead), so there is nothing to backtrack over and the
+ * cost is linear in the tail.
+ */
+function wrappedSecretRegex(value: string): RegExp | null {
+  if (/\s/.test(value)) return null;
+  const parts = [...value].map((ch) => ch.replace(/[\\^$.*+?()[\]{}|/-]/g, "\\$&"));
+  return new RegExp(parts.join("\\s*"), "g");
+}
+
+/**
+ * Replace credentials in `text` with `<redacted>` so the tail can be logged. The text MUST
+ * be bounded: the JWT pattern is quadratic on unbounded input, and the 8 KiB tail cap
+ * (`SETTLE_TAIL_MAX_BYTES`) is what makes that safe. Exact credential values are redacted
+ * even when the TUI wrapped them across lines.
+ */
 export function redactSecretsInTail(text: string, secretValues: readonly string[] = []): string {
   let out = text;
-  for (const value of secretValues) out = out.split(value).join("<redacted>");
+  for (const value of secretValues) {
+    out = out.split(value).join("<redacted>");
+    const wrapped = wrappedSecretRegex(value);
+    if (wrapped) out = out.replace(wrapped, "<redacted>");
+  }
   for (const pattern of TAIL_REDACTION_PATTERNS) {
     out = out.replace(pattern, "<redacted>");
   }

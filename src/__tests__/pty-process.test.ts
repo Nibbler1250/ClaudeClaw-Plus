@@ -6,7 +6,11 @@ import {
   PtyClosedError,
   type PtyProcessOptions,
 } from "../runner/index";
-import { __buildClaudeArgsForTests, collectSecretValues } from "../runner/pty-process";
+import {
+  __buildClaudeArgsForTests,
+  collectSecretValues,
+  redactSecretsInTail,
+} from "../runner/pty-process";
 import {
   neutralizeLeadingReplCommand,
   preparePtyPromptForWrite,
@@ -289,6 +293,84 @@ describe("PtyProcess — lifecycle", () => {
       EMPTY_TOKEN: "",
     });
     expect(values).toEqual(["x".repeat(12), "y".repeat(10), "z".repeat(9), "f".repeat(8)]);
+  });
+
+  test("a credential the TUI hard-wrapped across lines is still redacted (#562 security re-review)", () => {
+    const token = `fake${"0123456789abcdef".repeat(2)}ZZ`; // 38 chars, fake
+    expect(token.length).toBe(38);
+    const a = token.slice(0, 19);
+    const b = token.slice(19);
+    for (const sep of ["\n", "\r\n", "\n    ", "\r\n  \t "]) {
+      const out = redactSecretsInTail(`auth failed for key ${a}${sep}${b} — retry`, [token]);
+      expect(out).not.toContain(a);
+      expect(out).not.toContain(b);
+      expect(out).toContain("auth failed for key <redacted> — retry");
+    }
+    // Wrapped more than once.
+    const thrice = `${token.slice(0, 10)}\n  ${token.slice(10, 30)}\n  ${token.slice(30)}`;
+    expect(redactSecretsInTail(`x ${thrice} y`, [token])).toBe("x <redacted> y");
+  });
+
+  test("redaction of a wrapped secret stays linear on a full 8 KiB tail", () => {
+    const token = `fake${"x".repeat(36)}`;
+    const adversarial = "f".repeat(8 * 1024); // many partial matches: every char starts a run
+    const start = performance.now();
+    redactSecretsInTail(adversarial, [token, `${"f".repeat(30)}end`]);
+    expect(performance.now() - start).toBeLessThan(50);
+  });
+
+  test("a secret containing whitespace is still redacted exactly, and an unrelated line is untouched", () => {
+    const spaced = "test token with spaces 000";
+    expect(redactSecretsInTail(`say ${spaced} now\nother line`, [spaced])).toBe(
+      "say <redacted> now\nother line",
+    );
+  });
+
+  test("exitInfo().tail redacts a credential that wrapped at the TTY width", async () => {
+    const token = `test-token-wrapped-${"7".repeat(21)}`;
+    const half = Math.floor(token.length / 2);
+    const proc = await spawnPty(
+      baseOpts({
+        env: { ...(process.env as Record<string, string>), ANTHROPIC_AUTH_TOKEN: token },
+        _commandOverride: "/bin/sh",
+        _argsOverride: [
+          "-c",
+          `printf 'banner %s\\n    %s trailing\\n' '${token.slice(0, half)}' '${token.slice(half)}'; exit 9`,
+        ],
+      }),
+    );
+    await new Promise<void>((r) => setTimeout(r, 250));
+    const info = proc.exitInfo();
+    if (!info) throw new Error("type narrowing");
+    expect(info.tail).not.toContain(token.slice(0, half));
+    expect(info.tail).not.toContain(token.slice(half));
+    expect(info.tail).toContain("banner <redacted> trailing");
+    await proc.dispose();
+  });
+
+  test("collectSecretValues covers the wider name suffixes and URL passwords (L4)", () => {
+    const values = collectSecretValues({
+      DB_PASSWORD: "p".repeat(10),
+      SSH_PASSPHRASE: "q".repeat(11),
+      GCP_CREDENTIAL: "c".repeat(12),
+      AWS_CREDENTIALS: "d".repeat(13),
+      SOME_Key: "k".repeat(14),
+      DATABASE_URL: `postgres://app:${"u".repeat(15)}@db.internal:5432/main`,
+      REDIS_DSN: `redis://:${"v".repeat(16)}@cache:6379`,
+      PLAIN_URL: "https://example.com/path",
+      SHORT_PW_URL: "postgres://app:short@db/x",
+      PATH: "/usr/bin:/bin",
+      HOME: "/home/someone",
+    });
+    expect(values).toEqual([
+      "v".repeat(16),
+      "u".repeat(15),
+      "k".repeat(14),
+      "d".repeat(13),
+      "c".repeat(12),
+      "q".repeat(11),
+      "p".repeat(10),
+    ]);
   });
 
   test("'PTY exited before TUI settled' error includes exitCode + tail (#176)", async () => {
