@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { type AddressInfo, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { _setSettingsFileForTests, loadSettings, reloadSettings } from "../config.js";
@@ -375,6 +376,41 @@ describe("HTTP engines", () => {
     const result = await engines.get("llm-router")!.run(untrusted, {});
     expect(result).toMatchObject({ text: "from second", model: "second", exitCode: 0 });
     expect(server.seen.map((s) => s.body.model)).toEqual(["first", "second"]);
+  });
+
+  it("llm-router moves to the next tier model when the connection drops mid-body", async () => {
+    let calls = 0;
+    const tcp = createServer((socket) => {
+      socket.once("data", () => {
+        if (++calls === 1) {
+          // Headers promise 500 bytes; the connection drops after 11.
+          socket.write(
+            'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\n\r\n{"choices":',
+          );
+          setTimeout(() => socket.destroy(), 20);
+          return;
+        }
+        const body = JSON.stringify({ model: "second", choices: [{ message: { content: "ok" } }] });
+        socket.end(
+          `HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: ${body.length}\r\n\r\n${body}`,
+        );
+      });
+    });
+    await new Promise<void>((resolve) => tcp.listen(0, "127.0.0.1", () => resolve()));
+    try {
+      const { port } = tcp.address() as AddressInfo;
+      await useSettings({
+        llmRouter: {
+          openRouterBaseUrl: `http://127.0.0.1:${port}`,
+          tiers: { fast: ["first", "second"] },
+        },
+      });
+      const result = await engines.get("llm-router")!.run(untrusted, {});
+      expect(result).toMatchObject({ text: "ok", model: "second", exitCode: 0 });
+      expect(calls).toBe(2);
+    } finally {
+      tcp.close();
+    }
   });
 
   it("llm-router reads OPENROUTER_API_KEY by default", async () => {
