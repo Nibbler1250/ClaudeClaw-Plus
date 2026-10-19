@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanSpawnEnv } from "../runner/spawn-env.js";
 import type { OneShotRequest, OneShotResult } from "./engine.js";
-import { UNTRUSTED_CLAUDE_ARGS, validateIsolation } from "./isolation.js";
+import { UNTRUSTED_CLAUDE_ARGS, trustedToolFlags, validateIsolation } from "./isolation.js";
 import { cliModelFlag } from "./model.js";
 import { stderrExcerpt } from "./redact.js";
 
@@ -38,13 +38,7 @@ export function buildPrintArgs(req: OneShotRequest, stdinPrompt = false): string
   if (req.isolation === "untrusted") args.push(...UNTRUSTED_CLAUDE_ARGS);
   else {
     if (req.resumeSessionId) args.push("--resume", req.resumeSessionId);
-    if (req.allowedTools)
-      args.push(
-        "--tools",
-        req.allowedTools.join(","),
-        "--allowedTools",
-        req.allowedTools.join(","),
-      );
+    args.push(...(trustedToolFlags(req) ?? []));
   }
   // Claude CLI has no maxTokens flag. HTTP engines can honour it later.
   return args;
@@ -70,7 +64,7 @@ export async function runPrint(req: OneShotRequest): Promise<OneShotResult> {
       const { buildChildEnv, buildSecurityArgs } = await import("../runner.js");
       env = buildChildEnv(env, req.model ?? settings.model, settings.api);
       // Explicit tool restrictions win over the default permission profile.
-      if (!req.allowedTools) args.push(...buildSecurityArgs(settings.security));
+      if (!req.allowedTools && !req.tools) args.push(...buildSecurityArgs(settings.security));
     }
   }
   const cwd =
