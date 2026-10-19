@@ -49,7 +49,9 @@ export interface ResolveAgentOptions {
 export const DECLARED_AGENT_DEFAULT_SUPERVISION: SupervisionMode = "pty-stdin";
 
 /** The supervision `resolveBusAgentConfig` gives a settings entry; shared with the startup summary. */
-export function effectiveAgentSupervision(entry: Pick<BusAgentSettings, "supervision">): SupervisionMode {
+export function effectiveAgentSupervision(
+  entry: Pick<BusAgentSettings, "supervision">,
+): SupervisionMode {
   return (entry.supervision as SupervisionMode | undefined) ?? DECLARED_AGENT_DEFAULT_SUPERVISION;
 }
 

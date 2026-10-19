@@ -43,7 +43,12 @@ describe("#550 startup engine summary", () => {
 });
 
 describe("#562 review: PTY default without the MCP multiplexer", () => {
-  const base = { ptyEnabled: true, sharedServerCount: 0, webEnabled: false, multiplexerActive: false };
+  const base = {
+    ptyEnabled: true,
+    sharedServerCount: 0,
+    webEnabled: false,
+    multiplexerActive: false,
+  };
   it("warns when PTY is on and mcp.shared is empty, naming the consequence and the fix", () => {
     const warning = ptyWithoutSharedMcpWarning(base);
     expect(warning).toContain("mcp.shared is empty");
