@@ -6,7 +6,7 @@ import {
   PtyClosedError,
   type PtyProcessOptions,
 } from "../runner/index";
-import { __buildClaudeArgsForTests } from "../runner/pty-process";
+import { __buildClaudeArgsForTests, collectSecretValues } from "../runner/pty-process";
 import type { SecurityConfig } from "../config";
 
 // ─── Shared test helpers ────────────────────────────────────────────────────
@@ -226,6 +226,62 @@ describe("PtyProcess — lifecycle", () => {
     // The redaction marker should appear.
     expect(info.tail).toContain("<redacted>");
     await proc.dispose();
+  });
+
+  test("exitInfo().tail redacts the exact credential values in the child env, whatever their shape (#562 security review)", async () => {
+    // A z.ai GLM `id.secret` token or a Kimi key has no `sk-` prefix, so the prefix patterns
+    // miss it. Values are obviously fake and built at runtime.
+    const glmShaped = `${"a".repeat(32)}.${"b".repeat(16)}`;
+    const kimiShaped = `test-token-${"0".repeat(24)}`;
+    const authShaped = `fake_auth_${"1".repeat(24)}`;
+    const innocent = "plainword";
+    const proc = await spawnPty(
+      baseOpts({
+        env: {
+          ...(process.env as Record<string, string>),
+          ANTHROPIC_AUTH_TOKEN: authShaped,
+          KIMI_API_KEY: kimiShaped,
+          CUSTOM_SERVICE_TOKEN: glmShaped.replace(/\./g, "-"),
+          SHORT_TOKEN: "abc",
+          UNRELATED_NAME: innocent,
+        },
+        _commandOverride: "/bin/sh",
+        _argsOverride: [
+          "-c",
+          [
+            `echo 'auth: ${authShaped}'`,
+            `echo 'kimi: ${kimiShaped}'`,
+            `echo 'custom: ${glmShaped.replace(/\./g, "-")}'`,
+            `echo 'glm: ${glmShaped}'`,
+            `echo 'short: abc and ${innocent}'`,
+            "exit 9",
+          ].join("; "),
+        ],
+      }),
+    );
+    await new Promise<void>((r) => setTimeout(r, 200));
+    const info = proc.exitInfo();
+    if (!info) throw new Error("type narrowing");
+    expect(info.tail).not.toContain(authShaped);
+    expect(info.tail).not.toContain(kimiShaped);
+    expect(info.tail).not.toContain(glmShaped.replace(/\./g, "-"));
+    expect(info.tail).not.toContain(glmShaped);
+    // A short value and an unrelated env value are left alone.
+    expect(info.tail).toContain("short: abc and plainword");
+    await proc.dispose();
+  });
+
+  test("collectSecretValues picks credential env names and skips short or unrelated values", () => {
+    const values = collectSecretValues({
+      ANTHROPIC_AUTH_TOKEN: "x".repeat(12),
+      ANTHROPIC_API_KEY: "y".repeat(10),
+      CLAUDE_CODE_OAUTH_TOKEN: "z".repeat(9),
+      FOO_API_KEY: "f".repeat(8),
+      BAR_TOKEN: "short",
+      PATH: "/usr/bin:/bin:/usr/local/bin",
+      EMPTY_TOKEN: "",
+    });
+    expect(values).toEqual(["x".repeat(12), "y".repeat(10), "z".repeat(9), "f".repeat(8)]);
   });
 
   test("'PTY exited before TUI settled' error includes exitCode + tail (#176)", async () => {

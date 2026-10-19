@@ -309,12 +309,41 @@ const TAIL_REDACTION_PATTERNS: ReadonlyArray<RegExp> = [
   /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
   // Slack bot / app / user tokens (xoxb / xoxa / xoxp / xoxs).
   /\bxox[bapso]-[A-Za-z0-9-]{10,}/g,
+  // `id.secret` tokens with no recognisable prefix (the z.ai GLM form).
+  /\b[A-Za-z0-9]{32}\.[A-Za-z0-9]{16,}/g,
 ];
+
+/** Child-env names whose values are credentials, beyond any `*_API_KEY` / `*_TOKEN` / `*_SECRET`. */
+const CREDENTIAL_ENV_NAMES: ReadonlySet<string> = new Set([
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_API_KEY",
+  "KIMI_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+]);
+const CREDENTIAL_ENV_SUFFIX = /(?:_API_KEY|_TOKEN|_SECRET)$/i;
+/** Shorter values are not worth redacting: they would mangle ordinary words. */
+const MIN_REDACTED_SECRET_LENGTH = 8;
+
+/**
+ * The exact credential values in the child's env. The prefix patterns above only know
+ * a few token shapes; the child gets `ANTHROPIC_AUTH_TOKEN` / `KIMI_API_KEY` values of
+ * any shape, and one printed in an auth failure must not reach the log or a chat reply.
+ * Longest first, so a value that contains another is replaced whole.
+ */
+export function collectSecretValues(env: Record<string, string | undefined> | undefined): string[] {
+  const values = new Set<string>();
+  for (const [name, value] of Object.entries(env ?? {})) {
+    if (!value || value.length < MIN_REDACTED_SECRET_LENGTH) continue;
+    if (CREDENTIAL_ENV_NAMES.has(name) || CREDENTIAL_ENV_SUFFIX.test(name)) values.add(value);
+  }
+  return [...values].sort((a, b) => b.length - a.length);
+}
 
 /** Replace matches of any `TAIL_REDACTION_PATTERNS` with `<redacted>` so
  *  the tail can be safely logged without leaking credentials. */
-function redactSecretsInTail(text: string): string {
+export function redactSecretsInTail(text: string, secretValues: readonly string[] = []): string {
   let out = text;
+  for (const value of secretValues) out = out.split(value).join("<redacted>");
   for (const pattern of TAIL_REDACTION_PATTERNS) {
     out = out.replace(pattern, "<redacted>");
   }
@@ -443,6 +472,8 @@ class PtyProcessImpl implements PtyProcess {
   private _tailBufLen = 0;
   /** Diagnostic snapshot, populated when `_handleExit` fires. */
   private _exitInfo: PtyExitInfo | null = null;
+  /** Credential values in the child env, redacted from the tail snapshot. */
+  private readonly _secretValues: string[];
 
   constructor(pty: IPty, opts: PtyProcessOptions) {
     this._pty = pty;
@@ -450,6 +481,7 @@ class PtyProcessImpl implements PtyProcess {
     this._sessionId =
       opts.sessionId && opts.sessionId.length > 0 ? opts.sessionId : (opts.newSessionId ?? "");
     this.cwd = opts.cwd;
+    this._secretValues = collectSecretValues(opts.env);
     this.label = `${opts.agentName ?? "pty"}:${pty.pid}`;
     this._quietWindowMs = opts.quietWindowMs ?? DEFAULT_QUIET_WINDOW_MS;
     this._sentinelMaxWaitMs = opts.sentinelMaxWaitMs ?? DEFAULT_SENTINEL_MAX_WAIT_MS;
@@ -535,7 +567,7 @@ class PtyProcessImpl implements PtyProcess {
     // before the snapshot can be logged. Newlines are preserved.
     // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping control bytes by design
     const stripped = stripAnsiInline(decoded).replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "");
-    return redactSecretsInTail(stripped);
+    return redactSecretsInTail(stripped, this._secretValues);
   }
 
   // ─── data flow ────────────────────────────────────────────────────────
