@@ -3151,3 +3151,41 @@ describe("pty-supervisor retirement — the map's invariants (issue #394)", () =
     expect(sleeps).toEqual([]); // no backoff after the refusal
   });
 });
+
+describe("runOnPty: a prompt cannot be read as a REPL command (#562 security review)", () => {
+  let cmdKey = 0;
+  async function sentPrompt(prompt: string, ephemeral = false): Promise<string> {
+    injectMaxRetriesForTests(0);
+    const seen: string[] = [];
+    injectSpawnPty(async () =>
+      makeFakePty("cmd", {
+        onTurn: async (p) => {
+          seen.push(p);
+          return { text: "ok", bytesCaptured: 1, cleanBoundary: true, sessionId: "sid" };
+        },
+      }),
+    );
+    const result = await runOnPty(`thread:cmd-${++cmdKey}`, prompt, {
+      timeoutMs: 1000,
+      ...(ephemeral ? { ephemeral: true } : {}),
+    });
+    expect(result.exitCode).toBe(0);
+    return seen[0] ?? "";
+  }
+
+  for (const leader of ["/", "!", "#", "@"]) {
+    it(`a prompt starting with ${leader} gets one leading space`, async () => {
+      expect(await sentPrompt(`${leader}clear everything`)).toBe(` ${leader}clear everything`);
+      expect(await sentPrompt(`  ${leader}x`)).toBe(`   ${leader}x`);
+    });
+  }
+
+  it("leaves an ordinary prompt, including one led by a clock line, untouched", async () => {
+    expect(await sentPrompt("[Friday 10:00] /not a command")).toBe("[Friday 10:00] /not a command");
+    expect(await sentPrompt("hello")).toBe("hello");
+  });
+
+  it("leaves a one-shot (ephemeral) prompt alone, so /compact still reaches the REPL", async () => {
+    expect(await sentPrompt("/compact", true)).toBe("/compact");
+  });
+});

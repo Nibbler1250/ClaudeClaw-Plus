@@ -63,6 +63,7 @@
 // `moduleResolution: nodenext` (which requires the extension).
 import type { PtyProcess, PtyProcessOptions, PtyTurnResult, SpawnPty } from "./pty-process.js";
 import { PtyClosedError, PtyTurnTimeoutError } from "./pty-process.js";
+import { neutralizeLeadingReplCommand } from "./pty-prompt-sanitizer.js";
 import { ensureTrustAccepted } from "./pty-trust-prompt.js";
 import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";
 import { trustedToolFlags, validateIsolation } from "../oneshot/isolation.js";
@@ -807,6 +808,9 @@ export async function runOnPty(
   } & PtyRunScope,
 ): Promise<RunOnPtyResult> {
   if (opts.signal?.aborted) return errorResult(`[pty-supervisor] ${sessionKey} aborted`);
+  // A one-shot (`ephemeral`) may be a deliberate slash command (`/compact`); every other
+  // prompt is user or model text and must not be read by the REPL as a command.
+  if (!opts.ephemeral) prompt = neutralizeLeadingReplCommand(prompt);
   // Phase D fix #3 (Codex HIGH #3): lazily start the reaper interval. The
   // daemon runtime enters PTY mode through `runOnPty` directly and never
   // calls `initSupervisor`, so without this `settings.pty.idleReapMinutes`

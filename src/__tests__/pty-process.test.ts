@@ -1056,6 +1056,12 @@ describe("sanitizePtyPromptText (issue #65 item 3)", () => {
     expect(sanitizePtyPromptText("")).toBe("");
   });
 
+  test("strips C1 controls U+0080 to U+009F, which some terminals read as escape sequences", () => {
+    expect(sanitizePtyPromptText("a\u009bb\u0080c\u009fd\u0085e")).toBe("abcde");
+    // Printable Latin-1 just above the C1 range survives.
+    expect(sanitizePtyPromptText("caf\u00e9 \u00a0x")).toBe("caf\u00e9 \u00a0x");
+  });
+
   test("strips NUL bytes that would truncate the C-string PTY write", () => {
     expect(sanitizePtyPromptText("hello\x00world")).toBe("helloworld");
   });
