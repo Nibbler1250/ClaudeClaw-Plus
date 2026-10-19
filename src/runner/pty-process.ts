@@ -354,10 +354,10 @@ export function collectSecretValues(env: Record<string, string | undefined> | un
 /**
  * A regex matching `value` with optional whitespace between any two characters, because
  * the TUI hard-wraps at `pty.cols` and a token printed in a banner comes back as two
- * halves split by a newline and the indent of the next row. Every part is one escaped
- * literal followed by `\s*`; literals are never whitespace (a value containing
- * whitespace is matched exactly instead), so there is nothing to backtrack over and the
- * cost is linear in the tail.
+ * halves split by a newline and the indent of the next row. The parts are single escaped
+ * literals joined by `\s*`, so the `\s*` sits between characters and not after the last;
+ * literals are never whitespace (a value containing whitespace is matched exactly
+ * instead), so there is nothing to backtrack over and the cost is linear in the tail.
  */
 function wrappedSecretRegex(value: string): RegExp | null {
   if (/\s/.test(value)) return null;

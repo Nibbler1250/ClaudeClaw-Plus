@@ -1,10 +1,32 @@
 # PTY is the default engine
 
 On upgrade, a missing `pty.enabled` setting now selects the interactive Claude
-PTY engine for runner agent turns and scheduled jobs. Bootstrap, model fallback,
-stale or corrupted session recovery and post-compaction retries follow that
-setting too. An existing literal `false` is preserved. Invalid values such as
-`"false"` warn and use the platform default (`true`, or `false` on Windows).
+PTY engine for runner agent turns and scheduled jobs. Bootstrap, model fallback
+and the one-attempt retry after a stale session follow that setting too. An
+existing literal `false` is preserved. Invalid values such as `"false"` warn and
+use the platform default (`true`, or `false` on Windows).
+
+Two recovery behaviours differ from print mode:
+
+- **No auto-compact on timeout.** A PTY turn that times out returns exit 124 and
+  the supervisor retires that PTY, but the runner does not save memory, run
+  `/compact` or re-run the prompt. A PTY timeout is often a missed turn-end on a
+  healthy session, so re-running could repeat tool side effects, and the
+  interactive REPL compacts its own context. The save, `/compact` and re-run
+  recovery applies to the print path only.
+- **Corrupted-session reset needs two signals.** A session is reset after an
+  "Invalid signature in thinking block" error on the PTY only when the rendered
+  error ends the turn AND the session transcript's last entry is the CLI's own
+  API-error entry (`isApiErrorMessage`). Reply text that merely quotes the error
+  does not reset it, whatever the exit code. The print path keeps its non-zero
+  exit rule.
+
+Prompts that start with `/`, `!`, `#` or `@`: on the PTY engine a prompt whose
+first non-space character is one of these is sent with a leading space, so the
+REPL does not read it as a slash command, a shell command, a memory note or a
+file mention. Only the daemon's own `/compact` is exempt. Chat prompts normally
+start with the clock line anyway, so this matters mainly for scheduled-job and
+dispatched-job prompts.
 
 On Windows (`win32`) runner turns also stay on print (`claude -p`) by default,
 for the same reason as the bus fallback below: nothing in this codebase shows
@@ -101,10 +123,10 @@ small machine, enable sharing or set `pty.enabled: false`.
 
 Issue #559 (fresh PTY chat input with the runner's timestamp prefix could stay
 unsubmitted until timeout) is fixed by #563, which this branch contains. One
-visible side effect of that fix: prompts longer than about 1,000 characters are
-submitted to the Claude TUI as a bracketed paste, so the terminal may show them
-as a pasted block instead of as typed text. The turn is still submitted and runs
-as normal.
+visible side effect of that fix: every prompt is submitted to the Claude TUI as a
+bracketed paste (`runTurn` wraps each one in the paste markers), so the terminal
+may show it as a pasted block instead of as typed text. The turn is still
+submitted and runs as normal.
 
 The operator must complete the 48-hour soak in the issue #550 implementation
 report, covering chat, cron jobs, dispatched jobs, a restart and compaction, and

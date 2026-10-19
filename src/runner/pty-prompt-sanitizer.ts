@@ -36,8 +36,9 @@ const REPL_COMMAND_LEADERS = new Set(["/", "!", "#", "@"]);
 /**
  * What the REPL skips before deciding what a prompt is: whitespace (JS `\s` includes
  * U+00A0, U+FEFF and the Unicode spaces), controls (so the check does not depend on the
- * sanitizer having run), U+0085, and the zero-width marks. Built from escapes so the
- * source holds no literal control characters.
+ * sanitizer having run), U+0085, the zero-width marks, and the bidi controls (U+200E,
+ * U+200F, U+202A to U+202E). Built from escapes so the source holds no literal control
+ * characters.
  */
 const LEADING_SKIPPABLE = new RegExp(
   "^[\\s\\x00-\\x1f\\x7f-\\x9f\\u200b-\\u200f\\u2028\\u2029\\u202a-\\u202e\\u2060-\\u2064\\ufeff]*",
@@ -61,8 +62,8 @@ export function neutralizeLeadingReplCommand(text: string): string {
 
 /**
  * The only prompts allowed to reach the REPL as a command: `/compact`, alone or with
- * arguments on the same line. An opt-out that accepted any text would let a future caller
- * pass arbitrary input through it.
+ * arguments on the same line, capped at 500 characters of arguments. An opt-out that
+ * accepted any text would let a future caller pass arbitrary input through it.
  */
 const ALLOWED_REPL_COMMAND = /^\/compact(?: [^\n]{0,500})?$/;
 
