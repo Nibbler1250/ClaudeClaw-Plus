@@ -671,7 +671,7 @@ export interface PtyConfig {
   /** Master switch for runner turns. Defaults to true (#550), except on win32 where
    *  it defaults to false (`defaultPtyEnabled`); an explicit boolean always wins.
    *  An explicit false selects the `claude -p` path for every callsite.
-   *  See README "PTY runner mode". */
+   *  See README "Execution Modes and Engine Policy" and docs/pty-migration.md. */
   enabled: boolean;
   /** Ad-hoc thread PTYs are disposed after this many minutes of inactivity.
    *  Named agents are NEVER reaped when namedAgentsAlwaysAlive is true.

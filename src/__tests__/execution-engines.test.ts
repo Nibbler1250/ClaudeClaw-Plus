@@ -65,6 +65,16 @@ describe("#562 review: PTY default without the MCP multiplexer", () => {
       ptyWithoutSharedMcpWarning({ ...base, sharedServerCount: 2, webEnabled: true }),
     ).toContain("it started dormant");
   });
+  it("distinguishes a failed start from a dormant start", () => {
+    const shared = { ...base, sharedServerCount: 2, webEnabled: true };
+    expect(ptyWithoutSharedMcpWarning({ ...shared, startFailed: true })).toContain(
+      "it failed to start",
+    );
+    expect(ptyWithoutSharedMcpWarning({ ...shared, startFailed: true })).not.toContain(
+      "started dormant",
+    );
+    expect(ptyWithoutSharedMcpWarning(shared)).toContain("it started dormant");
+  });
   it("stays quiet when PTY is off or the multiplexer is serving", () => {
     expect(ptyWithoutSharedMcpWarning({ ...base, ptyEnabled: false })).toBeNull();
     expect(

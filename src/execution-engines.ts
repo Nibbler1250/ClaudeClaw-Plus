@@ -11,11 +11,13 @@ export function logExecutionEngineSummary(
 
 export interface PtyMcpSharingState {
   ptyEnabled: boolean;
-  /** Names in `settings.mcp.shared`. */
+  /** How many servers `settings.mcp.shared` lists. */
   sharedServerCount: number;
   webEnabled: boolean;
   /** `plugin.isActive()` after start; false when never started or left dormant. */
   multiplexerActive: boolean;
+  /** `plugin.start()` threw (start.ts's catch branch), as opposed to returning dormant. */
+  startFailed?: boolean;
 }
 
 /**
@@ -31,7 +33,9 @@ export function ptyWithoutSharedMcpWarning(state: PtyMcpSharingState): string | 
       ? "mcp.shared is empty"
       : !state.webEnabled
         ? "web.enabled is false"
-        : "it started dormant";
+        : state.startFailed
+          ? "it failed to start, see the startup error above"
+          : "it started dormant";
   return `[mcp-multiplexer] pty.enabled is true but the multiplexer is not running (${why}): each PTY session spawns its own copy of your MCP servers. To share one set, list the servers in settings.mcp.shared, define them in ~/.config/claudeclaw/mcp-proxy.json and set web.enabled: true (docs/mcp-proxy.md).`;
 }
 

@@ -1088,6 +1088,7 @@ export async function start(args: string[] = []) {
   // non-empty AND web.enabled is true. Otherwise the plugin would have
   // nothing to mount routes on.
   let mcpMultiplexerActive = false;
+  let mcpMultiplexerStartFailed = false;
   if (settings.mcp.shared.length > 0 && settings.web.enabled) {
     try {
       const plugin = getMcpMultiplexerPlugin();
@@ -1140,6 +1141,7 @@ export async function start(args: string[] = []) {
         );
       }
     } catch (err) {
+      mcpMultiplexerStartFailed = true;
       // Don't crash the daemon — log clearly and fall back to per-PTY MCP
       // discovery (settings.mcp.shared becomes effectively dormant).
       const msg = err instanceof Error ? err.message : String(err);
@@ -1165,6 +1167,7 @@ export async function start(args: string[] = []) {
     sharedServerCount: settings.mcp.shared.length,
     webEnabled: settings.web.enabled,
     multiplexerActive: mcpMultiplexerActive,
+    startFailed: mcpMultiplexerStartFailed,
   });
   if (sharingWarning) console.warn(sharingWarning);
 
