@@ -33,6 +33,7 @@ import {
   resetSleep,
   snapshotSupervisor,
 } from "../runner/pty-supervisor";
+import { injectSignatureConfirmForTests } from "../runner/signature-error";
 import {
   PtyClosedError,
   type PtyProcess,
@@ -213,6 +214,7 @@ afterEach(() => {
   (configMod.getSettings as unknown as { mockRestore?: () => void }).mockRestore?.();
   __resetSupervisorForTests();
   resetSleep();
+  injectSignatureConfirmForTests(null);
 });
 
 describe("#546 resolveAgentTurnRoute", () => {
@@ -530,14 +532,23 @@ describe("#546 rate-limit fallback", () => {
 
   it("pty.enabled: true, corrupted fallback session → fresh PTY, new id saved as the fallback session", async () => {
     stubSettings(true);
+    const renderedError =
+      'API Error: 400 {"error":{"message":"Invalid `signature` in `thinking` block"}}';
+    // The REPL renders the error and stays up (exit 0); a PTY reset also needs the session
+    // transcript to end in the CLI's own API-error entry, which this stands in for.
+    injectSignatureConfirmForTests({
+      sleep: async () => {},
+      readTail: async () =>
+        JSON.stringify({
+          type: "assistant",
+          isApiErrorMessage: true,
+          message: { content: [{ type: "text", text: renderedError }] },
+        }),
+    });
     turnScript = async (_p, _o, pty) => {
-      if (pty.sessionId === "fallback-session") {
-        throw new Error("API Error: Invalid signature in thinking block");
-      }
+      if (pty.sessionId === "fallback-session") return renderedError;
       return "recovered";
     };
-    // A turn that throws a non-retryable error surfaces as exit 1 + stderr,
-    // which is what the corrupted-session branch matches on.
     const r = await runnerMod.run("t546", "hello", thread);
     expect(legacyArgv).toHaveLength(0);
     expect(ptySpawns).toHaveLength(2);

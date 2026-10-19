@@ -143,6 +143,12 @@ describe("#550 default runner routing", () => {
     expect(result.ptyCalls).toEqual([]);
     expect(result.retired).toEqual([]);
   });
+  it("a PTY turn that quotes the phrase mid-output and times out (124) does not reset the session (L8)", async () => {
+    const result = await fixture("quoted-timeout");
+    expect(result.exitCode).toBe(124);
+    expect(result.ptyCalls).toEqual([]);
+    expect(result.retired).toEqual([]);
+  });
   it("recovers a signature error rendered by the fallback PTY", async () => {
     const result = await fixture("fallback-rendered");
     expect(result.ptyCalls).toHaveLength(2);

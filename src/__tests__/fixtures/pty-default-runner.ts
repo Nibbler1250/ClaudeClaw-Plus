@@ -193,7 +193,9 @@ injectSignatureConfirmForTests({
   readTail: async () =>
     JSON.stringify({
       type: "assistant",
-      ...(scenario === "rendered-quoted" ? {} : { isApiErrorMessage: true }),
+      ...(scenario === "rendered-quoted" || scenario === "quoted-timeout"
+        ? {}
+        : { isApiErrorMessage: true }),
       message: { role: "assistant", content: [{ type: "text", text: QUOTED_ERROR_LINE }] },
     }),
 });
@@ -207,6 +209,7 @@ if (
     "recovery-timeout",
     "rendered-corrupt",
     "rendered-quoted",
+    "quoted-timeout",
     "fallback-model",
     "fallback-stream",
     "fallback-rendered",
@@ -236,7 +239,19 @@ if (
         exitCode: 0,
       };
     if (scenario === "corrupt" || scenario === "recovery-timeout")
-      return { rawStdout: "", stderr: "Invalid signature in thinking block", exitCode: 1 };
+      // Print: the CLI's stderr and a non-zero exit. PTY: the rendered error row (the
+      // transcript injected above confirms it), since a PTY reset needs that confirmation.
+      return input.route === "pty"
+        ? { rawStdout: QUOTED_ERROR_LINE, stderr: "", exitCode: 1 }
+        : { rawStdout: "", stderr: "Invalid signature in thinking block", exitCode: 1 };
+    // A PTY turn that quotes the phrase mid-output and then times out: no transcript API
+    // error behind it, so the shared session must not be reset.
+    if (scenario === "quoted-timeout")
+      return {
+        rawStdout: `The log said:\n${QUOTED_ERROR_LINE}\nthen I kept working until the turn timed out.`,
+        stderr: "",
+        exitCode: 124,
+      };
     if (scenario === "stale")
       return {
         rawStdout: "",

@@ -85,9 +85,8 @@ import { encodeCwdForProjectsDir } from "./bus/jsonl-line-types";
 import { PTY_OUTPUT_FORMAT_CONSTRAINT } from "./runner/pty-output-format";
 import { SPAWN_ENV_STRIP_KEYS, cleanSpawnEnv, shouldStripSpawnEnvKey } from "./runner/spawn-env";
 import {
-  confirmRenderedSignatureError,
   endsInRenderedSignatureError,
-  hasSignatureError,
+  signatureErrorWarrantsReset,
 } from "./runner/signature-error";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
@@ -2182,20 +2181,21 @@ async function execClaude(
       usedFallback = true;
       let fallbackRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
 
-      // If the fallback resumed a corrupted session, reset it and retry fresh. A non-zero
-      // exit is the CLI's own verdict. On a PTY that exited 0 the error is only rendered
-      // text, so the transcript must confirm it (the model could have quoted it).
+      // If the fallback resumed a corrupted session, reset it and retry fresh. On the print
+      // path a non-zero exit with the phrase is the CLI's own verdict. On a PTY the output is
+      // rendered text the model can also write, so whatever the exit code the transcript must
+      // confirm it (`signatureErrorWarrantsReset`).
       const fallbackSignatureError =
         !fallbackRateLimit &&
         !!fallbackSession &&
-        (exec.exitCode !== 0
-          ? hasSignatureError(exec.rawStdout + exec.stderr)
-          : !useLegacyPath &&
-            (await confirmRenderedSignatureError({
-              output: exec.rawStdout,
-              sessionId: exec.sessionId ?? fallbackSession.sessionId,
-              cwd: spawnCwd ?? process.cwd(),
-            })));
+        (await signatureErrorWarrantsReset({
+          useLegacyPath,
+          exitCode: exec.exitCode,
+          output: exec.rawStdout,
+          stderr: exec.stderr,
+          sessionId: exec.sessionId ?? fallbackSession.sessionId,
+          cwd: spawnCwd ?? process.cwd(),
+        }));
       if (fallbackSession && fallbackSignatureError) {
         await resetFallbackSession(agentName, threadId);
         const flabel = threadId
@@ -2246,20 +2246,20 @@ async function execClaude(
     // Auto-detect corrupted primary session from thinking block signature mismatch.
     // Gated on !usedFallback — fallback corruption is handled inside the fallback block above.
     // The interactive REPL may render an API error and return to its input prompt without
-    // exiting. A non-zero exit is the CLI's own verdict; a rendered error on an exit-0 PTY
-    // turn counts only when the session transcript ends in the CLI's API-error entry too,
-    // because the model's reply can quote the same line.
+    // exiting, and its output is text the model can also write. On a PTY the reset needs the
+    // rendered tail AND the session transcript's own API-error entry, whatever the exit code;
+    // the print path keeps its non-zero-exit rule (`signatureErrorWarrantsReset`).
     const primarySignatureError =
       !isNew &&
       !usedFallback &&
-      (exitCode !== 0
-        ? hasSignatureError(rawStdout + stderr)
-        : !useLegacyPath &&
-          (await confirmRenderedSignatureError({
-            output: rawStdout,
-            sessionId: exec.sessionId ?? existing?.sessionId,
-            cwd: spawnCwd ?? process.cwd(),
-          })));
+      (await signatureErrorWarrantsReset({
+        useLegacyPath,
+        exitCode,
+        output: rawStdout,
+        stderr,
+        sessionId: exec.sessionId ?? existing?.sessionId,
+        cwd: spawnCwd ?? process.cwd(),
+      }));
     if (primarySignatureError) {
       if (threadId) {
         await removeThreadSession(threadId);

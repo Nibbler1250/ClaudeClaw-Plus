@@ -84,15 +84,29 @@ const TRANSCRIPT_TAIL_BYTES = 64 * 1024;
 /** Returns the end of the session transcript, or null when it cannot be read. */
 export type TranscriptTailReader = (cwd: string, sessionId: string) => Promise<string | null>;
 
+/** Claude Code names a session by a UUID, and so does every id this repo mints. */
+const SESSION_ID_FORMAT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The transcript path for a session, or null when the id is not a UUID. The id comes from
+ * CLI output and stored sessions; it is never allowed to carry a path separator or `..`
+ * into the path.
+ */
+export function transcriptPathFor(cwd: string, sessionId: string): string | null {
+  if (!SESSION_ID_FORMAT.test(sessionId)) return null;
+  return resolvePath(
+    homedir(),
+    ".claude",
+    "projects",
+    encodeCwdForProjectsDir(resolvePath(cwd)),
+    `${sessionId}.jsonl`,
+  );
+}
+
 const defaultReadTranscriptTail: TranscriptTailReader = async (cwd, sessionId) => {
   try {
-    const path = resolvePath(
-      homedir(),
-      ".claude",
-      "projects",
-      encodeCwdForProjectsDir(resolvePath(cwd)),
-      `${sessionId}.jsonl`,
-    );
+    const path = transcriptPathFor(cwd, sessionId);
+    if (!path) return null;
     const { size } = await stat(path);
     const start = Math.max(0, size - TRANSCRIPT_TAIL_BYTES);
     const handle = await open(path, "r");
@@ -154,6 +168,8 @@ export function transcriptEndsInSignatureApiError(tail: string): boolean {
     } catch {
       continue; // the first line of a tail read can be cut mid-entry
     }
+    // `null`, a number or an array parses fine and is not a transcript entry.
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
     if (entry.type !== "assistant" && entry.type !== "user") continue;
     return (
       entry.type === "assistant" &&
@@ -179,12 +195,43 @@ export async function confirmRenderedSignatureError(args: {
   sessionId: string | undefined;
   cwd: string;
 }): Promise<boolean> {
-  if (!endsInRenderedSignatureError(args.output)) return false;
-  if (!args.sessionId || args.sessionId === "unknown") return false;
-  for (let attempt = 0; attempt < CONFIRM_ATTEMPTS; attempt += 1) {
-    const tail = await readTranscriptTail(args.cwd, args.sessionId);
-    if (tail !== null && transcriptEndsInSignatureApiError(tail)) return true;
-    if (attempt < CONFIRM_ATTEMPTS - 1) await sleep(CONFIRM_RETRY_MS);
+  // Fail closed: anything unexpected means "not confirmed", so no session is reset.
+  try {
+    if (!endsInRenderedSignatureError(args.output)) return false;
+    if (!args.sessionId || args.sessionId === "unknown") return false;
+    for (let attempt = 0; attempt < CONFIRM_ATTEMPTS; attempt += 1) {
+      const tail = await readTranscriptTail(args.cwd, args.sessionId);
+      if (tail !== null && transcriptEndsInSignatureApiError(tail)) return true;
+      if (attempt < CONFIRM_ATTEMPTS - 1) await sleep(CONFIRM_RETRY_MS);
+    }
+    return false;
+  } catch {
+    return false;
   }
-  return false;
+}
+
+/**
+ * Whether a finished turn means the stored session is corrupt and must be reset.
+ *
+ * - Print (`claude -p`): a non-zero exit whose output has the phrase, as before.
+ * - PTY: always the confirmed check (rendered tail AND the transcript's own API-error
+ *   entry), whatever the exit code. A PTY turn that quotes the phrase and then times out
+ *   (124) or fails would otherwise reset the shared session on text the model wrote.
+ */
+export async function signatureErrorWarrantsReset(args: {
+  useLegacyPath: boolean;
+  exitCode: number;
+  output: string;
+  stderr: string;
+  sessionId: string | undefined;
+  cwd: string;
+}): Promise<boolean> {
+  if (args.useLegacyPath) {
+    return args.exitCode !== 0 && hasSignatureError(args.output + args.stderr);
+  }
+  return confirmRenderedSignatureError({
+    output: args.output,
+    sessionId: args.sessionId,
+    cwd: args.cwd,
+  });
 }

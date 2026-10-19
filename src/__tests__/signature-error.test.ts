@@ -4,7 +4,9 @@ import {
   endsInRenderedSignatureError,
   hasSignatureError,
   injectSignatureConfirmForTests,
+  signatureErrorWarrantsReset,
   transcriptEndsInSignatureApiError,
+  transcriptPathFor,
 } from "../runner/signature-error";
 
 const ERROR_LINE =
@@ -229,5 +231,123 @@ describe("confirmRenderedSignatureError", () => {
       await confirmRenderedSignatureError({ output: "all good", sessionId: "sid", cwd: "/w" }),
     ).toBe(false);
     expect(probe.reads).toEqual([]);
+  });
+});
+
+describe("transcriptEndsInSignatureApiError: non-object lines (L5)", () => {
+  const apiError = JSON.stringify({
+    type: "assistant",
+    isApiErrorMessage: true,
+    message: { content: [{ type: "text", text: ERROR_LINE }] },
+  });
+  it("skips null, numbers, strings, arrays and garbage instead of throwing", () => {
+    for (const junk of ["null", "42", '"text"', "[1,2]", "{", "undefined"]) {
+      expect(() => transcriptEndsInSignatureApiError(`${apiError}\n${junk}`)).not.toThrow();
+      // The junk is the last line; the walk skips it and finds the real error entry.
+      expect(transcriptEndsInSignatureApiError(`${apiError}\n${junk}`)).toBe(true);
+    }
+    expect(transcriptEndsInSignatureApiError("null")).toBe(false);
+  });
+  it("confirmRenderedSignatureError fails closed when the reader throws or returns junk", async () => {
+    injectSignatureConfirmForTests({
+      readTail: async () => {
+        throw new Error("EIO");
+      },
+      sleep: async () => {},
+    });
+    expect(
+      await confirmRenderedSignatureError({ output: ERROR_LINE, sessionId: "sid", cwd: "/w" }),
+    ).toBe(false);
+    injectSignatureConfirmForTests({
+      readTail: async () => "null\nnot json",
+      sleep: async () => {},
+    });
+    expect(
+      await confirmRenderedSignatureError({ output: ERROR_LINE, sessionId: "sid", cwd: "/w" }),
+    ).toBe(false);
+    injectSignatureConfirmForTests(null);
+  });
+});
+
+describe("transcriptPathFor: the session id is validated before it joins a path (L6)", () => {
+  const uuid = "123e4567-e89b-12d3-a456-426614174000";
+  it("builds the path for a UUID", () => {
+    expect(transcriptPathFor("/work", uuid)).toMatch(
+      new RegExp(`/\\.claude/projects/.+/${uuid}\\.jsonl$`),
+    );
+    expect(transcriptPathFor("/work", uuid.toUpperCase())).not.toBeNull();
+  });
+  it("refuses anything that is not a UUID, including traversal", () => {
+    for (const bad of [
+      "",
+      "unknown",
+      "old-sid",
+      "../../etc/passwd",
+      `${uuid}/../x`,
+      `${uuid}.jsonl`,
+      `${uuid}\n`,
+      "123e4567-e89b-12d3-a456-42661417400g",
+      `/${uuid}`,
+    ]) {
+      expect(transcriptPathFor("/work", bad)).toBeNull();
+    }
+  });
+});
+
+describe("signatureErrorWarrantsReset (L8)", () => {
+  afterEach(() => injectSignatureConfirmForTests(null));
+  const quoted = `The log said:\n${ERROR_LINE}\nand then I carried on working for a while.`;
+  const apiErrorTail = JSON.stringify({
+    type: "assistant",
+    isApiErrorMessage: true,
+    message: { content: [{ type: "text", text: ERROR_LINE }] },
+  });
+  const base = { output: quoted, stderr: "", sessionId: "sid", cwd: "/w" };
+  const useTail = (tail: string) =>
+    injectSignatureConfirmForTests({ readTail: async () => tail, sleep: async () => {} });
+
+  it("PTY: a timeout (124) or failure with the phrase quoted mid-output does not reset", async () => {
+    useTail("");
+    for (const exitCode of [124, 1]) {
+      expect(await signatureErrorWarrantsReset({ ...base, useLegacyPath: false, exitCode })).toBe(
+        false,
+      );
+    }
+  });
+
+  it("PTY: a non-zero exit WITH the genuine rendered error and the transcript entry still resets", async () => {
+    useTail(apiErrorTail);
+    expect(
+      await signatureErrorWarrantsReset({
+        ...base,
+        output: ERROR_LINE,
+        useLegacyPath: false,
+        exitCode: 1,
+      }),
+    ).toBe(true);
+  });
+
+  it("print path is unchanged: non-zero exit plus the phrase resets, exit 0 does not", async () => {
+    useTail("");
+    expect(
+      await signatureErrorWarrantsReset({
+        ...base,
+        output: "",
+        stderr: "Invalid signature in thinking block",
+        useLegacyPath: true,
+        exitCode: 1,
+      }),
+    ).toBe(true);
+    expect(await signatureErrorWarrantsReset({ ...base, useLegacyPath: true, exitCode: 124 })).toBe(
+      true,
+    ); // quoted phrase + non-zero exit, exactly as on main
+    expect(
+      await signatureErrorWarrantsReset({
+        ...base,
+        stderr: "Invalid signature in thinking block",
+        useLegacyPath: true,
+        exitCode: 0,
+      }),
+    ).toBe(false);
   });
 });
