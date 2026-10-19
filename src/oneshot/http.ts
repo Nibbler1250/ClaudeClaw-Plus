@@ -63,6 +63,8 @@ async function postChat(
       },
       body: JSON.stringify(body),
       signal,
+      // An API endpoint does not redirect; following one could carry the key elsewhere.
+      redirect: "error",
     });
   } catch (error) {
     if (signal.aborted) throw error;

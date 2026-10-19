@@ -242,6 +242,26 @@ describe("HTTP engines", () => {
       expect(out).toContain('"route":"discord.classifier"');
       expect(out).not.toContain("bad request");
     });
+
+    it(`${id}: a redirect is refused, so the key never follows it`, async () => {
+      const elsewhere = mockServer(() => completion({ content: "captured" }));
+      try {
+        server = mockServer(
+          () =>
+            new Response(null, {
+              status: 307,
+              headers: { location: `${elsewhere.url}/chat/completions` },
+            }),
+        );
+        const config = await pointAt(id, server.url, { apiKeyEnv: KEY_ENV });
+        process.env[KEY_ENV] = SECRET;
+        const { result } = await captureConsole(() => engines.get(id)!.run(untrusted, config));
+        expect(result.exitCode).not.toBe(0);
+        expect(elsewhere.seen).toHaveLength(0);
+      } finally {
+        elsewhere.stop();
+      }
+    });
   }
 
   it("ollama defaults its base URL to the local Ollama OpenAI endpoint", () => {

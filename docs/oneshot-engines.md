@@ -54,8 +54,10 @@ elapsed milliseconds, exit code and usage counts when the engine reports them.
 
 ## HTTP engines
 
-Three stateless engines run the untrusted routes (`discord.classifier`, `tuner.*`,
-`memory.recall`) without the `claude` CLI:
+Three stateless engines run the untrusted routes without the `claude` CLI. Today
+that means `discord.classifier` and `tuner.*`; `memory.recall` accepts an HTTP
+engine in settings but still runs in Python on the CLI (#545), so the route has no
+effect yet.
 
 - `openai-compatible`: `POST {baseUrl}/chat/completions` with `model`, `messages`
   (`system` + `user`) and `max_tokens` when the caller sets `maxTokens`. Covers
@@ -99,7 +101,6 @@ install can have several:
     },
     "routes": {
       "discord.classifier": "local",
-      "memory.recall": "local",
       "tuner.*": "openrouter"
     }
   }
