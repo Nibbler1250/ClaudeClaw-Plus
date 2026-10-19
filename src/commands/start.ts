@@ -6,7 +6,7 @@ import { homedir } from "os";
 import { extractErrorDetail } from "../messaging";
 import { join } from "path";
 import { fileURLToPath } from "url";
-import { logExecutionEngineSummary } from "../execution-engines.js";
+import { logExecutionEngineSummary, ptyWithoutSharedMcpWarning } from "../execution-engines.js";
 import { beginStartupInitialization } from "../startup-initialization.js";
 import {
   run,
@@ -1087,6 +1087,7 @@ export async function start(args: string[] = []) {
   // Activation rule (SPEC §6.3): only attempt to start when shared is
   // non-empty AND web.enabled is true. Otherwise the plugin would have
   // nothing to mount routes on.
+  let mcpMultiplexerActive = false;
   if (settings.mcp.shared.length > 0 && settings.web.enabled) {
     try {
       const plugin = getMcpMultiplexerPlugin();
@@ -1131,6 +1132,7 @@ export async function start(args: string[] = []) {
             sharedServers: plugin.sharedServerNames(),
           });
         }
+        mcpMultiplexerActive = true;
         console.log("[mcp-multiplexer] started");
       } else {
         console.warn(
@@ -1156,6 +1158,15 @@ export async function start(args: string[] = []) {
       `[mcp-multiplexer] settings.mcp.shared is set (${settings.mcp.shared.join(", ")}) but web.enabled is false — the multiplexer cannot mount its HTTP routes, so bus agents will spawn WITHOUT --mcp-config and these servers will be unreachable. Set web.enabled: true to use mcp.shared.`,
     );
   }
+  // PTY is the default engine (#550): say once, at startup, when it runs without the
+  // multiplexer, so the per-PTY MCP server footprint is not a surprise.
+  const sharingWarning = ptyWithoutSharedMcpWarning({
+    ptyEnabled: settings.pty.enabled,
+    sharedServerCount: settings.mcp.shared.length,
+    webEnabled: settings.web.enabled,
+    multiplexerActive: mcpMultiplexerActive,
+  });
+  if (sharingWarning) console.warn(sharingWarning);
 
   // Issue #165: deferred bus agent spawn. The MCP multiplexer issuer is now
   // wired (or confirmed dormant) above, so spawning here means each agent's

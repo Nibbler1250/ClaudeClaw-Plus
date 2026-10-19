@@ -222,8 +222,10 @@ const DEFAULT_SETTINGS: Settings = {
   shutdown: { drainTurnsMs: 30_000 },
   pty: {
     // Official engine for agent turns and cron jobs (#550). The MCP multiplexer
-    // has shipped. OAuth refresh through it is NOT shipped code: the operator
-    // validates it in the pre-release soak. false keeps print. Windows is the
+    // has shipped but is opt-in and dormant by default (it needs `mcp.shared`, an
+    // `mcp-proxy.json` and `web.enabled`); without it each PTY spawns its own MCP
+    // servers, and startup warns. OAuth refresh through it is NOT shipped code: the
+    // operator validates it in the pre-release soak. false keeps print. Windows is the
     // exception: no evidence the PTY path works there, so win32 defaults to print
     // and `pty.enabled: true` opts in (see `defaultPtyEnabled`).
     enabled: defaultPtyEnabled(),
@@ -666,9 +668,9 @@ export interface ShutdownConfig {
 }
 
 export interface PtyConfig {
-  /** Master switch. When false (default), runner uses today's `claude -p` path
-   *  for every callsite. Operators flip to true ONLY after the MCP multiplexer
-   *  follow-up ships and they've validated OAuth refresh on a test deployment.
+  /** Master switch for runner turns. Defaults to true (#550), except on win32 where
+   *  it defaults to false (`defaultPtyEnabled`); an explicit boolean always wins.
+   *  An explicit false selects the `claude -p` path for every callsite.
    *  See README "PTY runner mode". */
   enabled: boolean;
   /** Ad-hoc thread PTYs are disposed after this many minutes of inactivity.

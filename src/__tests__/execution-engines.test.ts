@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { executionEngineSummary, logExecutionEngineSummary } from "../execution-engines.js";
+import {
+  executionEngineSummary,
+  logExecutionEngineSummary,
+  ptyWithoutSharedMcpWarning,
+} from "../execution-engines.js";
 
 describe("#550 startup engine summary", () => {
   it("names the runner, cron and bus default engines", () => {
@@ -35,5 +39,36 @@ describe("#550 startup engine summary", () => {
     );
     expect(summary).toContain("bus non-channel default=process-stream-json");
     expect(summary).toContain("bus agents=default=pty-stdin, cli=tmux");
+  });
+});
+
+describe("#562 review: PTY default without the MCP multiplexer", () => {
+  const base = { ptyEnabled: true, sharedServerCount: 0, webEnabled: false, multiplexerActive: false };
+  it("warns when PTY is on and mcp.shared is empty, naming the consequence and the fix", () => {
+    const warning = ptyWithoutSharedMcpWarning(base);
+    expect(warning).toContain("mcp.shared is empty");
+    expect(warning).toContain("each PTY session spawns its own copy of your MCP servers");
+    expect(warning).toContain("mcp.shared");
+    expect(warning).toContain("web.enabled: true");
+    expect(warning).toContain("mcp-proxy.json");
+  });
+  it("names web.enabled false and a dormant start as the reason", () => {
+    expect(ptyWithoutSharedMcpWarning({ ...base, sharedServerCount: 2 })).toContain(
+      "web.enabled is false",
+    );
+    expect(
+      ptyWithoutSharedMcpWarning({ ...base, sharedServerCount: 2, webEnabled: true }),
+    ).toContain("it started dormant");
+  });
+  it("stays quiet when PTY is off or the multiplexer is serving", () => {
+    expect(ptyWithoutSharedMcpWarning({ ...base, ptyEnabled: false })).toBeNull();
+    expect(
+      ptyWithoutSharedMcpWarning({
+        ptyEnabled: true,
+        sharedServerCount: 2,
+        webEnabled: true,
+        multiplexerActive: true,
+      }),
+    ).toBeNull();
   });
 });

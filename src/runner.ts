@@ -3167,11 +3167,13 @@ export async function runFork(prompt: string): Promise<RunResult> {
 }
 
 /**
- * Longest a PTY bootstrap may hold the global queue. Issue #369 measured a 38.7 s real PTY
- * cold start (spawn, MCP fleet, first turn), so 30 s failed a healthy boot; 120 s is ~3x
- * that, and still far under the 5 min `timeouts.default`, because bootstrap holds the
- * serial queue a first channel message waits behind. It never blocks startup itself: the
- * daemon runs it in the background.
+ * The timeout handed to a PTY bootstrap's single `runOnPty` attempt. Issue #369 measured a
+ * 38.7 s real PTY cold start (spawn, MCP fleet, first turn), so 30 s failed a healthy boot;
+ * 120 s is ~3x that, and far under the 5 min `timeouts.default`, because bootstrap holds
+ * the serial queue a first channel message waits behind. It is a per-stage bound, not a
+ * total: `runOnPty` gives admission, lock-wait/spawn and the turn each `timeoutMs`
+ * (88cc310f), so the worst case a bootstrap holds the queue is about 3x this value. It
+ * never blocks startup itself: the daemon runs it in the background.
  */
 export const BOOTSTRAP_PTY_MAX_MS = 120_000;
 

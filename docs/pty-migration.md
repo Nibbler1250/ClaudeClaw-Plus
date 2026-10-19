@@ -85,6 +85,18 @@ print overrides and utility one-shot calls can legitimately show print mode.
 Utility migrations are managed separately by #548/#549; they are not controlled
 by this default change.
 
+## MCP servers are per PTY unless the multiplexer runs
+
+With PTY as the default, every PTY session loads your own MCP servers in its own
+process. The shared MCP multiplexer avoids that, but it is opt-in and dormant by
+default: it needs servers listed in `settings.mcp.shared`, matching entries in
+`~/.config/claudeclaw/mcp-proxy.json` (see [`mcp-proxy.md`](mcp-proxy.md)) and
+`web.enabled: true`. When `pty.enabled` is true and the multiplexer is not
+running (shared list empty, web disabled, or it started dormant), startup logs
+one `[mcp-multiplexer] pty.enabled is true but the multiplexer is not running`
+warning naming the reason. It is logged once at startup, not per turn. On a
+small machine, enable sharing or set `pty.enabled: false`.
+
 ## Rollout requirements
 
 Issue #559 (fresh PTY chat input with the runner's timestamp prefix could stay
