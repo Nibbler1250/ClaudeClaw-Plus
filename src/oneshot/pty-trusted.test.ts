@@ -168,6 +168,31 @@ describe("trusted-route PTY engine", () => {
     rmSync(cwd, { recursive: true, force: true });
   });
 
+  it("only the compact route asks to send a REPL command; every other route is neutralized (#562 security re-review)", async () => {
+    const seen: Array<{ prompt: string; allowReplCommand?: boolean }> = [];
+    injectSpawnPty(async (opts) => {
+      return {
+        label: "fake",
+        pid: 1,
+        sessionId: "sid",
+        cwd: opts.cwd,
+        isAlive: () => true,
+        lastTurnEndedAt: () => 0,
+        runTurn: async (prompt: string, turnOpts: { allowReplCommand?: boolean }) => {
+          seen.push({ prompt, allowReplCommand: turnOpts.allowReplCommand });
+          return ok;
+        },
+        dispose: async () => {},
+      } as never;
+    });
+    await pty().run(trusted({ route: "compact", prompt: "/compact" }));
+    await pty().run(trusted({ route: "summarise", prompt: "!id" }));
+    expect(seen.map((s) => [s.prompt, s.allowReplCommand === true])).toEqual([
+      ["/compact", true],
+      ["!id", false],
+    ]);
+  });
+
   it("builds spawn options like keyed sessions: settings.pty values and the multiplexer config", async () => {
     await useSettings({
       pty: {

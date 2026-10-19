@@ -94,7 +94,11 @@ export async function actOnSession(req: SessionActionRequest): Promise<SessionAc
     }
   }
   if (req.sessionKey && !req.skipLive) {
-    const sent = await sendToLiveSession(req.sessionKey, req.prompt, { timeoutMs: req.timeoutMs });
+    const sent = await sendToLiveSession(req.sessionKey, req.prompt, {
+      timeoutMs: req.timeoutMs,
+      // Only /compact is a deliberate REPL command; it is still matched exactly.
+      allowReplCommand: req.route === "compact",
+    });
     if (sent.status === "sent") {
       if (req.prompt.startsWith("/") && looksLikeCommandError(sent.text)) {
         return { ok: false, via: "live", text: sent.text, detail: sent.text.trim() };

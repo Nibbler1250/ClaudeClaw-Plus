@@ -53,7 +53,7 @@ import {
 // Re-export the sanitiser from its standalone home so existing callers that
 // pull it from `pty-process` (and through `runner/index`) keep working without
 // loading bun-pty just to get the helper.
-import { sanitizePtyPromptText } from "./pty-prompt-sanitizer";
+import { preparePtyPromptForWrite, sanitizePtyPromptText } from "./pty-prompt-sanitizer";
 import { appendFileSync } from "node:fs";
 
 /**
@@ -223,6 +223,8 @@ export interface PtyProcess {
       timeoutMs: number;
       onChunk?: (text: string) => void;
       onToolEvent?: (line: string) => void;
+      /** Deliberate REPL command (`/compact`); honoured only for an exact allowed command. */
+      allowReplCommand?: boolean;
     },
   ): Promise<PtyTurnResult>;
   dispose(): Promise<void>;
@@ -668,6 +670,8 @@ class PtyProcessImpl implements PtyProcess {
       timeoutMs: number;
       onChunk?: (text: string) => void;
       onToolEvent?: (line: string) => void;
+      /** Deliberate REPL command (`/compact`); honoured only for an exact allowed command. */
+      allowReplCommand?: boolean;
     },
   ): Promise<PtyTurnResult> {
     if (this._disposed) {
@@ -713,7 +717,9 @@ class PtyProcessImpl implements PtyProcess {
     // ESC, so the prompt cannot close the paste early.
     try {
       dumpPtyTrace(`>> pid=${this._pid} write prompt`, `${JSON.stringify(prompt).slice(0, 80)}+CR`);
-      this._pty.write(`${PASTE_START}${sanitizePtyPromptText(prompt)}${PASTE_END}\r`);
+      this._pty.write(
+        `${PASTE_START}${preparePtyPromptForWrite(prompt, { allowReplCommand: opts.allowReplCommand })}${PASTE_END}\r`,
+      );
     } catch (err) {
       this._turnInProgress = false;
       this._activeSentinelBytes = null;

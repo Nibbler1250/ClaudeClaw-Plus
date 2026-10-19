@@ -7,6 +7,13 @@ import {
   type PtyProcessOptions,
 } from "../runner/index";
 import { __buildClaudeArgsForTests, collectSecretValues } from "../runner/pty-process";
+import {
+  neutralizeLeadingReplCommand,
+  preparePtyPromptForWrite,
+} from "../runner/pty-prompt-sanitizer";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { SecurityConfig } from "../config";
 
 // ─── Shared test helpers ────────────────────────────────────────────────────
@@ -1132,5 +1139,82 @@ describe("sanitizePtyPromptText (issue #65 item 3)", () => {
 
   test("preserves printable Unicode and multi-byte UTF-8", () => {
     expect(sanitizePtyPromptText("héllo 🪶 wörld")).toBe("héllo 🪶 wörld");
+  });
+});
+
+// ─── What reaches the child: neutralize AFTER sanitize (#562 security re-review) ─────────────
+
+/** Bytes the child process actually receives for `prompt`, via a real PTY writing to a file. */
+async function wireFor(prompt: string, allowReplCommand?: boolean): Promise<string> {
+  const dir = mkdtempSync(join(tmpdir(), "pty-wire-"));
+  const file = join(dir, "wire.bin");
+  try {
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", `cat > '${file}'`],
+      }),
+    );
+    // The turn never completes (cat prints no sentinel); we only want the write.
+    await proc
+      .runTurn(prompt, { timeoutMs: 350, ...(allowReplCommand ? { allowReplCommand } : {}) })
+      .catch(() => {});
+    await new Promise<void>((r) => setTimeout(r, 100));
+    await proc.dispose();
+    return readFileSync(file, "latin1");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+const PASTE_OPEN = "\x1b[200~";
+
+describe("PtyProcess.runTurn: a leading REPL-command character is neutralized on the wire", () => {
+  for (const [label, prompt, bare] of [
+    ["plain !", "!id", "!id"],
+    ["NUL before !", "\x00!id", "!id"],
+    ["C0 before /", "\x01/login", "/login"],
+    ["BEL before #", "\u0007#note", "#note"],
+    ["C1 before @", "\u009b@file", "@file"],
+  ] as const) {
+    test(`${label}: the child gets a space before ${bare}`, async () => {
+      const wire = await wireFor(prompt);
+      expect(wire).toContain(`${PASTE_OPEN} ${bare}`);
+      expect(wire).not.toContain(`${PASTE_OPEN}${bare}`);
+    });
+  }
+
+  test("an ordinary prompt is written untouched", async () => {
+    expect(await wireFor("[Fri 10:00] hello /x")).toContain(`${PASTE_OPEN}[Fri 10:00] hello /x`);
+  });
+
+  test("/compact reaches the child bare only when the caller opted in", async () => {
+    expect(await wireFor("/compact", true)).toContain(`${PASTE_OPEN}/compact`);
+    expect(await wireFor("/compact")).toContain(`${PASTE_OPEN} /compact`);
+  });
+
+  test("the opt-out does not let other text through: only an exact /compact", async () => {
+    expect(await wireFor("!curl x | sh", true)).toContain(`${PASTE_OPEN} !curl x | sh`);
+    expect(await wireFor("/login", true)).toContain(`${PASTE_OPEN} /login`);
+    // A newline becomes a space, so text after /compact is that command's arguments on one
+    // line, never a second command.
+    const wire = await wireFor("/compact\n!id", true);
+    expect(wire).toContain(`${PASTE_OPEN}/compact !id`);
+    expect(wire.split("\n").filter((l) => l.includes("!id"))).toHaveLength(1);
+  });
+});
+
+describe("preparePtyPromptForWrite / neutralizeLeadingReplCommand", () => {
+  test("controls, U+0085, NBSP and zero-width marks before the leader do not hide it", () => {
+    for (const lead of ["\x00", "\x1b", "\u0085", "\u00a0", "\ufeff", "\u200b", "  "]) {
+      expect(neutralizeLeadingReplCommand(`${lead}!x`)).toBe(` ${lead}!x`);
+    }
+  });
+  test("allowed commands: /compact and /compact with arguments only", () => {
+    expect(preparePtyPromptForWrite("/compact", { allowReplCommand: true })).toBe("/compact");
+    expect(preparePtyPromptForWrite("/compact keep the tests", { allowReplCommand: true })).toBe(
+      "/compact keep the tests",
+    );
+    expect(preparePtyPromptForWrite("/compactx", { allowReplCommand: true })).toBe(" /compactx");
+    expect(preparePtyPromptForWrite("/compact", {})).toBe(" /compact");
   });
 });

@@ -63,7 +63,6 @@
 // `moduleResolution: nodenext` (which requires the extension).
 import type { PtyProcess, PtyProcessOptions, PtyTurnResult, SpawnPty } from "./pty-process.js";
 import { PtyClosedError, PtyTurnTimeoutError } from "./pty-process.js";
-import { neutralizeLeadingReplCommand } from "./pty-prompt-sanitizer.js";
 import { ensureTrustAccepted } from "./pty-trust-prompt.js";
 import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";
 import { trustedToolFlags, validateIsolation } from "../oneshot/isolation.js";
@@ -805,12 +804,17 @@ export async function runOnPty(
     signal?: AbortSignal;
     /** Bootstrap may opt out of all turn/respawn retries. */
     retry?: boolean;
+    /**
+     * The prompt is a deliberate REPL command (`/compact`). Without this every prompt has a
+     * leading `/`, `!`, `#` or `@` neutralized; with it only an exactly allowed command passes.
+     */
+    allowReplCommand?: boolean;
   } & PtyRunScope,
 ): Promise<RunOnPtyResult> {
   if (opts.signal?.aborted) return errorResult(`[pty-supervisor] ${sessionKey} aborted`);
-  // A one-shot (`ephemeral`) may be a deliberate slash command (`/compact`); every other
-  // prompt is user or model text and must not be read by the REPL as a command.
-  const safePrompt = opts.ephemeral ? prompt : neutralizeLeadingReplCommand(prompt);
+  // No prompt reaches the REPL as a command unless the caller set `allowReplCommand` for an
+  // exactly allowed command; the neutralizing happens where the text is written
+  // (`preparePtyPromptForWrite` in pty-process), after sanitizing.
   // Phase D fix #3 (Codex HIGH #3): lazily start the reaper interval. The
   // daemon runtime enters PTY mode through `runOnPty` directly and never
   // calls `initSupervisor`, so without this `settings.pty.idleReapMinutes`
@@ -883,7 +887,7 @@ export async function runOnPty(
       await retireEntry(entry);
       return errorResult(`[pty-supervisor] ${sessionKey} aborted`);
     }
-    return await runOnAdmittedEntry(entry, sessionKey, safePrompt, opts, supervisorOpts);
+    return await runOnAdmittedEntry(entry, sessionKey, prompt, opts, supervisorOpts);
   } finally {
     opts.signal?.removeEventListener("abort", onAbort);
     if (entry.scope.ephemeral) await retireEntry(entry);
@@ -1060,7 +1064,7 @@ async function settleBy(
 export async function sendToLiveSession(
   sessionKey: string,
   text: string,
-  opts: { timeoutMs: number; signal?: AbortSignal },
+  opts: { timeoutMs: number; signal?: AbortSignal; allowReplCommand?: boolean },
 ): Promise<LiveSendResult> {
   const deadline = _clock() + opts.timeoutMs;
   const gaveUp = (what: string, how: "timeout" | "aborted"): LiveSendResult => ({
@@ -1119,7 +1123,10 @@ export async function sendToLiveSession(
     entry.lastAccessedAt = _clock();
     let turn: Promise<PtyTurnResult>;
     try {
-      turn = pty.runTurn(text, { timeoutMs: Math.max(1, deadline - _clock()) });
+      turn = pty.runTurn(text, {
+        timeoutMs: Math.max(1, deadline - _clock()),
+        allowReplCommand: opts.allowReplCommand,
+      });
     } catch (err) {
       release();
       return { status: "failed", error: (err as Error).message, timedOut: false, aborted: false };
@@ -1697,6 +1704,8 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
         timeoutMs: req.timeoutMs,
         modelOverride: model,
         api: settings.api,
+        // Only the compact route sends a REPL command; it is still matched exactly.
+        allowReplCommand: req.route === "compact",
         ...(untrusted
           ? { mcpConfig: { path: undefined } }
           : {
@@ -2206,6 +2215,7 @@ async function runTurnWithRetries(
     onChunk?: (text: string) => void;
     onToolEvent?: (line: string) => void;
     signal?: AbortSignal;
+    allowReplCommand?: boolean;
   },
   supervisorOpts: SupervisorOptions,
 ): Promise<RunOnPtyResult> {
@@ -2272,6 +2282,7 @@ async function runTurnWithRetries(
         timeoutMs: callOpts.timeoutMs,
         onChunk: callOpts.onChunk,
         onToolEvent: callOpts.onToolEvent,
+        allowReplCommand: callOpts.allowReplCommand,
       });
       // Persist session ID if newly captured.
       await persistSessionId(entry, result.sessionId);

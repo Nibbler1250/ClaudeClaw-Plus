@@ -57,7 +57,11 @@ import * as configMod from "../config";
 
 interface FakePtyOpts {
   /** Hook: called on each runTurn invocation. Returns the result OR throws. */
-  onTurn?: (prompt: string, callIndex: number) => Promise<PtyTurnResult>;
+  onTurn?: (
+    prompt: string,
+    callIndex: number,
+    turnOpts?: { allowReplCommand?: boolean },
+  ) => Promise<PtyTurnResult>;
   /** Number of bytes to bill for each turn. */
   bytesCaptured?: number;
   /** Initial session ID surfaced to the supervisor. */
@@ -108,7 +112,7 @@ function makeFakePty(label: string, fopts: FakePtyOpts): FakePtyHandle {
         };
       }
       try {
-        const r = await fopts.onTurn(prompt, idx);
+        const r = await fopts.onTurn(prompt, idx, opts);
         lastTurnEndedAt = Date.now();
         if (r.sessionId && r.sessionId !== sessionId) sessionId = r.sessionId;
         return r;
@@ -3152,40 +3156,39 @@ describe("pty-supervisor retirement — the map's invariants (issue #394)", () =
   });
 });
 
-describe("runOnPty: a prompt cannot be read as a REPL command (#562 security review)", () => {
+describe("runOnPty: allowReplCommand is passed to the turn only when the caller sets it (#562 security re-review)", () => {
   let cmdKey = 0;
-  async function sentPrompt(prompt: string, ephemeral = false): Promise<string> {
+  async function turnFlag(
+    prompt: string,
+    runOpts: { ephemeral?: boolean; allowReplCommand?: boolean },
+  ): Promise<boolean | undefined> {
     injectMaxRetriesForTests(0);
-    const seen: string[] = [];
+    const seen: Array<{ prompt: string; flag: boolean | undefined }> = [];
     injectSpawnPty(async () =>
       makeFakePty("cmd", {
-        onTurn: async (p) => {
-          seen.push(p);
+        onTurn: async (p, _i, turnOpts) => {
+          seen.push({ prompt: p, flag: turnOpts?.allowReplCommand });
           return { text: "ok", bytesCaptured: 1, cleanBoundary: true, sessionId: "sid" };
         },
       }),
     );
     const result = await runOnPty(`thread:cmd-${++cmdKey}`, prompt, {
       timeoutMs: 1000,
-      ...(ephemeral ? { ephemeral: true } : {}),
+      ...runOpts,
     });
     expect(result.exitCode).toBe(0);
-    return seen[0] ?? "";
+    // The supervisor does not rewrite the prompt: neutralizing happens where it is written.
+    expect(seen[0]?.prompt).toBe(prompt);
+    return seen[0]?.flag;
   }
 
-  for (const leader of ["/", "!", "#", "@"]) {
-    it(`a prompt starting with ${leader} gets one leading space`, async () => {
-      expect(await sentPrompt(`${leader}clear everything`)).toBe(` ${leader}clear everything`);
-      expect(await sentPrompt(`  ${leader}x`)).toBe(`   ${leader}x`);
-    });
-  }
-
-  it("leaves an ordinary prompt, including one led by a clock line, untouched", async () => {
-    expect(await sentPrompt("[Friday 10:00] /not a command")).toBe("[Friday 10:00] /not a command");
-    expect(await sentPrompt("hello")).toBe("hello");
+  it("by default, including for an ephemeral one-shot, the turn carries no opt-out", async () => {
+    expect(await turnFlag("!id", {})).toBeUndefined();
+    expect(await turnFlag("!id", { ephemeral: true })).toBeUndefined();
+    expect(await turnFlag("/compact", { ephemeral: true })).toBeUndefined();
   });
 
-  it("leaves a one-shot (ephemeral) prompt alone, so /compact still reaches the REPL", async () => {
-    expect(await sentPrompt("/compact", true)).toBe("/compact");
+  it("the opt-out reaches the turn when the caller asks for it", async () => {
+    expect(await turnFlag("/compact", { ephemeral: true, allowReplCommand: true })).toBe(true);
   });
 });

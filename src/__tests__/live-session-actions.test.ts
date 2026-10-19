@@ -36,12 +36,16 @@ import type { SessionConfig } from "../config";
 
 interface FakePty extends PtyProcess {
   prompts: string[];
+  /** allowReplCommand as passed to runTurn, per prompt. */
+  allowed: Array<boolean | undefined>;
 }
 
 function makeFake(reply: (p: string) => Promise<PtyTurnResult> | PtyTurnResult): FakePty {
   const prompts: string[] = [];
+  const allowed: Array<boolean | undefined> = [];
   return {
     label: "fake",
+    allowed,
     pid: 7,
     sessionId: "live-sess",
     cwd: "/tmp/fake-cwd",
@@ -49,8 +53,9 @@ function makeFake(reply: (p: string) => Promise<PtyTurnResult> | PtyTurnResult):
     isAlive: () => true,
     lastTurnEndedAt: () => Date.now(),
     exitInfo: () => null,
-    async runTurn(prompt: string) {
+    async runTurn(prompt: string, opts?: { allowReplCommand?: boolean }) {
       prompts.push(prompt);
+      allowed.push(opts?.allowReplCommand);
       return reply(prompt);
     },
     async dispose() {},
@@ -138,6 +143,8 @@ describe("runCompact", () => {
     expect(fakes.length).toBe(1); // no second PTY
     expect(fakes[0].prompts).toEqual(["seed", "/compact"]);
     expect(oneShotCalls).toEqual([]); // and no `claude -p`
+    // Only the deliberate /compact asks to reach the REPL as a command; the seed turn does not.
+    expect(fakes[0].allowed).toEqual([undefined, true]);
   });
 
   it("with no entry: calls runOneShot as a trusted-session resume of the session id", async () => {

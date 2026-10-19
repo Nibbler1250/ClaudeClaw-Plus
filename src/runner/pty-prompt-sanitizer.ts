@@ -34,13 +34,53 @@ export function sanitizePtyPromptText(text: string): string {
 const REPL_COMMAND_LEADERS = new Set(["/", "!", "#", "@"]);
 
 /**
+ * What the REPL skips before deciding what a prompt is: whitespace (JS `\s` includes
+ * U+00A0, U+FEFF and the Unicode spaces), controls (so the check does not depend on the
+ * sanitizer having run), U+0085, and the zero-width marks. Built from escapes so the
+ * source holds no literal control characters.
+ */
+const LEADING_SKIPPABLE = new RegExp(
+  "^[\\s\\x00-\\x1f\\x7f-\\x9f\\u200b-\\u200f\\u2028\\u2029\\u202a-\\u202e\\u2060-\\u2064\\ufeff]*",
+);
+
+/**
  * Keep a prompt from being taken as a REPL command. The REPL treats a prompt that
- * starts with `/` as a slash command, `!` as a shell command, `#` as a memory note and
- * `@` as a file mention. Callers prepend a clock line today, but nothing enforced it,
- * so a prompt whose first non-space character is one of those gets a single leading
- * space. Not for deliberate command prompts (the one-shot `/compact`).
+ * starts with `/` as a slash command, `!` as a shell command (which bypasses the tool
+ * deny lists), `#` as a memory note and `@` as a file mention. A prompt whose first
+ * character that matters is one of those gets a single leading space.
+ *
+ * Apply it to the text that is actually written, after `sanitizePtyPromptText`: running
+ * it before lets a leading control character hide the leader from the check and then be
+ * stripped (`"\x00!id"` becomes `"!id"` on the wire).
  */
 export function neutralizeLeadingReplCommand(text: string): string {
-  const first = text.trimStart()[0];
+  const skipped = LEADING_SKIPPABLE.exec(text)?.[0].length ?? 0;
+  const first = text[skipped];
   return first !== undefined && REPL_COMMAND_LEADERS.has(first) ? ` ${text}` : text;
+}
+
+/**
+ * The only prompts allowed to reach the REPL as a command: `/compact`, alone or with
+ * arguments on the same line. An opt-out that accepted any text would let a future caller
+ * pass arbitrary input through it.
+ */
+const ALLOWED_REPL_COMMAND = /^\/compact(?: [^\n]{0,500})?$/;
+
+export interface PtyPromptWriteOptions {
+  /**
+   * The caller is deliberately sending a REPL command. Honoured only when the sanitized
+   * prompt is exactly an allowed command (`/compact`); anything else is neutralized.
+   */
+  allowReplCommand?: boolean;
+}
+
+/**
+ * The single last transform before a prompt is written to the PTY: sanitize, then
+ * neutralize a leading REPL-command character unless the caller opted out for an exactly
+ * matching command.
+ */
+export function preparePtyPromptForWrite(text: string, opts: PtyPromptWriteOptions = {}): string {
+  const sanitized = sanitizePtyPromptText(text);
+  if (opts.allowReplCommand === true && ALLOWED_REPL_COMMAND.test(sanitized)) return sanitized;
+  return neutralizeLeadingReplCommand(sanitized);
 }
