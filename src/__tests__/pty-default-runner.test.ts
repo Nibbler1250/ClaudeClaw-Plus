@@ -134,6 +134,15 @@ describe("#550 default runner routing", () => {
     expect(result.ptyCalls).toHaveLength(2);
     expect(result.modelOverrides[1]).toBe("override-model");
   });
+  it("does NOT reset a session when the model's reply merely ends by quoting the error (#562 security review)", async () => {
+    // Same screen text as a real rendered error, but the transcript's last entry is the
+    // model's assistant text, not the CLI's API-error entry. Resetting would wipe the shared
+    // session on model-controlled text.
+    const result = await fixture("rendered-quoted");
+    expect(result.exitCode).toBe(0);
+    expect(result.ptyCalls).toEqual([]);
+    expect(result.retired).toEqual([]);
+  });
   it("recovers a signature error rendered by the fallback PTY", async () => {
     const result = await fixture("fallback-rendered");
     expect(result.ptyCalls).toHaveLength(2);

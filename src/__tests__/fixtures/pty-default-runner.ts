@@ -6,6 +6,7 @@ import type { spawn } from "node:child_process";
 import { join } from "node:path";
 import { readFile, writeFile } from "node:fs/promises";
 import { PtyTurnTimeoutError } from "../../runner/pty-process.js";
+import { injectSignatureConfirmForTests } from "../../runner/signature-error.js";
 
 const config = await import("../../config.js");
 const runner = await import("../../runner.js");
@@ -183,6 +184,19 @@ const fakeOneShotSpawn = ((_cmd: string, args: string[]) => {
   });
   return child;
 }) as unknown as typeof spawn;
+// What the session transcript's last entry is, per scenario. The CLI writes its own API error
+// as an `isApiErrorMessage` assistant entry; the model's text never carries that flag.
+const QUOTED_ERROR_LINE =
+  'API Error: 400 {"error":{"message":"Invalid `signature` in `thinking` block"}}';
+injectSignatureConfirmForTests({
+  sleep: async () => {},
+  readTail: async () =>
+    JSON.stringify({
+      type: "assistant",
+      ...(scenario === "rendered-quoted" ? {} : { isApiErrorMessage: true }),
+      message: { role: "assistant", content: [{ type: "text", text: QUOTED_ERROR_LINE }] },
+    }),
+});
 let primary = true;
 if (
   [
@@ -192,6 +206,7 @@ if (
     "compact",
     "recovery-timeout",
     "rendered-corrupt",
+    "rendered-quoted",
     "fallback-model",
     "fallback-stream",
     "fallback-rendered",
@@ -209,6 +224,14 @@ if (
     if (scenario === "rendered-corrupt")
       return {
         rawStdout: 'API Error: 400 {"error":{"message":"Invalid `signature` in `thinking` block"}}',
+        stderr: "",
+        exitCode: 0,
+      };
+    // The model's own reply ends by quoting the error line: same screen text, but the
+    // transcript's last entry is assistant text, not the CLI's API-error entry.
+    if (scenario === "rendered-quoted")
+      return {
+        rawStdout: `The log said:\n${QUOTED_ERROR_LINE}`,
         stderr: "",
         exitCode: 0,
       };

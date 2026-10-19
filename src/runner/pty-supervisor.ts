@@ -810,7 +810,7 @@ export async function runOnPty(
   if (opts.signal?.aborted) return errorResult(`[pty-supervisor] ${sessionKey} aborted`);
   // A one-shot (`ephemeral`) may be a deliberate slash command (`/compact`); every other
   // prompt is user or model text and must not be read by the REPL as a command.
-  if (!opts.ephemeral) prompt = neutralizeLeadingReplCommand(prompt);
+  const safePrompt = opts.ephemeral ? prompt : neutralizeLeadingReplCommand(prompt);
   // Phase D fix #3 (Codex HIGH #3): lazily start the reaper interval. The
   // daemon runtime enters PTY mode through `runOnPty` directly and never
   // calls `initSupervisor`, so without this `settings.pty.idleReapMinutes`
@@ -883,7 +883,7 @@ export async function runOnPty(
       await retireEntry(entry);
       return errorResult(`[pty-supervisor] ${sessionKey} aborted`);
     }
-    return await runOnAdmittedEntry(entry, sessionKey, prompt, opts, supervisorOpts);
+    return await runOnAdmittedEntry(entry, sessionKey, safePrompt, opts, supervisorOpts);
   } finally {
     opts.signal?.removeEventListener("abort", onAbort);
     if (entry.scope.ephemeral) await retireEntry(entry);
