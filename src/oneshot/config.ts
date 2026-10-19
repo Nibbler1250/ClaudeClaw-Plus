@@ -38,13 +38,28 @@ export function resolveOneShotEngine(settings: OneShotSettings, route: string): 
   return settings.routes[route] ?? settings.routes[`${route.split(".")[0]}.*`] ?? settings.default;
 }
 
+/**
+ * The built-in engine `id` runs on: itself, or the `type` of its
+ * `oneShot.engines` declaration (`engines.local = { type: "ollama", ... }`).
+ */
+export function engineType(id: string, declarations: OneShotSettings["engines"]): string {
+  if (!Object.hasOwn(declarations, id)) return id;
+  const type = declarations[id]!.type ?? id;
+  if (typeof type !== "string" || !engines.has(type))
+    throw new Error(`oneShot.engines.${id}.type must be one of: ${[...engines.keys()].join(", ")}`);
+  if (engines.has(id) && type !== id)
+    throw new Error(`oneShot.engines.${id} cannot change the type of a built-in engine`);
+  return type;
+}
+
 export function validateRouteEngine(
   id: string,
   route: string,
   untrusted: boolean,
   resume: boolean,
+  declarations: OneShotSettings["engines"] = {},
 ): void {
-  const engine = engines.get(id);
+  const engine = engines.get(engineType(id, declarations));
   if (!engine) throw new Error(`Unknown oneShot engine '${id}' for route '${route}'`);
   if (resume && !engine.caps.resume)
     throw new Error(`oneShot route '${route}' requires resume; engine '${id}' cannot resume`);
@@ -68,9 +83,10 @@ export function parseOneShotSettings(raw: unknown): OneShotSettings {
   if (typeof defaultId !== "string") throw new Error("oneShot.default must be an engine id");
   const declarations = object(input.engines ?? {}, "engines");
   const routes = object(input.routes ?? {}, "routes");
+  const engineDeclarations = declarations as OneShotSettings["engines"];
   for (const [id, config] of Object.entries(declarations)) {
-    validateRouteEngine(id, "engine declaration", false, false);
     object(config, `engines.${id}`);
+    validateRouteEngine(id, "engine declaration", false, false, engineDeclarations);
   }
   for (const [route, id] of Object.entries(routes)) {
     if (!isKnownRouteKey(route))
@@ -78,17 +94,45 @@ export function parseOneShotSettings(raw: unknown): OneShotSettings {
         `oneShot.routes.${route} is not a known route (known: ${KNOWN_ROUTES.join(", ")}, or <family>.*)`,
       );
     if (typeof id !== "string") throw new Error(`oneShot.routes.${route} must be an engine id`);
-    validateRouteEngine(id, route, isUntrustedRoute(route), RESUME_ROUTES.includes(route));
+    validateRouteEngine(
+      id,
+      route,
+      isUntrustedRoute(route),
+      RESUME_ROUTES.includes(route),
+      engineDeclarations,
+    );
   }
   const settings: OneShotSettings = {
     default: defaultId,
-    engines: declarations as OneShotSettings["engines"],
+    engines: engineDeclarations,
     routes: routes as Record<string, string>,
   };
-  validateRouteEngine(defaultId, "default", false, false);
+  validateRouteEngine(defaultId, "default", false, false, engineDeclarations);
   for (const route of RESUME_ROUTES)
-    validateRouteEngine(resolveOneShotEngine(settings, route), route, false, true);
+    validateRouteEngine(
+      resolveOneShotEngine(settings, route),
+      route,
+      false,
+      true,
+      engineDeclarations,
+    );
   for (const route of UNTRUSTED_ROUTES)
-    validateRouteEngine(resolveOneShotEngine(settings, route), route, true, false);
+    validateRouteEngine(
+      resolveOneShotEngine(settings, route),
+      route,
+      true,
+      false,
+      engineDeclarations,
+    );
+  // Engine settings (base URL, model, ...) are checked for every engine declared
+  // or used, so a route to an unconfigured HTTP engine fails here, not on a call.
+  for (const id of new Set([
+    ...Object.keys(engineDeclarations),
+    defaultId,
+    ...Object.values(settings.routes),
+  ])) {
+    const config = Object.hasOwn(engineDeclarations, id) ? engineDeclarations[id]! : {};
+    engines.get(engineType(id, engineDeclarations))!.checkConfig?.(config, id);
+  }
   return settings;
 }

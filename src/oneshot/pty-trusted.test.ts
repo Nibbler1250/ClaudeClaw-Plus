@@ -149,6 +149,7 @@ const trusted = (over: Partial<OneShotRequest> = {}): OneShotRequest => ({
   ...over,
 });
 const pty = () => engines.get("pty")!;
+const HTTP_ENGINES = ["openai-compatible", "ollama", "llm-router"];
 
 describe("trusted-route PTY engine", () => {
   beforeEach(async () => {
@@ -297,9 +298,28 @@ describe("exit contract is the same for every engine", () => {
     rmSync(cwd, { recursive: true, force: true });
   });
 
-  /** Runs one request on one engine with the child behaving as `scenario`. */
+  /** Runs one request on one engine with the child (or server) behaving as `scenario`. */
   async function run(id: string, scenario: "timeout" | "failure") {
     const req = trusted({ timeoutMs: 40 });
+    if (HTTP_ENGINES.includes(id)) {
+      const server = Bun.serve({
+        port: 0,
+        fetch: () =>
+          scenario === "failure"
+            ? new Response("down", { status: 500 })
+            : new Promise<Response>(() => {}),
+      });
+      try {
+        const baseUrl = `http://127.0.0.1:${server.port}`;
+        await useSettings({
+          llmRouter: { openRouterBaseUrl: baseUrl, tiers: { fast: ["m"] } },
+        });
+        const config = id === "llm-router" ? {} : { baseUrl, model: "m" };
+        return await engines.get(id)!.run(req, config);
+      } finally {
+        server.stop(true);
+      }
+    }
     if (id === "pty") {
       const hanging = hangingPty();
       injectSpawnPty(
@@ -336,7 +356,7 @@ describe("exit contract is the same for every engine", () => {
     return withPrintRuntime({ spawn: spawnFn }, () => engines.get(id)!.run(req));
   }
 
-  for (const id of ["print", "pty"]) {
+  for (const id of ["print", "pty", ...HTTP_ENGINES]) {
     it(`${id}: a timeout resolves with exitCode 124`, async () => {
       expect((await run(id, "timeout")).exitCode).toBe(124);
     });
@@ -347,6 +367,6 @@ describe("exit contract is the same for every engine", () => {
     });
   }
   it("covers every registered engine", () => {
-    expect([...engines.keys()].sort()).toEqual(["print", "pty"]);
+    expect([...engines.keys()].sort()).toEqual(["print", "pty", ...HTTP_ENGINES].sort());
   });
 });

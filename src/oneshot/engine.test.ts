@@ -267,7 +267,10 @@ describe("one-shot isolation contract", () => {
         appendSystemPrompt: "persona",
       }),
   };
+  // HTTP engines spawn nothing; their request body is checked for tools in http.test.ts.
+  const httpEngines = ["openai-compatible", "ollama", "llm-router"];
   for (const engine of engines.values()) {
+    if (httpEngines.includes(engine.id)) continue;
     it(`${engine.id}: argv contains canonical isolation sequence without privileged flags`, () => {
       const build = argvBuilders[engine.id];
       expect(build).toBeDefined();
