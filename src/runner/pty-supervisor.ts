@@ -30,12 +30,15 @@
  *     outer loop terminates early with a "respawn failed after N attempts"
  *     error rather than consuming the remaining outer budget. After
  *     exhaustion the supervisor surfaces a structured error in
- *     RunOnPtyResult.stderr and exitCode=1; execClaude treats this as any
- *     other non-zero exit. A turn timeout is deliberately NOT exit 124: that
- *     code starts runner.ts's print-era compact-on-timeout (retire, memory
- *     save, /compact, full re-run), which assumes a wedged `claude -p`. A PTY
- *     timeout is usually a turn-detection miss on a healthy session (#369,
- *     #316/#317), and the interactive REPL compacts its own context.
+ *     RunOnPtyResult.stderr and exitCode=1, or exitCode=124 when the last
+ *     failure was a turn timeout (`PtyTurnTimeoutError`), so the watchdog and
+ *     the "timed out" messages see it as they do for `claude -p`. A PTY turn
+ *     timeout also RETIRES the entry before returning (the TUI may still be
+ *     busy with the old answer; the next call on the key respawns and
+ *     `--resume`s the stored session id, which is untouched). runner.ts does
+ *     NOT compact or re-run on a PTY 124: PTY timeouts are often detection
+ *     misses on a healthy session (#369, #316/#317), and the interactive REPL
+ *     compacts its own context.
  *
  *   - Settings are re-read via getSettings() on every call — never cached
  *     across calls — so hot-reload works. The reap interval is rebuilt
@@ -2303,8 +2306,14 @@ async function runTurnWithRetries(
     }
   }
 
+  // A timed-out turn leaves the TUI possibly still busy with the previous answer, so the
+  // next paste on this key could land mid-turn. Retire it, as `sendToLiveSession` does on
+  // timeout; the stored session id stays, so the next call respawns and resumes.
+  const timedOut = lastErr instanceof PtyTurnTimeoutError;
+  if (timedOut) await retireEntry(entry);
   return errorResult(
     `[pty-supervisor] max retries (${supervisorOpts.maxRetries}) exhausted for ${entry.sessionKey}: ${(lastErr as Error)?.message ?? "unknown"}`,
+    timedOut ? 124 : 1,
   );
 }
 
@@ -2314,11 +2323,11 @@ function pickBackoff(backoffMs: number[], attempt: number): number {
   return Math.max(0, backoffMs[idx] ?? 0);
 }
 
-function errorResult(message: string): RunOnPtyResult {
+function errorResult(message: string, exitCode = 1): RunOnPtyResult {
   return {
     rawStdout: "",
     stderr: message,
-    exitCode: 1,
+    exitCode,
     sessionId: undefined,
   };
 }

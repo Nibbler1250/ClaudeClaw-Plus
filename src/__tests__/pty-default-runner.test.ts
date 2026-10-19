@@ -3,11 +3,17 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-async function fixture(scenario: string) {
+async function fixture(scenario: string, extra?: string) {
   const cwd = mkdtempSync(join(tmpdir(), "pty-default-"));
   try {
     const proc = Bun.spawn(
-      [process.execPath, "run", join(import.meta.dir, "fixtures/pty-default-runner.ts"), scenario],
+      [
+        process.execPath,
+        "run",
+        join(import.meta.dir, "fixtures/pty-default-runner.ts"),
+        scenario,
+        ...(extra ? [extra] : []),
+      ],
       { cwd, stdout: "pipe", stderr: "pipe" },
     );
     const [out, err, code] = await Promise.all([
@@ -64,27 +70,43 @@ describe("#550 default runner routing", () => {
       expect(result.agentPrintCalls).toBe(1);
     });
   }
-  it("a PTY turn timeout is exit 1: no memory save, no /compact, no re-run (#562 review)", async () => {
-    // The real supervisor times out on its only turn. Exit 124 would retire the session,
-    // save memory, /compact and re-run the prompt, although the answer may have landed.
+  it("a PTY turn timeout is exit 124, retires the PTY, and neither saves memory, compacts nor re-runs (#562 re-review)", async () => {
+    // The real supervisor times out on its only turn. The runner must hand the 124 back and
+    // stop: the answer may already have landed, so a memory save, /compact or re-run would
+    // compact a healthy session and repeat tool side effects.
     const result = await fixture("compact");
     expect(result.events.filter((event: string) => event === "timeout")).toHaveLength(1);
-    expect(result.exitCode).toBe(1);
+    expect(result.exitCode).toBe(124);
+    expect(result.events).toContain("disposed");
     expect(result.utilityResumes).toEqual([]);
     expect(result.oneShotLog).toEqual([]);
     expect(result.events).not.toContain("utility-memory");
     expect(result.events).not.toContain("utility-compact");
+    expect(result.agentPrintCalls).toBe(0);
   });
-  it("the print opt-out still compacts on a 124 timeout, retiring no PTY", async () => {
+  it("the watchdog counts a PTY turn timeout as a consecutive timeout", async () => {
+    // maxConsecutiveTimeouts is 1 in this fixture. With exit 1 the timeout would be
+    // invisible to the watchdog and it could never trip on PTY.
+    const result = await fixture("compact", "watchdog");
+    expect(result.exitCode).toBe(124);
+    expect(result.watchdogWarnings).toHaveLength(1);
+    expect(result.watchdogWarnings[0]).toContain("1 consecutive timeouts");
+  });
+  it("the print opt-out still saves memory, compacts and re-runs on a 124 timeout", async () => {
     const result = await fixture("legacy-compact");
     expect(result.primaryRoute).toBe("legacy");
     expect(result.retired).toEqual([]);
+    expect(result.utilityResumes).toEqual([
+      { prompt: "memory", resume: "old-sid" },
+      { prompt: "/compact", resume: "old-sid" },
+    ]);
+    expect(result.agentPrintCalls).toBe(1);
     expect(result.exitCode).toBe(0);
   });
   it("a recovery call is one attempt: no supervisor retries compounded on top of the downstream recovery", async () => {
     // pty.maxRetries is 5 and the PTY times out on every turn. The stale/corrupt recovery
-    // times out (exit 1, not 124, so no compact block follows): one recovery call, ONE
-    // turn. With the full retry envelope that was 6.
+    // times out (exit 124, which the runner does not compact or re-run on a PTY): one
+    // recovery call, ONE turn. With the full retry envelope that was 6.
     const result = await fixture("recovery-timeout");
     expect(result.retryFlags).toEqual([false]);
     expect(result.events.filter((event: string) => event === "timeout")).toHaveLength(1);
@@ -125,7 +147,7 @@ describe("#550 default runner routing", () => {
   });
   it("bootstrap reserves the queue, uses one bounded attempt, and releases a later chat", async () => {
     const result = await fixture("bootstrap-attempt");
-    expect(result.bootstrapError).toContain("exited 1");
+    expect(result.bootstrapError).toContain("124");
     expect(result.events.filter((event: string) => event === "timeout")).toHaveLength(1);
     // Capped at BOOTSTRAP_PTY_MAX_MS (120 s), under the configured 5 min timeouts.default.
     expect(result.bootstrapTimeoutMs).toBe(120_000);

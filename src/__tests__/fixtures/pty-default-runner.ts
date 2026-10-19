@@ -26,6 +26,9 @@ if (scenario === "recovery-timeout") {
 if (scenario === "compact" && !rawScenario.startsWith("legacy-")) {
   const settings = JSON.parse(await readFile(settingsPath, "utf8"));
   settings.pty.maxRetries = 0;
+  // `watchdog` as argv[3]: one timeout trips the watchdog, which shows whether the PTY 124
+  // reached it. Off by default, because a tripped watchdog returns before the compact block.
+  if (process.argv[3] === "watchdog") settings.watchdog = { maxConsecutiveTimeouts: 1 };
   await writeFile(settingsPath, JSON.stringify(settings));
 }
 if (scenario.startsWith("fallback-") || scenario.startsWith("dashboard-fallback-")) {
@@ -53,6 +56,12 @@ const realRunOnPty = supervisor.runOnPty;
 const realRetire = supervisor.retirePtySession;
 let bootstrapTimeoutMs = 0;
 let bootstrapError = "";
+const watchdogWarnings: string[] = [];
+const realWarn = console.warn;
+console.warn = (...args: unknown[]) => {
+  if (String(args[0]).includes("Watchdog: aborted after")) watchdogWarnings.push(String(args[0]));
+  realWarn(...args);
+};
 supervisor.injectSleep(async () => {});
 supervisor.injectIsSessionResumable(async () => true);
 supervisor.injectSpawnPty(async (opts) => ({
@@ -292,5 +301,5 @@ await withPrintRuntime({ spawn: fakeOneShotSpawn }, async () => {
   }
 });
 console.log(
-  `FIXTURE_RESULT ${JSON.stringify({ enabled: config.getSettings().pty.enabled, exitCode, primaryRoute, ptyCalls, retired, agentPrintCalls, utilityPrintCalls, events, utilityResumes, oneShotLog, modelOverrides, retryFlags, chunks, tools, bootstrapTimeoutMs, bootstrapError, resultStdout })}`,
+  `FIXTURE_RESULT ${JSON.stringify({ enabled: config.getSettings().pty.enabled, exitCode, primaryRoute, ptyCalls, retired, agentPrintCalls, utilityPrintCalls, events, utilityResumes, oneShotLog, modelOverrides, retryFlags, chunks, tools, bootstrapTimeoutMs, bootstrapError, resultStdout, watchdogWarnings })}`,
 );

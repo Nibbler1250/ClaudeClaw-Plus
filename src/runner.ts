@@ -178,10 +178,11 @@ export async function probeClaudeCliVersion(): Promise<{ version: string | null;
 /**
  * Compact configuration.
  * COMPACT_WARN_THRESHOLD: notify user that context is getting large.
- * COMPACT_TIMEOUT_ENABLED: whether to auto-compact on timeout (exit 124). Only the
- * print (`claude -p`) paths produce 124: a PTY turn timeout is exit 1 (see the
- * pty-supervisor header), because it is usually a turn-detection miss on a healthy
- * session and the interactive REPL compacts its own context.
+ * COMPACT_TIMEOUT_ENABLED: whether to auto-compact on timeout (exit 124). This applies
+ * to the print (`claude -p`) path only. A PTY turn timeout is also exit 124 (so the
+ * watchdog and the timeout messages see it), and the supervisor retires the PTY, but the
+ * runner neither compacts nor re-runs it: it is usually a turn-detection miss on a
+ * healthy session, and the interactive REPL compacts its own context.
  */
 const COMPACT_WARN_THRESHOLD = 25;
 const COMPACT_TIMEOUT_ENABLED = true;
@@ -2542,20 +2543,24 @@ async function execClaude(
       }
     }
 
-    // --- Auto-compact on timeout (exit 124) ---
-    // Print-era recovery for a wedged `claude -p`. A PTY turn timeout is exit 1, not 124
-    // (pty-supervisor header), so under PTY this block is reached only via the explicit
-    // `pty.enabled: false` opt-out path (`useLegacyPath`) or a print-engine failure.
-    if (COMPACT_TIMEOUT_ENABLED && exitCode === 124 && !isNew && existing && !recoveredFromStale) {
-      // The turn timed out, so the session is wedged. Retire it first so no
-      // utility --resume below races a live writer of this transcript, even when
-      // the save returns before reaching its own retire (a memory path
-      // `memoryFileGrant` cannot scope). Save and compact then skip the live path
-      // and resume it one-shot (#549).
-      if (!useLegacyPath) await retirePtySession(ptySessionKey);
-      // The explicit print opt-out has no supervisor session: give the utility calls no
-      // key, so they resume one-shot without touching the PTY machinery at all.
-      const compactSessionKey = useLegacyPath ? undefined : ptySessionKey;
+    // --- Auto-compact on timeout (exit 124): PRINT PATH ONLY ---
+    // Print-era recovery for a wedged `claude -p`. A PTY turn timeout is also exit 124
+    // (so the watchdog and the "timed out" messages see it), but the supervisor has
+    // already retired that PTY, and the runner does nothing more on it: no memory save,
+    // no /compact, no re-run. PTY timeouts are often turn-detection misses on a healthy
+    // session (#369, #316/#317); re-running would repeat tool side effects, and the
+    // interactive REPL compacts its own context. The next turn on the key respawns and
+    // resumes the stored session id.
+    if (
+      useLegacyPath &&
+      COMPACT_TIMEOUT_ENABLED &&
+      exitCode === 124 &&
+      !isNew &&
+      existing &&
+      !recoveredFromStale
+    ) {
+      // No `sessionKey` below: the print opt-out has no supervisor session, so the
+      // utility calls resume one-shot without touching the PTY machinery at all.
       // Save memory before compact wipes context.
       try {
         const memPath = getMemoryPath(agentName);
@@ -2565,7 +2570,6 @@ async function execClaude(
         const saved = await saveMemoryBeforeCompact({
           memPath,
           prompt: `Session is about to compact. Save your current memory to ${memPath} now. Include: current status, what was accomplished, key context for next session. Keep it concise.`,
-          sessionKey: compactSessionKey,
           sessionId: existing.sessionId,
           skipLive: exitCode === 124,
           model: primaryConfig.model,
@@ -2584,7 +2588,6 @@ async function execClaude(
       emitCompactEvent({ type: "auto-compact-start" });
       const compactOk = await runCompact({
         sessionId: existing.sessionId,
-        sessionKey: compactSessionKey,
         skipLive: true,
         model: primaryConfig.model,
         timeoutMs,

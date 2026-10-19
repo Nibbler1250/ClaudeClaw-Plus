@@ -478,20 +478,46 @@ describe("pty-supervisor retry and backoff", () => {
     expect(sleeps).toEqual([1000]);
   });
 
-  it("returns exit 1, not 124, when its final turn failure is a timeout", async () => {
+  it("a final turn timeout returns 124 and retires the entry, so the next call respawns", async () => {
     injectMaxRetriesForTests(0);
-    injectSpawnPty(async () =>
+    let turns = 0;
+    const { spawn, spawned } = makeSpawnTracker(() =>
       makeFakePty("timeout", {
         onTurn: async () => {
-          throw new PtyTurnTimeoutError("timeout", 10);
+          turns += 1;
+          if (turns === 1) throw new PtyTurnTimeoutError("timeout", 10);
+          return { text: "second", sessionId: "sid" };
         },
       }),
     );
+    injectSpawnPty(spawn);
     const result = await runOnPty("global", "p", { timeoutMs: 1000 });
-    // 124 would start runner.ts's compact-on-timeout (retire, memory save, /compact, re-run)
-    // on a session whose answer may already have landed (#562 review).
-    expect(result.exitCode).toBe(1);
+    // 124 so the watchdog and the "timed out" messages see it. The TUI may still be busy with
+    // the old answer, so the supervisor retires it rather than leave it live (#562 re-review).
+    expect(result.exitCode).toBe(124);
     expect(result.stderr).toContain("max retries");
+    expect(spawned[0]?.disposed).toBe(true);
+    expect(snapshotSupervisor().ptys).toHaveLength(0);
+    const next = await runOnPty("global", "again", { timeoutMs: 1000 });
+    expect(next.exitCode).toBe(0);
+    expect(next.rawStdout).toBe("second");
+    expect(spawned).toHaveLength(2);
+  });
+
+  it("a non-timeout exhaustion returns 1 and does not retire the entry", async () => {
+    injectMaxRetriesForTests(0);
+    const { spawn, spawned } = makeSpawnTracker(() =>
+      makeFakePty("closed", {
+        onTurn: async () => {
+          throw new PtyClosedError("closed", 1, null);
+        },
+      }),
+    );
+    injectSpawnPty(spawn);
+    injectSleep(async () => {});
+    const result = await runOnPty("global", "p", { timeoutMs: 1000 });
+    expect(result.exitCode).toBe(1);
+    expect(spawned[0]?.disposed).toBe(false);
   });
 
   it("retry false permits exactly one turn and no respawn despite global retry settings", async () => {
@@ -509,7 +535,7 @@ describe("pty-supervisor retry and backoff", () => {
       timeoutMs: 1000,
       retry: false,
     } as Parameters<typeof runOnPty>[2]);
-    expect(result.exitCode).toBe(1);
+    expect(result.exitCode).toBe(124);
     expect(spawned).toHaveLength(1);
     expect(spawned[0]?.turnCount).toBe(1);
   });
