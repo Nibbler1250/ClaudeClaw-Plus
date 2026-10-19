@@ -2152,7 +2152,10 @@ async function execClaude(
         load: async () => (await getFallbackSession(agentName, threadId))?.sessionId,
         save: (id) => createFallbackSession(id, agentName, threadId),
       };
-      const execFallback = (legacyArgs: string[]) => {
+      // `recovery` marks the fallback's own corruption retry: one supervisor attempt, like
+      // `execRecovery`, so recovery does not compound with the supervisor's retries. The
+      // first fallback attempt keeps the normal envelope. The print path is unchanged.
+      const execFallback = (legacyArgs: string[], { recovery = false } = {}) => {
         fallbackStreamedText = false;
         return useLegacyPath
           ? runClaudeStream(
@@ -2165,6 +2168,7 @@ async function execClaude(
             )
           : runOnPty(fallbackPtyKey, prompt, {
               timeoutMs,
+              ...(recovery ? { retry: false } : {}),
               threadId,
               agentName,
               modelOverride: fallbackConfig.model,
@@ -2202,7 +2206,7 @@ async function execClaude(
         // The PTY on the fallback key still holds the corrupted session; drop
         // it so the retry spawns fresh from the store just reset.
         if (!useLegacyPath) await retirePtySession(fallbackPtyKey);
-        exec = await execFallback(freshFallbackArgs);
+        exec = await execFallback(freshFallbackArgs, { recovery: true });
         fallbackRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
         if (!fallbackRateLimit && exec.sessionId) {
           await createFallbackSession(exec.sessionId, agentName, threadId);

@@ -102,6 +102,11 @@ describe("#550 default runner routing", () => {
   it("a fallback's stale-session recovery is one attempt; the fallback's own first attempt is not changed", async () => {
     expect((await fixture("fallback-model")).retryFlags).toEqual([null, false]);
   });
+  it("the fallback's own corruption retry is one attempt; its first attempt keeps the normal envelope", async () => {
+    // fallback-rendered: the primary hits the rate limit, the fallback attempt renders a
+    // signature error, and the fallback is retried fresh. Only that retry is `retry: false`.
+    expect((await fixture("fallback-rendered")).retryFlags).toEqual([null, false]);
+  });
   it("recovers signature errors rendered by a PTY that returned exit zero", async () => {
     const result = await fixture("rendered-corrupt");
     expect(result.ptyCalls).toHaveLength(1);
