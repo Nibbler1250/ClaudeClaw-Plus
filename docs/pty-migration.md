@@ -4,7 +4,13 @@ On upgrade, a missing `pty.enabled` setting now selects the interactive Claude
 PTY engine for runner agent turns and scheduled jobs. Bootstrap, model fallback,
 stale or corrupted session recovery and post-compaction retries follow that
 setting too. An existing literal `false` is preserved. Invalid values such as
-`"false"` warn and use the default `true`.
+`"false"` warn and use the platform default (`true`, or `false` on Windows).
+
+On Windows (`win32`) runner turns also stay on print (`claude -p`) by default,
+for the same reason as the bus exception below: nothing in this codebase shows
+the PTY path working there, and `claude` resolves to a `.cmd` wrapper. Opt in
+with an explicit `pty.enabled: true`. The default is `defaultPtyEnabled` in
+`src/config.ts`.
 
 Agents spawned without the settings resolver now default to `pty-stdin` for
 every origin, including cron, heartbeat, CLI and REST. The exception is Windows:

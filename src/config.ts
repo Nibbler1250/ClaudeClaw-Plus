@@ -223,8 +223,10 @@ const DEFAULT_SETTINGS: Settings = {
   pty: {
     // Official engine for agent turns and cron jobs (#550). The MCP multiplexer
     // has shipped. OAuth refresh through it is NOT shipped code: the operator
-    // validates it in the pre-release soak. false keeps print.
-    enabled: true,
+    // validates it in the pre-release soak. false keeps print. Windows is the
+    // exception: no evidence the PTY path works there, so win32 defaults to print
+    // and `pty.enabled: true` opts in (see `defaultPtyEnabled`).
+    enabled: defaultPtyEnabled(),
     idleReapMinutes: 30,
     maxRetries: 5,
     respawnRetries: 3,
@@ -512,7 +514,7 @@ export interface McpConfig {
    * substrate. Filed in response to Nibbler review on #64: the silent
    * degradation mode (one shared MCP crashes → all PTYs lose that tool)
    * needed an operator-visible signal before `pty.enabled` could default to true
-   * (#550).
+   * (#550; on win32 it defaults to false, see `defaultPtyEnabled`).
    */
   healthProbeIntervalMs: number;
   /**
@@ -1047,15 +1049,37 @@ function parseAgenticConfig(raw: any): AgenticConfig {
   };
 }
 
+/**
+ * #550 made the PTY supervisor the default engine for runner turns. Nothing in this
+ * codebase shows that path working on win32: `claude` resolves to a `.cmd` wrapper
+ * there (runner.ts `CLAUDE_EXECUTABLE`) and the spec (§5.3) names `process` as the
+ * Windows fallback. So win32 keeps print by default and `pty.enabled: true` opts in,
+ * mirroring `defaultSupervisionFor` in `src/bus/types.ts`. `platform` is a parameter
+ * so the choice is testable on any host.
+ */
+export function defaultPtyEnabled(platform: NodeJS.Platform = process.platform): boolean {
+  return platform !== "win32";
+}
+
 const invalidPtyEnabledWarned = new Set<string>();
-function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Settings {
-  if (raw.pty?.enabled !== undefined && typeof raw.pty.enabled !== "boolean") {
-    const key = JSON.stringify(raw.pty.enabled);
+/** An explicit boolean wins; anything else gets the platform default (non-booleans warn once). */
+export function resolvePtyEnabled(
+  value: unknown,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (typeof value === "boolean") return value;
+  const fallback = defaultPtyEnabled(platform);
+  if (value !== undefined) {
+    const key = `${platform}:${JSON.stringify(value)}`;
     if (!invalidPtyEnabledWarned.has(key)) {
       invalidPtyEnabledWarned.add(key);
-      console.warn("pty.enabled must be a boolean; using default true");
+      console.warn(`pty.enabled must be a boolean; using the platform default (${fallback})`);
     }
   }
+  return fallback;
+}
+
+function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Settings {
   const rawLevel = raw.security?.level;
   const level: SecurityLevel =
     typeof rawLevel === "string" && VALID_LEVELS.has(rawLevel as SecurityLevel)
@@ -1237,7 +1261,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
           : 30_000,
     },
     pty: {
-      enabled: raw.pty?.enabled !== false, // only explicit false selects print (#550)
+      enabled: resolvePtyEnabled(raw.pty?.enabled), // explicit boolean wins; else platform default (#550)
       idleReapMinutes:
         Number.isFinite(raw.pty?.idleReapMinutes) && Number(raw.pty.idleReapMinutes) > 0
           ? Number(raw.pty.idleReapMinutes)

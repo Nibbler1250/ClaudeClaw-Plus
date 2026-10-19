@@ -11,7 +11,13 @@ import { join } from "path";
 import { mkdir, copyFile, unlink } from "fs/promises";
 import { existsSync } from "fs";
 
-import { loadSettings, reloadSettings, getSettings } from "../config";
+import {
+  loadSettings,
+  reloadSettings,
+  getSettings,
+  defaultPtyEnabled,
+  resolvePtyEnabled,
+} from "../config";
 
 const SETTINGS_DIR = join(process.cwd(), ".claude", "claudeclaw");
 const SETTINGS_FILE = join(SETTINGS_DIR, "settings.json");
@@ -647,5 +653,58 @@ describe("parseSettings — mcp.audit (#232)", () => {
     await writeRawSettings({ mcp: { audit: "enforced" } });
     await reloadSettings();
     expect(getSettings().mcp.audit).toBe("enforce");
+  });
+});
+
+describe("pty.enabled platform default (#550, #562)", () => {
+  it("win32 + absent → false (print stays the Windows default)", () => {
+    expect(resolvePtyEnabled(undefined, "win32")).toBe(false);
+    expect(defaultPtyEnabled("win32")).toBe(false);
+  });
+
+  it("win32 + explicit true → true (opt-in)", () => {
+    expect(resolvePtyEnabled(true, "win32")).toBe(true);
+  });
+
+  it("win32 + explicit false → false", () => {
+    expect(resolvePtyEnabled(false, "win32")).toBe(false);
+  });
+
+  it("linux + absent → true", () => {
+    expect(resolvePtyEnabled(undefined, "linux")).toBe(true);
+  });
+
+  it("darwin + absent → true", () => {
+    expect(resolvePtyEnabled(undefined, "darwin")).toBe(true);
+  });
+
+  it("linux + explicit false → false", () => {
+    expect(resolvePtyEnabled(false, "linux")).toBe(false);
+  });
+
+  it("win32 + non-boolean → false, warning names the platform default", () => {
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(resolvePtyEnabled("562-win32-not-a-boolean", "win32")).toBe(false);
+      const lines = warning.mock.calls.map(([line]) => String(line));
+      expect(lines.some((l) => /pty\.enabled.*boolean.*platform default \(false\)/.test(l))).toBe(
+        true,
+      );
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it("linux + non-boolean → true, warning names the platform default", () => {
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(resolvePtyEnabled("562-linux-not-a-boolean", "linux")).toBe(true);
+      const lines = warning.mock.calls.map(([line]) => String(line));
+      expect(lines.some((l) => /pty\.enabled.*boolean.*platform default \(true\)/.test(l))).toBe(
+        true,
+      );
+    } finally {
+      warning.mockRestore();
+    }
   });
 });

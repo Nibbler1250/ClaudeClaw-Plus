@@ -755,6 +755,11 @@ export interface RunOptions {
  *
  *   - `settings.pty.enabled === false` → legacy `claude -p` (SPEC §5.2).
  *   - otherwise → the PTY supervisor.
+ *
+ * `pty.enabled` defaults to true except on win32, where it defaults to false: nothing
+ * in the codebase shows the PTY path working there (`claude` is a `.cmd` wrapper,
+ * spec §5.3 names `process` as the Windows fallback). An explicit `pty.enabled: true`
+ * still opts in. See `defaultPtyEnabled` in `src/config.ts`.
  */
 export function resolveAgentTurnRoute(name?: string): "legacy" | "pty" {
   return getSettings().pty.enabled ? "pty" : "legacy";
