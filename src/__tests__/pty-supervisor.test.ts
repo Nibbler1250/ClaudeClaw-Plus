@@ -486,7 +486,7 @@ describe("pty-supervisor retry and backoff", () => {
         onTurn: async () => {
           turns += 1;
           if (turns === 1) throw new PtyTurnTimeoutError("timeout", 10);
-          return { text: "second", sessionId: "sid" };
+          return { text: "second", bytesCaptured: 1, cleanBoundary: true, sessionId: "sid" };
         },
       }),
     );
