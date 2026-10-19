@@ -1,5 +1,10 @@
 import { getSettings } from "../config.js";
-import { parseOneShotSettings, resolveOneShotEngine, validateRouteEngine } from "./config.js";
+import {
+  engineType,
+  parseOneShotSettings,
+  resolveOneShotEngine,
+  validateRouteEngine,
+} from "./config.js";
 import { validateIsolation } from "./isolation.js";
 import { engines } from "./registry.js";
 import { printRuntime } from "./print.js";
@@ -40,7 +45,10 @@ export interface OneShotResult {
 export interface OneShotEngine {
   id: string;
   caps: { resume: boolean; tools: boolean; isolation: boolean };
-  run(req: OneShotRequest): Promise<OneShotResult>;
+  /** Throws on settings this engine cannot run with; called at settings load. */
+  checkConfig?(config: Record<string, unknown>, name: string): void;
+  /** `config` is the `oneShot.engines` declaration the route named, if any. */
+  run(req: OneShotRequest, config?: Record<string, unknown>): Promise<OneShotResult>;
 }
 
 export async function runOneShot(req: OneShotRequest): Promise<OneShotResult> {
@@ -58,13 +66,15 @@ export async function runOneShot(req: OneShotRequest): Promise<OneShotResult> {
   const id = printRuntime()?.forcePrint
     ? "print"
     : resolveOneShotEngine(settings ?? parseOneShotSettings(undefined), req.route);
+  const declarations = settings?.engines ?? {};
   validateRouteEngine(
     id,
     req.route,
     req.isolation === "untrusted",
     req.resumeSessionId !== undefined,
+    declarations,
   );
-  const engine = engines.get(id)!;
+  const engine = engines.get(engineType(id, declarations))!;
   if ((req.allowedTools !== undefined || req.tools !== undefined) && !engine.caps.tools)
     throw new Error(`oneShot engine '${id}' does not support tools`);
   const started = Date.now();
@@ -75,7 +85,10 @@ export async function runOneShot(req: OneShotRequest): Promise<OneShotResult> {
   let result: OneShotResult | undefined;
   try {
     req.signal?.throwIfAborted();
-    result = await engine.run(request);
+    result = await engine.run(
+      request,
+      Object.hasOwn(declarations, id) ? declarations[id] : undefined,
+    );
     return result;
   } finally {
     console.info(
