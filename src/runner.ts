@@ -178,7 +178,10 @@ export async function probeClaudeCliVersion(): Promise<{ version: string | null;
 /**
  * Compact configuration.
  * COMPACT_WARN_THRESHOLD: notify user that context is getting large.
- * COMPACT_TIMEOUT_ENABLED: whether to auto-compact on timeout (exit 124).
+ * COMPACT_TIMEOUT_ENABLED: whether to auto-compact on timeout (exit 124). Only the
+ * print (`claude -p`) paths produce 124: a PTY turn timeout is exit 1 (see the
+ * pty-supervisor header), because it is usually a turn-detection miss on a healthy
+ * session and the interactive REPL compacts its own context.
  */
 const COMPACT_WARN_THRESHOLD = 25;
 const COMPACT_TIMEOUT_ENABLED = true;
@@ -2089,8 +2092,7 @@ async function execClaude(
       // One attempt: no supervisor turn/respawn retries on a recovery call. The PTY
       // migration (§5.3) does not compound supervisor recovery with downstream
       // recovery, and this IS the downstream one. With `pty.maxRetries` 5 a persistent
-      // timeout cost ~6 x timeoutMs here, and the exit-124 compact block's retry another
-      // ~6 while holding the global queue.
+      // timeout would cost ~6 x timeoutMs here while holding the global queue.
       return runOnPty(key, prompt, {
         timeoutMs,
         retry: false,
@@ -2541,6 +2543,9 @@ async function execClaude(
     }
 
     // --- Auto-compact on timeout (exit 124) ---
+    // Print-era recovery for a wedged `claude -p`. A PTY turn timeout is exit 1, not 124
+    // (pty-supervisor header), so under PTY this block is reached only via the explicit
+    // `pty.enabled: false` opt-out path (`useLegacyPath`) or a print-engine failure.
     if (COMPACT_TIMEOUT_ENABLED && exitCode === 124 && !isNew && existing && !recoveredFromStale) {
       // The turn timed out, so the session is wedged. Retire it first so no
       // utility --resume below races a live writer of this transcript, even when

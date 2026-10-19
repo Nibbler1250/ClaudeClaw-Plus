@@ -44,19 +44,17 @@ describe("#550 default runner routing", () => {
     expect(result.primaryRoute).toBe("pty");
     expect(result.agentPrintCalls).toBe(0);
   });
-  for (const scenario of ["corrupt", "stale", "compact"]) {
+  for (const scenario of ["corrupt", "stale"]) {
     it(`${scenario} retry retires the old PTY and follows the configured engine`, async () => {
       const result = await fixture(scenario);
       expect(result.primaryRoute).toBe("pty");
       expect(result.exitCode).toBe(0);
       expect(result.ptyCalls).toEqual(["thread:fixture-thread"]);
-      // compact: the up-front retire of the wedged PTY, the memory save's and the
-      // /compact's own `skipLive` retire (#549), and the retry's. Each is idempotent.
-      expect(result.retired).toEqual(
-        scenario === "compact" ? Array(4).fill("thread:fixture-thread") : ["thread:fixture-thread"],
-      );
+      expect(result.retired).toEqual(["thread:fixture-thread"]);
       expect(result.agentPrintCalls).toBe(0);
     });
+  }
+  for (const scenario of ["corrupt", "stale", "compact"]) {
     it(`${scenario} retry preserves the explicit print opt-out`, async () => {
       const result = await fixture(`legacy-${scenario}`);
       expect(result.primaryRoute).toBe("legacy");
@@ -66,35 +64,32 @@ describe("#550 default runner routing", () => {
       expect(result.agentPrintCalls).toBe(1);
     });
   }
-  it("retires the actual timed-out PTY before memory save or compact can resume it", async () => {
+  it("a PTY turn timeout is exit 1: no memory save, no /compact, no re-run (#562 review)", async () => {
+    // The real supervisor times out on its only turn. Exit 124 would retire the session,
+    // save memory, /compact and re-run the prompt, although the answer may have landed.
     const result = await fixture("compact");
-    expect(result.events[0]).toBe("timeout");
-    // The process is gone before EITHER utility --resume starts, and both resume the
-    // old session through the oneshot module's print engine (the configured default).
-    expect(result.events.indexOf("retire")).toBeLessThan(result.events.indexOf("utility-memory"));
-    expect(result.events.indexOf("disposed")).toBeLessThan(result.events.indexOf("utility-memory"));
-    expect(result.events.indexOf("disposed")).toBeLessThan(
-      result.events.indexOf("utility-compact"),
-    );
-    expect(result.utilityResumes).toEqual([
-      { prompt: "memory", resume: "old-sid" },
-      { prompt: "/compact", resume: "old-sid" },
-    ]);
-    expect(result.oneShotLog).toEqual([
-      { route: "memory.save.precompact", engine: "print", exitCode: 0 },
-      { route: "compact", engine: "print", exitCode: 0 },
-    ]);
+    expect(result.events.filter((event: string) => event === "timeout")).toHaveLength(1);
+    expect(result.exitCode).toBe(1);
+    expect(result.utilityResumes).toEqual([]);
+    expect(result.oneShotLog).toEqual([]);
+    expect(result.events).not.toContain("utility-memory");
+    expect(result.events).not.toContain("utility-compact");
+  });
+  it("the print opt-out still compacts on a 124 timeout, retiring no PTY", async () => {
+    const result = await fixture("legacy-compact");
+    expect(result.primaryRoute).toBe("legacy");
+    expect(result.retired).toEqual([]);
     expect(result.exitCode).toBe(0);
   });
   it("a recovery call is one attempt: no supervisor retries compounded on top of the downstream recovery", async () => {
     // pty.maxRetries is 5 and the PTY times out on every turn. The stale/corrupt recovery
-    // times out (exit 124), which starts the compact block and its post-compact recovery:
-    // two recovery calls, each ONE turn. With the full retry envelope that was 6 + 6.
+    // times out (exit 1, not 124, so no compact block follows): one recovery call, ONE
+    // turn. With the full retry envelope that was 6.
     const result = await fixture("recovery-timeout");
-    expect(result.retryFlags).toEqual([false, false]);
-    expect(result.events.filter((event: string) => event === "timeout")).toHaveLength(2);
+    expect(result.retryFlags).toEqual([false]);
+    expect(result.events.filter((event: string) => event === "timeout")).toHaveLength(1);
   });
-  for (const scenario of ["corrupt", "stale", "compact"]) {
+  for (const scenario of ["corrupt", "stale"]) {
     it(`${scenario}: the recovery call goes out with retry false`, async () => {
       expect((await fixture(scenario)).retryFlags).toEqual([false]);
     });
@@ -130,7 +125,7 @@ describe("#550 default runner routing", () => {
   });
   it("bootstrap reserves the queue, uses one bounded attempt, and releases a later chat", async () => {
     const result = await fixture("bootstrap-attempt");
-    expect(result.bootstrapError).toContain("124");
+    expect(result.bootstrapError).toContain("exited 1");
     expect(result.events.filter((event: string) => event === "timeout")).toHaveLength(1);
     // Capped at BOOTSTRAP_PTY_MAX_MS (120 s), under the configured 5 min timeouts.default.
     expect(result.bootstrapTimeoutMs).toBe(120_000);

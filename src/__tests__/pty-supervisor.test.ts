@@ -478,7 +478,7 @@ describe("pty-supervisor retry and backoff", () => {
     expect(sleeps).toEqual([1000]);
   });
 
-  it("returns 124 when its final turn failure is a timeout", async () => {
+  it("returns exit 1, not 124, when its final turn failure is a timeout", async () => {
     injectMaxRetriesForTests(0);
     injectSpawnPty(async () =>
       makeFakePty("timeout", {
@@ -488,7 +488,10 @@ describe("pty-supervisor retry and backoff", () => {
       }),
     );
     const result = await runOnPty("global", "p", { timeoutMs: 1000 });
-    expect(result.exitCode).toBe(124);
+    // 124 would start runner.ts's compact-on-timeout (retire, memory save, /compact, re-run)
+    // on a session whose answer may already have landed (#562 review).
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("max retries");
   });
 
   it("retry false permits exactly one turn and no respawn despite global retry settings", async () => {
@@ -506,7 +509,7 @@ describe("pty-supervisor retry and backoff", () => {
       timeoutMs: 1000,
       retry: false,
     } as Parameters<typeof runOnPty>[2]);
-    expect(result.exitCode).toBe(124);
+    expect(result.exitCode).toBe(1);
     expect(spawned).toHaveLength(1);
     expect(spawned[0]?.turnCount).toBe(1);
   });
