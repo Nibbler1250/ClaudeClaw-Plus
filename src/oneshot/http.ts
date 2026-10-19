@@ -81,10 +81,16 @@ async function postChat(
     choices?: Array<{ message?: { content?: unknown } }>;
     usage?: { prompt_tokens?: number; completion_tokens?: number };
   };
+  let text: string;
   try {
-    json = JSON.parse(await readBounded(res, signal));
+    text = await readBounded(res, signal);
   } catch (error) {
     if (signal.aborted || error instanceof ProviderError) throw error;
+    throw new ProviderError("network error", 503, model);
+  }
+  try {
+    json = JSON.parse(text);
+  } catch {
     throw new ProviderError(`invalid JSON reply (HTTP ${res.status})`, res.status, model);
   }
   const content = json.choices?.[0]?.message?.content;
@@ -233,6 +239,8 @@ export async function runLlmRouter(
       tried++;
       try {
         const reply = await postChat(baseUrl, model, opts.messages, opts.maxTokens, key, signal);
+        // Retriable, so an empty answer moves on to the next tier model.
+        if (!reply.content.trim()) throw new ProviderError("empty content", 502, model);
         const usage = {
           input: reply.usage?.inputTokens ?? 0,
           output: reply.usage?.outputTokens ?? 0,

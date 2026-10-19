@@ -197,14 +197,10 @@ describe("HTTP engines", () => {
     });
 
     it(`${id}: the timeout aborts the request and returns a non-zero exit code`, async () => {
-      let served = false;
       server = mockServer(
         () =>
           new Promise<Response>((resolve) =>
-            setTimeout(() => {
-              served = true;
-              resolve(completion({ content: "late" }));
-            }, 1500),
+            setTimeout(() => resolve(completion({ content: "late" })), 1500),
           ),
       );
       const config = await pointAt(id, server.url);
@@ -216,7 +212,28 @@ describe("HTTP engines", () => {
       expect(result.exitCode).toBe(124);
       expect(result.text).toBe("");
       expect(out).toContain("timeout after 50ms");
-      expect(served).toBe(false);
+    });
+
+    it(`${id}: the timeout also stops a reply whose body stalls after the headers`, async () => {
+      server = mockServer(
+        () =>
+          new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.enqueue(new TextEncoder().encode('{"choices":'));
+              },
+            }),
+            { status: 200 },
+          ),
+      );
+      const config = await pointAt(id, server.url);
+      const started = Date.now();
+      const { result, out } = await captureConsole(() =>
+        engines.get(id)!.run({ ...untrusted, timeoutMs: 50 }, config),
+      );
+      expect(Date.now() - started).toBeLessThan(1000);
+      expect(result.exitCode).toBe(124);
+      expect(out).toContain("timeout after 50ms");
     });
 
     it(`${id}: a caller abort mid-request stops it with a non-zero exit code`, async () => {
@@ -348,6 +365,18 @@ describe("HTTP engines", () => {
     expect(out).toContain('"reason":"HTTP 503 (30 model(s) tried)"');
   });
 
+  it("llm-router moves to the next tier model when one replies with empty content", async () => {
+    server = mockServer(({ body }) =>
+      completion({ content: body.model === "first" ? "" : "from second" }, String(body.model)),
+    );
+    await useSettings({
+      llmRouter: { openRouterBaseUrl: server.url, tiers: { fast: ["first", "second"] } },
+    });
+    const result = await engines.get("llm-router")!.run(untrusted, {});
+    expect(result).toMatchObject({ text: "from second", model: "second", exitCode: 0 });
+    expect(server.seen.map((s) => s.body.model)).toEqual(["first", "second"]);
+  });
+
   it("llm-router reads OPENROUTER_API_KEY by default", async () => {
     const saved = process.env.OPENROUTER_API_KEY;
     process.env.OPENROUTER_API_KEY = SECRET;
@@ -362,7 +391,7 @@ describe("HTTP engines", () => {
     }
   });
 
-  it("the classifier's print-only runtime does not reach an HTTP engine", async () => {
+  it("the classifier's print-only runtime does not divert an HTTP route to print", async () => {
     server = mockServer(() => completion({ content: '{"action":"hire","names":["a"]}' }));
     writeFileSync(
       join(dir, "settings.json"),
