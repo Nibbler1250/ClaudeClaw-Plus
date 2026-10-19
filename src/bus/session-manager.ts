@@ -5,7 +5,10 @@
  *
  * Responsibility: spawn + supervise one `claude` process per Plus agent.
  * Uses the PTY-backed REPL for every origin unless the agent explicitly
- * selects another `SupervisionMode`, including `process-stream-json`.
+ * selects another `SupervisionMode`, including `process-stream-json`. The one
+ * default exception is win32: an `AgentConfig` with no `supervision` falls back,
+ * for non-channel origins, to `process-stream-json` (`defaultSupervisionFor`).
+ * Declared agents always carry `supervision` (resolver default `pty-stdin`).
  * Provides a stable per-agent handle (`AgentProcess`) with
  * lifecycle methods and slash-command relay.
  *

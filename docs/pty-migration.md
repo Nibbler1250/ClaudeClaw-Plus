@@ -7,10 +7,11 @@ setting too. An existing literal `false` is preserved. Invalid values such as
 `"false"` warn and use the platform default (`true`, or `false` on Windows).
 
 On Windows (`win32`) runner turns also stay on print (`claude -p`) by default,
-for the same reason as the bus exception below: nothing in this codebase shows
+for the same reason as the bus fallback below: nothing in this codebase shows
 the PTY path working there, and `claude` resolves to a `.cmd` wrapper. Opt in
 with an explicit `pty.enabled: true`. The default is `defaultPtyEnabled` in
-`src/config.ts`.
+`src/config.ts`. This does not touch declared bus agents: they already run
+`pty-stdin` on Windows, as on every platform (the resolver default).
 
 Agents spawned without the settings resolver now default to `pty-stdin` for
 every origin, including cron, heartbeat, CLI and REST. The exception is Windows:

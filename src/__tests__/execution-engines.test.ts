@@ -26,4 +26,14 @@ describe("#550 startup engine summary", () => {
       "  Engines: agent turns=pty; cron jobs=pty; bus non-channel default=pty-stdin; bus agents=none",
     ]);
   });
+  it("win32: a declared agent without supervision is pty-stdin, as the resolver runs it", () => {
+    // resolveBusAgentConfig gives every declared agent `pty-stdin` on every platform; only
+    // the origin fallback for hand-built AgentConfigs is process-stream-json on win32.
+    const summary = executionEngineSummary(
+      { pty: { enabled: false }, agents: [{ id: "default" }, { id: "cli", supervision: "tmux" }] },
+      "win32",
+    );
+    expect(summary).toContain("bus non-channel default=process-stream-json");
+    expect(summary).toContain("bus agents=default=pty-stdin, cli=tmux");
+  });
 });

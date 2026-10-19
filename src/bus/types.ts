@@ -31,8 +31,9 @@ export type BusOrigin =
   | "rest";
 
 /**
- * Channel origins require the REPL for notifications. All origins now use
- * PTY by default (#550); this set still controls channel-specific delivery.
+ * Channel origins require the REPL for notifications. All origins use PTY by
+ * default (#550), except the non-channel origins' hand-built-config fallback on
+ * win32 (`defaultSupervisionFor`); this set still controls channel-specific delivery.
  */
 export const CHANNEL_DRIVEN_ORIGINS: ReadonlySet<BusOrigin> = new Set([
   "discord",
@@ -45,7 +46,7 @@ export const CHANNEL_DRIVEN_ORIGINS: ReadonlySet<BusOrigin> = new Set([
  * Supervision mode per §5.3.
  */
 export type SupervisionMode =
-  | "pty-stdin" // default for every origin (#550); bun-pty for TTY, stdout ignored
+  | "pty-stdin" // default for every origin (#550; win32 non-channel fallback excepted); bun-pty for TTY, stdout ignored
   | "process-stream-json" // `claude -p --input-format=stream-json`; non-channel origins on Windows
   | "tmux" // opt-in: detached tmux for pane-attach inspection
   | "process"; // Windows fallback only — slash commands won't work
@@ -58,6 +59,12 @@ export type SupervisionMode =
  * origins keep their pre-#550 default, `process-stream-json`. Channel origins already
  * ran on `pty-stdin` before #550 (they need the REPL for notifications), so they are
  * unchanged. `platform` is a parameter so the choice is testable on any host.
+ *
+ * Scope: this is the origin fallback for an `AgentConfig` built by hand, with no
+ * `supervision`. Declared agents go through `resolveBusAgentConfig`, which has defaulted
+ * them to `pty-stdin` on every platform since 0cd86d3a, so they run PTY on win32 too.
+ * The Windows exception covers this fallback and runner turns (`defaultPtyEnabled`),
+ * not declared bus agents.
  */
 export function defaultSupervisionFor(
   origin: BusOrigin,

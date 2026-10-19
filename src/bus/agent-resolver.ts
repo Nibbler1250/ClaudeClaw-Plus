@@ -41,6 +41,19 @@ export interface ResolveAgentOptions {
 }
 
 /**
+ * What a declared agent runs under when its settings entry names no `supervision`.
+ * The same on every platform (including win32): only the origin fallback in
+ * `defaultSupervisionFor` (`src/bus/types.ts`), which applies to hand-built
+ * `AgentConfig`s that never pass through this resolver, differs on Windows.
+ */
+export const DECLARED_AGENT_DEFAULT_SUPERVISION: SupervisionMode = "pty-stdin";
+
+/** The supervision `resolveBusAgentConfig` gives a settings entry; shared with the startup summary. */
+export function effectiveAgentSupervision(entry: Pick<BusAgentSettings, "supervision">): SupervisionMode {
+  return (entry.supervision as SupervisionMode | undefined) ?? DECLARED_AGENT_DEFAULT_SUPERVISION;
+}
+
+/**
  * Resolve one settings entry into a spawnable `AgentConfig`.
  *
  * Defaults applied:
@@ -71,7 +84,7 @@ export async function resolveBusAgentConfig(
     cwd,
     session_id,
     permission_mode: entry.permission_mode ?? "bypassPermissions",
-    supervision: (entry.supervision as SupervisionMode | undefined) ?? "pty-stdin",
+    supervision: effectiveAgentSupervision(entry),
   };
   if (entry.system_prompt_file) config.system_prompt_file = entry.system_prompt_file;
   if (entry.memory_file) config.memory_file = entry.memory_file;

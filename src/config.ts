@@ -1056,6 +1056,10 @@ function parseAgenticConfig(raw: any): AgenticConfig {
  * Windows fallback. So win32 keeps print by default and `pty.enabled: true` opts in,
  * mirroring `defaultSupervisionFor` in `src/bus/types.ts`. `platform` is a parameter
  * so the choice is testable on any host.
+ *
+ * Scope: `pty.enabled` governs `runner.ts` turns only. Declared bus agents are not
+ * affected: `resolveBusAgentConfig` defaults them to `pty-stdin` on every platform, win32
+ * included.
  */
 export function defaultPtyEnabled(platform: NodeJS.Platform = process.platform): boolean {
   return platform !== "win32";
