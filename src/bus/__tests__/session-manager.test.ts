@@ -60,6 +60,18 @@ describe("defaultSupervisionFor", () => {
       expect(defaultSupervisionFor(origin)).toBe("pty-stdin");
     }
   });
+
+  it("win32: non-channel origins keep their pre-#550 process-stream-json (no evidence the PTY path runs there)", () => {
+    for (const origin of ["cron", "heartbeat", "cli", "rest"] as BusOrigin[]) {
+      expect(defaultSupervisionFor(origin, "win32")).toBe("process-stream-json");
+    }
+    // channel origins were already pty-stdin before #550, and need the REPL
+    for (const origin of ["discord", "telegram", "slack", "webui"] as BusOrigin[]) {
+      expect(defaultSupervisionFor(origin, "win32")).toBe("pty-stdin");
+    }
+    expect(defaultSupervisionFor("cron", "linux")).toBe("pty-stdin");
+    expect(defaultSupervisionFor("cron", "darwin")).toBe("pty-stdin");
+  });
 });
 
 /* ───────────────────────────────────────────────────────────────────── */

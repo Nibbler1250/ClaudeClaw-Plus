@@ -18,6 +18,11 @@ const rawScenario = process.argv[2] ?? "cron";
 const scenario = rawScenario.replace(/^legacy-/, "");
 await config.initConfig();
 const settingsPath = join(process.cwd(), ".claude/claudeclaw/settings.json");
+if (scenario === "recovery-timeout") {
+  const settings = JSON.parse(await readFile(settingsPath, "utf8"));
+  settings.pty.maxRetries = 5;
+  await writeFile(settingsPath, JSON.stringify(settings));
+}
 if (scenario === "compact" && !rawScenario.startsWith("legacy-")) {
   const settings = JSON.parse(await readFile(settingsPath, "utf8"));
   settings.pty.maxRetries = 0;
@@ -40,6 +45,8 @@ const ptyCalls: string[] = [];
 const retired: string[] = [];
 const events: string[] = [];
 const modelOverrides: Array<string | undefined> = [];
+// The `retry` option each runOnPty call carried (JSON drops `undefined`, so null).
+const retryFlags: Array<boolean | null> = [];
 const chunks: string[] = [];
 const tools: string[] = [];
 const realRunOnPty = supervisor.runOnPty;
@@ -69,6 +76,9 @@ let agentPrintCalls = 0;
 let utilityPrintCalls = 0;
 spyOn(supervisor, "runOnPty").mockImplementation(async (key, _prompt, opts) => {
   ptyCalls.push(key);
+  retryFlags.push(opts.retry ?? null);
+  // The real supervisor, so the turn count shows what a recovery call is allowed to retry.
+  if (scenario === "recovery-timeout") return realRunOnPty(key, _prompt, opts);
   if (scenario.startsWith("dashboard-fallback-")) {
     if (key === "global") {
       const notice = "You've hit your limit · resets 5pm (UTC)";
@@ -108,7 +118,8 @@ spyOn(supervisor, "runOnPty").mockImplementation(async (key, _prompt, opts) => {
 spyOn(supervisor, "retirePtySession").mockImplementation(async (key) => {
   events.push("retire");
   retired.push(key);
-  if (scenario === "compact" || scenario === "bootstrap-attempt") await realRetire(key);
+  if (scenario === "compact" || scenario === "bootstrap-attempt" || scenario === "recovery-timeout")
+    await realRetire(key);
 });
 // Agent turns on the print route still spawn through the runner's own seam.
 runner._setClaudeSpawnForTests((args) => {
@@ -170,6 +181,7 @@ if (
     "corrupt",
     "stale",
     "compact",
+    "recovery-timeout",
     "rendered-corrupt",
     "fallback-model",
     "fallback-stream",
@@ -191,7 +203,7 @@ if (
         stderr: "",
         exitCode: 0,
       };
-    if (scenario === "corrupt")
+    if (scenario === "corrupt" || scenario === "recovery-timeout")
       return { rawStdout: "", stderr: "Invalid signature in thinking block", exitCode: 1 };
     if (scenario === "stale")
       return {
@@ -280,5 +292,5 @@ await withPrintRuntime({ spawn: fakeOneShotSpawn }, async () => {
   }
 });
 console.log(
-  `FIXTURE_RESULT ${JSON.stringify({ enabled: config.getSettings().pty.enabled, exitCode, primaryRoute, ptyCalls, retired, agentPrintCalls, utilityPrintCalls, events, utilityResumes, oneShotLog, modelOverrides, chunks, tools, bootstrapTimeoutMs, bootstrapError, resultStdout })}`,
+  `FIXTURE_RESULT ${JSON.stringify({ enabled: config.getSettings().pty.enabled, exitCode, primaryRoute, ptyCalls, retired, agentPrintCalls, utilityPrintCalls, events, utilityResumes, oneShotLog, modelOverrides, retryFlags, chunks, tools, bootstrapTimeoutMs, bootstrapError, resultStdout })}`,
 );

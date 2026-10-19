@@ -221,8 +221,9 @@ const DEFAULT_SETTINGS: Settings = {
   // service manager's stop timeout (systemd TimeoutStopSec defaults to 90s).
   shutdown: { drainTurnsMs: 30_000 },
   pty: {
-    // Official engine for agent turns and cron jobs (#550). The MCP
-    // multiplexer and OAuth validation have shipped; false keeps print.
+    // Official engine for agent turns and cron jobs (#550). The MCP multiplexer
+    // has shipped. OAuth refresh through it is NOT shipped code: the operator
+    // validates it in the pre-release soak. false keeps print.
     enabled: true,
     idleReapMinutes: 30,
     maxRetries: 5,
@@ -510,7 +511,8 @@ export interface McpConfig {
    * with the per-server crash/failure events already emitted by the proxy
    * substrate. Filed in response to Nibbler review on #64: the silent
    * degradation mode (one shared MCP crashes → all PTYs lose that tool)
-   * needs an operator-visible signal before `pty.enabled: true` ships.
+   * needed an operator-visible signal before `pty.enabled` could default to true
+   * (#550).
    */
   healthProbeIntervalMs: number;
   /**

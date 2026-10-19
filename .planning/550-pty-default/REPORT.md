@@ -10,7 +10,7 @@ Implemented on `feat/550-pty-default` from `povai/main` at `d81bd579`. The testa
 - Startup emits the effective runner-turn, cron-job and bus non-channel default engines, plus every declared agent's supervision override.
 - docs/pty-migration.md explains upgrade behavior, both print opt-outs, restart requirements and startup/spawn/process verification. The job-loop comment and warning now accurately describe the configured engine.
 - Print-specific bus fixtures explicitly request process-stream-json. Existing runner default/bootstrap assertions were updated. The #559 restoreDir defect was not changed; its routing suite was run in an isolated temporary cwd to protect developer state.
-- Both plugin manifests were bumped with the prescribed scripts to 2.2.337.
+- Both plugin manifests were bumped with the prescribed scripts; the branch is at 2.2.341 (main is 2.2.340).
 
 ## Bus confirmation and cron proof
 
@@ -33,7 +33,7 @@ All test runners were invoked directly, with output captured and summarized in c
 | `bun run lint` over the whole repository (JSON reporter for final diagnostic summary) | exit 0; 0 errors, advisory warnings remain |
 | `bun run typecheck` | baseline and final: 149 diagnostics against baseline 149; exit 0 |
 | `git diff --check` | clean |
-| both version bump scripts | 2.2.337 |
+| both version bump scripts | 2.2.341 |
 
 The initial 55-second cap on the session-manager file was inadequate after lifecycle fixtures began using PTYs by default; the complete scoped rerun passed in 95.37 seconds. The earlier capped invocation was not counted as a pass. No live Claude model turn or production daemon check was performed. CLI 2.1.302 is installed, but #559 is an existing independently owned merge blocker; no claim of resolving or live-verifying it is made here.
 
@@ -213,7 +213,7 @@ This section supersedes the initial report where behavior changed. Applied the s
 - M5: invalid pty.enabled warnings are deduplicated for each distinct JSON value for the life of the process, including repeated reloads. The bad value itself is never logged.
 - M6: migration guidance now states runner engine flips apply after the approximately 30-second settings reload; bus-agent supervision/runtime changes require restart. It narrows the origin fallback change to agents spawned without resolver-selected supervision, since resolved declared agents already defaulted to PTY.
 - M7: startup logging is exercised through the actual logger helper called by start, replacing source-string inspection. Removed the bootstrap source prohibition covered by routing behavior. Added actual SessionManager.spawnAgent cron selection with no declared supervision, alongside the explicit print control.
-- Both bump scripts ran twice, moving plugin and marketplace plugin entries from 2.2.337 through 2.2.338 to **2.2.339**. Read-back asserted both equal 2.2.339.
+- Both bump scripts ran twice, moving plugin and marketplace plugin entries from 2.2.337 through 2.2.338 to 2.2.339; merging main (2.2.340) and a further bump took the branch to **2.2.341**. Read-back asserted both equal 2.2.341.
 
 ### Final review validation
 
@@ -358,4 +358,4 @@ Final validation used Bun with --preload <repo>/scripts/test-preload.ts and abso
 | bun run typecheck ratchet | exit 0, 149 diagnostics against baseline 149, unchanged |
 | git diff --check | clean |
 
-No requested fix remains undone. Version 2.2.339 is deliberately unchanged under the explicit no-bump dispatch instruction. No new Ultra code was reused. No live Claude, browser or production SSE check was performed; dashboard delivery is proved at its runner stream callback boundary. README and issue 559 remain untouched, existing external integration/operator soak gates remain applicable, and no GitHub comment or thread resolution was posted.
+No requested fix remains undone. Version 2.2.341 is deliberately unchanged under the explicit no-bump dispatch instruction. No new Ultra code was reused. No live Claude, browser or production SSE check was performed; dashboard delivery is proved at its runner stream callback boundary. README and issue 559 remain untouched, existing external integration/operator soak gates remain applicable, and no GitHub comment or thread resolution was posted.

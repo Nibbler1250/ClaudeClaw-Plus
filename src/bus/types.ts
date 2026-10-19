@@ -45,12 +45,25 @@ export const CHANNEL_DRIVEN_ORIGINS: ReadonlySet<BusOrigin> = new Set([
  * Supervision mode per §5.3.
  */
 export type SupervisionMode =
-  | "pty-stdin" // default for every origin; bun-pty for TTY, stdout ignored
-  | "process-stream-json" // explicit override; `claude -p --input-format=stream-json`
+  | "pty-stdin" // default for every origin (#550); bun-pty for TTY, stdout ignored
+  | "process-stream-json" // `claude -p --input-format=stream-json`; non-channel origins on Windows
   | "tmux" // opt-in: detached tmux for pane-attach inspection
   | "process"; // Windows fallback only — slash commands won't work
 
-export function defaultSupervisionFor(_origin: BusOrigin): SupervisionMode {
+/**
+ * #550 made `pty-stdin` the default for every origin. Nothing in this codebase shows the
+ * PTY path working on win32: there is no platform guard anywhere in `bun-pty`'s callers,
+ * the spec (§5.3) names `process` as the Windows fallback, and `claude` resolves to a
+ * `.cmd` wrapper there (runner.ts `CLAUDE_EXECUTABLE`). So on win32 the non-channel
+ * origins keep their pre-#550 default, `process-stream-json`. Channel origins already
+ * ran on `pty-stdin` before #550 (they need the REPL for notifications), so they are
+ * unchanged. `platform` is a parameter so the choice is testable on any host.
+ */
+export function defaultSupervisionFor(
+  origin: BusOrigin,
+  platform: NodeJS.Platform = process.platform,
+): SupervisionMode {
+  if (platform === "win32" && !CHANNEL_DRIVEN_ORIGINS.has(origin)) return "process-stream-json";
   return "pty-stdin";
 }
 

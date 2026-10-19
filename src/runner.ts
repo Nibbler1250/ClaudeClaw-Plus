@@ -403,8 +403,24 @@ export interface AgentStreamEvent {
 const RATE_LIMIT_PATTERN = /you(?:'|')ve hit your limit|out of extra usage/i;
 const RATE_LIMIT_RESET_PATTERN = /resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*\(?\s*UTC\s*\)?/i;
 const SIGNATURE_ERROR = /Invalid.*signature.*thinking.*block/i;
-const RENDERED_SIGNATURE_ERROR =
-  /(?:^|\n)\s*API Error:[^\n]*Invalid[^\n]*signature[^\n]*thinking[^\n]*block/i;
+const RENDERED_SIGNATURE_ERROR_LINE =
+  /^\s*API Error:[^\n]*Invalid[^\n]*signature[^\n]*thinking[^\n]*block/i;
+/** Non-empty trailing lines scanned for the rendered error. */
+const RENDERED_SIGNATURE_TAIL_LINES = 2;
+
+/**
+ * A PTY turn that exits 0 but ENDS in the REPL's rendered `API Error: ... Invalid signature
+ * ... thinking block`. Only the tail counts: the error ends the turn, so it is the last
+ * thing printed, while an agent that quotes a log or a test fixture keeps talking after it.
+ * A mid-output match must not reset (wipe) the session transcript.
+ */
+export function endsInRenderedSignatureError(output: string): boolean {
+  const tail = output
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .slice(-RENDERED_SIGNATURE_TAIL_LINES);
+  return tail.some((line) => RENDERED_SIGNATURE_ERROR_LINE.test(line));
+}
 
 // Claude Code prints this when --resume references a session it no longer
 // has on disk (cleared, expired, compacted away, or moved to another machine).
@@ -2065,8 +2081,14 @@ async function execClaude(
       const key = fallback ? `fallback:${ptySessionKey}` : ptySessionKey;
       await retirePtySession(key);
       if (fallback) fallbackStreamedText = false;
+      // One attempt: no supervisor turn/respawn retries on a recovery call. The PTY
+      // migration (§5.3) does not compound supervisor recovery with downstream
+      // recovery, and this IS the downstream one. With `pty.maxRetries` 5 a persistent
+      // timeout cost ~6 x timeoutMs here, and the exit-124 compact block's retry another
+      // ~6 while holding the global queue.
       return runOnPty(key, prompt, {
         timeoutMs,
+        retry: false,
         threadId,
         agentName,
         modelOverride: config.model || modelOverride,
@@ -2091,6 +2113,11 @@ async function execClaude(
     // id of its own (CodeRabbit on #376): resumed, so the CLI may omit it.
     let fallbackSessionId: string | undefined;
 
+    // Not for bootstrap, on either route: its job is to create the PRIMARY session, and a
+    // fallback run cannot (it persists to the separate fallback session store, never
+    // `createSession`, see `!usedFallback` below). It would only spend a second full turn
+    // holding the global queue that startup chat waits behind. The print opt-out gets
+    // the same rule: a "live" log line for a session that does not exist helps nobody.
     if (
       name !== "bootstrap" &&
       primaryRateLimit &&
@@ -2157,8 +2184,7 @@ async function execClaude(
       if (
         !fallbackRateLimit &&
         fallbackSession &&
-        (exec.exitCode !== 0 ||
-          (!useLegacyPath && RENDERED_SIGNATURE_ERROR.test(exec.rawStdout))) &&
+        (exec.exitCode !== 0 || (!useLegacyPath && endsInRenderedSignatureError(exec.rawStdout))) &&
         SIGNATURE_ERROR.test(exec.rawStdout + exec.stderr)
       ) {
         await resetFallbackSession(agentName, threadId);
@@ -2212,7 +2238,7 @@ async function execClaude(
     // The interactive REPL may render an API error and return to its input
     // prompt without exiting. Recognise that specific error line as well as
     // the non-zero print result; ordinary quoted signature text is not enough.
-    const renderedSignatureError = !useLegacyPath && RENDERED_SIGNATURE_ERROR.test(rawStdout);
+    const renderedSignatureError = !useLegacyPath && endsInRenderedSignatureError(rawStdout);
     if (
       (exitCode !== 0 || renderedSignatureError) &&
       !isNew &&
@@ -3127,6 +3153,24 @@ export async function runFork(prompt: string): Promise<RunResult> {
 }
 
 /**
+ * Longest a PTY bootstrap may hold the global queue. Issue #369 measured a 38.7 s real PTY
+ * cold start (spawn, MCP fleet, first turn), so 30 s failed a healthy boot; 120 s is ~3x
+ * that, and still far under the 5 min `timeouts.default`, because bootstrap holds the
+ * serial queue a first channel message waits behind. It never blocks startup itself: the
+ * daemon runs it in the background.
+ */
+export const BOOTSTRAP_PTY_MAX_MS = 120_000;
+
+/**
+ * The bootstrap's one-attempt timeout. The PTY route is capped at `BOOTSTRAP_PTY_MAX_MS`
+ * (a smaller configured `timeouts.default` still wins); the explicit print opt-out keeps
+ * `timeouts.default`, as the old bootstrap did.
+ */
+export function resolveBootstrapTimeoutMs(route: "pty" | "legacy", configuredMs: number): number {
+  return route === "pty" ? Math.min(configuredMs, BOOTSTRAP_PTY_MAX_MS) : configuredMs;
+}
+
+/**
  * Bootstrap the session: fires Claude with the system prompt so the
  * session is created immediately. No-op if a session already exists.
  */
@@ -3151,7 +3195,7 @@ export async function bootstrap(): Promise<void> {
       wakeupPrompt,
       undefined,
       undefined,
-      Math.min(resolveTimeoutMs("bootstrap"), 30_000),
+      resolveBootstrapTimeoutMs(resolveAgentTurnRoute("bootstrap"), resolveTimeoutMs("bootstrap")),
     );
     if (result.exitCode !== 0) {
       if (resolveAgentTurnRoute("bootstrap") === "pty") await retirePtySession("global");

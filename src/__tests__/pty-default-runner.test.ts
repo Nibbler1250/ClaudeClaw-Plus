@@ -86,6 +86,22 @@ describe("#550 default runner routing", () => {
     ]);
     expect(result.exitCode).toBe(0);
   });
+  it("a recovery call is one attempt: no supervisor retries compounded on top of the downstream recovery", async () => {
+    // pty.maxRetries is 5 and the PTY times out on every turn. The stale/corrupt recovery
+    // times out (exit 124), which starts the compact block and its post-compact recovery:
+    // two recovery calls, each ONE turn. With the full retry envelope that was 6 + 6.
+    const result = await fixture("recovery-timeout");
+    expect(result.retryFlags).toEqual([false, false]);
+    expect(result.events.filter((event: string) => event === "timeout")).toHaveLength(2);
+  });
+  for (const scenario of ["corrupt", "stale", "compact"]) {
+    it(`${scenario}: the recovery call goes out with retry false`, async () => {
+      expect((await fixture(scenario)).retryFlags).toEqual([false]);
+    });
+  }
+  it("a fallback's stale-session recovery is one attempt; the fallback's own first attempt is not changed", async () => {
+    expect((await fixture("fallback-model")).retryFlags).toEqual([null, false]);
+  });
   it("recovers signature errors rendered by a PTY that returned exit zero", async () => {
     const result = await fixture("rendered-corrupt");
     expect(result.ptyCalls).toHaveLength(1);
@@ -111,7 +127,8 @@ describe("#550 default runner routing", () => {
     const result = await fixture("bootstrap-attempt");
     expect(result.bootstrapError).toContain("124");
     expect(result.events.filter((event: string) => event === "timeout")).toHaveLength(1);
-    expect(result.bootstrapTimeoutMs).toBeLessThanOrEqual(30_000);
+    // Capped at BOOTSTRAP_PTY_MAX_MS (120 s), under the configured 5 min timeouts.default.
+    expect(result.bootstrapTimeoutMs).toBe(120_000);
     expect(result.ptyCalls).toEqual(["global", "global"]);
     expect(result.exitCode).toBe(0);
   });

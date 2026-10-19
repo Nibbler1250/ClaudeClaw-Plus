@@ -30,8 +30,9 @@
  *     outer loop terminates early with a "respawn failed after N attempts"
  *     error rather than consuming the remaining outer budget. After
  *     exhaustion the supervisor surfaces a structured error in
- *     RunOnPtyResult.stderr and exitCode=1; execClaude treats this as any
- *     other non-zero exit.
+ *     RunOnPtyResult.stderr and exitCode=1, or exitCode=124 when the last
+ *     failure was a turn timeout (`PtyTurnTimeoutError`); execClaude treats
+ *     either as any other non-zero exit, and 124 starts the auto-compact.
  *
  *   - Settings are re-read via getSettings() on every call — never cached
  *     across calls — so hot-reload works. The reap interval is rebuilt

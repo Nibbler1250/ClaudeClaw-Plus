@@ -7,7 +7,10 @@ setting too. An existing literal `false` is preserved. Invalid values such as
 `"false"` warn and use the default `true`.
 
 Agents spawned without the settings resolver now default to `pty-stdin` for
-every origin, including cron, heartbeat, CLI and REST. Declared agents processed
+every origin, including cron, heartbeat, CLI and REST. The exception is Windows:
+nothing in this codebase shows the PTY path working there, so the non-channel
+origins keep `process-stream-json` on `win32` (`defaultSupervisionFor` in
+`src/bus/types.ts`). Declared agents processed
 by `resolveBusAgentConfig` already defaulted to PTY; this change affects agents
 that relied on the origin fallback to select print. Non-channel
 deliveries use the existing delivery-confirmation loop: typing Enter alone does
@@ -77,11 +80,14 @@ by this default change.
 
 ## Rollout requirements
 
-Issue #559 is a merge blocker: fresh PTY chat input with the runner's timestamp
-prefix can remain unsubmitted until timeout. Merge and verify that fix before
-rolling out these defaults. The module changes do not prove that live bug fixed.
+Issue #559 (fresh PTY chat input with the runner's timestamp prefix could stay
+unsubmitted until timeout) is fixed by #563, which this branch contains. One
+visible side effect of that fix: prompts longer than about 1,000 characters are
+submitted to the Claude TUI as a bracketed paste, so the terminal may show them
+as a pasted block instead of as typed text. The turn is still submitted and runs
+as normal.
 
 The operator must complete the 48-hour soak in the issue #550 implementation
-report, covering chat, cron jobs, dispatched jobs, a restart and compaction.
-This migration guide accompanies the code change; the README link and defaults
-update follow PR #558's README rewrite.
+report, covering chat, cron jobs, dispatched jobs, a restart and compaction, and
+confirm the #559 fix live. The README's "Execution Modes and Engine Policy"
+section documents the new defaults.

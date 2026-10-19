@@ -38,12 +38,12 @@ src/config.ts; src/bus/types.ts; src/bus/session-manager.ts; src/bus/session-age
 - Background bootstrap through the serial runner queue, bounded to one attempt and a finite startup-specific timeout. Startup continuation and engine logging get behavioural tests.
 - Align retry model fallback and stream callbacks; deduplicate invalid enabled warnings by distinct bad value; correct hot-reload and resolver-origin migration wording.
 - Replace source assertions with behaviour and verify actual SessionManager cron default selection.
-- Add commits without force-pushing. Both manifest versions must exceed 2.2.338. README/#559 and live soak remain out of scope.
+- Add commits without force-pushing. Both manifest versions are 2.2.341 (main is 2.2.340). README/#559 and live soak remain out of scope.
 
 # PR 562 fallback stream follow-up (task_d6cfe1f8b211)
 
 - Problem/current behavior: runner.ts:2200 streams PTY fallback chunks, but streamClaude at runner.ts:2770 re-emits the complete fallback stdout whenever usedFallback is true.
 - Target behavior: dashboard chat delivers streamed fallback text once; a silent fallback still emits its stdout once even after the primary streamed a rate-limit notice.
-- Frozen decisions: track text emitted by the fallback separately from primary text, preserve buffered/non-streaming and legacy print behavior, and keep version 2.2.339 per the explicit dispatch instruction.
+- Frozen decisions: track text emitted by the fallback separately from primary text, preserve buffered/non-streaming and legacy print behavior, and keep version 2.2.341 per the explicit dispatch instruction.
 - Key files: src/runner.ts and the isolated pty-default-runner fixture/tests; REPORT.md records RED probes and validation.
 - Out of scope: README, issue 559, version bump, GitHub comments/thread resolution, deployment and operator soak.
