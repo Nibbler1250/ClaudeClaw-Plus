@@ -158,8 +158,14 @@ describe("execClaude routing — flag and bootstrap (source-pinned)", () => {
 
   it("runner.ts routes to runOnPty on the PTY branch", async () => {
     const src = await Bun.file(join(process.cwd(), "src", "runner.ts")).text();
-    // The PTY call should still use runOnPty with a sessionKey.
-    expect(src).toMatch(/runOnPty\(\s*sessionKey/);
+    // The PTY call is `runOnPty(ptySessionKey, …)` (a thread / agent / global key), and it
+    // comes after the route decision. Match the call itself, not the prose around it: a
+    // comment saying `runOnPty(sessionKey, …)` once satisfied this pin on its own.
+    const decision = src.indexOf("useLegacyPath = resolveAgentTurnRoute(name)");
+    const call = src.search(/exec\s*=\s*await runOnPty\(\s*ptySessionKey\s*,/);
+    expect(decision).toBeGreaterThan(-1);
+    expect(call).toBeGreaterThan(decision);
+    expect(src).toMatch(/const ptySessionKey\s*=\s*threadId/);
   });
 
   it("runner.ts streamClaude (dashboard chat) goes through the same route decision (#546)", async () => {

@@ -50,10 +50,10 @@ describe("#550 default runner routing", () => {
       expect(result.primaryRoute).toBe("pty");
       expect(result.exitCode).toBe(0);
       expect(result.ptyCalls).toEqual(["thread:fixture-thread"]);
+      // compact: the up-front retire of the wedged PTY, the memory save's and the
+      // /compact's own `skipLive` retire (#549), and the retry's. Each is idempotent.
       expect(result.retired).toEqual(
-        scenario === "compact"
-          ? ["thread:fixture-thread", "thread:fixture-thread"]
-          : ["thread:fixture-thread"],
+        scenario === "compact" ? Array(4).fill("thread:fixture-thread") : ["thread:fixture-thread"],
       );
       expect(result.agentPrintCalls).toBe(0);
     });
@@ -69,10 +69,21 @@ describe("#550 default runner routing", () => {
   it("retires the actual timed-out PTY before memory save or compact can resume it", async () => {
     const result = await fixture("compact");
     expect(result.events[0]).toBe("timeout");
+    // The process is gone before EITHER utility --resume starts, and both resume the
+    // old session through the oneshot module's print engine (the configured default).
     expect(result.events.indexOf("retire")).toBeLessThan(result.events.indexOf("utility-memory"));
+    expect(result.events.indexOf("disposed")).toBeLessThan(result.events.indexOf("utility-memory"));
     expect(result.events.indexOf("disposed")).toBeLessThan(
       result.events.indexOf("utility-compact"),
     );
+    expect(result.utilityResumes).toEqual([
+      { prompt: "memory", resume: "old-sid" },
+      { prompt: "/compact", resume: "old-sid" },
+    ]);
+    expect(result.oneShotLog).toEqual([
+      { route: "memory.save.precompact", engine: "print", exitCode: 0 },
+      { route: "compact", engine: "print", exitCode: 0 },
+    ]);
     expect(result.exitCode).toBe(0);
   });
   it("recovers signature errors rendered by a PTY that returned exit zero", async () => {

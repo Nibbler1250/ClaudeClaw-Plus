@@ -2513,6 +2513,9 @@ async function execClaude(
       // `memoryFileGrant` cannot scope). Save and compact then skip the live path
       // and resume it one-shot (#549).
       if (!useLegacyPath) await retirePtySession(ptySessionKey);
+      // The explicit print opt-out has no supervisor session: give the utility calls no
+      // key, so they resume one-shot without touching the PTY machinery at all.
+      const compactSessionKey = useLegacyPath ? undefined : ptySessionKey;
       // Save memory before compact wipes context.
       try {
         const memPath = getMemoryPath(agentName);
@@ -2522,7 +2525,7 @@ async function execClaude(
         const saved = await saveMemoryBeforeCompact({
           memPath,
           prompt: `Session is about to compact. Save your current memory to ${memPath} now. Include: current status, what was accomplished, key context for next session. Keep it concise.`,
-          sessionKey: ptySessionKey,
+          sessionKey: compactSessionKey,
           sessionId: existing.sessionId,
           skipLive: exitCode === 124,
           model: primaryConfig.model,
@@ -2541,7 +2544,7 @@ async function execClaude(
       emitCompactEvent({ type: "auto-compact-start" });
       const compactOk = await runCompact({
         sessionId: existing.sessionId,
-        sessionKey: ptySessionKey,
+        sessionKey: compactSessionKey,
         skipLive: true,
         model: primaryConfig.model,
         timeoutMs,
