@@ -1,6 +1,6 @@
 import { getSettings } from "../config.js";
 import { DEFAULT_OPENROUTER_BASE_URL } from "../plugins/llm-router/openrouter.js";
-import { callLlm } from "../plugins/llm-router/router.js";
+import { callLlm, type Dispatch } from "../plugins/llm-router/router.js";
 import {
   type ChatMessage,
   type LlmRouterRuntimeConfig,
@@ -68,19 +68,25 @@ async function postChat(
     });
   } catch (error) {
     if (signal.aborted) throw error;
-    // Retriable for the router's fallback, like its own client.
-    throw new ProviderError(
-      `network error: ${error instanceof Error ? error.message : String(error)}`,
-      503,
-      model,
-    );
+    // Retriable for the router's fallback, like its own client. Fixed text: a
+    // fetch error can quote the request headers, the key included.
+    throw new ProviderError("network error", 503, model);
   }
-  if (!res.ok) throw new ProviderError(`HTTP ${res.status}`, res.status, model);
-  const json = (await res.json()) as {
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {});
+    throw new ProviderError(`HTTP ${res.status}`, res.status, model);
+  }
+  let json: {
     model?: string;
     choices?: Array<{ message?: { content?: unknown } }>;
     usage?: { prompt_tokens?: number; completion_tokens?: number };
   };
+  try {
+    json = JSON.parse(await readBounded(res, signal));
+  } catch (error) {
+    if (signal.aborted || error instanceof ProviderError) throw error;
+    throw new ProviderError(`invalid JSON reply (HTTP ${res.status})`, res.status, model);
+  }
   const content = json.choices?.[0]?.message?.content;
   return {
     content: typeof content === "string" ? content : "",
@@ -94,6 +100,30 @@ async function postChat(
         }
       : {}),
   };
+}
+
+/** Same bound as the print engine's stdout. */
+const REPLY_LIMIT = 16 * 1024 * 1024;
+
+async function readBounded(res: Response, signal: AbortSignal): Promise<string> {
+  const tooLarge = () =>
+    new ProviderError(`reply over ${REPLY_LIMIT} bytes (HTTP ${res.status})`, res.status, "");
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    signal.throwIfAborted();
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > REPLY_LIMIT) {
+      await reader.cancel().catch(() => {});
+      throw tooLarge();
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 /** Deadline and caller abort on the request; failures become a non-zero exit code. */
@@ -131,7 +161,8 @@ async function dispatch(
     // Same exit code as the print engine when stopped.
     if (controller.signal.aborted)
       return fail(124, timedOut ? `timeout after ${req.timeoutMs}ms` : "aborted");
-    if (error instanceof ProviderError) return fail(1, `HTTP ${error.status}`);
+    // ProviderError text is ours (status, fixed words); anything else is masked.
+    if (error instanceof ProviderError) return fail(1, error.message);
     return fail(1, stderrExcerpt(error instanceof Error ? error.message : String(error)));
   } finally {
     clearTimeout(timer);
@@ -193,25 +224,45 @@ export async function runLlmRouter(
   const key = apiKey(config.apiKeyEnv);
   const baseUrl = router.openRouterBaseUrl.replace(/\/+$/, "");
   return dispatch(req, "llm-router", `tier:${config.tier}`, async (signal) => {
-    const result = await callLlm(
-      { tier: config.tier, messages: messages(req), maxTokens: req.maxTokens },
-      router,
-      (model, opts) => {
-        signal.throwIfAborted();
-        return postChat(baseUrl, model, opts.messages, opts.maxTokens, key, signal).then(
-          (reply) => ({
-            content: reply.content,
-            model: reply.model,
-            usage: {
-              promptTokens: reply.usage?.inputTokens ?? 0,
-              completionTokens: reply.usage?.outputTokens ?? 0,
-              totalTokens: (reply.usage?.inputTokens ?? 0) + (reply.usage?.outputTokens ?? 0),
-            },
-            schemaApplied: false,
-          }),
-        );
-      },
-    );
+    // callLlm folds every model's error into one long message; report the last
+    // provider error instead, so the status survives and nothing else is logged.
+    let last: ProviderError | undefined;
+    let tried = 0;
+    const dispatchModel: Dispatch = async (model, opts) => {
+      signal.throwIfAborted();
+      tried++;
+      try {
+        const reply = await postChat(baseUrl, model, opts.messages, opts.maxTokens, key, signal);
+        const usage = {
+          input: reply.usage?.inputTokens ?? 0,
+          output: reply.usage?.outputTokens ?? 0,
+        };
+        return {
+          content: reply.content,
+          model: reply.model,
+          usage: {
+            promptTokens: usage.input,
+            completionTokens: usage.output,
+            totalTokens: usage.input + usage.output,
+          },
+          schemaApplied: false,
+        };
+      } catch (error) {
+        if (error instanceof ProviderError) last = error;
+        throw error;
+      }
+    };
+    let result: Awaited<ReturnType<typeof callLlm>>;
+    try {
+      result = await callLlm(
+        { tier: config.tier, messages: messages(req), maxTokens: req.maxTokens },
+        router,
+        dispatchModel,
+      );
+    } catch (error) {
+      if (error instanceof ProviderError || !last) throw error;
+      throw new ProviderError(`${last.message} (${tried} model(s) tried)`, last.status, last.model);
+    }
     return {
       content: result.content,
       model: result.model,

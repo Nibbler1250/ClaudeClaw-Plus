@@ -11,7 +11,8 @@ import { engines } from "./registry.js";
 
 const HTTP_ENGINES = ["openai-compatible", "ollama", "llm-router"];
 const KEY_ENV = "ONESHOT_HTTP_TEST_KEY";
-const SECRET = "sk-test-0123456789abcdef";
+// Not shaped like any credential the stderr masker knows, so only the engine keeps it out.
+const SECRET = "hunter2-oneshot-secret";
 
 interface Seen {
   path: string;
@@ -234,13 +235,60 @@ describe("HTTP engines", () => {
     });
 
     it(`${id}: a non-2xx reply is a non-zero exit with the status in the log line`, async () => {
-      server = mockServer(() => new Response("bad request", { status: 400 }));
+      // Chat-shaped body: only the status says it failed.
+      server = mockServer(() =>
+        Response.json({ choices: [{ message: { content: "bad request" } }] }, { status: 400 }),
+      );
       const config = await pointAt(id, server.url);
       const { result, out } = await captureConsole(() => engines.get(id)!.run(untrusted, config));
       expect(result.exitCode).toBe(1);
       expect(out).toContain("HTTP 400");
       expect(out).toContain('"route":"discord.classifier"');
       expect(out).not.toContain("bad request");
+    });
+
+    it(`${id}: a key the HTTP client rejects never reaches the log`, async () => {
+      server = mockServer(() => completion({ content: "ok" }));
+      const config = await pointAt(id, server.url, { apiKeyEnv: KEY_ENV });
+      // A pasted curly quote: fetch refuses the header and quotes it in its error.
+      process.env[KEY_ENV] = "pasted\u2019SECRETTAIL99";
+      const { result, out } = await captureConsole(() => engines.get(id)!.run(untrusted, config));
+      expect(result.exitCode).toBe(1);
+      expect(out).toContain("network error");
+      expect(out).not.toContain("SECRETTAIL99");
+      expect(server.seen).toHaveLength(0);
+    });
+
+    it(`${id}: a 200 reply that is not JSON is a non-zero exit, logged with its status`, async () => {
+      server = mockServer(() => new Response("<html>proxy login</html>", { status: 200 }));
+      const config = await pointAt(id, server.url);
+      const { result, out } = await captureConsole(() => engines.get(id)!.run(untrusted, config));
+      expect(result.exitCode).toBe(1);
+      expect(out).toContain("invalid JSON reply (HTTP 200)");
+    });
+
+    it(`${id}: a reply over 16 MiB is cut off, not buffered`, async () => {
+      const chunk = new Uint8Array(1024 * 1024).fill(32);
+      server = mockServer(() => {
+        // 17 MiB then the end: just over the bound, finite so a missing bound fails the test
+        // instead of filling memory.
+        let sent = 0;
+        return new Response(
+          new ReadableStream({
+            pull(controller) {
+              if (sent++ < 17) controller.enqueue(chunk);
+              else controller.close();
+            },
+          }),
+          { status: 200 },
+        );
+      });
+      const config = await pointAt(id, server.url);
+      const { result, out } = await captureConsole(() =>
+        engines.get(id)!.run({ ...untrusted, timeoutMs: 4000 }, config),
+      );
+      expect(result.exitCode).toBe(1);
+      expect(out).toContain("reply over 16777216 bytes");
     });
 
     it(`${id}: a redirect is refused, so the key never follows it`, async () => {
@@ -286,6 +334,18 @@ describe("HTTP engines", () => {
     const result = await engines.get("llm-router")!.run(untrusted, { tier: "balanced" });
     expect(result).toMatchObject({ text: "from second", model: "second", exitCode: 0 });
     expect(server.seen.map((s) => s.body.model)).toEqual(["first", "second"]);
+  });
+
+  it("llm-router logs the last status when every tier model fails", async () => {
+    server = mockServer(() => new Response("overloaded", { status: 503 }));
+    const many = Array.from({ length: 30 }, (_, n) => `vendor/a-rather-long-model-id-${n}`);
+    await useSettings({ llmRouter: { openRouterBaseUrl: server.url, tiers: { fast: many } } });
+    const { result, out } = await captureConsole(() =>
+      engines.get("llm-router")!.run(untrusted, {}),
+    );
+    expect(result.exitCode).toBe(1);
+    expect(server.seen).toHaveLength(30);
+    expect(out).toContain('"reason":"HTTP 503 (30 model(s) tried)"');
   });
 
   it("llm-router reads OPENROUTER_API_KEY by default", async () => {
