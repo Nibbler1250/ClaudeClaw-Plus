@@ -1339,6 +1339,18 @@ describe("r15 A4: concurrent untrusted PTY one-shots are capped", () => {
     expect(untrustedOneShotsInFlightForTests()).toBe(0);
   });
 
+  it("a spawn that never lands does not hold a slot once the call has returned its deadline", async () => {
+    // A late claude is retired by lateRetire, which never settles for a spawn that never lands. A
+    // slot tied to that would leak, and after two such calls the cap would refuse every call.
+    injectSpawnPty(() => new Promise(() => {}));
+    for (let i = 0; i < UNTRUSTED_ONESHOT_MAX_CONCURRENT + 1; i++) {
+      const result = await run(callerEnv(), { timeoutMs: 100 });
+      expect(result.diagnostic?.reason).not.toBe("busy");
+      expect([1, 124]).toContain(result.exitCode);
+      expect(untrustedOneShotsInFlightForTests()).toBe(0);
+    }
+  });
+
   it("a slot frees when the call fails before any state exists (config dir not absolute)", async () => {
     fakeSpawn();
     for (let i = 0; i < UNTRUSTED_ONESHOT_MAX_CONCURRENT + 1; i++) {

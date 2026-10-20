@@ -2084,16 +2084,17 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
       // Interactive claude ignores --no-session-persistence, so its on-disk state is
       // removed here, on success, failure and abort alike. The PTY is normally retired
       // before this point; when admission outlived the deadline it is retired later, so
-      // the same cleanup runs again once that late retirement settles. The concurrency slot
-      // is held until then too: a late claude is still a running one.
+      // the same cleanup runs again once that late retirement settles. The concurrency slot is
+      // not held for that: a spawn that never lands would hold it for ever, and the cap would
+      // then refuse every later call. The call is finished here, whatever its cleanup does.
       const release = (): void => {
         untrustedCleanup.releaseOneShotDir(state.configRoot);
         untrustedCleanup.releaseOneShotDir(state.tempCwd);
-        freeSlot();
       };
       try {
         await cleanupUntrustedOneShot(state);
       } finally {
+        freeSlot();
         if (lateRetire) {
           void lateRetire
             .catch(() => {})
