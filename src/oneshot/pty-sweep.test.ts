@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EscapeScan } from "../runner/pty-escape-scan.js";
 import { terminateProcessGroup } from "../runner/pty-group-kill.js";
+import { withPlatform } from "../runner/pty-test-platform.js";
 import {
   DAEMON_INSTANCE,
   ONESHOT_CONFIG_PREFIX,
@@ -30,6 +31,8 @@ import {
   createUntrustedTempCwd,
   groupSurvivorCount,
   groupSurvivorOf,
+  heldProcAlive,
+  isOwnerDead,
   markGroupSurvivor,
   markUnknownProcs,
   markOneShotDirActive,
@@ -829,5 +832,25 @@ describe("unknown holds (r14b)", () => {
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+// #570 r14d (H1): on Linux a recorded start time is exact, so a one-second move is another process.
+describe("start-time comparison by platform (r14d, H1)", () => {
+  const alive = () => {};
+  it("a held process whose /proc start moved by one second is gone; under ps it is the same", () => {
+    const held = { pid: 4242, startMs: 10_000 };
+    const deps = { kill: alive, startMs: () => 11_000 };
+    // Went red (true) with the 2000 ms window on the Linux path of heldProcAlive.
+    expect(withPlatform("linux", () => heldProcAlive(held, deps))).toBe(false);
+    expect(withPlatform("darwin", () => heldProcAlive(held, deps))).toBe(true);
+  });
+
+  it("an owner whose /proc start moved by one second is dead; under ps it is still the owner", () => {
+    const owner = live({ pid: 4242, startMs: 10_000, instance: "an-earlier-daemon" });
+    const deps = { kill: alive, startMs: () => 11_000 };
+    // Went red (false) with the 2000 ms window on the Linux path of isOwnerDead.
+    expect(withPlatform("linux", () => isOwnerDead(owner, deps))).toBe(true);
+    expect(withPlatform("darwin", () => isOwnerDead(owner, deps))).toBe(false);
   });
 });

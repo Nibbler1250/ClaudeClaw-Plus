@@ -28,10 +28,10 @@ import {
   terminateProcessGroup,
 } from "../runner/pty-group-kill.js";
 import {
-  START_TIME_TOLERANCE_MS,
   type StartMsReader,
   cachedStartMs,
   processStartMs,
+  sameStart,
 } from "../runner/pty-proc-identity.js";
 
 export { processStartMs };
@@ -321,7 +321,7 @@ export function markUnknownProcs(
 }
 
 /** The process is alive with the start time recorded for it. A dead or recycled pid is gone. */
-function heldProcAlive(
+export function heldProcAlive(
   proc: HeldProc,
   deps: { kill?: (pid: number, signal: 0) => void; startMs?: StartMsReader } = {},
 ): boolean {
@@ -333,7 +333,7 @@ function heldProcAlive(
   }
   const now = (deps.startMs ?? processStartMs)(proc.pid);
   if (proc.startMs === null || now === null) return true; // cannot tell: assume it is the same
-  return Math.abs(now - proc.startMs) <= START_TIME_TOLERANCE_MS;
+  return sameStart(now, proc.startMs);
 }
 
 /** Drop the dead processes of a hold, and the hold itself when none is left. True while it stands. */
@@ -498,7 +498,7 @@ export function isOwnerDead(
   }
   const now = (deps.startMs ?? processStartMs)(owner.pid);
   if (owner.startMs === null || now === null) return false; // cannot tell: assume it is the owner
-  return Math.abs(now - owner.startMs) > START_TIME_TOLERANCE_MS;
+  return !sameStart(now, owner.startMs);
 }
 
 /** Create the per-call temp cwd (mode 0700, owner file inside). Removed again on error. */

@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { findEscapees, terminateEscapees } from "./pty-escape-scan.js";
 import { type PtyProcessOptions, spawnPty } from "./pty-process.js";
+import { withPlatformAsync } from "./pty-test-platform.js";
 
 /**
  * #570 r13 (C): a descendant that leaves claude's process group (`setsid`, `setpgid`) escapes
@@ -273,6 +274,19 @@ describe("terminateEscapees (fake /proc)", () => {
     });
     expect(k.sent).toEqual([]);
     expect(left).toEqual([6004]);
+  });
+
+  it("does not signal a pid whose /proc start time moved by one second (a recycled pid on Linux)", async () => {
+    spawnFake(6009);
+    const k = kernel("SIGTERM");
+    let reads = 0;
+    const startMs = () => (reads++ === 0 ? 10_000 : 11_000);
+    const left = await withPlatformAsync("linux", () =>
+      terminateEscapees(TARGET, { procDir: proc, selfPid: 1, signal: k.signal, startMs, ...fast }),
+    );
+    // Went red (a SIGTERM sent to the replacement) with the 2000 ms window on the Linux path.
+    expect(k.sent).toEqual([]);
+    expect(left).toEqual([6009]);
   });
 
   it("does not signal a pid whose start time cannot be read", async () => {

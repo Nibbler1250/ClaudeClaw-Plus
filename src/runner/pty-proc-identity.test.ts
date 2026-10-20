@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { procStartMs, processStartMs } from "./pty-proc-identity.js";
+import { pidIdentity, procStartMs, processStartMs, sameStart } from "./pty-proc-identity.js";
+import { withPlatform } from "./pty-test-platform.js";
 
 /** #570 r14 (E): on Linux the start time comes from `/proc/<pid>/stat` field 22, not from `ps`. */
 
@@ -45,5 +46,37 @@ describe.skipIf(process.platform !== "linux")("processStartMs on Linux", () => {
     expect(first).not.toBeNull();
     expect(first).toBe(procStartMs(process.pid));
     expect(processStartMs(process.pid)).toBe(first);
+  });
+});
+
+/** #570 r14d (H1): a `/proc` start time is exact, so a 2 s window only lets a recycled pid read as the same. */
+describe("sameStart", () => {
+  it("compares Linux /proc start times to within one clock tick", () => {
+    expect(sameStart(10_000, 10_000, "linux")).toBe(true);
+    expect(sameStart(10_000, 10_010, "linux")).toBe(true);
+    // Went red (true) with the 2000 ms window put back on the Linux path.
+    expect(sameStart(10_000, 11_000, "linux")).toBe(false);
+    expect(sameStart(11_000, 10_000, "linux")).toBe(false);
+  });
+
+  it("keeps 2 s for `ps -o lstart=`, which has one-second resolution", () => {
+    expect(sameStart(10_000, 11_000, "darwin")).toBe(true);
+    expect(sameStart(10_000, 12_001, "darwin")).toBe(false);
+  });
+
+  it("takes the platform from the process by default", () => {
+    expect(withPlatform("linux", () => sameStart(10_000, 11_000))).toBe(false);
+    expect(withPlatform("darwin", () => sameStart(10_000, 11_000))).toBe(true);
+  });
+});
+
+describe("pidIdentity on Linux", () => {
+  const exists = () => true;
+  it("calls a pid whose start moved by one second recycled", () => {
+    const read = () => 11_000;
+    expect(withPlatform("linux", () => pidIdentity(4242, 10_000, { exists, read }))).toBe(
+      "recycled",
+    );
+    expect(withPlatform("darwin", () => pidIdentity(4242, 10_000, { exists, read }))).toBe("same");
   });
 });
