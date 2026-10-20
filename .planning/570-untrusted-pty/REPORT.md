@@ -460,3 +460,26 @@ Two injections first did not count: D1's `waited.failure === "aborted"` was redu
 ### Out of scope, for the coordinator
 
 bun-pty `env_clear` instead of the global env swap; a classifier rate limit; a narrower tuner env allowlist; `discord.ts`'s retired model id; claude's own `.claude.json.lock` for the trust write; a process that never runs `start.ts` (the tuner CLI) now stays on print by default, which is the safe direction but changes its routing.
+
+## r10: the print `@` baseline row
+
+Commit `558d7a4a` (test only, version stays 2.2.353). Live run [39368709175](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39368709175), Claude **2.1.304**: **46 pass, 0 fail**. The coordinator's run 39367590662 on `94804fcb` had 45 pass, 1 fail, on `B3 @ file mention, PRINT engine: CONTROL PRESENT` (`exit=1; replyLength=62; canaryInReply=false`).
+
+**Cause of the exit 1: not determined.** `runPrint` returns `exitCode: stopped ? 124 : (code ?? 1)`. `stopped` is only set by our own timeout (90 s) or an abort, and the row took 4.4 s with no abort, so 1 was the `claude` child's own exit code (or a signal death, which `code ?? 1` also maps to 1). The 62 characters were its trimmed stdout. The harness logged only the length, and `runPrint` exposes stderr only through `onStderr`, which the row did not set, so neither the text nor the stderr is in the log. Nothing in the code points to a production bug, and the symptom did not recur: this run's identical call returned exit 0. The old row also never checked that a model had answered.
+
+**Change (that row only; production untouched).** The print engine's spawn is wrapped like `src/oneshot/e2e.test.ts` (`--output-format stream-json --verbose` appended), and `onStderr` records the stderr length. Control present now requires exit 0 or 1 (anything else fails), `reachedModel` (a stream-json `assistant` event that is neither synthetic nor an API error), and the canary absent from the whole wire. The twin keeps `exit 0`, and its predicate is the canary in the wire, going RED. Each run logs only shapes: exit, lengths, event-type counts, result subtype and `is_error`, `reachedModel`. If exit 1 recurs, the log will now say whether the CLI wrote an error result or never reached the model, which is what this run could not tell me.
+
+Live result, verbatim:
+
+```text
+[isolation-spike] B3 PRINT CONTROL PRESENT: exit=0; replyLength=4789; stderrLength=0; events={"system":1,"assistant":1,"rate_limit_event":1,"result":1}; resultSubtype=success; resultIsError=false; reachedModel=true; canaryInWire=false
+[isolation-spike] B3 @ file mention (print): isolated=true
+[isolation-spike] B3 PRINT CONTROL REMOVED — expected RED predicate: exit=0; replyLength=7451; stderrLength=0; events={"system":3,"assistant":2,"rate_limit_event":1,"result":1}; resultSubtype=success; resultIsError=false; reachedModel=true; canaryInWire=true
+[isolation-spike] RED-with-control-removed B3 @ file mention (print): expected true, received false
+```
+
+(`replyLength` is now the stream-json wire length, not the reply text, so it is not comparable with earlier runs.) The assertion comment in the test was written after this pass. The exit-1 tolerance is not exercised by this run, since the call exited 0.
+
+Local: `src/oneshot` + `session-actions-argv` 237 pass, 1 skip, 0 fail; lint 0 errors (1319 warnings, 324 infos); typecheck ratchet 149 against baseline 149.
+
+**Process slip.** My first commit landed on a detached HEAD, so `git push` reported "up to date" and I dispatched a workflow run against the old `94804fcb`. I noticed straight away and cancelled it ([39368623537](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39368623537), `completed cancelled`, no results), re-attached the branch to `558d7a4a`, pushed, and dispatched the run above. So two runs were dispatched; one produced results. The assertion comment mentioned in the brief was already written after the pass, as asked.
