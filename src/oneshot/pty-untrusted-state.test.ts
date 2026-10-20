@@ -304,6 +304,48 @@ describe("A: the root and the cwd are removed whatever the turn did", () => {
   });
 });
 
+describe("A: removal proves the root stays gone", () => {
+  it("removes a root a dying writer re-creates during the quiet wait", async () => {
+    const root = mkdtempSync(join(dir, "reappear-"));
+    writeFileSync(join(root, "f"), CANARY);
+    let sleeps = 0;
+    await cleanup.removeUntrustedConfigRoot(root, {
+      quietMs: 1,
+      sleep: async () => {
+        // The first quiet wait sees a late write that brings the directory back.
+        if (sleeps++ === 0) {
+          mkdirSync(root, { recursive: true });
+          writeFileSync(join(root, "late"), CANARY);
+        }
+      },
+    });
+    expect(sleeps).toBe(2);
+    expect(existsSync(root)).toBe(false);
+  });
+
+  it("gives up, and throws, when the root never stays gone", async () => {
+    const root = mkdtempSync(join(dir, "never-"));
+    let sleeps = 0;
+    await expect(
+      cleanup.removeUntrustedConfigRoot(root, {
+        quietMs: 1,
+        maxPasses: 3,
+        sleep: async () => {
+          sleeps++;
+          mkdirSync(root, { recursive: true });
+        },
+      }),
+    ).rejects.toThrow("kept reappearing");
+    expect(sleeps).toBe(3);
+  });
+
+  it("the child is told not to clone the official plugin marketplace into a fresh root", async () => {
+    fakeSpawn();
+    await run();
+    expect(spawned[0]!.env.CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL).toBe("1");
+  });
+});
+
 describe("A: fail closed", () => {
   it("a root that cannot be created fails the call before any spawn and leaves nothing", async () => {
     // Went red when the temp cwd was left behind after the failed create.

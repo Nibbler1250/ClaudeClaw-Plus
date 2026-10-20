@@ -1733,6 +1733,10 @@ function untrustedChildEnvWithRoot(
     ...untrustedChildEnv(cleanEnv),
     CLAUDE_CONFIG_DIR: config.root,
     CLAUDE_SECURESTORAGE_CONFIG_DIR: config.secureStorageDir,
+    // A fresh config root would otherwise make claude clone the official plugin marketplace
+    // (~800 files) in the background on every call, and that clone can still be writing when
+    // the root is removed.
+    CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1",
   };
 }
 
@@ -1762,7 +1766,7 @@ function errorCode(error: unknown): string {
 async function cleanupUntrustedOneShot(state: UntrustedOneShotState): Promise<void> {
   let failure: unknown;
   try {
-    untrustedCleanup.removeUntrustedConfigRoot(state.configRoot);
+    await untrustedCleanup.removeUntrustedConfigRoot(state.configRoot);
   } catch (error) {
     console.error(
       `[pty-supervisor] untrusted one-shot cleanup failed: config root (${errorCode(error)})`,

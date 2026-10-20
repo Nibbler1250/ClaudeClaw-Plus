@@ -23,12 +23,16 @@ import {
   MIN_PTY_ISOLATION_CLAUDE_VERSION,
   applyPtyIsolationVersionGate,
 } from "../src/oneshot/claude-version.js";
+import { setRootRemovalQuietMsForTests } from "../src/oneshot/pty-cleanup.js";
 
 // #570: PTY isolation is advertised only after a startup probe finds a measured claude, and
 // starts OFF (fail closed). Unit tests stand in for that probe so the routing they exercise
 // is the one a daemon on the measured build gets. The unprobed default is pinned by
 // src/oneshot/claude-version.test.ts, which reads it in a fresh process.
 applyPtyIsolationVersionGate(MIN_PTY_ISOLATION_CLAUDE_VERSION, () => {});
+// #570 r11: removing an untrusted call's throwaway config root waits 200 ms to see it stay
+// gone. Unit tests do not run a real claude that could write into it, so they wait 5 ms.
+setRootRemovalQuietMsForTests(5);
 
 const need =
   !process.env.PLUS_PLUGIN_AUDIT_PATH ||

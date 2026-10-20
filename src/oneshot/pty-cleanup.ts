@@ -90,13 +90,48 @@ export function createUntrustedConfigRoot(cwds: string[]): string {
   return root;
 }
 
+const defaultSleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+const DEFAULT_QUIET_MS = 200;
+let quietMsDefault = DEFAULT_QUIET_MS;
+/** Test seam: shorten the quiet wait of every removal (the test preload does). `null` restores it. */
+export function setRootRemovalQuietMsForTests(ms: number | null): void {
+  quietMsDefault = ms ?? DEFAULT_QUIET_MS;
+}
+
+export interface RemoveRootOptions {
+  /** How long the root must stay gone before the removal counts. */
+  quietMs?: number;
+  /** Removal attempts before giving up. */
+  maxPasses?: number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
 /**
- * Remove the throwaway config root. Throws if it is still there afterwards, so a call never
- * reports an isolated success while prompt text sits on disk.
+ * Remove the throwaway config root, and prove it stays removed. The claude that used it is
+ * retired before this runs, but a dying claude (or a git clone it started) can write into
+ * the directory for a moment longer, which re-creates it (seen live, r11 run 1: the first
+ * check after `rmSync` found the root again). So: remove, wait `quietMs`, look again, and
+ * repeat while it comes back. Throws if it never stays gone (or the last removal failed), so
+ * a call never reports an isolated success while prompt text sits on disk.
  */
-export function removeUntrustedConfigRoot(root: string): void {
-  rmSync(root, { recursive: true, force: true });
-  if (existsSync(root)) throw new Error("throwaway config root was not removed");
+export async function removeUntrustedConfigRoot(
+  root: string,
+  { quietMs = quietMsDefault, maxPasses = 12, sleep = defaultSleep }: RemoveRootOptions = {},
+): Promise<void> {
+  let lastError: unknown;
+  for (let pass = 0; pass < maxPasses; pass++) {
+    try {
+      rmSync(root, { recursive: true, force: true });
+      lastError = undefined;
+    } catch (error) {
+      lastError = error; // a writer added files mid-removal (ENOTEMPTY): try again
+    }
+    await sleep(quietMs);
+    if (!existsSync(root)) return;
+  }
+  throw lastError ?? new Error("throwaway config root kept reappearing");
 }
 
 /**

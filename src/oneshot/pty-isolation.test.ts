@@ -141,14 +141,15 @@ it("untrusted PTY spawn uses the exact same caller environment policy as print",
   await withPrintRuntime({ env }, () => runOnceOnPty({ ...request, model: "glm" }));
   expect(spawned).toHaveLength(1);
   // Compare in memory: a failed assertion must never dump a real environment.
-  // Exactly print's policy, plus the two variables that move the config location: the
-  // throwaway root, and the operator's credential store ("" = the default, as none is set).
+  // Exactly print's policy, plus three variables: the throwaway root, the operator's
+  // credential store ("" = the default, as none is set), and the marketplace-clone switch.
   const childRoot = spawned[0]!.env.CLAUDE_CONFIG_DIR ?? "";
   expect(childRoot.includes("claudeclaw-oneshot-cfg-")).toBe(true);
   const expected = {
     ...env,
     CLAUDE_CONFIG_DIR: childRoot,
     CLAUDE_SECURESTORAGE_CONFIG_DIR: "",
+    CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1",
   };
   expect(
     JSON.stringify(Object.entries(spawned[0]!.env).sort()) ===

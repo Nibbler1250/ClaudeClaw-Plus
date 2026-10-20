@@ -777,7 +777,9 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       async () => {
         // Twin: removal of the throwaway root is switched off; its transcript stays.
         if (twin)
-          cleanupSpies = [spyOn(cleanup, "removeUntrustedConfigRoot").mockImplementation(() => {})];
+          cleanupSpies = [
+            spyOn(cleanup, "removeUntrustedConfigRoot").mockImplementation(async () => {}),
+          ];
         await run();
         expect(transcriptSeen).toBeGreaterThan(0);
         checkIsolation("transcript cleanup", jsonls(project).length === 0, twin);
@@ -1216,7 +1218,9 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       `A-paste a long prompt lands only in the throwaway root: ${direction}`,
       async () => {
         if (twin)
-          cleanupSpies = [spyOn(cleanup, "removeUntrustedConfigRoot").mockImplementation(() => {})];
+          cleanupSpies = [
+            spyOn(cleanup, "removeUntrustedConfigRoot").mockImplementation(async () => {}),
+          ];
         const filler =
           "Please keep the release notes tidy and the channel names consistent. ".repeat(30);
         const prompt = `${classifierContract}\n\n---\nUser message: ${filler}\nReference marker: ${PASTE_CANARY}\nplease create a thread called release-notes`;
@@ -1536,7 +1540,9 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         };
         // Twin: removal of the throwaway root is switched off.
         if (twin) {
-          cleanupSpies = [spyOn(cleanup, "removeUntrustedConfigRoot").mockImplementation(() => {})];
+          cleanupSpies = [
+            spyOn(cleanup, "removeUntrustedConfigRoot").mockImplementation(async () => {}),
+          ];
         }
         await run(`Reply with ${DONE}. Reference marker: ${PROMPT_CANARY}.`);
         console.info(`[isolation-spike] C1 ${direction}: stage=after-cleanup`);
