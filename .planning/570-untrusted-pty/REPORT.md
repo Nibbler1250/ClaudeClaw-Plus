@@ -1652,3 +1652,60 @@ What this shows: slot accounting on the untrusted path did not regress any live 
 - Two calls on the same config root cannot happen (the root is unique per call), so `handOver` keeps one reservation per root; the second would be freed. A test records this.
 - The ceiling is still 60 s and still unmeasured; it is now only a log trigger.
 - A late retirement that never settles holds its slot until a restart. There is no operator-visible count other than the ceiling log line.
+
+## r15f: an unknown hold keeps the slot too (Codex MEDIUM, still open after r15e)
+
+Commit `418d5951`, from `432c9202`, pushed to povai. No version bump (2.2.355), no PR comment, no `@codex review`.
+
+The invariant (same as r15e): **a slot is held while any process of that call may still be alive.** That covers a recorded survivor and an unknown hold alike. Both places the coordinator verified were real: `retrySurvivingGroups` released the slot when `groupGone && escapees.length === 0`, although the reap had just recorded an unknown hold on the same root, and `handOver` in `OneShotSlot.settle` kept the slot only for `survivingGroups.has(root)`.
+
+| Item | Change |
+| --- | --- |
+| One rule | New `releaseIfClear(root)`: the reservation is owned by the root while `survivingGroups.has(root) \|\| unknownHolds.has(root)`, and is released, once, when neither holds. It is called where a map loses its entry for a root: the survivor retry, and the hold pruning in `holdStands`. The clear/reset helper already releases every reservation, and the sweeper never deletes from either map, so no other site needed a call. |
+| `handOver` | Uses the same predicate: `unknownHoldActive(root) \|\| survivingGroups.has(root)`. `unknownHoldActive` goes first because it prunes a hold whose processes have already exited. |
+| Timer prune | `retrySurvivingGroups` now ends with a `holdStands` pass over every hold, so a hold's slot comes back on the sweeper timer once its processes exit. Before, a hold was pruned only when the sweep looked at an old directory or `unknownHoldActive` was called. Nothing is signalled for a hold. |
+| Restart adoption | **Unknown holds are persisted** (the `unknown` list in `survivor.json`) **and adopted**. A hold adopted on its own (group gone, only unreadable processes alive) now calls `reserveSurvivorSlot`, as an adopted survivor does. Before, it reserved nothing. Adopting twice reserves once. No persistence was added. |
+| Test seam | `setHeldAliveForTests(check \| null)`: the liveness check every hold uses unless a sweep names its own. The tests use it so no real pid is probed. |
+| Comments and docs | `survivorSlots`, `OneShotSlot.settle`, `UNTRUSTED_ONESHOT_MAX_CONCURRENT`, the finally-block comment in `pty-supervisor.ts` and `docs/oneshot-engines.md` now say "survivor or unknown hold". |
+
+### Tests
+
+`src/oneshot/pty-slot.test.ts`: 6 new tests (17 in the file), pure, injected deps, no PTY. The worst case exceeds the cap of 2 in each (two held calls refused 3rd and 4th acquires, or three adopted holds):
+
+- Survivor retry where the group is gone but a hold is recorded: the slot stays held, the 3rd acquire is `undefined`; when the hold's process is confirmed gone the slot is released once (a second pass does not release again).
+- A call whose cleanup leaves a hold keeps its slot, and frees it when the process is gone.
+- A hold already gone when the call settles does not hold the slot.
+- A late retirement that leaves a hold hands its slot to the hold.
+- A root with both a survivor and a hold: clearing one keeps the slot (checked in both orders, on two roots), clearing both frees it once.
+- Three adopted holds hold the pool; adopting again reserves nothing more.
+
+### Fault injection (`git archive` copy outside the repo, one site each)
+
+| Injection | RED lines (verbatim) |
+| --- | --- |
+| I1: restore the unconditional `releaseSurvivorSlot(root)` at the retry | `Expected: 2` / `Received: 1` at `pty-slot.test.ts:319` and again at `:388`; 2 fail |
+| I2: `handOver` back to survivor-only | `Expected: 2` / `Received: 0` at `:339`; `Expected: 1` / `Received: 0` at `:368`; 2 fail |
+| I3: release on the first map emptying (hold pruning releases unconditionally) | `Expected: 1` / `Received: 0` at `:395`; 1 fail |
+| I4: skip `reserveSurvivorSlot` when a hold is adopted | `Expected: 3` / `Received: 0` at `:444`; 1 fail |
+| I5: drop the timer-side `holdStands` pass | `Expected: 0` / `Received: 1` at `:324`; `Expected: 1` / `Received: 2` at `:344`, `Expected: 0` / `Received: 1` at `:370`, `Expected: 1` / `Received: 2` at `:391`, `Expected: 2` / `Received: 3` at `:451`; 5 fail |
+
+I1 to I3 are the three the brief named; I4 and I5 cover the two additions it did not name. Each of the three named injections was predicted to go red in the tests written for it, and did.
+
+### Gates
+
+`src/oneshot` + `src/runner`: 490 pass, 7 skip, 0 fail, normally and with `CLAUDECLAW_TEST_PLATFORM=linux` (497 tests, 20 files each). `bun run lint` exit 0 (1420 warnings, no errors). Typecheck ratchet 149, baseline 149.
+
+### Integration run: results
+
+Run [39515969211](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39515969211) on `418d5951` (checked: the run's `headSha`): **conclusion success; 61 pass / 0 fail**; Linux step 86 pass / 0 fail.
+
+**Row-retry lines: none** (0 `row-retry` lines in the log). No row hit the hang signature.
+
+Probe summaries: baseline 0/5, contract 0/5, c-lookalike 2/5 (attempts 2 and 3, `exit=124 assistantEntries=0 elapsedMs=75248`). The c-lookalike probe has now hung in four integration runs (1 of 5 in r15c, r15d and r15e, 2 of 5 here); the cause is still unknown and this change does not touch the spawn path.
+
+What this shows: slot accounting did not regress any live row. It does not exercise a hold or a survivor: the real claude retires cleanly in every row, so those paths are covered by the unit tests and the injections only.
+
+### Not done / open
+
+- Holds were already persisted and adopted; no persistence was added. A hold adopted at restart now reserves a slot, which it did not before.
+- A hold whose process the daemon can never confirm gone (an identity it cannot read) keeps its slot until restart. That is the fail-closed choice, same as an unsettled retirement.
