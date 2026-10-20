@@ -85,6 +85,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
   let opts: PtyProcessOptions[];
   let project: string;
   let transcriptSeen: number;
+  let assistantReply: string;
   let toolUse: boolean;
   let childHasCanary: boolean;
   let mutateArgs: (args: string[]) => string[];
@@ -117,6 +118,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     opts = [];
     project = "";
     transcriptSeen = 0;
+    assistantReply = "";
     toolUse = false;
     childHasCanary = false;
     mutateArgs = (args) => args;
@@ -147,12 +149,20 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       let pty: PtyProcess;
       try {
         pty = await spawnPty({ ...options, _argsOverride: args });
-      } catch {
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "";
+        // Classify known startup failures without printing the captured screen.
+        console.info(
+          `[isolation-spike] startup rejection: printOnlyPersistence=${
+            /no-session-persistence/i.test(message) && /print/i.test(message)
+          }; auth=${/not logged in|authentication failed|invalid.*token/i.test(message)}`,
+        );
         throw new Error("real PTY spawn failed; raw screen suppressed");
       }
       // Examine only a synthetic env key in the actual child, never print /proc.
       const bytes = readFileSync(`/proc/${pty.pid}/environ`, "utf8");
       childHasCanary = bytes.split("\0").some((entry) => entry.startsWith(`${ENV_CANARY}=`));
+      console.info(`[isolation-spike] actual child fake env canary present=${childHasCanary}`);
       const turn = pty.runTurn.bind(pty);
       pty.runTurn = async (prompt, turnOptions) => {
         const result = await turn(prompt, {
@@ -161,18 +171,22 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         });
         const files = jsonls(project);
         transcriptSeen = files.length;
-        toolUse = files.some((file) =>
-          readFileSync(file, "utf8")
-            .split("\n")
-            .filter(Boolean)
-            .some((line) => {
-              try {
-                return containsToolUse(JSON.parse(line));
-              } catch {
-                return false;
+        for (const file of files) {
+          for (const line of readFileSync(file, "utf8").split("\n").filter(Boolean)) {
+            try {
+              const record = JSON.parse(line);
+              toolUse ||= containsToolUse(record);
+              if (record.type === "assistant" && Array.isArray(record.message?.content)) {
+                for (const block of record.message.content) {
+                  if (block.type === "text" && typeof block.text === "string")
+                    assistantReply += block.text;
+                }
               }
-            }),
-        );
+            } catch {
+              /* A partial trailing line supplies no evidence. */
+            }
+          }
+        }
         return result;
       };
       return pty;
@@ -217,9 +231,12 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     // Login/trust/onboarding screens must not masquerade as isolation success.
     expect(result.exitCode).toBe(0);
     expect(opts).toHaveLength(1);
-    expect(result.text.includes(DONE)).toBe(true);
+    // The echoed user prompt contains DONE too. Only an actual assistant
+    // transcript record proves that the model was reached.
+    expect(transcriptSeen).toBeGreaterThan(0);
+    expect(assistantReply.includes(DONE)).toBe(true);
     expect(existsSync(opts[0]!.cwd)).toBe(false);
-    return result;
+    return { ...result, text: assistantReply };
   }
 
   for (const twin of [false, true]) {
@@ -351,7 +368,8 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
           }),
         );
         expect(result.exitCode).toBe(0);
-        expect(result.text.includes(DONE)).toBe(true);
+        expect(transcriptSeen).toBeGreaterThan(0);
+        expect(assistantReply.includes(DONE)).toBe(true);
         expect(opts).toHaveLength(1);
         const isolated = !childHasCanary;
         checkIsolation("environment", isolated, twin);
