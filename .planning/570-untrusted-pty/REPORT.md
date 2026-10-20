@@ -1046,3 +1046,56 @@ R19-leader-time-not-passed-by-retry       (fail) retrySurvivingGroups > terminat
 - Re-run the integration workflow once (it was not allowed here) to confirm the harness fix and take the contract-variant hang sample.
 - Decide whether 8 s is enough: p95 6.99 s leaves little room.
 - The security-review items above.
+
+## r14c: classifier attempt timeout 12 s, and integration run 3
+
+Commit `1fb48dbd` (code, tests, harness bound) plus a commit with this section. No PR, no GitHub comment, no version bump (2.2.353). Integration run 3 of 3, the last: [39445331168](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39445331168) on `1fb48dbd`, Claude 2.1.304. **No fourth run.**
+
+### The change (Terry's ruling)
+
+`CLASSIFIER_ATTEMPT_TIMEOUT_MS` goes from **8 s to 12 s** (`src/commands/discord.ts:648`), still exactly one retry, still failing closed after it. The whole call is now bounded at **24 s** of attempts plus overhead (was 16 s). Reason: run 2's F3 sample had p50 6.6 s / p95 7.0 s, which left about 1 s of headroom, and one GENUINE-row attempt hung for 35 s.
+
+- `src/__tests__/discord-classifier-isolation.test.ts`: per-request timeouts expected as `[12000, 12000]`, total bound `24_000`, test name and header comment say 12 s.
+- `tests/integration/untrusted-pty-isolation.test.ts`: the F3 row's own test timeout was `20 * 20_000 + 60_000`, sized for a 16 s call. A 24 s worst case per message would have let the harness cut the row off before production did, so it is now `20 * 30_000 + 60_000`. The two comments naming the bound were updated. The "RETIRED model id" row keeps its own 15 s deadline: it passes its own `timeoutMs: 15_000` and does not use the classifier constant, so I did not change it; the comment now says so.
+- Historical text in the r14 and r14b sections (the "8 s" table row, the p95 note, the follow-up "decide whether 8 s is enough") is left as written. `rg` for `8 s|8000|16 s|16000` in `src` and this directory found no other reference to the classifier's timeout or total.
+
+### Local verification
+
+`src/oneshot src/runner src/__tests__/discord-classifier-isolation.test.ts src/commands`: **436 pass, 7 skip, 0 fail**. Full-repo `bun run lint`: 0 errors (1390 warnings, 324 infos). Typecheck ratchet: **149 against baseline 149**.
+
+### Fault injection, one site each, on a fresh `git archive` copy (baseline 11 pass, 0 fail), restored after
+
+Predictions were written before running; both held.
+
+```text
+R-const-8000       (fail) classifyThreadIntent: model, bound and retry > retries a no-reply exit too, and keeps both attempts untrusted with the 12 s bound   [received 8000, 8000 where 12000, 12000 expected; 10 pass, 1 fail]
+R-retry-removed    (fail) classifyThreadIntent: model, bound and retry > retries once when the first attempt hangs, and succeeds when the second replies
+                   (fail) classifyThreadIntent: model, bound and retry > fails closed after two hangs, with no third attempt
+                   (fail) classifyThreadIntent: model, bound and retry > retries a no-reply exit too, and keeps both attempts untrusted with the 12 s bound   [8 pass, 3 fail]
+```
+
+The retry injection changed `attempts === 2` to `attempts >= 1`, so the loop returns after the first attempt. The "first hangs, second replies" test goes RED, as in r14.
+
+### Integration run 3: results
+
+**56 tests across 3 files in the integration step, 65 across 4 files in the Linux step; 121 `(pass)`, 0 `(fail)`.** Every step of the job succeeded.
+
+| Required item | Result |
+| --- | --- |
+| 1. The 7 harness rows fixed in `4ccbf535` | **All pass.** The five "HANG RATE classifier contract variant" rows (9 660, 10 464, 9 398, 9 140, 9 491 ms), "RETIRED model id fails closed fast (15 s deadline)" (exit 1 in 4 343 ms, `warnedApiError=true`, `warnedTimeout=false`) and "HANG RATE summary". |
+| 2. A rows, positive control, Linux escape test | **A-login:** `authenticated=true; exit=0; assistantEntries=1; apiErrors=0; storageDirIsOperatorRoot=true; childHasOauthToken=false`; twin RED (`exit=1; assistantEntries=0`). **A-untouched:** `filesBefore=2; filesAfter=2`; twin RED (`filesAfter=16`). **A-paste:** `promptLength=2834`, canary held mid-turn in `paste-cache/` and `projects/<cwd>/`, `isolated=true` after cleanup; twin RED. **A-proc:** `processesNamingThrowawayRoot=0`. **Positive control:** pass (12 893 ms). **Linux escape test:** `a descendant that calls setsid() (Linux) > is dead once the child is retired [55.15ms]` and its twin `[53.74ms]` both pass. That is the third run in a row where it passes. |
+| 3. F3, 20 messages at 12 s | `n=20; repliedFirstTime=20; repliedOnRetry=0; failedClosed=0; p50Ms=6257; p95Ms=7253; failReasons=[]` |
+| 4. Contract-variant hang sample | **0 of 5 hung** (`hung=0/5; exit124=0`), all exit 0 with two assistant entries each, 9.1 to 10.5 s. |
+| 5. "unknown" scan log lines | **None.** `escape scan could not read pid` and the harness's `scan-unknown:` prefix both appear 0 times in the log. As in run 2, this does not separate "the age filter skipped it" from "it did not occur". |
+
+### Things Terry should read
+
+- **The tools-baseline prompt hung once in 5 this time**: attempt 5 returned `exit=124` after 35.2 s (`hang-rate-summary probe=baseline: hung=1/5; exit124=1`). Attempts 1 to 4 took 7.3 to 8.0 s. This is a different prompt from the classifier's, but it is the same 35 s hang shape the GENUINE row showed in run 2, so a 12 s attempt bound does not prevent it: that attempt would time out at 12 s and take the retry. The hang is an availability cost, not an isolation failure.
+- **The classifier-contract prompt is slower than the F3 messages**: 9.1 to 10.5 s per attempt against 12 s, so about 1.5 s of headroom on that prompt shape, while the F3 messages sat at 6.3 to 7.3 s. Those are different inputs (the variant row sends the whole contract with a thread-creation request), so I cannot say which is representative of real Discord traffic. If real messages look like the contract variant, 12 s is tighter than the F3 sample suggests.
+- F3 is 20 of 20 in two runs, each a sample from one CI run, not a rate. The retry has still not been exercised on real traffic.
+- Not exercised: the retry path against a real hang. The unit tests cover it with a scripted runner.
+
+### Follow-ups (unchanged from r14b)
+
+- The other `claude-sonnet-4-20250514` uses in `src/oneshot/pty-trusted.test.ts:61` and `src/oneshot/http.test.ts:53` (test fixtures).
+- The r14b security-review items (cgroup or PID namespace for untrusted PTYs; `survivor.json` in a daemon-owned directory).
