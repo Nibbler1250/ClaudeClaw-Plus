@@ -899,14 +899,16 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         const path = plantMentionFile();
         // Twin: the U+FF20 replacement is switched off through its test seam.
         if (twin) setUntrustedFileMentionNeutralizingForTests(false);
-        // Control present: the model may try a (disabled) Read and end on an API-error record,
-        // which is exit 1 (r9, D3). The canary predicate below is what is judged.
-        const result = await run(
-          mentionPrompt(path),
-          twin
-            ? { timeoutMs: BUDGET }
-            : { allowNoTurn: true, timeoutMs: 60_000, requireModel: true },
-        );
+        // Either direction: the model may try a (disabled) Read and end on an API-error record,
+        // which is exit 1 (r9, D3). r11 run 39372817216 hit exactly that on the twin (exit 1 at
+        // the exit-0 guard, before the predicate ran). The canary predicate below is what is
+        // judged, and requireModel proves the call reached the model. This widening of the
+        // twin is not live-verified: that was the last allowed run.
+        const result = await run(mentionPrompt(path), {
+          allowNoTurn: true,
+          timeoutMs: twin ? BUDGET : 60_000,
+          requireModel: true,
+        });
         const inReply = result.text.includes(FILE_CANARY);
         const inTranscript = transcriptRaw.includes(FILE_CANARY);
         console.info(

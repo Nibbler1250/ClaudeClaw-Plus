@@ -483,3 +483,98 @@ Live result, verbatim:
 Local: `src/oneshot` + `session-actions-argv` 237 pass, 1 skip, 0 fail; lint 0 errors (1319 warnings, 324 infos); typecheck ratchet 149 against baseline 149.
 
 **Process slip.** My first commit landed on a detached HEAD, so `git push` reported "up to date" and I dispatched a workflow run against the old `94804fcb`. I noticed straight away and cancelled it ([39368623537](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39368623537), `completed cancelled`, no results), re-attached the branch to `558d7a4a`, pushed, and dispatched the run above. So two runs were dispatched; one produced results.
+
+## r11: a throwaway config root for every untrusted call, plus the r10 review fixes
+
+Commits `093da9d1`, `dd33f3ba`, `6aa3c5b2`, and a final commit with the B3 twin guard and these docs. Two workflow runs, the maximum: [39372239821](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39372239821) on `dd33f3ba` (**failed every row**, see below) and [39372817216](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39372817216) on `6aa3c5b2` (Claude **2.1.304**, **53 pass, 1 fail**). No PR, no GitHub comment, no version bump (2.2.353).
+
+### A. What changed
+
+Four reviewers found one theme: every cleanup on the operator's real root is fragile. The fix is to stop touching it. Each untrusted PTY call now gets `mkdtemp` `claudeclaw-oneshot-cfg-*` (0700, in the tmpdir next to the temp cwd) holding a minimal `.claude.json` (onboarding, `projects[cwd]` and `projects[realpath cwd]` trusted), and a child env of `CLAUDE_CONFIG_DIR=<root>`, `CLAUDE_SECURESTORAGE_CONFIG_DIR=<operator dir, or "">`, `HOME` unchanged. The root is removed in `finally` and again after a late spawn settles. A daemon start removes `claudeclaw-oneshot-cfg-*` and `claudeclaw-oneshot-pty-*` older than 10 minutes. If the root cannot be written the call fails before spawn; a removal failure is logged by step and code and the call throws.
+
+**Deleted:** the trust write and removal for untrusted calls (`pty-trust-prompt.ts` is its pre-r9 self), the `history.jsonl` rewrite with its mkdir lock and `Atomics.wait`, the `sessions/ todos/ file-history/ debug/` per-id deletions, `untrustedSessionIds`. The trusted-path `ensureTrust` is unchanged.
+
+**Binary reading (`~/.local/share/claude/versions/2.1.304`, identifiers minified, shape verbatim):**
+
+```js
+function yD(){let e=process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR;if(e!==void 0)return(e||u(o(),".claude")).normalize("NFC");return Me()}
+function uB(e=""){let n=process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR,t=n!==void 0?!n:!process.env.CLAUDE_CONFIG_DIR,r=n!==void 0?n.normalize("NFC"):Me(),a=t?"":`-${c("sha256").update(r).digest("hex").substring(0,8)}`;return`Claude Code${cn().OAUTH_FILE_SUFFIX}${e}${a}`}
+function h(){let e=yD(),r=".credentials.json";return{storageDir:e,storagePath:oe(e,".credentials.json")}}
+```
+
+macOS keychain service name: `Claude Code` + `OAUTH_FILE_SUFFIX` + the argument + a suffix that is empty when the variable is `""` (or undefined with `CLAUDE_CONFIG_DIR` empty/unset) and otherwise `-<sha256(NFC dir)[0:8]>`. Linux: `<dir or ~/.claude>/.credentials.json`. **Not measured on macOS.** CI is Linux; the keychain was never exercised. The reading does not show `OAUTH_FILE_SUFFIX` or what `Me()` returns for a trailing-slash or symlinked `CLAUDE_CONFIG_DIR` (we pass the raw string). The Linux store shape used in the A-login row is the object claude builds from `CLAUDE_CODE_OAUTH_TOKEN` itself (`{accessToken, refreshToken: null, expiresAt: null, scopes: ["user:inference"], ...}`).
+
+**B.** `validateRouteEngine` no longer checks `pty` isolation at settings load (`isolationCheckedAtLoad`: every other engine is still checked at load); the call still rejects, with text naming the 2.1.304 gate. Fresh-process tests (`claude-version.test.ts`) load explicit `default`, `discord.classifier` and `tuner.*` pty routes with isolation off and assert the call-time message; `engine.test.ts` now calls `applyPtyIsolationVersionGate` itself; a test pins that `start.ts` passes the probed version, after the probe. **C.** `restoreFileMentions` (U+FF20 to `@`) is applied to every untrusted reply of `print` and `pty` in `registry.ts`; trusted replies are untouched. **D.** An untrusted PTY writes `[withheld: untrusted, N chars]` to `CLAUDECLAW_PTY_DUMP` (`pty-untrusted-trace.test.ts`, with a trusted twin that keeps the text). **E.** `scanTranscript` now exposes `apiErrors`, `synthetic` and `promptSeen`; the tools baseline, the PTY B3 baseline and the new look-alike row require `requireModel`. B1's twin is judged on stall, `pty-reply.test.ts` has the post-settle test, `e2e.test.ts` loops over isolated engines except pty. **F.** `llm.ts`, `discord.ts`, `pty-process.ts` comments, `docs/oneshot-engines.md` and the spike doc.
+
+### Live results
+
+**Run 1 (`dd33f3ba`): every row failed.** The positive control completed its turn (`MCP=true; hooks=true; memory=true; assistant=true; completed=false`: `completed` is false because cleanup threw `throwaway config root was not removed`) and every later row then failed on `positiveProved`. `removeUntrustedConfigRoot` found the root present right after `rmSync` returned. **Cause not established.** In r9 the child's root grew an ~800-file plugin clone, so my hypothesis is that a dying claude, or its background marketplace clone, wrote into the root during removal; I did not observe the writer. `6aa3c5b2` therefore (a) repeats removal until the root has stayed gone for a 200 ms quiet wait and throws if it never does, and (b) sets `CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1` on the child (a switch found in the binary, not otherwise measured). Which of the two mattered is not separated by run 2.
+
+**Run 2 (`6aa3c5b2`): 53 pass, 1 fail.**
+
+| Row | Control present | Twin |
+| --- | --- | --- |
+| Positive control | MCP, hooks, memory true, `completed=true` | |
+| tools, MCP, hooks, memory, command flag, transcript cleanup, environment | all isolated | all RED |
+| tools baseline | `exit=0; assistantEntries=2`, `reached-model: promptSeen=true; assistant=2; apiErrors=0; synthetic=0` | RED |
+| **B1** trust seeded in the throwaway root | `trustAtSpawn=true; exit=0; completed=true` | RED (`trustAtSpawn=false; exit=1; assistantEntries=0; stalled=true`) |
+| **B2** `ANTHROPIC_API_KEY` | `childHasApiKey=false; exit=0` | RED (`childHasApiKey=true; exit=124`) |
+| **B3** `@`, PTY | `canaryInReply=false; canaryInTranscript=false`, `reached=true` | **FAIL at the exit-0 guard (`exit=1`), predicate never ran** |
+| **B3** `@`, print | `exit=0; reachedModel=true; canaryInWire=false` | RED (`canaryInWire=true`) |
+| **C** U+FF20 and U+FE6B typed | `canaryInReply=false; canaryInTranscript=false`, `reached=true` | RED (ASCII `@`, replacement off: `canaryInTranscript=true`) |
+| **A-login** | `authenticated=true; storageDirIsOperatorRoot=true; childHasOauthToken=false` (store `0600`, token length 108) | RED (`authenticated=false; apiErrors=1`) |
+| **A-untouched** | `filesBefore=2; filesAfter=2; changed=[]` | RED (`filesAfter=15`: `.claude.json`, `history.jsonl`, `projects/`, `cache/`, `sessions/` ... changed) |
+| **A-paste** | prompt 2834 chars; mid-turn `paste-cache/<hash>.txt` and `projects/<cwd>/<uuid>.jsonl` hold the canary; `rootGone=true; operatorRootHolds=0; tmpdirHolds=[]` | RED (`rootGone=false`; tmpdir holds `<cfgroot>/paste-cache/...`) |
+| **C1** (re-run on the new layout) | `holdingCanaryAfterCleanup=[]; rootGone=true; snapshotCut=false`, `holdingCanaryBeforeCleanup` has `history.jsonl` and the transcript, so the assertion `heldCanaryMidTurn.length > 0` holds | RED (both still held) |
+| Hang rate, genuine message, production model id | baseline 0/5, contract 0/5; haiku `outcome=intent; action=hire` 2/2; production id `exit=1` in 3303 ms, `warnedApiError=true` | |
+
+All three STOP conditions were checked and none fired: A-login authenticated through the secure-storage dir (so the secure-storage path **is** measured on Linux), A-untouched showed no change with the override on, and A-paste showed the canary outside the throwaway root nowhere after cleanup. The paste cache is `paste-cache/<hash>.txt`, which is what the brief predicted. The U+FF20/U+FE6B result answers the NFKC question for this build: neither typed look-alike expanded to the file, on a call that provably reached the model.
+
+**The one failure.** The B3 PTY **twin** (replacement off, so the file is expanded) ended at `expect(result.exitCode).toBe(0)` with `exit=1`; the control-present side, which had `allowNoTurn`, passed. This is the r9 failure mode (the model tries a disabled tool, the CLI writes an API-error record, a real reply followed by an error is exit 1). The row log gives no `reached-model` line for the twin, so I cannot say from the run whether the model answered. **The final commit gives the twin the same guard as the control (`allowNoTurn` plus `requireModel`). That edit is not live-verified: both allowed runs are spent.** The PTY expansion itself is still evidenced live: in run 2 the C look-alike twin (ASCII `@`, replacement off) put the canary into the transcript, and the B3 print twin put it into the wire.
+
+### Local verification
+
+- `src/oneshot` + `src/runner/pty-untrusted-trace.test.ts` + `src/__tests__/oneshot-pty-tools.test.ts` + `tests/integration/untrusted-pty-isolation.test.ts` (skipped locally, as designed): **246 pass, 4 skip, 0 fail**. Wider run (`src/oneshot src/runner src/__tests__ src/skills-tuner src/commands`): 2496 pass, 4 skip, **3 fail, all unrelated and pre-existing**: `agents.test.ts` "accepts simple kebab-case names" (passes alone; fails only in the wide run), and two `gateway/session-id-seam.test.ts` cases (fail alone too). The same three fail on a `git archive` of the r10 commit `5c6b56f9`.
+- Lint: **0 errors**, 1365 warnings, 324 infos. Typecheck ratchet **149 against baseline 149**. Plugin and marketplace versions unchanged (2.2.353).
+
+### Fault injection, one site each, on a `git archive` copy, restored after (RED verbatim)
+
+Each injection changes one site and runs the named tests; the `(fail)` line is the first one reported. I wrote each assertion comment after seeing its line. C3's first attempt had a syntax error in the mutation (never ran), was redefined, then went RED. A5 first targeted a line that no longer existed after the removal rewrite and was redefined to the new site.
+
+```text
+A1 seed without trust                (fail) A: each untrusted call gets its own throwaway config root > is a 0700 sibling of the temp cwd, seeded with onboarding and trust for both cwd forms
+A2 secure-storage dir not passed     (fail) untrusted PTY spawn uses the exact same caller environment policy as print   [+2 more]
+A3 explicit secure-storage ignored   (fail) A: each untrusted call gets its own throwaway config root > passes an explicit CLAUDE_SECURESTORAGE_CONFIG_DIR through as given   [+1 more]
+A4 child keeps the operator's CLAUDE_CONFIG_DIR (fail) the actual untrusted PTY spawn preserves every interactive isolation argument   [+13 more]
+A5 root not removed                  (fail) the actual untrusted PTY spawn preserves every interactive isolation argument   [+22 more]
+A6 cleanup failure swallowed         (fail) A: fail closed > D6: a root that cannot be removed is logged by step and code, and the call throws
+A7 create failure leaves the cwd     (fail) A: fail closed > a root that cannot be created fails the call before any spawn and leaves nothing
+A8 no second cleanup pass            (fail) C3: cleanup runs again once a late-landing spawn has settled > removes the root a claude wrote into after the call had already returned
+A9 sweep ignores age                 (fail) A: startup sweep of leftovers > removes oneshot dirs older than 10 minutes, and only those
+A9b sweep removes non-directories    (fail) A: startup sweep of leftovers > removes oneshot dirs older than 10 minutes, and only those
+A10 daemon start does not sweep      (fail) A: startup sweep of leftovers > the daemon runs it at start, before the version probe
+R1 removal does not look again       (fail) A: removal proves the root stays gone > removes a root a dying writer re-creates during the quiet wait   [+1 more]
+R2 removal never gives up            (fail) A: removal proves the root stays gone > gives up, and throws, when the root never stays gone
+R3 marketplace switch not set        (fail) untrusted PTY spawn uses the exact same caller environment policy as print   [+1 more]
+B1 load-time isolation check back    (fail) one-shot configuration > loads before the startup gate has run, with isolation still off: {"routes":{"tuner.judge":"pty"}}   [+3 more]
+B2 error text loses the version      (fail) the call, not the load, refuses an untrusted pty route while isolation is off
+B3 startup gate not given the version (fail) start.ts hands the gate the probed version, after the probe
+C1 pty reply not restored            (fail) C: the reply gets its `@` back, on both engines, in one place > pty: a model that echoes the neutralised prompt returns the original text
+C2 print reply not restored          (fail) C: the reply gets its `@` back, on both engines, in one place > print: the echoed prompt comes back with its @
+C3 trusted replies restored too      (fail) C: the reply gets its `@` back, on both engines, in one place > a trusted call's reply is left exactly as the model wrote it
+D1 untrusted trace keeps text        (fail) an untrusted PTY writes metadata only: neither the prompt nor the raw output reaches the dump
+E1 no post-settle re-read verdict    (fail) #570 failed-turn latency > an error record that lands during the settle still fails the reply (E: the post-settle re-read)
+RESTORED: pty-untrusted-state.test.ts back to 36 pass, 0 fail after the last injection
+```
+
+Not injected: the 200 ms quiet-wait *length* (a value, not a branch); `CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL` is asserted present in the env but its effect on the live clone is not measured. Not covered by a live row: macOS.
+
+### Follow-ups (not done here)
+
+- Whole-paste image-path handling for raw-text untrusted routes (security review L4).
+- The version gate is checked once, at startup (L5): a claude upgraded under a running daemon is not re-probed.
+- bun-pty `env_clear` instead of the global env swap.
+- A classifier rate limit.
+- A tuner env allowlist.
+- Carried from earlier rounds: `discord.ts` hard-codes the retired classifier model id; a process that never runs `start.ts` (the tuner CLI) stays on print.
+- Unproven: what exactly wrote into the root during removal in run 1.
