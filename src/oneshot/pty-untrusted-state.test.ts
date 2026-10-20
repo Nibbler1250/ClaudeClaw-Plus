@@ -30,11 +30,9 @@ import {
   __untrustedGroupOptionsForTests,
   __landPtyForTests,
   __resetSupervisorForTests,
-  UNTRUSTED_ONESHOT_MAX_CONCURRENT,
   injectOneShotTrustForTests,
   injectSpawnPty,
   runOnceOnPty,
-  untrustedOneShotsInFlightForTests,
 } from "../runner/pty-supervisor.js";
 import { applyPtyIsolationVersionGate, claudeVersionAtLeast } from "./claude-version.js";
 import { resolveOneShotEngine } from "./config.js";
@@ -1283,28 +1281,28 @@ describe("r15 A4: concurrent untrusted PTY one-shots are capped", () => {
   const LONG = { timeoutMs: 30_000 };
 
   it("is two", () => {
-    expect(UNTRUSTED_ONESHOT_MAX_CONCURRENT).toBe(2);
+    expect(cleanup.UNTRUSTED_ONESHOT_MAX_CONCURRENT).toBe(2);
   });
 
   it("a third call while two are in flight returns busy without spawning or creating a directory", async () => {
     const parked = parkedSpawn();
     const first = run(callerEnv(), LONG);
     const second = run(callerEnv(), LONG);
-    await until(() => spawned.length === UNTRUSTED_ONESHOT_MAX_CONCURRENT);
+    await until(() => spawned.length === cleanup.UNTRUSTED_ONESHOT_MAX_CONCURRENT);
     const dirsBefore = oneShotTempDirs("claudeclaw-oneshot-").length;
 
     const third = await run(callerEnv(), LONG);
 
     expect(third.exitCode).toBe(1);
     expect(third.diagnostic?.reason).toBe("busy");
-    expect(spawned).toHaveLength(UNTRUSTED_ONESHOT_MAX_CONCURRENT);
+    expect(spawned).toHaveLength(cleanup.UNTRUSTED_ONESHOT_MAX_CONCURRENT);
     expect(oneShotTempDirs("claudeclaw-oneshot-")).toHaveLength(dirsBefore);
-    expect(untrustedOneShotsInFlightForTests()).toBe(UNTRUSTED_ONESHOT_MAX_CONCURRENT);
+    expect(cleanup.untrustedOneShotsInFlight()).toBe(cleanup.UNTRUSTED_ONESHOT_MAX_CONCURRENT);
 
     for (const release of parked) release();
     expect((await first).exitCode).toBe(0);
     expect((await second).exitCode).toBe(0);
-    expect(untrustedOneShotsInFlightForTests()).toBe(0);
+    expect(cleanup.untrustedOneShotsInFlight()).toBe(0);
   });
 
   it("a slot frees when a call finishes: the next call runs", async () => {
@@ -1312,12 +1310,12 @@ describe("r15 A4: concurrent untrusted PTY one-shots are capped", () => {
     const calls = [run(callerEnv(), LONG), run(callerEnv(), LONG)];
     await until(() => parked.length === 2);
     parked[0]!(); // whichever call owns this spawn finishes; the other stays in flight
-    await until(() => untrustedOneShotsInFlightForTests() === 1);
+    await until(() => cleanup.untrustedOneShotsInFlight() === 1);
     const next = run(callerEnv(), LONG);
     await until(() => parked.length === 3); // it spawned: the freed slot was usable
     for (const release of parked) release();
     for (const outcome of await Promise.all([...calls, next])) expect(outcome.exitCode).toBe(0);
-    expect(untrustedOneShotsInFlightForTests()).toBe(0);
+    expect(cleanup.untrustedOneShotsInFlight()).toBe(0);
   });
 
   it("a slot frees when the call throws (a root that could not be removed)", async () => {
@@ -1327,7 +1325,7 @@ describe("r15 A4: concurrent untrusted PTY one-shots are capped", () => {
     });
     try {
       // More throwing calls than slots: a leaked slot per throw would make the third one busy.
-      for (let i = 0; i < UNTRUSTED_ONESHOT_MAX_CONCURRENT + 1; i++) {
+      for (let i = 0; i < cleanup.UNTRUSTED_ONESHOT_MAX_CONCURRENT + 1; i++) {
         await expect(run()).rejects.toThrow();
       }
     } finally {
@@ -1335,29 +1333,54 @@ describe("r15 A4: concurrent untrusted PTY one-shots are capped", () => {
       for (const opts of spawned)
         rmSync(opts.env.CLAUDE_CONFIG_DIR!, { recursive: true, force: true });
     }
-    expect(spawned).toHaveLength(UNTRUSTED_ONESHOT_MAX_CONCURRENT + 1);
-    expect(untrustedOneShotsInFlightForTests()).toBe(0);
+    expect(spawned).toHaveLength(cleanup.UNTRUSTED_ONESHOT_MAX_CONCURRENT + 1);
+    expect(cleanup.untrustedOneShotsInFlight()).toBe(0);
   });
 
-  it("a spawn that never lands does not hold a slot once the call has returned its deadline", async () => {
-    // A late claude is retired by lateRetire, which never settles for a spawn that never lands. A
-    // slot tied to that would leak, and after two such calls the cap would refuse every call.
-    injectSpawnPty(() => new Promise(() => {}));
-    for (let i = 0; i < UNTRUSTED_ONESHOT_MAX_CONCURRENT + 1; i++) {
-      const result = await run(callerEnv(), { timeoutMs: 100 });
-      expect(result.diagnostic?.reason).not.toBe("busy");
-      expect([1, 124]).toContain(result.exitCode);
-      expect(untrustedOneShotsInFlightForTests()).toBe(0);
+  /** Run `body` with the late-slot ceiling set to `ms`, and put the preload's value back after. */
+  async function withLateCeiling(ms: number, body: () => Promise<void>): Promise<void> {
+    const saved = cleanup.lateSlotCeilingMsForTests();
+    cleanup.setLateSlotCeilingMsForTests(ms);
+    try {
+      await body();
+    } finally {
+      cleanup.setLateSlotCeilingMsForTests(saved);
     }
+  }
+
+  it("a late claude stays counted after its call returned, but only up to the ceiling (a spawn that never lands)", async () => {
+    await withLateCeiling(300, async () => {
+      injectSpawnPty(() => new Promise(() => {}));
+      const result = await run(callerEnv(), { timeoutMs: 100 });
+      expect([1, 124]).toContain(result.exitCode);
+      // The call has returned, but its claude may still land: it is still counted.
+      expect(cleanup.untrustedOneShotsInFlight()).toBe(1);
+      // A spawn that never lands must not hold it for ever.
+      await until(() => cleanup.untrustedOneShotsInFlight() === 0);
+      fakeSpawn();
+      expect((await run()).exitCode).toBe(0);
+    });
+  });
+
+  it("a late claude that lands and is retired frees its slot at once, not at the ceiling", async () => {
+    await withLateCeiling(30_000, async () => {
+      injectSpawnPty(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        return { dispose: async () => {} } as never;
+      });
+      await run(callerEnv(), { timeoutMs: 100 });
+      expect(cleanup.untrustedOneShotsInFlight()).toBe(1);
+      await until(() => cleanup.untrustedOneShotsInFlight() === 0); // polls for 2 s, ceiling is 30 s
+    });
   });
 
   it("a slot frees when the call fails before any state exists (config dir not absolute)", async () => {
     fakeSpawn();
-    for (let i = 0; i < UNTRUSTED_ONESHOT_MAX_CONCURRENT + 1; i++) {
+    for (let i = 0; i < cleanup.UNTRUSTED_ONESHOT_MAX_CONCURRENT + 1; i++) {
       const failed = await run(callerEnv({ CLAUDE_CONFIG_DIR: "relative/dir" }));
       expect(failed.diagnostic?.reason).toBe("config-dir");
     }
-    expect(untrustedOneShotsInFlightForTests()).toBe(0);
+    expect(cleanup.untrustedOneShotsInFlight()).toBe(0);
   });
 
   it("a trusted call neither takes a slot nor is refused when the slots are full", async () => {
@@ -1366,9 +1389,9 @@ describe("r15 A4: concurrent untrusted PTY one-shots are capped", () => {
     await until(() => parked.length === 2);
     const trusted = run(callerEnv(), { ...LONG, route: "compact", isolation: "trusted-session" });
     await until(() => parked.length === 3);
-    expect(untrustedOneShotsInFlightForTests()).toBe(UNTRUSTED_ONESHOT_MAX_CONCURRENT);
+    expect(cleanup.untrustedOneShotsInFlight()).toBe(cleanup.UNTRUSTED_ONESHOT_MAX_CONCURRENT);
     for (const release of parked) release();
     await Promise.allSettled([...full, trusted]);
-    expect(untrustedOneShotsInFlightForTests()).toBe(0);
+    expect(cleanup.untrustedOneShotsInFlight()).toBe(0);
   });
 });

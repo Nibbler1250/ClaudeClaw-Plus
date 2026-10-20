@@ -186,6 +186,64 @@ export function activeOneShotDirCount(): number {
 }
 
 /**
+ * Untrusted PTY one-shots that may run at once. In-process, not a setting: each is an interactive
+ * claude, and the ephemeral scope sits outside the supervisor's `maxConcurrent`. Over it a call
+ * returns `busy` without spawning (the classifier treats that like any other failure: null, no
+ * retry). #570 r15, A4.
+ */
+export const UNTRUSTED_ONESHOT_MAX_CONCURRENT = 2;
+
+/**
+ * A call that returned its deadline while its claude was still being admitted keeps its slot
+ * until that claude has landed and been retired, but never longer than this. Unbounded, a spawn
+ * that never lands would hold the slot for ever and the cap would refuse every later call;
+ * freed at once, a claude that lands late would run uncounted.
+ */
+export const UNTRUSTED_LATE_SLOT_CEILING_MS = 60_000;
+let lateSlotCeilingMs = UNTRUSTED_LATE_SLOT_CEILING_MS;
+/** Test seam: shorten the late-slot ceiling (the test preload does). `null` restores it. */
+export function setLateSlotCeilingMsForTests(ms: number | null): void {
+  lateSlotCeilingMs = ms ?? UNTRUSTED_LATE_SLOT_CEILING_MS;
+}
+/** Test seam: the ceiling in force, so a test that changes it can put it back. */
+export function lateSlotCeilingMsForTests(): number {
+  return lateSlotCeilingMs;
+}
+
+let untrustedInFlight = 0;
+/** Test seam: how many untrusted one-shots hold a slot. */
+export function untrustedOneShotsInFlight(): number {
+  return untrustedInFlight;
+}
+
+export interface OneShotSlot {
+  /** The call is finished: free the slot now. Idempotent. */
+  free(): void;
+  /** The call returned while a late claude may still land: free once `retired` settles, or at the ceiling. */
+  freeWhen(retired: Promise<unknown>): void;
+}
+
+/** Take a slot, or `undefined` when `UNTRUSTED_ONESHOT_MAX_CONCURRENT` calls are already running. */
+export function acquireUntrustedOneShotSlot(): OneShotSlot | undefined {
+  if (untrustedInFlight >= UNTRUSTED_ONESHOT_MAX_CONCURRENT) return undefined;
+  untrustedInFlight++;
+  let held = true;
+  const free = (): void => {
+    if (!held) return;
+    held = false;
+    untrustedInFlight--;
+  };
+  return {
+    free,
+    freeWhen(retired) {
+      const ceiling = setTimeout(free, lateSlotCeilingMs);
+      ceiling.unref?.();
+      void retired.then(free, free).finally(() => clearTimeout(ceiling));
+    },
+  };
+}
+
+/**
  * What is needed to stop a claude that outlived its retirement, and to keep its directories safe
  * meanwhile: the leader's pid with the start time it had at spawn, the temp cwd and its forms.
  */
