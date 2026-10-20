@@ -155,6 +155,7 @@ const oneShotTempDirs = (prefix: string): string[] =>
 
 describe("A: each untrusted call gets its own throwaway config root", () => {
   it("is a 0700 sibling of the temp cwd, seeded with onboarding and trust for both cwd forms", async () => {
+    // Went red alone when the seed was written without hasTrustDialogAccepted.
     let mode = 0;
     let seeded: Record<string, any> = {};
     let fileMode = 0;
@@ -187,6 +188,7 @@ describe("A: each untrusted call gets its own throwaway config root", () => {
   });
 
   it("keeps the operator's login: credentials are read from the operator's config dir", async () => {
+    // Went red (with the env-policy test in pty-isolation.test.ts) when CLAUDE_SECURESTORAGE_CONFIG_DIR was not set.
     fakeSpawn();
     await run();
     expect(spawned[0]!.env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe(join(dir, "config"));
@@ -201,6 +203,7 @@ describe("A: each untrusted call gets its own throwaway config root", () => {
   });
 
   it("passes an explicit CLAUDE_SECURESTORAGE_CONFIG_DIR through as given", async () => {
+    // Went red when the caller's explicit value was ignored in favour of CLAUDE_CONFIG_DIR.
     fakeSpawn();
     await run(callerEnv({ CLAUDE_SECURESTORAGE_CONFIG_DIR: join(dir, "store") }));
     await run(callerEnv({ CLAUDE_SECURESTORAGE_CONFIG_DIR: "" }));
@@ -247,6 +250,7 @@ describe("A: nothing on the untrusted path writes under the operator's config ro
     ],
   ] as const) {
     it(`leaves the operator's root and HOME byte-identical after ${label}`, async () => {
+      // Went red (14 failures across the file) when the child kept the operator's CLAUDE_CONFIG_DIR.
       const { config, home } = operatorFiles();
       const before = { config: snapshot(config), home: snapshot(home) };
       let wroteInRoot = false;
@@ -271,6 +275,7 @@ describe("A: the root and the cwd are removed whatever the turn did", () => {
     !existsSync(opts.env.CLAUDE_CONFIG_DIR!) && !existsSync(opts.cwd);
 
   it("after a successful turn, with the prompt canary written into it", async () => {
+    // Went red when the root removal was a no-op.
     fakeSpawn((opts) => {
       mkdirSync(join(opts.env.CLAUDE_CONFIG_DIR!, "paste-cache"), { recursive: true });
       writeFileSync(join(opts.env.CLAUDE_CONFIG_DIR!, "paste-cache", "p.txt"), CANARY);
@@ -301,6 +306,7 @@ describe("A: the root and the cwd are removed whatever the turn did", () => {
 
 describe("A: fail closed", () => {
   it("a root that cannot be created fails the call before any spawn and leaves nothing", async () => {
+    // Went red when the temp cwd was left behind after the failed create.
     fakeSpawn();
     const before = oneShotTempDirs("claudeclaw-oneshot-pty-");
     const failing = spyOn(cleanup, "createUntrustedConfigRoot").mockImplementation(() => {
@@ -316,6 +322,7 @@ describe("A: fail closed", () => {
   });
 
   it("D6: a root that cannot be removed is logged by step and code, and the call throws", async () => {
+    // Went red when the removal error was swallowed instead of thrown.
     fakeSpawn((opts) => writeFileSync(join(opts.env.CLAUDE_CONFIG_DIR!, "history.jsonl"), CANARY));
     const failing = spyOn(cleanup, "removeUntrustedConfigRoot").mockImplementation(() => {
       throw Object.assign(new Error(`EACCES: ${CANARY}`), { code: "EACCES" });
@@ -341,6 +348,7 @@ describe("A: startup sweep of leftovers", () => {
   };
 
   it("removes oneshot dirs older than 10 minutes, and only those", () => {
+    // Went red when the age test was dropped (fresh dirs removed) and when non-directories (file, symlink) were removed.
     const base = mkdtempSync(join(dir, "sweep-"));
     const outside = join(dir, "outside");
     mkdirSync(outside);
@@ -378,6 +386,7 @@ describe("A: startup sweep of leftovers", () => {
   });
 
   it("the daemon runs it at start, before the version probe", () => {
+    // Went red when start.ts stopped calling the sweep.
     const start = readFileSync(join(import.meta.dir, "../commands/start.ts"), "utf8");
     const sweep = start.indexOf("sweepStaleOneShotDirs()");
     expect(sweep).toBeGreaterThan(0);
@@ -513,6 +522,7 @@ describe("C2: PTY isolation is advertised only on a measured claude version", ()
 
 describe("C3: cleanup runs again once a late-landing spawn has settled", () => {
   it("removes the root a claude wrote into after the call had already returned", async () => {
+    // Went red when the second pass after lateRetire was a no-op.
     let root = "";
     let landed = false;
     injectSpawnPty(async (opts) => {
@@ -603,6 +613,7 @@ describe("C: the reply gets its `@` back, on both engines, in one place", () => 
   const SKILL = "use @anthropic-ai/sdk, write to me@example.com, mark it @decorator";
 
   it("pty: a model that echoes the neutralised prompt returns the original text", async () => {
+    // Went red when the pty engine did not map U+FF20 back; the print and trusted-reply tests below went red for their own sites.
     let modelSaw = "";
     injectSpawnPty(async (opts) => {
       spawned.push(opts);

@@ -256,6 +256,7 @@ describe("#570 failed-turn latency", () => {
   });
 
   it("an error record that lands during the settle still fails the reply (E: the post-settle re-read)", async () => {
+    // Went red when the verdict of the post-settle re-read was dropped.
     const projectDir = project([userEntry(), assistant("m1", [text("real")])]);
     const file = join(projectDir, "s.jsonl");
     const sleeps: number[] = [];

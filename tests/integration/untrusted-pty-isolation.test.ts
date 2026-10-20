@@ -1081,7 +1081,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
 
   // A-login. The child gets the operator's login only through CLAUDE_SECURESTORAGE_CONFIG_DIR.
   // The CI token is written, in the Linux store shape read out of claude 2.1.304
-  // (`{claudeAiOauth:{accessToken,expiresAt,scopes}}` in `<dir>/.credentials.json`), into the
+  // (`{claudeAiOauth:{accessToken,refreshToken,expiresAt,scopes,...}}` in `<dir>/.credentials.json`), into the
   // fake operator root. The token is removed from the CHILD's env, so the only way to the API
   // is that store. Only presence and lengths are logged.
   let secureStorageMeasured = false;
@@ -1096,10 +1096,15 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         writeFileSync(
           store,
           JSON.stringify({
+            // The object claude 2.1.304 itself builds from CLAUDE_CODE_OAUTH_TOKEN: no refresh
+            // token, no expiry, inference scope only.
             claudeAiOauth: {
               accessToken: token,
-              expiresAt: Date.now() + 365 * 24 * 3600 * 1000,
+              refreshToken: null,
+              expiresAt: null,
               scopes: ["user:inference"],
+              subscriptionType: null,
+              rateLimitTier: null,
             },
           }),
           { mode: 0o600 },
@@ -1436,7 +1441,13 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     let truncated = false;
     const walk = (current: string): void => {
       if (truncated) return;
-      for (const entry of readdirSync(current, { withFileTypes: true })) {
+      let entries: import("node:fs").Dirent[];
+      try {
+        entries = readdirSync(current, { withFileTypes: true });
+      } catch {
+        return; // a directory this user cannot list (the tmpdir scan meets some)
+      }
+      for (const entry of entries) {
         if (files.size >= SNAPSHOT_CAP) {
           truncated = true;
           return;
@@ -1446,8 +1457,12 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
           files.set(`${relative(dir, path)}/`, { size: 0, mtimeMs: 0 });
           walk(path);
         } else if (entry.isFile()) {
-          const stat = statSync(path);
-          files.set(relative(dir, path), { size: stat.size, mtimeMs: stat.mtimeMs });
+          try {
+            const stat = statSync(path);
+            files.set(relative(dir, path), { size: stat.size, mtimeMs: stat.mtimeMs });
+          } catch {
+            /* vanished between listing and stat */
+          }
         }
       }
     };

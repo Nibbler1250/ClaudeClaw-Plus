@@ -21,6 +21,7 @@ it("pty isolation is OFF in a fresh process that never probed (fail closed)", ()
  * capability the probe sets. A fresh process has not probed, so isolation is off here.
  */
 it("explicit pty untrusted routes load in a fresh process whose gate has not run", () => {
+  // Went red (with three in-process twins in engine.test.ts) when the load-time isolation check came back.
   const probe = Bun.spawnSync(
     [
       process.execPath,
@@ -42,6 +43,7 @@ it("explicit pty untrusted routes load in a fresh process whose gate has not run
 });
 
 it("the call, not the load, refuses an untrusted pty route while isolation is off", () => {
+  // Went red when the error text lost the version.
   const probe = Bun.spawnSync(
     [
       process.execPath,
@@ -61,6 +63,7 @@ it("the call, not the load, refuses an untrusted pty route while isolation is of
 });
 
 it("start.ts hands the gate the probed version, after the probe", async () => {
+  // Went red when start.ts passed null instead of the probed version.
   const start = await Bun.file(`${process.cwd()}/src/commands/start.ts`).text();
   const probe = start.indexOf("await probeClaudeCliVersion()");
   const gate = start.indexOf("applyPtyIsolationVersionGate(cliProbe.version)");

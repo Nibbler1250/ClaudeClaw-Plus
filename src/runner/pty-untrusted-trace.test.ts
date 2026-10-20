@@ -46,6 +46,7 @@ async function dumpFor(isolation: "untrusted" | undefined): Promise<string> {
 }
 
 it("an untrusted PTY writes metadata only: neither the prompt nor the raw output reaches the dump", async () => {
+  // Went red when the untrusted flag was forced off.
   const dump = await dumpFor("untrusted");
   // The trace ran (so an empty file cannot pass), and carries lengths, not text.
   expect(dump).toContain("write prompt");
