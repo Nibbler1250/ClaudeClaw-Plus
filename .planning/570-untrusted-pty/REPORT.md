@@ -184,3 +184,25 @@ RED lines, verbatim from the run:
 - Transcript evidence is collected in a `finally` around the turn, polling up to 15 s for a non-synthetic assistant entry, then settling 500 ms and re-reading. If none appears it logs type names, counts, stop reasons and block types only, never content.
 - The command-flag baseline runs with a 30 s bound and accepts exit 0 or 124 (no API turn expected), asserting the canary is absent. The twin keeps the strict path: exit 0 and a real assistant entry, so it still has to execute the command to go RED.
 - Local: guard suite **0 pass, 16 skip, 0 fail**; lint 0 errors; no type errors in the changed file. Plugin and marketplace bumped to **2.2.348**.
+
+### r4 confirmation run (last allowed run)
+
+[39351240090](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39351240090), `9b2d9da0`, Claude **2.1.304**: **21 pass, 1 fail**. Positive control again `MCP=true; hooks=true; memory=true; assistant=true; completed=true`.
+
+| Property | Control present | Control removed |
+| --- | --- | --- |
+| Tools | **UNPROVEN**: no assistant response was produced at all, turn timed out (exit 124) | Valid RED |
+| MCP | isolated=true | Valid RED |
+| Hooks/settings | isolated=true | Valid RED |
+| User memory | isolated=true | Valid RED |
+| Command flag alone | isolated=true (`no-turn probe: exit=124; assistantEntries=0`, canary absent) | Valid RED |
+| Transcript cleanup | isolated=true | Valid RED |
+| Environment | isolated=true | Valid RED |
+
+No baseline leak. Six of seven rows are proved in both directions.
+
+**Tools baseline, what the diagnostics showed:** the transcript holds one `user` record, six `attachment`, an `ai-title`, two `cost-state`, and **no `assistant` record**: `synthetic=0; apiError=0; stop=[]; blocks=[]`. So the earlier "transcript lag" hypothesis is refuted (15 s of polling found nothing) and so is the synthetic-error one. Under `--tools ""` this prompt (which tells the model to run Bash) gets no assistant response, in either run (3 s with exit 0 in the first, a 120 s timeout in the second). The same prompt with tools enabled gets a response (the twin goes RED). Benign prompts under the identical `--tools ""` argv respond fine in the other rows. A hang is not evidence that tools are refused, so this row is **not** counted as proved.
+
+Not determined: why that prompt gets no response with no tools. A screen capture is needed, and the logs deliberately carry none.
+
+**Not done:** brief-570-v2 Step 3 (flip `caps.isolation`, untrusted default `pty`, docs). The continuation allowed one more workflow run; Step 3 needs its own final run, and all rows are not yet proved.
