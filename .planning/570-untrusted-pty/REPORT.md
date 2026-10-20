@@ -374,3 +374,89 @@ Fault injection, one site each, restored after, RED verbatim:
 ```
 
 Local: `src/oneshot` + `session-actions-argv` **202 pass, 5 skip, 0 fail**; PTY-related files + `runner.test.ts` + `runner-recovery-guards.test.ts` **414 pass, 0 fail**; integration guard **0 pass, 30 skip, 0 fail**; lint 0 errors (1304 warnings); typecheck ratchet **149 against baseline 149**; plugin and marketplace **2.2.352**. No PR opened.
+
+## r9: review fixes, and probes through the production spawn path
+
+Brief r9. Commits `a37e7165` (run 1) and `645e6525` (run 2), plus a final commit with the guard edit and these docs. Two workflow runs, as allowed: 39364441123 and 39365573022, Claude **2.1.304**. No PR opened.
+
+### What changed
+
+- **A1.** The harness no longer pre-writes `projects[cwd].hasTrustDialogAccepted` (r1 to r8 evidence all had it; production skips the trust heal for untrusted spawns). Onboarding and theme seeding stay.
+- **B1.** `runOnceOnPty` marks the throwaway cwd (as given and as resolved) trusted in the **child's** config root (caller env `CLAUDE_CONFIG_DIR`, else `HOME`, never `homedir()`), through `ensureTrustAccepted` with a new `configRoot` parameter and the same per-file queue. `removeTrustEntry` takes the entry out again under that queue.
+- **B2.** `stripSpawnEnvKeys` (`spawn-env.ts`) applies `shouldStripSpawnEnvKey` over `SPAWN_ENV_STRIP_KEYS` to the untrusted policy env; `sk-ant-oat01-` stays.
+- **B3.** `neutralizeFileMentions` replaces every `@` with U+FF20 in untrusted prompts after sanitising (not on the trusted path). **`claude -p` expands `@` too (measured), so print's untrusted stdin prompt gets the same helper.**
+- **C1.** `history.jsonl` lines for this cwd/session and per-session files (`session-env`, `file-history`, `debug`, `todos`, `sessions/*.json`) are removed with the transcript.
+- **C2.** `pty` `caps.isolation` starts **false**; `applyPtyIsolationVersionGate` (called in `start.ts` after `claude --version`) turns it on for >= 2.1.304 only, with one startup warning otherwise. Implicit untrusted routing consults it. The automated security review of the first push flagged the original `true` default as fail-open; fixed in the second commit, test preload stands in for the probe, and `claude-version.test.ts` reads the unprobed default in a fresh process.
+- **C3.** `RunOnPtyResult.lateRetire` (spawn-deadline and admission-deadline branches); `runOnceOnPty` cleans up again after it settles.
+- **D1** abort/own-deadline during the transcript wait is 124. **D2** empty `CLAUDE_CONFIG_DIR` is unset, relative root fails closed before any spawn (exit 1). **D3** unguarded `readdirSync`; a real reply followed by an API-error record is a failure. **D4** `req.system` is passed as `--system-prompt`. **D5** `_preparePromptForWriteForTests` left `PtyProcessOptions` for `pty-process-test-seams.ts`. **D6** documented and logged (step + error code). **D7** `e2e.test.ts` covers print only.
+- **E.** Comments in `pty-supervisor.ts`, `runner.ts`, `pty-process.ts`, `discord.ts`, `llm.ts`, `engine.test.ts`; `docs/oneshot-engines.md`, `docs/pty-migration.md`, the spike doc.
+
+### Live results
+
+Run 1 ended without a summary partway through the C1 row (exit 1, nothing in the log after the spawn). Cause not established; the C1 row then polled the whole config tree every 10 ms and the root grows an 804-file plugin clone, which is a hypothesis only. The polling was removed and C1 moved last; run 2 completed (**44 pass, 2 fail**, 3 files).
+
+| Row | Run 1 present | Run 1 twin | Run 2 present | Run 2 twin |
+| --- | --- | --- | --- | --- |
+| Positive control | MCP, hooks, memory true | | same | |
+| Tools | isolated | RED | **fail at exit-0 guard** (see below) | RED |
+| MCP, hooks, memory, command flag, transcript cleanup, environment | all isolated | all RED | all isolated | all RED |
+| **B1** trust write and removal | harness error (realpath of a removed cwd) before the predicate | stall seen, harness error | `trustAtSpawn=true; entryAfterCall=false`, turn complete | RED (`trustAtSpawn=false`, `exit=1`, no turn) |
+| **B2** `ANTHROPIC_API_KEY` | `childHasApiKey=false`, `exit=0` | RED (key in env, `exit=124`) | same | same |
+| **B3** `@`, PTY | canary absent from reply and transcript | RED (present in both) | **fail at exit-0 guard** | RED |
+| **B3** `@`, print | canary **in reply** (`-p` expands it; no fix yet) | n/a | `canaryInReply=false` | RED (`canaryInReply=true`) |
+| **C1** persistence | no result (run died) | | no file holds the canary | RED (history line and transcript remain) |
+
+RED lines, verbatim from run 2 (the pre-existing seven rows are unchanged from r6 to r8):
+
+```text
+[isolation-spike] RED-with-control-removed B1 trust (production write completes the turn): expected true, received false
+[isolation-spike] RED-with-control-removed B2 ANTHROPIC_API_KEY strip: expected true, received false
+[isolation-spike] RED-with-control-removed B3 @ file mention (PTY): expected true, received false
+[isolation-spike] RED-with-control-removed B3 @ file mention (print): expected true, received false
+[isolation-spike] RED-with-control-removed C1 persistence (no file holds the prompt canary): expected true, received false
+```
+
+**The two run-2 failures** are baselines that stopped at the harness's `expect(exitCode).toBe(0)`: the model tried a tool under `--tools ""`, the CLI wrote a synthetic API-error record after its reply (`stop=["tool_use","stop_sequence"]; synthetic=1; apiError=1`, `toolUse=false`), and the D3 rule (a real reply followed by an error is a failure) made that exit 1. Their isolation predicates never ran in run 2; both passed in run 1. I widened the guard for those two baselines to accept 0, 1 or 124, as the hang-rate probes already do, after the run. **That edit is not live-verified.** The tools-baseline prompt ended on an API error in 1 of 5 hang-rate attempts in run 2 (0 of 5 in r6 to r8), reported as exit 1 now rather than as a success.
+
+**C1 findings** (path shapes): new or changed during the turn were `.claude.json`, `backups/.claude.json.backup.<n>`, `cache/changelog.md`, `history.jsonl`, `plugins/` (804 files), `policy-limits.json` (+stamp), `remote-settings.json` (+synced-at), `projects/<encoded cwd>/{<uuid>.jsonl,memory/}`, `sessions/<pid>.json` and `sessions/<pid>.<hash>.key`. **The prompt canary was in exactly two places: one `history.jsonl` line and the project transcript.** After cleanup: none. `sessions/<pid>.*` is removed by claude on exit (absent even in the cleanup-disabled twin). Residue that is not prompt text: the `.claude.json` backup (temp cwd path), caches, plugin clone, an empty `sessions/` directory.
+
+**Not established.** The lock claude uses for `history.jsonl`: only `.claude.json.lock` was ever seen at top level (a mkdir lock lives milliseconds, the probe polled every 20 ms). The rewrite uses `mkdir history.jsonl.lock`, waits 3 s, takes over a 10 s-stale lock, fails closed. `.claude.json` itself is claude's read-modify-write file under `.claude.json.lock`; our trust write and removal (and #566's) only serialise in-process. Follow-up: take claude's lock there.
+
+Other live rows, run 2: genuine message on Haiku `outcome=intent; action=hire` 2/2; contract variant `productionParseOk=true` 5/5; production model id exit 1 in 2982 ms (`warnedApiError=true`); hang rate baseline 1/5 hung, contract 0/5.
+
+### Local verification
+
+- `src/oneshot` + `session-actions-argv`: **237 pass, 1 skip, 0 fail**. PTY/runner files (16): **460 pass, 0 fail**. The HTTP "stalled body" timeout test failed once in four runs (1 instead of 124, noted in r3) and passed on both reruns.
+- Lint: **0 errors, 1319 warnings, 324 infos**. Typecheck ratchet: **149 against baseline 149**. Plugin and marketplace **2.2.353**.
+- Integration file run locally: 40 skipped, as designed.
+- biome's safe autofix rewrote the sanitiser's `new RegExp(...)` into literals and tripped `noControlCharactersInRegex`; reverted by hand.
+
+### Fault injection, one site each, restored after (RED verbatim)
+
+```text
+B1 trust write skipped        (fail) ... B1: the throwaway cwd is trusted in the child's config root, then unmarked > writes the trust entry where the child's CLAUDE_CONFIG_DIR points, during the turn
+B1 removal skipped            (fail) ... > removes only its own entry afterwards and keeps every other key
+B1 wrong root (configDir)     (fail) ... > uses HOME/.claude.json when CLAUDE_CONFIG_DIR is not set
+B2 strip skipped              (fail) B2: the spawn strip list applies to the untrusted policy env > never passes ANTHROPIC_API_KEY, CLAUDECODE or a short-lived OAuth token to the child
+B3 replacement off            (fail) B3: `@` file mentions are neutralised for untrusted prompts only > replaces every `@`, not just a leading one, with U+FF20 on the untrusted path
+B3 leading-only               (same row)
+B3 print replacement skipped  (fail) B3 (print): `claude -p` expands @ mentions too, so the same replacement applies > replaces every @ in an untrusted print prompt
+C1 history skipped            (fail) C1: persistence beyond the transcript is removed > removes this call's history lines and per-session files, and nothing else   (+2)
+C1 session files skipped      (fail) ... > removes this call's history lines and per-session files, and nothing else   (+1)
+C2 implicit ignores the gate  (fail) C2: PTY isolation is advertised only on a measured claude version > below, or unreadable: isolation withheld, untrusted routes resolve to print, one warning
+C2 gate sets nothing          (fail) ... same row, and: an explicit pty route is refused at the call while isolation is withheld
+C2 registry default true      (fail) pty isolation is OFF in a fresh process that never probed (fail closed)
+C3 no second cleanup          (fail) C3: cleanup runs again once a late-landing spawn has settled > removes state a claude wrote after the call had already returned
+D1 abort not 124              (fail) #570 failed-turn latency > runOnceOnPty: an abort during the transcript wait is exit 124, not 1 (D1)
+D2 relative root allowed      (fail) D2: the config root must be absolute; empty means unset > fails closed before any spawn on a relative root
+D3 failure after reply        (fail) #570 one-shot PTY reply extraction > (b) a real reply followed by an API-error entry is a failure, not a partial success   (+1)
+D3 readdir unguarded          (fail) #570 failed-turn latency > scanning a project dir that cannot be listed supplies no evidence and does not throw (D3)
+D4 system not passed          (fail) D4: req.system reaches the untrusted PTY as --system-prompt > passes it as print does
+D6 failure swallowed          (fail) C1: persistence beyond the transcript is removed > D6: a failing step is logged by step and code, still attempts the rest, then throws
+```
+
+Two injections first did not count: D1's `waited.failure === "aborted"` was redundant with `req.signal?.aborted` (removed, then RED), and D3's first readdir injection was a syntax error (redefined, then RED). Not injected: the bounded lock loop (an unbounded one hangs the runner, so no test can go red on it; there is a test that a dangling-symlink lock fails closed in bounded time), and D5 (structural: the old option no longer type-checks). The C3 test exercises the late-spawn branch; the late-admission branch shares `lateRetire` but has no test of its own.
+
+### Out of scope, for the coordinator
+
+bun-pty `env_clear` instead of the global env swap; a classifier rate limit; a narrower tuner env allowlist; `discord.ts`'s retired model id; claude's own `.claude.json.lock` for the trust write; a process that never runs `start.ts` (the tuner CLI) now stays on print by default, which is the safe direction but changes its routing.
