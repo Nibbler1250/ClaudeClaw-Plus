@@ -715,7 +715,7 @@ describe("retrySurvivingGroups with no recorded start time (r14d, H2)", () => {
         reap: async () => [],
       });
       expect(cleared).toBe(0);
-      // Went red (a SIGTERM to -4242 among the calls) with the first-termination check dropped.
+      // Went red (SIGTERM then SIGKILL to -4242 sent) with the first-termination check dropped.
       expect(sent.filter(([, name]) => name !== 0)).toEqual([]);
       expect(groupSurvivorOf("/tmp/root-null")).toBe(4242);
     } finally {

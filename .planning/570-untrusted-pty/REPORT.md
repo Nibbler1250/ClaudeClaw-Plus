@@ -1099,3 +1099,121 @@ The retry injection changed `attempts === 2` to `attempts >= 1`, so the loop ret
 
 - The other `claude-sonnet-4-20250514` uses in `src/oneshot/pty-trusted.test.ts:61` and `src/oneshot/http.test.ts:53` (test fixtures).
 - The r14b security-review items (cgroup or PID namespace for untrusted PTYs; `survivor.json` in a daemon-owned directory).
+
+
+## r14d: Codex r14 review fixes (two HIGH, one MEDIUM)
+
+Commits `caefb808` (H1), `233113e7` (H2), `58b58d96` (M1), plus this section. No PR, no GitHub comment, no version bump (2.2.353). **No integration run**: all three are unit-testable. Codex reviewed `b70de61c..1fb48dbd`; the coordinator checked all three findings in the code before dispatch.
+
+### H1. Linux start times compare exactly
+
+`START_TIME_TOLERANCE_MS = 2000` was applied to Linux `/proc/<pid>/stat` field-22 start times, which are exact (boot time plus ticks). A 2 s window there only lets a recycled pid read as the same process (Codex's probe: recorded 10000, replacement 11000, both signals sent to the replacement).
+
+- `src/runner/pty-proc-identity.ts`: new `sameStart(a, b, platform = process.platform)`. Linux compares within `LINUX_START_TOLERANCE_MS` (= 1000 / `LINUX_CLOCK_TICKS_PER_SECOND` = 10 ms; the code already fixes the tick rate at 100, it does not call `getconf CLK_TCK`). Everything else keeps `START_TIME_TOLERANCE_MS` (2000 ms), because `ps -o lstart=` has one-second resolution.
+- All four comparison sites now call it: `pidIdentity` (`pty-proc-identity.ts`), `terminateEscapees` (`pty-escape-scan.ts`), `heldProcAlive` and `isOwnerDead` (`src/oneshot/pty-cleanup.ts`). `rg START_TIME_TOLERANCE_MS` finds it only in the helper and its doc comment now.
+- `heldProcAlive` is exported so its Linux path can be tested. `src/runner/pty-test-platform.ts` (`withPlatform`, `withPlatformAsync`) sets `process.platform` for a test body and restores it, so the Linux path runs on a macOS dev machine and the `ps` path on Linux CI.
+- Tests, each with a Linux case (one second apart is a different process) and, where it can be asked, a `darwin` twin (still the same process): `sameStart` (3), `pidIdentity`, `terminateEscapees` (no signal sent to the replacement), `heldProcAlive`, `isOwnerDead`.
+
+Fault injection on a `git archive` copy of the H1 commit, one site at a time (A is "the 2000 ms window back on the Linux path only", B to E are the old comparison at one site):
+
+```text
+== inj-A.txt
+(fail) start-time comparison by platform (r14d, H1) > a held process whose /proc start moved by one second is gone; under ps it is the same
+(fail) start-time comparison by platform (r14d, H1) > an owner whose /proc start moved by one second is dead; under ps it is still the owner
+(fail) sameStart > compares Linux /proc start times to within one clock tick
+(fail) sameStart > takes the platform from the process by default
+(fail) pidIdentity on Linux > calls a pid whose start moved by one second recycled
+(fail) terminateEscapees (fake /proc) > does not signal a pid whose /proc start time moved by one second (a recycled pid on Linux)
+== inj-B_pidIdentity.txt
+(fail) pidIdentity on Linux > calls a pid whose start moved by one second recycled
+== inj-C_escapeScan.txt
+(fail) terminateEscapees (fake /proc) > does not signal a pid whose /proc start time moved by one second (a recycled pid on Linux)
+== inj-D_heldProcAlive.txt
+(fail) start-time comparison by platform (r14d, H1) > a held process whose /proc start moved by one second is gone; under ps it is the same
+== inj-E_isOwnerDead.txt
+(fail) start-time comparison by platform (r14d, H1) > an owner whose /proc start moved by one second is dead; under ps it is still the owner
+```
+
+### H2. No recorded start time means no signal on a later retry
+
+`GroupTarget.sendGroup` signalled `-pid` whenever `leaderStartMs === null` and the group had a member. That is right during the immediate dispose (the leader was spawned moments ago) and wrong for a survivor retried minutes later, when group membership no longer proves the group is ours.
+
+- `GroupTerminationOptions.firstTermination?: boolean` (`src/runner/pty-group-kill.ts`). `sendGroup` allows the unrecorded-start fallback only when `leaderStartMs === null && firstTermination`. It is an explicit flag from the caller, never inferred from timing in `GroupTarget`.
+- `PtyProcess.dispose` passes `firstTermination: true`. That call is already inside the `sweepGroup` window (alive, or exited within `GROUP_SWEEP_MAX_AGE_MS`), so the flag sits inside the existing 30 s bound. A `_groupTermination` test override spreads after it, as before.
+- `retrySurvivingGroups` (`pty-cleanup.ts`) does not pass it, so a survivor with `startMs === null` is not signalled: the group poll still runs (it may die on its own and clear the entry), the root stays registered, and one `console.warn` per root says `survivor of pid N not signalled again: start time not recorded (<root basename>); root kept`. Metadata only: pid and the root's basename, no path, no cwd. The sweeper's own `groupGoneNow` never signalled, so it needed no change; a survivor restored from `survivor.json` with a null start lands in the same retry path.
+- The "signalling its group on group membership alone" warning in `GroupTarget` now fires only when that fallback is actually used (first termination).
+- Tests: `terminateProcessGroup` with a null start and no flag signals nothing and warns nothing (new); with the flag it still sends `-pid` only, once-logged (existing, now passes the flag); the group-absent case keeps the flag so it still tests what it says. `retrySurvivingGroups` with a null start is not told `firstTermination`, stays registered after three passes, logs once, and the log holds no path (new); with the real termination against a live group it sends nothing (new). A real-PTY dispose test with the pid answering `kill(pid, 0)` and an unreadable start sends `-pid` SIGTERM then SIGKILL, and never the bare pid.
+
+First draft of that last test failed to fail: with a real shell the reaped leader reads `gone`, which signals the group regardless of the flag, so injection H2c stayed green. It now uses a kernel on which the pid still answers and its start cannot be read, the one case the flag decides. The H2c line below is from that version.
+
+```text
+== inj-H2a_flagCheckDropped.txt
+(fail) retrySurvivingGroups with no recorded start time (r14d, H2) > sends no signal at all to a live group with the real termination
+(fail) terminateProcessGroup > pid identity (#570 r13, B) > signals nothing for an unrecorded start time on a later retry, however live the group, and logs nothing
+== inj-H2b_retryPassesFlag.txt
+(fail) retrySurvivingGroups with no recorded start time (r14d, H2) > is not told it is the first termination, keeps the root registered, and says so once with metadata only
+(fail) retrySurvivingGroups with no recorded start time (r14d, H2) > sends no signal at all to a live group with the real termination
+== inj-H2c.txt
+(fail) retiring a PTY child > signals the group, not the bare pid, of a child that exited on its own with no start time recorded, during the dispose that follows
+== inj-H2d_logEveryPass.txt
+(fail) retrySurvivingGroups with no recorded start time (r14d, H2) > is not told it is the first termination, keeps the root registered, and says so once with metadata only
+```
+
+### M1. No terminal text in public CI logs
+
+- `captureScreen` (`tests/integration/untrusted-pty-isolation.test.ts`) no longer prints `screen-begin` / `screen-end` or any line of the screen. It prints one line from `screenSignals` (`src/runner/pty-screen-signals.ts`, pure): `lines`, `permissionPrompt`, `errorBanner`, `spinner`, `blocked` (the name of the first matching `BLOCKED_BOOT_SCREENS` entry, or `none`) and `ready` (the REPL footer). `BLOCKED_BOOT_SCREENS` and `REPL_FOOTER` are now exported from `pty-process.ts` so the harness names what production matches. Flags are still computed on the whole text, so one sensitive word cannot hide a line.
+- Unit guard (`src/runner/pty-screen-signals.test.ts`): hostile screens (a password, a `sk-ant-oat01-...` token, an email, a throwaway-root path, 100 repeated lines) produce a line that contains none of it **and** matches a whole-line pattern of the six fixed fields, so a free-text field cannot be added without going red.
+
+What I checked in the harness (every `console.info` call, 44 of them, extracted in full, plus the `expect` calls whose diff prints a value):
+
+| Site | Prints | Verdict |
+| --- | --- | --- |
+| `captureScreen` | was 40 lines of screen text | **fixed**: signals only |
+| `replyShape` (`production-text:` at the `reply-shape` and `genuine` rows) | parse booleans, outcome from a fixed set, `action` = the model's `intent.action` string, names count, length | **fixed**: `action` was model text; now `hire` / `other` / `none` (`actionWord`). Label renamed `production-shape` |
+| transcript `diagnostics` (`kinds`, `stop`, `blocks`) | record types, stop reasons, block types from the child's transcript | **fixed**: each goes through `plainWord` (short plain word, else `other`) |
+| `shapeOf` / `shapeSummary` | first three path segments under a throwaway root | **fixed**: each segment through `plainWord`, so a child-made file name cannot appear |
+| `argv=` | the argv, including `--system-prompt` text | **fixed**: prompt text becomes its length (`argvShape`) |
+| `scan-unknown:` | production warning for unreadable processes, which for the restart case names the throwaway dir | **fixed**: dir name removed (`withoutDirNames`) |
+| `afterTurnHook failed` (2 rows) | `String(error)`, a message | **fixed**: `errorWord` (code or class name) |
+| `run-threw`, `F3 failReasons` | code, sanitised inline | **unified** on `errorWord` |
+| `expect(result.text).toBe("")` | a failing diff would print the child's text | **fixed**: asserts the length |
+| `expect(readdirSync(options.cwd))` | a failing diff would print file names in the throwaway cwd | **fixed**: names through `plainWord` |
+| `transcriptRaw`, `liveChunks`, `rawText`, `assistantReply` | in-memory only | no print site found (`rg`: none reaches a log) |
+| everything else (`property`, `direction`, counts, lengths, exit codes, timings, booleans, `tokenLength`, `storeMode`, `reached-api`, hang-rate rows) | fixed words, numbers, booleans | unchanged |
+
+Residual, not changed: a failing `toEqual` on the canonical argv prints the production system prompt (a constant, not child text), and `shapeSummary` still prints the first path segments of files the child's config root holds, now limited to plain words. If the coordinator wants those gone too, say so.
+
+Fault injection (one site each; `M1a` adds a text sample to the signals, `M1b` makes `blocked` return the pattern source, `M1c` to `M1f` pass `plainWord`, `actionWord`, `argvShape` and `errorWord` through unchanged):
+
+```text
+== inj-M1a_sampleAdded.txt
+(fail) screenSignals > lets nothing of the screen into the log line, whatever the screen holds
+(fail) screenSignals > still says what the screen is: flags, a blocked screen by name, the footer, a line count
+(fail) screenSignals > reports an empty screen as zero lines and nothing blocked
+== inj-M1b_blockedIsPatternSource.txt
+(fail) screenSignals > lets nothing of the screen into the log line, whatever the screen holds
+(fail) screenSignals > still says what the screen is: flags, a blocked screen by name, the footer, a line count
+== inj-M1c_plainWordPassThrough.txt
+(fail) the other words the harness prints from the child's side > plainWord keeps a short plain word and replaces anything else
+== inj-M1d_actionPassThrough.txt
+(fail) the other words the harness prints from the child's side > actionWord names the one known action and hides the rest
+== inj-M1e_argvUnshaped.txt
+(fail) the other words the harness prints from the child's side > argvShape replaces prompt text with its length and leaves the flags
+== inj-M1f.txt
+(fail) the other words the harness prints from the child's side > errorWord is a code or a class name, never the message
+```
+
+### Gate
+
+- `bun run lint`: exit 0, 1390 warnings, no errors. `bun run typecheck`: 149 errors, baseline 149.
+- `bun test src/oneshot src/runner discord` (26 files): **521 pass, 7 skip, 0 fail**. Run with `env -u ANTHROPIC_BASE_URL`, output to a file.
+- No integration run. The H2 and M1 changes touch no spawn path; H1 changes only a comparison. The coordinator decides whether a confirming run is wanted.
+
+### Not fixed: two flaky tests that exist at `a0b44f09`
+
+`src/runner/pty-group-retire.test.ts` fails about 1 run in 8 on the unmodified HEAD archive (measured: 1 of 8), in `does not signal the group of a child that exited long ago` and, in another run, `sweeps the descendants of a child that already exited on its own`. Both start `(trap '' HUP; exec sleep 60) & echo $! > $BG` and let the shell exit at once: if the shell exits and the PTY hangs up before the background job has run `trap`, the `sleep` dies of the hangup and `alive(bg)` is false. My new dispose test avoids it by not depending on the background job. The same one-line fix (let the shell outlive the trap, e.g. `; sleep 0.5`) would stabilise the two old ones; I did not touch them. They passed in the full gate run above.
+
+### Follow-ups
+
+- The two flaky tests above.
+- The r14b items still open (cgroup or PID namespace for untrusted PTYs; `survivor.json` in a daemon-owned directory).
