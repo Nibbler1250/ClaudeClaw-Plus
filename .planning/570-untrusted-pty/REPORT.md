@@ -1215,5 +1215,5 @@ Fault injection (one site each; `M1a` adds a text sample to the signals, `M1b` m
 
 ### Follow-ups
 
-- The two flaky tests above.
+- ~~The two flaky tests above.~~ Fixed in the follow-up commit: `BG_THEN_EXIT` in `pty-group-retire.test.ts` makes the shell wait for a `.ready` file the background child creates after `trap`, for all three exit-at-once tests (the third, `sweeps the descendants`, had flaked too). Test-only. 20 consecutive runs of the file, each to its own file: 20 exit 0, 0 `(fail)` lines, `16 pass / 0 fail` in every run (baseline was 1 failure in 8).
 - The r14b items still open (cgroup or PID namespace for untrusted PTYs; `survivor.json` in a daemon-owned directory).

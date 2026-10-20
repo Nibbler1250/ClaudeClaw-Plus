@@ -68,6 +68,13 @@ async function spawnShell(script: string, extra: Partial<PtyProcessOptions> = {}
 // The shell itself dies of the hangup; the background job ignores it and outlives the closed PTY.
 const HUP_PROOF_BG = "(trap '' HUP; exec sleep 60) & echo $! > $BG; sleep 60";
 
+// A shell that exits at once, leaving a HUP-proof background child. The shell does not exit until
+// the child has installed its trap and said so: the pid file is written at the fork, before the
+// trap, and a hangup that arrives first (the shell is a session leader) kills the child, which
+// flaked these tests about 1 run in 8.
+const BG_THEN_EXIT =
+  "(trap '' HUP; : > $BG.ready; exec sleep 60) & echo $! > $BG; while [ ! -e $BG.ready ]; do sleep 0.02; done";
+
 describe("retiring a PTY child", () => {
   it("is the leader of its own process group (pgid equals pid)", async () => {
     const { child } = await spawnShell(HUP_PROOF_BG);
@@ -121,7 +128,7 @@ describe("retiring a PTY child", () => {
   });
 
   it("sweeps the descendants of a child that already exited on its own", async () => {
-    const { child, bg } = await spawnShell("(trap '' HUP; exec sleep 60) & echo $! > $BG");
+    const { child, bg } = await spawnShell(BG_THEN_EXIT);
     await until(() => !child.isAlive());
     expect(alive(bg)).toBe(true); // the leader is gone, its background child is not
     await child.dispose();
@@ -164,7 +171,7 @@ describe("retiring a PTY child", () => {
 
   it("does not signal the group of a child that exited long ago (its pid may be someone else's now)", async () => {
     let clock = 1_000_000;
-    const { child, bg } = await spawnShell("(trap '' HUP; exec sleep 60) & echo $! > $BG", {
+    const { child, bg } = await spawnShell(BG_THEN_EXIT, {
       _now: () => clock,
     });
     await until(() => !child.isAlive());
@@ -177,7 +184,7 @@ describe("retiring a PTY child", () => {
   it("still looks for descendants that left the group when the child exited long ago", async () => {
     let clock = 1_000_000;
     let scans = 0;
-    const { child } = await spawnShell("(trap '' HUP; exec sleep 60) & echo $! > $BG", {
+    const { child } = await spawnShell(BG_THEN_EXIT, {
       _now: () => clock,
       reapEscapees: async () => {
         scans++;
