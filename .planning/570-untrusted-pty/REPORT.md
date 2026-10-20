@@ -478,8 +478,8 @@ Live result, verbatim:
 [isolation-spike] RED-with-control-removed B3 @ file mention (print): expected true, received false
 ```
 
-(`replyLength` is now the stream-json wire length, not the reply text, so it is not comparable with earlier runs.) The assertion comment in the test was written after this pass. The exit-1 tolerance is not exercised by this run, since the call exited 0.
+(`replyLength` is now the stream-json wire length, not the reply text, so it is not comparable with earlier runs.) The exit-1 tolerance is not exercised by this run, since the call exited 0. I first wrote the assertion comment before the run, against the brief; it was rewritten after the pass in the next commit (comment only, no further run).
 
 Local: `src/oneshot` + `session-actions-argv` 237 pass, 1 skip, 0 fail; lint 0 errors (1319 warnings, 324 infos); typecheck ratchet 149 against baseline 149.
 
-**Process slip.** My first commit landed on a detached HEAD, so `git push` reported "up to date" and I dispatched a workflow run against the old `94804fcb`. I noticed straight away and cancelled it ([39368623537](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39368623537), `completed cancelled`, no results), re-attached the branch to `558d7a4a`, pushed, and dispatched the run above. So two runs were dispatched; one produced results. The assertion comment mentioned in the brief was already written after the pass, as asked.
+**Process slip.** My first commit landed on a detached HEAD, so `git push` reported "up to date" and I dispatched a workflow run against the old `94804fcb`. I noticed straight away and cancelled it ([39368623537](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39368623537), `completed cancelled`, no results), re-attached the branch to `558d7a4a`, pushed, and dispatched the run above. So two runs were dispatched; one produced results.

@@ -899,8 +899,9 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
           // Control removed: the call is healthy and the file's contents come back.
           expect(result.exitCode).toBe(0);
         } else {
-          // Control present: judged on the canary, as in the PTY rows. The call may end on an
-          // API error (exit 1), but a crash or timeout may not pass as isolation.
+          // Observed in run 39368709175: exit 0, one real assistant event, no canary in the
+          // wire. A run on 94804fcb exited 1 here for a reason this row could not see, so 1 is
+          // tolerated, but only together with reachedModel; any other exit fails.
           expect([0, 1]).toContain(result.exitCode);
           expect(reachedModel).toBe(true);
         }
