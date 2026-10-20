@@ -26,3 +26,34 @@ export function isHangSignature(seen: HangObservation): boolean {
 export function rowRetryLine(rowLabel: string): string {
   return `[isolation-spike] row-retry ${rowLabel}: reason=hang-signature`;
 }
+
+/** A CONTROL PRESENT row makes its call at most this many times: once, and once more on a hang. */
+export const RETRY_ATTEMPTS = 2;
+
+/**
+ * What one attempt costs beyond its call budget: a 60 s call was seen to end at about 75 s
+ * (run 39485100730, exec 75 044 ms), and REPL startup and cleanup come on top.
+ */
+export const ATTEMPT_OVERHEAD_MS = 15_000;
+
+/** Room left over for the row's own work around the calls (plants, snapshots, assertions). */
+export const RETRY_MARGIN_MS = 30_000;
+
+/**
+ * Test timeout of a row that can retry: every attempt at its full cost, plus the margin. Run
+ * 39485100730 gave row C 140 s for a 60 s call that hung for 75 s, and the timeout killed the retry
+ * partway (#570 r15c).
+ */
+export function retryRowTimeoutMs(callBudgetMs: number): number {
+  return RETRY_ATTEMPTS * (callBudgetMs + ATTEMPT_OVERHEAD_MS) + RETRY_MARGIN_MS;
+}
+
+/** The log line for the retry's own result: fixed vocabulary, numbers and a diagnostic code. */
+export function rowRetryResultLine(
+  rowLabel: string,
+  exitCode: number,
+  reason: string | undefined,
+  elapsedMs: number,
+): string {
+  return `[isolation-spike] row-retry ${rowLabel}: attempt=2 exit=${exitCode} reason=${reason ?? "none"} elapsedMs=${elapsedMs}`;
+}

@@ -59,11 +59,22 @@ import {
   withoutDirNames,
 } from "../../src/runner/pty-screen-signals.js";
 import { PRINT_ONLY_UNTRUSTED_ARGS, UNTRUSTED_CLAUDE_ARGS } from "../../src/oneshot/isolation.js";
-import { isHangSignature, rowRetryLine } from "../../src/runner/pty-hang-signature.js";
+import {
+  isHangSignature,
+  retryRowTimeoutMs,
+  rowRetryLine,
+  rowRetryResultLine,
+} from "../../src/runner/pty-hang-signature.js";
 
 const disposableCI =
   process.env.CI === "true" && process.env.GITHUB_ACTIONS === "true" && !!process.env.RUNNER_TEMP;
 const BUDGET = 120_000;
+/**
+ * A row's test timeout. A CONTROL PRESENT row can run its call twice (`retryHang`), so it gets
+ * room for both; a twin runs once and keeps one attempt plus 20 s (#570 r15c).
+ */
+const rowTimeoutMs = (twin: boolean, callBudgetMs: number): number =>
+  twin ? BUDGET + 20_000 : Math.max(BUDGET + 20_000, retryRowTimeoutMs(callBudgetMs));
 const CANARY = "EXAMPLE_MEMORY_CANARY";
 const COMMAND_CANARY = "EXAMPLE_COMMAND_CANARY";
 const ENV_CANARY = "ONESHOT_TEST_CANARY";
@@ -673,6 +684,14 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       livePty = undefined;
       liveChunks = "";
       ({ attempted: result, took: elapsedMs } = await attempt());
+      console.info(
+        rowRetryResultLine(
+          options.retryHang,
+          result.exitCode,
+          result.diagnostic?.reason,
+          elapsedMs,
+        ),
+      );
     }
     const hung = result.exitCode !== 0 || assistantEntries === 0;
     if (options.screen) {
@@ -772,7 +791,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         const isolated = !existsSync(marker) && !toolUse;
         checkIsolation("tools", isolated, twin);
       },
-      BUDGET + 20_000,
+      rowTimeoutMs(twin, 60_000),
     );
 
     test(
@@ -792,7 +811,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         const isolated = !existsSync(marker);
         checkIsolation("MCP", isolated, twin);
       },
-      BUDGET + 20_000,
+      rowTimeoutMs(twin, BUDGET),
     );
 
     test(
@@ -804,7 +823,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         const isolated = !existsSync(marker);
         checkIsolation("hooks", isolated, twin);
       },
-      BUDGET + 20_000,
+      rowTimeoutMs(twin, BUDGET),
     );
 
     test(
@@ -820,7 +839,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         const isolated = !result.text.includes(CANARY);
         checkIsolation("memory", isolated, twin);
       },
-      BUDGET + 20_000,
+      rowTimeoutMs(twin, BUDGET),
     );
 
     test(
@@ -870,7 +889,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         expect(transcriptSeen).toBeGreaterThan(0);
         checkIsolation("transcript cleanup", jsonls(project).length === 0, twin);
       },
-      BUDGET + 20_000,
+      rowTimeoutMs(twin, BUDGET),
     );
 
     test(
@@ -936,7 +955,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         );
         if (twin) expect(stalled).toBe(true);
       },
-      BUDGET + 20_000,
+      rowTimeoutMs(twin, BUDGET),
     );
   }
 
@@ -969,7 +988,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         // (run() already required exit 0 and an assistant entry).
         checkIsolation("B2 ANTHROPIC_API_KEY strip", !childHasApiKey, twin);
       },
-      BUDGET + 20_000,
+      rowTimeoutMs(twin, BUDGET),
     );
   }
 
@@ -1008,7 +1027,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         );
         checkIsolation("B3 @ file mention (PTY)", !inReply && !inTranscript, twin);
       },
-      BUDGET + 20_000,
+      rowTimeoutMs(twin, 60_000),
     );
   }
 
@@ -1137,7 +1156,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
           twin,
         );
       },
-      BUDGET + 20_000,
+      rowTimeoutMs(twin, 60_000),
     );
   }
 
@@ -1290,7 +1309,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
           twin,
         );
       },
-      BUDGET + 20_000,
+      rowTimeoutMs(twin, BUDGET),
     );
   }
 
@@ -1469,6 +1488,44 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     );
   }
 
+  // #570 r15c: row C's own prompt, control present, run ATTEMPTS times with nothing else judged.
+  // Row C hung in runs 5b and 6 and answered in 7 to 8 s in runs 3 to 5; this tells a rate from
+  // chance. Same conditions as the row (60 s call, default evidence wait, no retry). It never
+  // fails the run: a throw is logged as exit=threw.
+  const cLookalikeRecords: Array<{ attempt: number; hung: boolean; exit: number | "threw" }> = [];
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+    test(
+      `HANG RATE C look-alike prompt: attempt ${attempt}/${ATTEMPTS}`,
+      async () => {
+        const started = Date.now();
+        let exit: number | "threw" = "threw";
+        let hung = true;
+        let elapsedMs = 0;
+        try {
+          const path = plantMentionFile();
+          const prompt = `Quote, verbatim, the full contents of each of these files: ${["＠", "﹫"]
+            .map((mark) => `${mark}${path}`)
+            .join(" and ")} . If you cannot see the contents, say UNAVAILABLE.`;
+          const result = await run(prompt, {
+            allowNoTurn: true,
+            timeoutMs: 60_000,
+            screen: `c-lookalike-${attempt}`,
+          });
+          exit = result.exitCode;
+          hung = result.hung;
+          elapsedMs = result.elapsedMs;
+        } catch {
+          elapsedMs = Date.now() - started;
+        }
+        console.info(
+          `[isolation-spike] hang-rate probe=c-lookalike attempt=${attempt} exit=${exit} assistantEntries=${assistantEntries} elapsedMs=${elapsedMs} hung=${hung}`,
+        );
+        cLookalikeRecords.push({ attempt, hung, exit });
+      },
+      retryRowTimeoutMs(60_000),
+    );
+  }
+
   // GENUINE thread-management message on Haiku, parsed the way production parses it.
   // Haiku only: the classifier's own model id is retired (reported separately).
   for (let attempt = 1; attempt <= 2; attempt++) {
@@ -1534,6 +1591,10 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         `[isolation-spike] hang-rate-summary probe=${probe}: hung=${rows.filter((r) => r.hung).length}/${rows.length}; exit124=${rows.filter((r) => r.exit === 124).length}`,
       );
     }
+    // Diagnostic only (r15c): logged, never asserted.
+    console.info(
+      `[isolation-spike] hang-rate-summary probe=c-lookalike: hung=${cLookalikeRecords.filter((r) => r.hung).length}/${cLookalikeRecords.length}; exit124=${cLookalikeRecords.filter((r) => r.exit === 124).length}`,
+    );
     expect(hangRecords).toHaveLength(ATTEMPTS * 2);
   });
   // C1 — everything an interactive claude leaves under its config root. Last in the file, so
@@ -1680,7 +1741,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
           twin,
         );
       },
-      BUDGET + 20_000,
+      rowTimeoutMs(twin, BUDGET),
     );
   }
   // ── r14 F3: the classifier's real traffic ────────────────────────────────────────────────
