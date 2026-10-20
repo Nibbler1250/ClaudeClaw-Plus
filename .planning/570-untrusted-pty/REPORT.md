@@ -1588,3 +1588,67 @@ hang-rate probe=c-lookalike attempt=5 exit=0 assistantEntries=4 elapsedMs=9933 h
 ```
 
 The c-lookalike probe hung again, this time on attempt 3 rather than the first call, so r15c's "first call of a fresh sequence" reading is not supported by this run. The cause is still unknown.
+
+
+## r15e: the concurrency slot follows the child (Codex MEDIUM)
+
+Commit `220d554a`, from `bde5be0c`, pushed to povai. No version bump (2.2.355), no PR comment, no `@codex review`.
+
+The invariant restored: **a slot is held while a child of that call may still be alive, and is freed only on positive evidence that it is gone.** Both halves of the finding were real: the survivor path freed the slot in `runOnceOnPty`'s `finally` even when `cleanupUntrustedOneShot` threw on a survivor, and the ceiling path freed it at 60 s whether or not `retired` had settled.
+
+| Item | Change |
+| --- | --- |
+| Survivor | `OneShotSlot.freeWhen` is replaced by `settle(root, retired?)`. If `root` is a recorded survivor, the reservation moves into `survivorSlots` (keyed by config root, holding the reservation's own `free`, not a second counter). `retrySurvivingGroups` releases it, once, when it clears the entry (the identity-checked group kill plus escape scan). A survivor already cleared before `settle` runs frees at once. |
+| Ceiling | The `setTimeout` no longer frees. At the ceiling it logs `[pty-supervisor] one-shot slot held past ceiling: retirement pending` once per held slot. The slot then waits on `retired`; when that settles (resolve or reject) `settle` hands over to the survivor path if the root is by then a survivor, otherwise frees. A new call meanwhile gets `busy`. |
+| Adoption | `adoptPersistedSurvivors` calls `reserveSurvivorSlot(path)` where it re-registers a survivor, so a restarted daemon counts it against the cap until `retrySurvivingGroups` clears it. Small change, no redesign. It can take the count past the cap (the cap only refuses new calls). Re-adopting the same root on a later pass reserves once. |
+| Once only | `reserveCount()` returns an idempotent `free` (the `held` guard); `releaseSurvivorSlot` deletes the map entry before calling it. A slot epoch stops a reservation from before `resetUntrustedSlotsForTests()` from decrementing a later test's count. |
+| Test seam | `resetUntrustedSlotsForTests()`; `resetGroupSurvivorsForTests()` now also releases survivor reservations. The unit `afterEach` in `pty-untrusted-state.test.ts` calls it, because the ceiling no longer frees a slot whose fake spawn never lands. |
+| Comments and docs | `pty-supervisor.ts` finally-block comment, the `UNTRUSTED_LATE_SLOT_CEILING_MS` and `OneShotSlot` docs, `docs/oneshot-engines.md`, and the A4 row and two notes earlier in this file now say the slot follows the child until it is confirmed gone. |
+
+**No permanent wedge without a reason.** A held slot comes back when its retirement settles (including by rejection), when its survivor is confirmed gone, or when the daemon restarts. A retirement that never settles holds its slot until restart, which is the fail-closed choice the brief asked for; the ceiling log line is how it is noticed. Tests prove the three ways back.
+
+### Tests
+
+New `src/oneshot/pty-slot.test.ts` (11 tests, pure: injected `terminate`, `reap`, retirement promises and ceiling; no PTY). Every worst case exceeds the cap of 2 (3 to 4 callers, or 3 adopted survivors). Two supervisor-level changes in `pty-untrusted-state.test.ts`: the old "late claude stays counted only up to the ceiling" test now asserts the opposite (still counted past the ceiling, ceiling line logged, freed when the spawn lands), and a new case runs three real `runOnceOnPty` calls where each leaves a survivor (two throw, the third is `busy`, one retry frees one slot).
+
+### Fault injection (git archive copy outside the repo, one site each, restored after)
+
+| Injection | RED line |
+| --- | --- |
+| I1: `handOver` frees unconditionally (the old `slot?.free()`) | `pty-slot.test.ts:88` `expect(acquireUntrustedOneShotSlot()).toBeUndefined()`: `Received: { free: [Function], settle: [Function: settle] }`; 4 fail |
+| I2: the ceiling timer calls `free()` again | `pty-slot.test.ts:143` the same `toBeUndefined()` with a granted slot received; 1 fail |
+| I3: remove the `held` guard | `pty-slot.test.ts:190` `expect(untrustedOneShotsInFlight()).toBe(0)`: `Expected: 0`, `Received: -2`; 1 fail |
+| I4: skip `reserveSurvivorSlot` on adopt | `pty-slot.test.ts:241` `expect(untrustedOneShotsInFlight()).toBe(3)`: `Expected: 3`, `Received: 0`; 2 fail |
+| I5: `runOnceOnPty` calls `slot?.free()` instead of `settle` | `pty-untrusted-state.test.ts:1413` `expect(outcomes.map(...)).toEqual(["threw","threw","busy"])`: the third is `"threw"`, not `"busy"`; plus the two late-claude tests; 3 fail |
+| I6: `retrySurvivingGroups` does not release the reservation | `pty-untrusted-state.test.ts:1423` `Expected: 1`, `Received: 2`; 5 fail across both files |
+| I7: `settle` is handed `tempCwd` instead of `configRoot` | `pty-untrusted-state.test.ts:1413` third outcome `"threw"` not `"busy"`; 1 fail |
+
+I1 to I4 are the four injections the brief named. I5 to I7 cover the supervisor wiring, the wedge, and the key. Two comments I had written before running the injections predicted different numbers than I saw (`-1` and a granted slot for I3, a granted slot for I4); I corrected them to the observed lines.
+
+### Gates
+
+`src/oneshot` + `src/runner`: 484 pass, 7 skip, 0 fail, normally and with `CLAUDECLAW_TEST_PLATFORM=linux` (491 tests, 20 files). `bun run lint` exit 0 (1412 warnings, none errors; the new test file adds `noNonNullAssertion` warnings in the style the neighbouring tests already have). Typecheck ratchet 149, baseline 149. `runner.ts` was not touched, so the README `path:line` references were not re-measured.
+
+### Integration run: results
+
+Run [39513122859](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39513122859) on `220d554a` (checked: the run's `headSha`): **conclusion success; 61 pass / 0 fail**; Linux step 86/86.
+
+**Row-retry lines: none.** No row hit the hang signature, so the retry path was not exercised in CI this time either.
+
+Probe summaries: baseline 0/5, contract 0/5, c-lookalike 1/5:
+
+```
+hang-rate probe=c-lookalike attempt=1 exit=0 assistantEntries=2 elapsedMs=6672 hung=false
+hang-rate probe=c-lookalike attempt=2 exit=0 assistantEntries=2 elapsedMs=6893 hung=false
+hang-rate probe=c-lookalike attempt=3 exit=0 assistantEntries=2 elapsedMs=8207 hung=false
+hang-rate probe=c-lookalike attempt=4 exit=124 assistantEntries=0 elapsedMs=75248 hung=true
+hang-rate probe=c-lookalike attempt=5 exit=0 assistantEntries=2 elapsedMs=7547 hung=false
+```
+
+What this shows: slot accounting on the untrusted path did not regress any live row. It does not exercise the new paths (a survivor, a late retirement past the ceiling): the real claude retires cleanly in every row, so those paths are covered by the unit tests and the injections above only. The c-lookalike probe has now run in three integration runs (r15c, r15d, this one) and hung 1 of 5 each time, on attempts 1, 3 and 4; the cause is still unknown.
+
+### Not done / open
+
+- Two calls on the same config root cannot happen (the root is unique per call), so `handOver` keeps one reservation per root; the second would be freed. A test records this.
+- The ceiling is still 60 s and still unmeasured; it is now only a log trigger.
+- A late retirement that never settles holds its slot until a restart. There is no operator-visible count other than the ceiling log line.
