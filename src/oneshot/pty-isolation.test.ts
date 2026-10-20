@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, it } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { _setSettingsFileForTests, loadSettings } from "../config.js";
 import {
@@ -16,7 +16,7 @@ import {
 } from "../runner/pty-supervisor.js";
 import { untrustedPtyProjectDir } from "./pty-cleanup.js";
 import { PRINT_ONLY_UNTRUSTED_ARGS, UNTRUSTED_CLAUDE_ARGS } from "./isolation.js";
-import { withPrintRuntime } from "./print.js";
+import { printRuntime, withPrintRuntime } from "./print.js";
 import { engines } from "./registry.js";
 
 let dir: string;
@@ -60,6 +60,20 @@ function fakeSpawn(onTurn: (opts: PtyProcessOptions) => void = () => {}): void {
       lastTurnEndedAt: () => 0,
       runTurn: async () => {
         onTurn(opts);
+        // An untrusted one-shot returns the transcript reply (#570), so the
+        // double writes one where the caller's config root points.
+        const caller = printRuntime()?.env;
+        const project = untrustedPtyProjectDir(
+          opts.cwd,
+          caller
+            ? (caller.CLAUDE_CONFIG_DIR ?? join(caller.HOME ?? homedir(), ".claude"))
+            : undefined,
+        );
+        mkdirSync(project, { recursive: true });
+        writeFileSync(
+          join(project, "reply.jsonl"),
+          `${JSON.stringify({ type: "assistant", message: { id: "m", model: "haiku", content: [{ type: "text", text: "ok" }] } })}\n`,
+        );
         return { text: "ok", sessionId: "probe-session", cleanBoundary: true, bytesCaptured: 2 };
       },
       dispose: async () => {},

@@ -1,7 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { EventEmitter } from "node:events";
 import type { spawn } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  mkdtempSync,
+  writeFileSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { _setSettingsFileForTests, loadSettings, reloadSettings } from "../config.js";
@@ -9,6 +17,7 @@ import { runOneShot, type OneShotRequest } from "./engine.js";
 import { engines } from "./registry.js";
 import { KNOWN_ROUTES, UNTRUSTED_ROUTES, parseOneShotSettings } from "./config.js";
 import { PRINT_ONLY_UNTRUSTED_ARGS, UNTRUSTED_CLAUDE_ARGS } from "./isolation.js";
+import { untrustedPtyProjectDir } from "./pty-cleanup.js";
 import { buildPrintArgs, withPrintRuntime } from "./print.js";
 import { PtyClosedError, __buildClaudeArgsForTests } from "../runner/pty-process.js";
 import {
@@ -439,20 +448,31 @@ describe("one-shot isolation contract", () => {
     });
     it("is removed after a normal turn", async () => {
       let cwd = "";
+      const saved = process.env.CLAUDE_CONFIG_DIR;
+      process.env.CLAUDE_CONFIG_DIR = configDir;
       injectSpawnPty(async (opts) => {
         cwd = opts.cwd;
         return {
-          runTurn: async () => ({
-            text: "ok",
-            sessionId: "s",
-            bytesCaptured: 2,
-            cleanBoundary: true,
-          }),
+          runTurn: async () => {
+            // The untrusted result is the transcript reply (#570), not the screen.
+            const project = untrustedPtyProjectDir(opts.cwd, configDir);
+            mkdirSync(project, { recursive: true });
+            writeFileSync(
+              join(project, "s.jsonl"),
+              `${JSON.stringify({ type: "assistant", message: { id: "m", model: "haiku", content: [{ type: "text", text: "ok" }] } })}\n`,
+            );
+            return { text: "screen", sessionId: "s", bytesCaptured: 2, cleanBoundary: true };
+          },
           dispose: async () => {},
         } as never;
       });
-      const result = await withPtyIsolation(() => engines.get("pty")!.run(req));
-      expect(result.text).toBe("ok");
+      try {
+        const result = await withPtyIsolation(() => engines.get("pty")!.run(req));
+        expect(result.text).toBe("ok");
+      } finally {
+        if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+        else process.env.CLAUDE_CONFIG_DIR = saved;
+      }
       expect(existsSync(cwd)).toBe(false);
     });
   });

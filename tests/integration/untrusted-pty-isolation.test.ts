@@ -454,6 +454,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       allowNoTurn?: boolean;
       timeoutMs?: number;
       screen?: string;
+      model?: string;
     } = {},
   ) {
     expect(baselineLeakObserved).toBe(false);
@@ -466,6 +467,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
           route: "discord.classifier",
           isolation: "untrusted",
           prompt,
+          ...(options.model ? { model: options.model } : {}),
           timeoutMs: options.timeoutMs ?? BUDGET,
         }),
       );
@@ -683,23 +685,42 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
   const ATTEMPTS = 5;
   const hangRecords: Array<{ probe: string; attempt: number; hung: boolean; exit: number }> = [];
 
-  /** Shape only: never the reply content. Mirrors classifyThreadIntent's parse. */
-  function replyShape(text: string): string {
+  /**
+   * Mirrors classifyThreadIntent's parse of the one-shot text (src/commands/discord.ts).
+   * Reports shape only: booleans, the action name and counts, never other content.
+   */
+  function productionParse(text: string): {
+    ok: boolean;
+    outcome: "null" | "intent" | "unparseable";
+    action?: string;
+    names?: string[];
+  } {
     const trimmed = text.trim();
-    const isNull = trimmed === "null";
+    if (!trimmed || trimmed === "null") return { ok: true, outcome: "null" };
     const match = trimmed.match(/\{[\s\S]*\}/);
-    let json = false;
-    if (match) {
-      try {
-        JSON.parse(match[0]);
-        json = true;
-      } catch {
-        json = false;
-      }
+    if (!match) return { ok: true, outcome: "null" };
+    try {
+      const intent = JSON.parse(match[0]) as { action?: unknown; names?: unknown };
+      return {
+        ok: true,
+        outcome: "intent",
+        ...(typeof intent.action === "string" ? { action: intent.action } : {}),
+        ...(Array.isArray(intent.names) ? { names: intent.names.map(String) } : {}),
+      };
+    } catch {
+      return { ok: false, outcome: "unparseable" };
     }
-    const strict = isNull || (json && match?.[0] === trimmed);
-    return `empty=${trimmed === ""}; isNull=${isNull}; parsesJson=${json}; strictContractShape=${strict}; productionParseOk=${isNull || json}; length=${trimmed.length}`;
   }
+  function replyShape(text: string): string {
+    const parsed = productionParse(text);
+    const trimmed = text.trim();
+    return `productionParseOk=${parsed.ok}; outcome=${parsed.outcome}; action=${parsed.action ?? "none"}; namesCount=${parsed.names?.length ?? 0}; screenEcho=${/Return ONLY valid JSON/.test(trimmed)}; length=${trimmed.length}`;
+  }
+  const PRODUCTION_MODEL = (() => {
+    const source = readFileSync(join(import.meta.dir, "../../src/commands/discord.ts"), "utf8");
+    const at = source.indexOf('route: "discord.classifier"');
+    return source.slice(at, at + 200).match(/model:\s*"(claude-[^"]+)"/)?.[1] ?? "";
+  })();
 
   for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
     test(
@@ -743,12 +764,9 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         console.info(
           `[isolation-spike] hang-rate probe=contract attempt=${attempt} exit=${result.exitCode} assistantEntries=${assistantEntries} elapsedMs=${result.elapsedMs} hung=${result.hung}`,
         );
-        // rawText is what classifyThreadIntent would parse; transcript is the model's own entries.
+        // result.rawText is the real runOnceOnPty result: what classifyThreadIntent parses.
         console.info(
           `[isolation-spike] reply-shape probe=contract attempt=${attempt} production-text: ${replyShape(result.rawText)}`,
-        );
-        console.info(
-          `[isolation-spike] reply-shape probe=contract attempt=${attempt} transcript-text: ${replyShape(result.text)}`,
         );
         hangRecords.push({
           probe: "contract",
@@ -761,6 +779,41 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       },
       BUDGET,
     );
+  }
+
+  // GENUINE thread-management message, parsed the way production parses it.
+  // Reports whether the real runOnceOnPty result is the intent the model chose.
+  const genuineCompleted: boolean[] = [];
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    for (const fallback of [false, true]) {
+      test(
+        `GENUINE message ${fallback ? "haiku fallback" : "production model"}: attempt ${attempt}/2`,
+        async () => {
+          if (fallback && genuineCompleted[attempt - 1]) {
+            console.info(`[isolation-spike] genuine attempt=${attempt} haiku-fallback=skipped`);
+            return;
+          }
+          const model = fallback ? "haiku" : PRODUCTION_MODEL;
+          expect(model).not.toBe("");
+          const prompt = `${classifierContract}\n\n---\nUser message: please create a thread called release-notes`;
+          evidenceWaitMs = 5_000;
+          const result = await run(prompt, {
+            allowNoTurn: true,
+            timeoutMs: 30_000,
+            model,
+            screen: `genuine-${attempt}-${fallback ? "haiku" : "prod"}`,
+          });
+          const parsed = productionParse(result.rawText);
+          const completed = result.exitCode === 0 && !result.hung;
+          if (!fallback) genuineCompleted[attempt - 1] = completed;
+          console.info(
+            `[isolation-spike] genuine attempt=${attempt} model=${fallback ? "haiku" : "production"} exit=${result.exitCode} completed=${completed} elapsedMs=${result.elapsedMs} ${replyShape(result.rawText)}; expectedIntent=${parsed.outcome === "intent" && parsed.action === "hire" && (parsed.names ?? []).some((name) => /release-notes/i.test(name))}`,
+          );
+          expect(toolUse).toBe(false);
+        },
+        BUDGET,
+      );
+    }
   }
 
   test("HANG RATE summary", () => {

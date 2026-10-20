@@ -68,6 +68,7 @@ import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";
 import { trustedToolFlags, validateIsolation } from "../oneshot/isolation.js";
 import { validateRouteEngine } from "../oneshot/config.js";
 import * as untrustedCleanup from "../oneshot/pty-cleanup.js";
+import { TRANSCRIPT_WAIT_MS, awaitLastAssistantReply } from "../oneshot/pty-transcript.js";
 import { printRuntime } from "../oneshot/print.js";
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -1668,6 +1669,12 @@ function cloneSecurity(security: SecurityConfig): SecurityConfig {
 // every PTY spawn. Don't add a local copy — always go through
 // `getCleanSpawnEnv()`.
 
+let oneShotTranscriptWaitMs = TRANSCRIPT_WAIT_MS;
+/** Test seam: bound the untrusted reply wait. `null` restores the default. */
+export function injectOneShotTranscriptWaitForTests(ms: number | null): void {
+  oneShotTranscriptWaitMs = ms ?? TRANSCRIPT_WAIT_MS;
+}
+
 /**
  * A utility turn on its own PTY, through the same spawn path as keyed sessions
  * (`buildSpawnOptions`, trust self-heal, multiplexer config) with the #546
@@ -1742,6 +1749,22 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
       console.warn(`[pty-supervisor] one-shot ${req.route} failed: ${exec.stderr}`);
       return result(exec.exitCode);
     }
+    if (tempProjectDir) {
+      // The rendered screen carries the echoed prompt (for the classifier, its
+      // example JSON), so an untrusted caller must never parse it. Return the
+      // model's own reply from the transcript, which the finally below removes.
+      const reply = await awaitLastAssistantReply(tempProjectDir, {
+        waitMs: oneShotTranscriptWaitMs,
+        signal: req.signal,
+      });
+      if (reply === undefined) {
+        console.warn(`[pty-supervisor] one-shot ${req.route}: no assistant reply in transcript`);
+        return result(1, "", exec.sessionId);
+      }
+      return result(0, reply, exec.sessionId);
+    }
+    // Trusted routes keep the screen text: they carry no untrusted input, no
+    // caller parses it, and a resumed session's transcript path is not fixed.
     return result(0, exec.rawStdout, exec.sessionId);
   } finally {
     try {
