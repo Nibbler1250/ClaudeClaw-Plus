@@ -2,10 +2,18 @@ import { describe, expect, it } from "bun:test";
 import {
   actionWord,
   argvShape,
+  BLOCK_TYPES,
+  boolWord,
+  configPathWord,
   errorWord,
-  plainWord,
+  fixedWord,
+  RESULT_SUBTYPES,
   screenLogLine,
   screenSignals,
+  STOP_REASONS,
+  TRANSCRIPT_RECORD_TYPES,
+  WIRE_EVENT_TYPES,
+  wireSummary,
   withoutDirNames,
 } from "./pty-screen-signals.js";
 
@@ -71,13 +79,68 @@ describe("screenSignals", () => {
 });
 
 describe("the other words the harness prints from the child's side", () => {
-  it("plainWord keeps a short plain word and replaces anything else", () => {
-    expect(plainWord("assistant")).toBe("assistant");
-    expect(plainWord("end_turn")).toBe("end_turn");
+  it("configPathWord keeps a short plain word and replaces anything else", () => {
+    expect(configPathWord("projects")).toBe("projects");
+    expect(configPathWord(".claude.json")).toBe(".claude.json");
     // Went red (the sentence passed through) with the pattern loosened to allow spaces.
-    expect(plainWord("my password is hunter2")).toBe("other");
-    expect(plainWord("a".repeat(33))).toBe("other");
-    expect(plainWord("")).toBe("other");
+    expect(configPathWord("my password is hunter2")).toBe("other");
+    expect(configPathWord("a".repeat(33))).toBe("other");
+    expect(configPathWord("")).toBe("other");
+  });
+
+  // r14e (M1): a short plain marker passes a character filter, so each field the child writes
+  // has a fixed vocabulary instead.
+  const MARKER = "PRIVMARK123";
+
+  it("fixedWord prints a word of the vocabulary and nothing else, a short plain marker included", () => {
+    expect(fixedWord("assistant", TRANSCRIPT_RECORD_TYPES)).toBe("assistant");
+    expect(fixedWord("ai-title", TRANSCRIPT_RECORD_TYPES)).toBe("ai-title");
+    expect(fixedWord("stop_sequence", STOP_REASONS)).toBe("stop_sequence");
+    expect(fixedWord("tool_use", BLOCK_TYPES)).toBe("tool_use");
+    for (const vocabulary of [
+      TRANSCRIPT_RECORD_TYPES,
+      WIRE_EVENT_TYPES,
+      STOP_REASONS,
+      BLOCK_TYPES,
+      RESULT_SUBTYPES,
+    ]) {
+      // Went red (PRIVMARK123 printed) with the raw value passed through.
+      expect(fixedWord(MARKER, vocabulary)).toBe("other");
+      expect(fixedWord(undefined, vocabulary)).toBe("other");
+      expect(fixedWord({ type: "assistant" }, vocabulary)).toBe("other");
+    }
+  });
+
+  it("boolWord prints true or false for the booleans only", () => {
+    expect(boolWord(true)).toBe("true");
+    expect(boolWord(false)).toBe("false");
+    // Went red (Received "true") with the string "true" accepted as well.
+    expect(boolWord(MARKER)).toBe("other");
+    expect(boolWord("true")).toBe("other");
+    expect(boolWord(1)).toBe("other");
+    expect(boolWord(undefined)).toBe("other");
+  });
+
+  it("wireSummary counts known event types, and prints a marker in a type, subtype or is_error as other", () => {
+    const summary = wireSummary([
+      { type: "system" },
+      { type: "assistant" },
+      { type: MARKER },
+      { type: MARKER },
+      { type: "result", subtype: MARKER, is_error: MARKER },
+    ]);
+    expect(summary).toEqual({
+      events: { system: 1, assistant: 1, other: 2, result: 1 },
+      resultSubtype: "other",
+      resultIsError: "other",
+    });
+    expect(JSON.stringify(summary)).not.toContain(MARKER);
+    expect(wireSummary([{ type: "result", subtype: "success", is_error: false }])).toEqual({
+      events: { result: 1 },
+      resultSubtype: "success",
+      resultIsError: "false",
+    });
+    expect(wireSummary([{ type: "assistant" }]).resultSubtype).toBe("other"); // no result event
   });
 
   it("actionWord names the one known action and hides the rest", () => {

@@ -42,13 +42,89 @@ export function screenLogLine(label: string, source: string, signals: ScreenSign
   return `[isolation-spike] screen-signals ${label}: ${JSON.stringify(signals)}; source=${source}`;
 }
 
-/** Words a CI line may carry from the child's side: short, plain, or the fixed word "other". */
-const PLAIN_WORD = /^[A-Za-z0-9_.<>-]{1,32}$/;
+/**
+ * The words a CI line may carry for a field the child writes: a fixed list, and "other" for
+ * anything else. A character filter is not a vocabulary: it passes any short plain word, so a
+ * child that wrote a marker into a `type` would have printed it (#570 r14e, M1).
+ */
+export const TRANSCRIPT_RECORD_TYPES = [
+  "user",
+  "assistant",
+  "system",
+  "attachment",
+  "ai-title",
+  "cost-state",
+] as const;
+export const WIRE_EVENT_TYPES = [
+  "system",
+  "assistant",
+  "user",
+  "rate_limit_event",
+  "result",
+] as const;
+export const STOP_REASONS = [
+  "end_turn",
+  "max_tokens",
+  "stop_sequence",
+  "tool_use",
+  "pause_turn",
+  "refusal",
+] as const;
+export const BLOCK_TYPES = [
+  "text",
+  "tool_use",
+  "tool_result",
+  "thinking",
+  "redacted_thinking",
+] as const;
+export const RESULT_SUBTYPES = [
+  "success",
+  "error_max_turns",
+  "error_during_execution",
+  "error_max_budget_usd",
+] as const;
 
-/** A record type, stop reason, path segment or the like, kept only when it is a short plain word. */
-export function plainWord(value: unknown): string {
+/** `value` when it is exactly one word of `vocabulary`, else the fixed word "other". */
+export function fixedWord(value: unknown, vocabulary: readonly string[]): string {
+  return typeof value === "string" && vocabulary.includes(value) ? value : "other";
+}
+
+/** `true` or `false` only for the booleans themselves; anything else the child wrote is "other". */
+export function boolWord(value: unknown): string {
+  if (value === true) return "true";
+  if (value === false) return "false";
+  return "other";
+}
+
+/** The `--output-format stream-json` events of a print call, as the counts and words a CI line may carry. */
+export function wireSummary(events: readonly Record<string, unknown>[]): {
+  events: Record<string, number>;
+  resultSubtype: string;
+  resultIsError: string;
+} {
+  const counts: Record<string, number> = {};
+  for (const event of events) {
+    const kind = fixedWord(event.type, WIRE_EVENT_TYPES);
+    counts[kind] = (counts[kind] ?? 0) + 1;
+  }
+  const done = events.find((event) => event.type === "result");
+  return {
+    events: counts,
+    resultSubtype: fixedWord(done?.subtype, RESULT_SUBTYPES),
+    resultIsError: boolWord(done?.is_error),
+  };
+}
+
+/** Words a config path segment may carry in a CI line: short and plain, or the fixed word "other". */
+const CONFIG_PATH_WORD = /^[A-Za-z0-9_.<>-]{1,32}$/;
+
+/**
+ * A path segment of the throwaway config root, kept only when it is a short plain word. For
+ * `shapeSummary` and nothing sourced from the child's own output (that is `fixedWord`).
+ */
+export function configPathWord(value: unknown): string {
   const text = String(value);
-  return PLAIN_WORD.test(text) ? text : "other";
+  return CONFIG_PATH_WORD.test(text) ? text : "other";
 }
 
 /** The classifier action, as one of the words the harness knows: `hire`, any other (`other`), or `none`. */

@@ -47,10 +47,15 @@ import { engines } from "../../src/oneshot/registry.js";
 import {
   actionWord,
   argvShape,
+  BLOCK_TYPES,
+  configPathWord,
   errorWord,
-  plainWord,
+  fixedWord,
   screenLogLine,
   screenSignals,
+  STOP_REASONS,
+  TRANSCRIPT_RECORD_TYPES,
+  wireSummary,
   withoutDirNames,
 } from "../../src/runner/pty-screen-signals.js";
 import { PRINT_ONLY_UNTRUSTED_ARGS, UNTRUSTED_CLAUDE_ARGS } from "../../src/oneshot/isolation.js";
@@ -249,7 +254,9 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     injectSpawnPty(async (options) => {
       opts.push(options);
       // Empty but for the owner file the sweep reads (r12): nothing else is planted in the cwd.
-      expect(readdirSync(options.cwd).map(plainWord)).toEqual([cleanup.ONESHOT_OWNER_FILE]);
+      expect(
+        readdirSync(options.cwd).map((name) => fixedWord(name, [cleanup.ONESHOT_OWNER_FILE])),
+      ).toEqual([cleanup.ONESHOT_OWNER_FILE]);
       // r11: the child's config root is a per-call throwaway, never the operator's `config`.
       // A twin may re-point it at the spawn boundary (extraChildEnv); production is judged
       // on what it passed in `options.env`.
@@ -371,7 +378,8 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       for (const line of contents.split("\n").filter(Boolean)) {
         try {
           const record = JSON.parse(line);
-          kinds[plainWord(record.type)] = (kinds[plainWord(record.type)] ?? 0) + 1;
+          const kind = fixedWord(record.type, TRANSCRIPT_RECORD_TYPES);
+          kinds[kind] = (kinds[kind] ?? 0) + 1;
           toolUse ||= containsToolUse(record);
           // This call's own prompt: a `user` record carrying its (neutralised) text.
           if (
@@ -384,13 +392,13 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
             sawPrompt = true;
           if (record.type !== "assistant" || !Array.isArray(record.message?.content)) continue;
           if (typeof record.message.stop_reason === "string")
-            stops.add(plainWord(record.message.stop_reason));
+            stops.add(fixedWord(record.message.stop_reason, STOP_REASONS));
           if (record.isApiErrorMessage) apiErrors++;
           if (record.message?.model === "<synthetic>") synthetic++;
           if (!record.isApiErrorMessage && record.message?.model !== "<synthetic>")
             assistantEntries++;
           for (const block of record.message.content) {
-            blocks.add(plainWord(block.type));
+            blocks.add(fixedWord(block.type, BLOCK_TYPES));
             if (block.type === "text" && typeof block.text === "string")
               assistantReply += block.text;
           }
@@ -1010,10 +1018,8 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
               return [];
             }
           });
-        const kinds: Record<string, number> = {};
-        for (const event of events)
-          kinds[String(event.type)] = (kinds[String(event.type)] ?? 0) + 1;
-        const done = events.find((event) => event.type === "result");
+        // Counts and fixed words only: the child wrote these fields (#570 r14e, M1).
+        const wireWords = wireSummary(events);
         // A real model message: an assistant event that is neither the CLI's synthetic record
         // nor flagged as an API error.
         const reachedModel = events.some((event) => {
@@ -1027,7 +1033,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         const expanded = wire.includes(FILE_CANARY);
         // Shapes and booleans only, never content.
         console.info(
-          `[isolation-spike] B3 PRINT ${direction}: exit=${result.exitCode}; replyLength=${result.text.length}; stderrLength=${stderrLength}; events=${JSON.stringify(kinds)}; resultSubtype=${String(done?.subtype)}; resultIsError=${String(done?.is_error)}; reachedModel=${reachedModel}; canaryInWire=${expanded}`,
+          `[isolation-spike] B3 PRINT ${direction}: exit=${result.exitCode}; replyLength=${result.text.length}; stderrLength=${stderrLength}; events=${JSON.stringify(wireWords.events)}; resultSubtype=${wireWords.resultSubtype}; resultIsError=${wireWords.resultIsError}; reachedModel=${reachedModel}; canaryInWire=${expanded}`,
         );
         if (twin) {
           // Control removed: the call is healthy and the file's contents come back.
@@ -1521,7 +1527,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       .replace(/\b\d{3,}\b/g, "<n>")
       .split("/")
       .slice(0, 3)
-      .map(plainWord)
+      .map(configPathWord)
       .join("/");
   /** Distinct shapes with a count each, capped so one fat tree cannot flood the log. */
   const shapeSummary = (paths: string[]): string => {
