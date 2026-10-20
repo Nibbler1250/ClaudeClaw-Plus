@@ -358,7 +358,7 @@ const UNTRUSTED_REPL_READY_MS = 20_000;
  * proves nothing). Matched on the ANSI-stripped screen with gaps allowed, because the
  * renderer draws word gaps as cursor moves.
  */
-const BLOCKED_BOOT_SCREENS: ReadonlyArray<readonly [string, RegExp]> = [
+export const BLOCKED_BOOT_SCREENS: ReadonlyArray<readonly [string, RegExp]> = [
   [
     "login-required",
     /Not\s*logged\s*in|Run\s*\/login|Select\s*login\s*method|Paste\s*code\s*here/i,
@@ -371,7 +371,7 @@ const BLOCKED_BOOT_SCREENS: ReadonlyArray<readonly [string, RegExp]> = [
  * claude's idle REPL footer: the mode-cycler hint ("tab to cycle", every mode of 2.1.304 that
  * has one) or the default mode's "? for shortcuts".
  */
-const REPL_FOOTER = /tab\s*to\s*cycle|for\s*shortcuts/;
+export const REPL_FOOTER = /tab\s*to\s*cycle|for\s*shortcuts/;
 
 /** A child that exited on its own is still swept for descendants for this long. */
 const GROUP_SWEEP_MAX_AGE_MS = 30_000;

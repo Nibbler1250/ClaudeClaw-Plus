@@ -44,6 +44,15 @@ import {
 import * as cleanup from "../../src/oneshot/pty-cleanup.js";
 import { withPrintRuntime } from "../../src/oneshot/print.js";
 import { engines } from "../../src/oneshot/registry.js";
+import {
+  actionWord,
+  argvShape,
+  errorWord,
+  plainWord,
+  screenLogLine,
+  screenSignals,
+  withoutDirNames,
+} from "../../src/runner/pty-screen-signals.js";
 import { PRINT_ONLY_UNTRUSTED_ARGS, UNTRUSTED_CLAUDE_ARGS } from "../../src/oneshot/isolation.js";
 
 const disposableCI =
@@ -240,7 +249,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     injectSpawnPty(async (options) => {
       opts.push(options);
       // Empty but for the owner file the sweep reads (r12): nothing else is planted in the cwd.
-      expect(readdirSync(options.cwd)).toEqual([cleanup.ONESHOT_OWNER_FILE]);
+      expect(readdirSync(options.cwd).map(plainWord)).toEqual([cleanup.ONESHOT_OWNER_FILE]);
       // r11: the child's config root is a per-call throwaway, never the operator's `config`.
       // A twin may re-point it at the spawn boundary (extraChildEnv); production is judged
       // on what it passed in `options.env`.
@@ -277,7 +286,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         ),
       );
       const args = mutateArgs([...canonical]);
-      console.info(`[isolation-spike] argv=${JSON.stringify(args)}`);
+      console.info(`[isolation-spike] argv=${JSON.stringify(argvShape(args))}`);
       let pty: PtyProcess;
       try {
         // Only the test seams differ from production: the argv mutations of the twins, an
@@ -362,7 +371,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       for (const line of contents.split("\n").filter(Boolean)) {
         try {
           const record = JSON.parse(line);
-          kinds[String(record.type)] = (kinds[String(record.type)] ?? 0) + 1;
+          kinds[plainWord(record.type)] = (kinds[plainWord(record.type)] ?? 0) + 1;
           toolUse ||= containsToolUse(record);
           // This call's own prompt: a `user` record carrying its (neutralised) text.
           if (
@@ -374,13 +383,14 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
           )
             sawPrompt = true;
           if (record.type !== "assistant" || !Array.isArray(record.message?.content)) continue;
-          if (typeof record.message.stop_reason === "string") stops.add(record.message.stop_reason);
+          if (typeof record.message.stop_reason === "string")
+            stops.add(plainWord(record.message.stop_reason));
           if (record.isApiErrorMessage) apiErrors++;
           if (record.message?.model === "<synthetic>") synthetic++;
           if (!record.isApiErrorMessage && record.message?.model !== "<synthetic>")
             assistantEntries++;
           for (const block of record.message.content) {
-            blocks.add(String(block.type));
+            blocks.add(plainWord(block.type));
             if (block.type === "text" && typeof block.text === "string")
               assistantReply += block.text;
           }
@@ -427,7 +437,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     for (const call of warnings?.mock.calls ?? []) {
       const line = String(call[0]);
       if (/^\[oneshot\] (escape scan could not read pid|\d+ unreadable process)/.test(line)) {
-        console.info(`[isolation-spike] scan-unknown: ${line}`);
+        console.info(`[isolation-spike] scan-unknown: ${withoutDirNames(line)}`);
       }
     }
     warnings?.mockRestore();
@@ -533,11 +543,10 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
   }
 
   /**
-   * Print the PTY output seen during a HUNG diagnostic turn, CI only. Source is
-   * the live ANSI-stripped chunk stream (read before the PTY is disposed), with
-   * the supervisor's exit tail as a fallback. It is a stream of redraws, not a
-   * cursor-addressed screen. Flags are computed on the UNREDACTED text; only
-   * then is each matched token masked, so one sensitive word cannot hide a line.
+   * Report what the PTY showed during a HUNG diagnostic turn, CI only, as signals: line count,
+   * flags and which blocked boot screen matched (`screenSignals`). The text itself is never
+   * printed. Source is the live ANSI-stripped chunk stream (read before the PTY is disposed),
+   * with the supervisor's exit tail as a fallback.
    */
   async function captureScreen(label: string): Promise<void> {
     if (!disposableCI) return;
@@ -559,33 +568,8 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       console.info(`[isolation-spike] screen-unavailable ${label}: no output captured`);
       return;
     }
-    const lines = raw
-      .split(/\r?\n/)
-      .map((line) => line.trimEnd())
-      .filter((line) => line.trim() !== "")
-      .slice(-40);
-    const unredacted = lines.join("\n");
-    const flags = {
-      permissionPrompt: /do you want|allow (?:this|once)|approve|\(y\/n\)|1\. yes/i.test(
-        unredacted,
-      ),
-      errorBanner: /error|failed|unable to|rate limit|overloaded|invalid/i.test(unredacted),
-      spinner: /esc to interrupt|thinking|[✻✽✶✳✢]/i.test(unredacted),
-    };
-    const text = lines
-      .map((line) =>
-        line
-          .replace(/\S*(?:token|key|secret|oauth)\S*/gi, "[redacted]")
-          .replace(/\S*@[a-z0-9.-]+\.[a-z]{2,}\S*/gi, "[redacted]")
-          .slice(0, 240),
-      )
-      .join("\n");
-    console.info(
-      `[isolation-spike] screen-flags ${label}: ${JSON.stringify(flags)}; source=${source}; lines=${lines.length}`,
-    );
-    console.info(
-      `[isolation-spike] screen-begin ${label}\n${text}\n[isolation-spike] screen-end ${label}`,
-    );
+    // Flags, a fixed reason name and a count: never a character of the screen (public CI logs).
+    console.info(screenLogLine(label, source, screenSignals(raw)));
   }
 
   async function run(
@@ -631,9 +615,8 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       );
     } catch (error) {
       // A code and a timing only: the thrown message may carry a path or a screen.
-      const code = (error as NodeJS.ErrnoException)?.code ?? (error as Error)?.name ?? "error";
       console.info(
-        `[isolation-spike] run-threw ${options.screen ?? "-"}: reason=threw:${String(code).replace(/[^A-Za-z0-9_-]/g, "")}; elapsedMs=${Date.now() - started}`,
+        `[isolation-spike] run-threw ${options.screen ?? "-"}: reason=threw:${errorWord(error)}; elapsedMs=${Date.now() - started}`,
       );
       if (options.screen) await captureScreen(options.screen);
       throw error;
@@ -1270,7 +1253,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
             heldMidTurn = filesHoldingCanary(childRoot, PASTE_CANARY);
           } catch (error) {
             console.info(
-              `[isolation-spike] A-paste ${direction}: afterTurnHook failed: ${String(error)}`,
+              `[isolation-spike] A-paste ${direction}: afterTurnHook failed: ${errorWord(error)}`,
             );
           }
         };
@@ -1356,7 +1339,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
   function replyShape(text: string): string {
     const parsed = productionParse(text);
     const trimmed = text.trim();
-    return `productionParseOk=${parsed.ok}; outcome=${parsed.outcome}; action=${parsed.action ?? "none"}; namesCount=${parsed.names?.length ?? 0}; screenEcho=${/Return ONLY valid JSON/.test(trimmed)}; length=${trimmed.length}`;
+    return `productionParseOk=${parsed.ok}; outcome=${parsed.outcome}; action=${actionWord(parsed.action)}; namesCount=${parsed.names?.length ?? 0}; screenEcho=${/Return ONLY valid JSON/.test(trimmed)}; length=${trimmed.length}`;
   }
   // The dated id production named until r14. It was retired on 15 Jun 2026; production now asks
   // for the `haiku` alias. Kept as a probe that a retired id still fails closed fast.
@@ -1406,7 +1389,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         );
         // result.rawText is the real runOnceOnPty result: what classifyThreadIntent parses.
         console.info(
-          `[isolation-spike] reply-shape probe=contract attempt=${attempt} production-text: ${replyShape(result.rawText)}`,
+          `[isolation-spike] reply-shape probe=contract attempt=${attempt} production-shape: ${replyShape(result.rawText)}`,
         );
         hangRecords.push({
           probe: "contract",
@@ -1473,7 +1456,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         `[isolation-spike] production-model attempt exit=${result.exitCode} elapsedMs=${elapsedMs} textLength=${result.text.length} warnedApiError=${warned.some((line) => line.includes("(api-error)"))} warnedTimeout=${warned.some((line) => line.includes("(timeout)"))}`,
       );
       expect(result.exitCode).toBe(1);
-      expect(result.text).toBe("");
+      expect(result.text.length).toBe(0); // a length: a failing diff must not print the text
       expect(elapsedMs).toBeLessThan(15_000);
     },
     BUDGET,
@@ -1538,6 +1521,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       .replace(/\b\d{3,}\b/g, "<n>")
       .split("/")
       .slice(0, 3)
+      .map(plainWord)
       .join("/");
   /** Distinct shapes with a count each, capped so one fat tree cannot flood the log. */
   const shapeSummary = (paths: string[]): string => {
@@ -1588,7 +1572,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
             heldCanaryMidTurn = filesHoldingCanary(childRoot, PROMPT_CANARY);
           } catch (error) {
             console.info(
-              `[isolation-spike] C1 ${direction}: afterTurnHook failed: ${String(error)}`,
+              `[isolation-spike] C1 ${direction}: afterTurnHook failed: ${errorWord(error)}`,
             );
           }
           console.info(`[isolation-spike] C1 ${direction}: stage=after-turn`);
@@ -1683,8 +1667,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
           }
         } catch (error) {
           outcome.closed++;
-          const code = (error as NodeJS.ErrnoException)?.code ?? (error as Error)?.name ?? "error";
-          reasons.push(`threw:${String(code).replace(/[^A-Za-z0-9_-]/g, "")}`);
+          reasons.push(`threw:${errorWord(error)}`);
         }
       }
       latencies.sort((a, b) => a - b);
