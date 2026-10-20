@@ -379,6 +379,7 @@ describe("retrySurvivingGroups", () => {
     expect(cleared).toBe(1);
     expect(seen).toEqual([{ pid: 4242, start: 1_700_000_000_000, owned: false }]);
     expect(reaped).toEqual([
+      // Went red (no leaderStartMs) with the survivor's start time no longer handed to the scan.
       { root: "/tmp/root-a", cwds: ["/tmp/cwd-a"], leaderStartMs: 1_700_000_000_000 },
     ]);
     expect(groupSurvivorOf("/tmp/root-a")).toBeUndefined();
@@ -736,11 +737,13 @@ describe("unknown holds (r14b)", () => {
 
       expect(groupSurvivorCount()).toBe(0); // an unknown is not a group survivor
       expect(unknownHoldCount()).toBe(1);
+      // Went red (both removed) with the hold ignored by the sweep.
       expect(sweep()).toBe(0);
       expect(existsSync(root)).toBe(true);
       expect(existsSync(cwd)).toBe(true);
 
       await died(spawned[0] as never);
+      // Went red (root kept for ever) with the hold never dropped once the process died.
       expect(sweep()).toBe(2);
       expect(existsSync(root)).toBe(false);
       expect(existsSync(cwd)).toBe(false);
@@ -761,6 +764,7 @@ describe("unknown holds (r14b)", () => {
       const proc = stray();
       markUnknownProcs(root, leader, [unreadable(proc.pid, (proc.startMs ?? 0) - 3_600_000)]);
       utimesSync(root, OLD, OLD);
+      // Went red (0 removed) with the start time ignored when checking the held process.
       expect(sweep()).toBe(1);
       expect(existsSync(root)).toBe(false);
     } finally {
@@ -774,6 +778,7 @@ describe("unknown holds (r14b)", () => {
       const root = leftover(`${ONESHOT_CONFIG_PREFIX}persisted`, OLD, own());
       markUnknownProcs(root, leader, [unreadable(5151, 123_450)], { cwds: ["/tmp/c"] });
       const record = JSON.parse(readFileSync(join(root, ONESHOT_SURVIVOR_FILE), "utf8"));
+      // Went red (no unknown list) with the held processes left out of the record.
       expect(record).toMatchObject({
         pid: 4242,
         startMs: 7,
@@ -794,6 +799,7 @@ describe("unknown holds (r14b)", () => {
       utimesSync(root, OLD, OLD);
       resetGroupSurvivorsForTests(); // the daemon restarted
       const quiet = { groupGone: () => true, scan: () => ({ pids: [], unknown: [] }) };
+      // Went red (removed) with the recorded unknown list not read on adoption.
       expect(sweep({ ...quiet, heldAlive: () => true })).toBe(0);
       expect(existsSync(root)).toBe(true);
       expect(unknownHoldCount()).toBe(1);
@@ -813,6 +819,7 @@ describe("unknown holds (r14b)", () => {
       markUnknownProcs("/tmp/secret-root-path", leader, [unreadable(5151, 123_450)]);
       markUnknownProcs("/tmp/secret-root-path", leader, [unreadable(5151, 123_450)]);
       const logged = warn.mock.calls.map((call: unknown[]) => String(call[0]));
+      // Went red (2 lines) with the once-per-process dedupe removed.
       expect(logged).toHaveLength(1); // once per process
       expect(logged[0]).toContain("pid 5151");
       expect(logged[0]).toContain("environ EACCES, cwd EACCES");

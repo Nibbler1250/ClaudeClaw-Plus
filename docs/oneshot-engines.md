@@ -90,16 +90,23 @@ well. That narrows pid reuse to the instant between the check and the `kill()`; 
 close it without a native process handle, and none is built. On
 Linux a descendant that left the group (`setsid()`, `setpgid()`) is found afterwards by the
 throwaway `CLAUDE_CONFIG_DIR` in its environment, or a cwd inside the throwaway temp cwd, and
-stopped the same way. That scan fails closed: a `/proc` that cannot be listed, or a process
-of our uid whose environment or cwd cannot be read for any reason but its having gone, makes
-the answer "unknown", which counts as a survivor, never as "nothing escaped". **On macOS there is no cheap equivalent: containment there is the
+stopped the same way. Only a process that started after the child can be ours: its start time
+is read from `/proc/<pid>/stat` field 22, which stays readable even for a non-dumpable process,
+and an older process of our uid is foreign whether or not it can be read. The scan fails closed
+where it can: a `/proc` that cannot be listed counts as a survivor. A process born after the
+child whose `environ` and `cwd` both cannot be read is "unknown": it is logged (pid, errno of
+each read, whether the daemon is an ancestor, age relative to the child; nothing else), the call
+still returns its reply, and the root and temp cwd are kept, with the process and its start time
+in `survivor.json`, until it is gone (a dead or recycled pid counts as gone). A process that
+positively matches and will not die still fails the call. **On macOS there is no cheap equivalent: containment there is the
 process group plus the remove-and-recheck loop, and a process that leaves the group and keeps
 writing is not stopped.** If the group, or anything outside it, will not die, the call fails
 and the root and temp cwd are kept, with a `survivor.json` (pid, start time, cwds) in the root;
 the sweeper signals the survivor again every pass and never sweeps them while it is recorded.
 After a daemon restart the sweep reads `survivor.json` before it removes anything: a recorded
-group (checked with its identity) or an escapee still running, or one it cannot tell, puts the
-root back on the survivor list instead of removing it. The prompt is written only into a REPL that is ready
+group (checked with its identity) or an escapee still running, or a `/proc` it cannot list, puts
+the root back on the survivor list; a recorded unreadable process still alive puts it back as a
+hold instead of removing it. The prompt is written only into a REPL that is ready
 (footer on the current screen, no login, onboarding or trust screen after one quiet window);
 otherwise the spawn fails and nothing is sent. If the root cannot be created or removed the call fails (the error is logged by step
 and code, never content). Each root and temp cwd holds an owner file (daemon pid, start time,
@@ -108,7 +115,7 @@ instance). A daemon start, and then every ten minutes, removes leftover
 than ten minutes, belong to this uid, are not a running call of this daemon, and whose
 owner is dead (a directory with no owner file at all falls back to the age rule; one whose
 owner file or `survivor.json` cannot be read or understood is quarantined: logged once by
-name, and removed only after 24 h and only if the escape scan finds nothing in it). It applies the spawn strip list (`ANTHROPIC_API_KEY`,
+name, and removed only after 24 h and only if the escape scan finds no matching process in it). It applies the spawn strip list (`ANTHROPIC_API_KEY`,
 `CLAUDECODE`, short-lived OAuth tokens) to the caller's env, because an interactive
 claude with an API key in its env stops at a "custom API key" gate; it replaces every `@`
 in the prompt with U+FF20, because the REPL expands `@path` mentions itself, anywhere in a

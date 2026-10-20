@@ -803,12 +803,15 @@ describe("r14b: an unreadable process is a hold on the root, not a failure", () 
         } as never;
       });
       const result = await run();
+      // Went red (the call threw) with a held root failing the call, and (root removed under the
+      // live process) with the hold ignored by the cleanup.
       expect(result.exitCode).toBe(0);
       expect(result.text).toBe("ok");
       const root = spawned[0]!.env.CLAUDE_CONFIG_DIR!;
       const tempCwd = spawned[0]!.cwd;
       expect(existsSync(root)).toBe(true);
       expect(existsSync(tempCwd)).toBe(true);
+      // Went red (1 survivor) with the unknown also recorded as a group survivor.
       expect(cleanup.groupSurvivorCount()).toBe(0);
       expect(cleanup.unknownHoldCount()).toBe(1);
 
@@ -844,6 +847,7 @@ describe("r14b: an unreadable process is a hold on the root, not a failure", () 
     );
     const left = await options.reapEscapees!({ pid: 4242, startMs: 98_760 });
     expect(left).toEqual([]);
+    // Went red (undefined) with the leader's start time not handed to the scan.
     expect((seen[0]!.target as { leaderStartMs?: number }).leaderStartMs).toBe(98_760);
     expect(cleanup.unknownHoldCount()).toBe(1);
     expect(cleanup.unknownHoldActive("/tmp/root-wired")).toBe(false); // pid 5151 is not alive here

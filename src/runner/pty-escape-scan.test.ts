@@ -91,11 +91,13 @@ describe("findEscapees (fake /proc)", () => {
 
   it("ignores an unreadable process that started before the leader: foreign, not unknown", () => {
     unreadable(5302, 500); // 5 000 ms, before the leader's 10 000 ms
+    // Went red (the process reported as unknown) with the age filter removed or inverted.
     expect(scan()).toEqual({ pids: [], unknown: [] });
   });
 
   it("reports an unreadable process born after the leader as unknown, with metadata only", () => {
     unreadable(5303, 1250);
+    // Went red (empty unknown) with the both-reads-fail rule removed.
     expect(scan(999).unknown).toEqual([
       {
         pid: 5303,
@@ -124,6 +126,7 @@ describe("findEscapees (fake /proc)", () => {
     writeFileSync(join(proc, "5306", "stat"), statLine(5306, 1, 1250));
     mkdirSync(join(proc, "5306", "environ"));
     symlinkSync("/somewhere/else", join(proc, "5306", "cwd"));
+    // Went red (reported unknown) with a single failed read made enough.
     expect(scan().unknown).toEqual([]);
   });
 
@@ -148,6 +151,7 @@ describe("findEscapees (fake /proc)", () => {
     writeFileSync(join(proc, "5309", "stat"), statLine(5309, 1, 1250));
     process_(5310, { env: [`CLAUDE_CONFIG_DIR=${ROOT}`] });
     writeFileSync(join(proc, "5310", "stat"), statLine(5310, 1, 500));
+    // Went red with the age filter removed: the older one cannot be ours.
     expect(scan().pids).toEqual([5309]);
   });
 
@@ -156,6 +160,7 @@ describe("findEscapees (fake /proc)", () => {
     writeFileSync(join(proc, "4000", "stat"), statLine(4000, 77, 1100)); // daemon is 77
     unreadable(5311, 1250, 4000); // child of 4000
     unreadable(5312, 1250, 1); // reparented to init
+    // Went red (5311 false) with the ancestry walk answering false.
     const byPid = Object.fromEntries(scan(77).unknown.map((u) => [u.pid, u.descendant]));
     expect(byPid).toEqual({ 5311: true, 5312: false });
   });
@@ -308,6 +313,7 @@ describe("terminateEscapees (fake /proc)", () => {
         ...fast,
       },
     );
+    // Went red (onUnknown never called) with the report removed.
     expect(told).toEqual([[6006]]);
     expect(left).toEqual([]);
     expect(k.sent).toEqual([]);
@@ -333,6 +339,7 @@ describe("terminateEscapees (fake /proc)", () => {
         ...fast,
       },
     );
+    // Went red (nothing signalled) with positive matches no longer stopped.
     expect(k.sent).toEqual([[6007, "SIGTERM"]]);
     expect(left).toEqual([]);
     expect(told).toEqual([[6008]]);
