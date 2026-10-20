@@ -20,10 +20,13 @@ export const engines = new Map<string, OneShotEngine>([
       id: "pty",
       // Interactive isolation spike: every row green in both directions on claude
       // 2.1.304, with a known intermittent no-reply on tool-instruction prompts
-      // (bounded, fails closed). See docs/spikes/0.7-interactive-isolation.md. The untrusted spawn passes
-      // untrustedInteractiveArgs() and the caller env policy, and removes its
-      // transcripts in runOnceOnPty's finally. Reverting this flag is the kill switch.
-      caps: { resume: true, tools: true, isolation: true },
+      // (bounded, fails closed). See docs/spikes/0.7-interactive-isolation.md. The untrusted
+      // spawn passes untrustedInteractiveArgs() and the caller env policy, and removes its
+      // on-disk state in runOnceOnPty's finally.
+      // Fail closed: isolation starts OFF and `applyPtyIsolationVersionGate` (claude-version.ts)
+      // turns it on only after a probe finds claude at least the measured version. A process
+      // that never probes (a CLI tool, a test) therefore keeps untrusted routes on print.
+      caps: { resume: true, tools: true, isolation: false },
       run: async (req) => (await import("../runner/pty-supervisor.js")).runOnceOnPty(req),
     },
   ],

@@ -19,6 +19,16 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  MIN_PTY_ISOLATION_CLAUDE_VERSION,
+  applyPtyIsolationVersionGate,
+} from "../src/oneshot/claude-version.js";
+
+// #570: PTY isolation is advertised only after a startup probe finds a measured claude, and
+// starts OFF (fail closed). Unit tests stand in for that probe so the routing they exercise
+// is the one a daemon on the measured build gets. The unprobed default is pinned by
+// src/oneshot/claude-version.test.ts, which reads it in a fresh process.
+applyPtyIsolationVersionGate(MIN_PTY_ISOLATION_CLAUDE_VERSION, () => {});
 
 const need =
   !process.env.PLUS_PLUGIN_AUDIT_PATH ||

@@ -1,5 +1,6 @@
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
@@ -92,14 +93,24 @@ const HISTORY_LOCK_WAIT_MS = 3_000;
 const HISTORY_LOCK_STALE_MS = 10_000;
 
 function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    // Not allowed on this thread: a short bounded spin instead.
+    const until = Date.now() + ms;
+    while (Date.now() < until) {
+      /* wait */
+    }
+  }
 }
 
 /**
  * `mkdir <file>.lock` is the lock convention of `proper-lockfile`, which claude is
- * believed to use for this file (not observable from the binary: see the spike doc). A
- * lock older than the library's default stale window is taken over. Holding it for the
+ * believed to use for this file (see the spike doc for what the live run saw). A lock older
+ * than the library's default stale window is taken over. Holding it for the
  * read-modify-rename keeps a concurrent claude's append from being lost in between.
+ * Every path through the loop is bounded by the deadline, so a lock that cannot be taken
+ * or cleared fails closed instead of spinning.
  */
 function withFileLock<T>(file: string, fn: () => T): T {
   const lock = `${file}.lock`;
@@ -110,15 +121,15 @@ function withFileLock<T>(file: string, fn: () => T): T {
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (Date.now() >= deadline) throw new Error("history.jsonl lock is held");
       try {
-        if (Date.now() - statSync(lock).mtimeMs > HISTORY_LOCK_STALE_MS) {
+        if (Date.now() - lstatSync(lock).mtimeMs > HISTORY_LOCK_STALE_MS) {
           rmSync(lock, { recursive: true, force: true });
           continue;
         }
       } catch {
-        continue; // released between the mkdir and the stat
+        // released (or unreadable) between the mkdir and the stat: pause, then retry
       }
-      if (Date.now() >= deadline) throw new Error("history.jsonl lock is held");
       sleepSync(50);
     }
   }

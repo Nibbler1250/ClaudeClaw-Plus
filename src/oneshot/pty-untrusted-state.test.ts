@@ -7,8 +7,10 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { _setSettingsFileForTests, loadSettings } from "../config.js";
@@ -17,6 +19,7 @@ import {
   spawnPty,
   type PtyProcessOptions,
 } from "../runner/pty-process.js";
+import { setUntrustedFileMentionNeutralizingForTests } from "../runner/pty-process-test-seams.js";
 import {
   __resetSupervisorForTests,
   injectOneShotTrustForTests,
@@ -376,6 +379,17 @@ describe("C1: persistence beyond the transcript is removed", () => {
     expect(readFileSync(file, "utf8")).toContain("/a");
   });
 
+  it("a lock path that can be neither taken nor stat'ed (dangling symlink) fails closed in bounded time", () => {
+    const config = join(dir, "dangling");
+    mkdirSync(config, { recursive: true });
+    const file = join(config, "history.jsonl");
+    writeFileSync(file, `${JSON.stringify({ project: "/a" })}\n`);
+    symlinkSync(join(config, "nowhere"), `${file}.lock`);
+    const started = Date.now();
+    expect(() => cleanup.removeUntrustedHistory(config, ["/a"], [])).toThrow("lock is held");
+    expect(Date.now() - started).toBeLessThan(6000);
+  });
+
   it("an id that is not a session id never reaches a path", () => {
     const config = join(dir, "ids");
     mkdirSync(join(config, "session-env", "sibling"), { recursive: true });
@@ -479,5 +493,54 @@ describe("D4: req.system reaches the untrusted PTY as --system-prompt", () => {
     fakeSpawn();
     await run();
     expect(__buildClaudeArgsForTests(spawned[0]!)).not.toContain("--system-prompt");
+  });
+});
+
+describe("B3 (print): `claude -p` expands @ mentions too, so the same replacement applies", () => {
+  async function stdinFor(isolation: "untrusted" | "trusted-session"): Promise<string> {
+    let input = "";
+    const spawnFn = (() => {
+      const child = Object.assign(new EventEmitter(), {
+        stdin: Object.assign(new EventEmitter(), {
+          end: (text: string) => {
+            input = text;
+          },
+        }),
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+        kill: () => true,
+      });
+      queueMicrotask(() => {
+        child.stdout.emit("data", Buffer.from("ok"));
+        child.emit("close", 0);
+      });
+      return child;
+    }) as never;
+    await withPrintRuntime({ spawn: spawnFn, env: callerEnv(), stdinPrompt: true }, () =>
+      engines.get("print")!.run({
+        route: isolation === "untrusted" ? "discord.classifier" : "compact",
+        isolation,
+        prompt: "hire @/path/to/secret and @x",
+        timeoutMs: 1000,
+      }),
+    );
+    return input;
+  }
+
+  it("replaces every @ in an untrusted print prompt", async () => {
+    expect(await stdinFor("untrusted")).toBe("hire \uff20/path/to/secret and \uff20x");
+  });
+
+  it("leaves a trusted print prompt alone", async () => {
+    expect(await stdinFor("trusted-session")).toBe("hire @/path/to/secret and @x");
+  });
+
+  it("the shared test seam switches it off", async () => {
+    setUntrustedFileMentionNeutralizingForTests(false);
+    try {
+      expect(await stdinFor("untrusted")).toContain("@/path/to/secret");
+    } finally {
+      setUntrustedFileMentionNeutralizingForTests(true);
+    }
   });
 });

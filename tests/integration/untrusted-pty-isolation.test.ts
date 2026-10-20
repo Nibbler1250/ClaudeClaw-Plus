@@ -122,6 +122,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
   let extraChildEnv: Record<string, string>;
   let childHasApiKey: boolean;
   let trustAtSpawn: boolean;
+  let spawnCwdForms: string[];
   let transcriptRaw: string;
   let afterTurnHook: (() => void) | undefined;
   let markerWaits: string[];
@@ -168,6 +169,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     extraChildEnv = {};
     childHasApiKey = false;
     trustAtSpawn = false;
+    spawnCwdForms = [];
     transcriptRaw = "";
     afterTurnHook = undefined;
     markerWaits = [];
@@ -196,6 +198,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       // completed onboarding (seeded below), but nothing marks a fresh cwd trusted except
       // production's own pre-spawn write, which this records so the rows prove it ran.
       const cwdForms = [options.cwd, realpathSync(options.cwd)];
+      spawnCwdForms = cwdForms;
       trustAtSpawn = cwdForms.some(
         (cwd) => existing.projects?.[cwd]?.hasTrustDialogAccepted === true,
       );
@@ -733,8 +736,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
           `Reply with ${DONE}.`,
           twin ? { allowNoTurn: true, timeoutMs: 30_000, screen: "trust-twin" } : {},
         );
-        const cwdForms = [opts[0]!.cwd, realpathSync(opts[0]!.cwd)];
-        const stillThere = cwdForms.some((cwd) => cwd in trustProjects());
+        const stillThere = spawnCwdForms.some((cwd) => cwd in trustProjects());
         console.info(
           `[isolation-spike] B1 ${direction}: trustAtSpawn=${trustAtSpawn}; entryAfterCall=${stillThere}; exit=${result.exitCode}; assistantEntries=${assistantEntries}`,
         );
@@ -810,134 +812,32 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     );
   }
 
-  test(
-    "B3 @ file mention, PRINT engine: does -p expand it? (information, no twin)",
-    async () => {
-      expect(baselineLeakObserved).toBe(false);
-      expect(positiveProved).toBe(true);
-      const path = plantMentionFile();
-      const result = await withPrintRuntime({ env: callerPolicy() }, () =>
-        engines.get("print")!.run({
-          route: "discord.classifier",
-          isolation: "untrusted",
-          prompt: mentionPrompt(path),
-          timeoutMs: 90_000,
-        }),
-      );
-      const expanded = result.text.includes(FILE_CANARY);
-      console.info(
-        `[isolation-spike] B3 PRINT: exit=${result.exitCode}; replyLength=${result.text.length}; canaryInReply=${expanded}`,
-      );
-      expect(result.exitCode).toBe(0);
-    },
-    BUDGET,
-  );
-
-  // C1 — everything an interactive claude leaves under its config root. Path SHAPES only
-  // (uuids, the temp cwd and its encoding are masked); file contents are never printed.
-  const PROMPT_CANARY = `EXAMPLE_PROMPT_CANARY_${Math.random().toString(16).slice(2, 10)}`;
-  type FileFacts = { size: number; mtimeMs: number };
-  function snapshot(dir: string): Map<string, FileFacts> {
-    const out = new Map<string, FileFacts>();
-    const walk = (current: string): void => {
-      for (const entry of readdirSync(current, { withFileTypes: true })) {
-        const path = join(current, entry.name);
-        if (entry.isDirectory()) {
-          out.set(`${relative(dir, path)}/`, { size: 0, mtimeMs: 0 });
-          walk(path);
-        } else if (entry.isFile()) {
-          const stat = statSync(path);
-          out.set(relative(dir, path), { size: stat.size, mtimeMs: stat.mtimeMs });
-        }
-      }
-    };
-    if (existsSync(dir)) walk(dir);
-    return out;
-  }
-  const shapeOf = (path: string): string =>
-    path
-      .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, "<uuid>")
-      .replace(/claudeclaw-oneshot-pty-[A-Za-z0-9]+/g, "<tmpcwd>")
-      .replace(/untrusted-pty-[A-Za-z0-9]+/g, "<root>")
-      .replace(/\b\d{3,}\b/g, "<n>");
-  const changedSince = (before: Map<string, FileFacts>, now: Map<string, FileFacts>): string[] =>
-    [...now.entries()]
-      .filter(([path, facts]) => {
-        const old = before.get(path);
-        return !old || old.size !== facts.size || old.mtimeMs !== facts.mtimeMs;
-      })
-      .map(([path]) => path);
-  const filesHoldingCanary = (dir: string, needle: string): string[] =>
-    [...snapshot(dir).keys()]
-      .filter((path) => !path.endsWith("/"))
-      .filter((path) => {
-        try {
-          return readFileSync(join(dir, path)).includes(needle);
-        } catch {
-          return false;
-        }
-      });
-
   for (const twin of [false, true]) {
     const direction = twin ? "CONTROL REMOVED — expected RED predicate" : "CONTROL PRESENT";
     test(
-      `C1 persistence beyond the transcript: ${direction}`,
+      `B3 @ file mention, PRINT engine: ${direction}`,
       async () => {
-        // The config root as a real child leaves it: onboarding seeded, nothing of this call yet.
-        const before = snapshot(config);
-        const lockShapes = new Set<string>();
-        const poll = setInterval(() => {
-          try {
-            for (const path of snapshot(config).keys()) {
-              if (/\.lock\/?$/.test(path)) lockShapes.add(shapeOf(path));
-            }
-          } catch {
-            /* racing claude's own writes */
-          }
-        }, 10);
-        let duringTurn: Map<string, FileFacts> = new Map();
-        let heldCanaryMidTurn: string[] = [];
-        afterTurnHook = () => {
-          duringTurn = snapshot(config);
-          heldCanaryMidTurn = filesHoldingCanary(config, PROMPT_CANARY);
-        };
-        if (twin) {
-          cleanupSpies = [
-            spyOn(cleanup, "removeUntrustedPtyTranscripts").mockImplementation(() => {}),
-            spyOn(cleanup, "removeUntrustedHistory").mockImplementation(() => 0),
-            spyOn(cleanup, "removeUntrustedSessionFiles").mockImplementation(() => {}),
-          ];
-        }
-        try {
-          await run(`Reply with ${DONE}. Reference marker: ${PROMPT_CANARY}.`);
-        } finally {
-          clearInterval(poll);
-        }
-        const after = snapshot(config);
-        const shapes = (paths: string[]): string[] => [...new Set(paths.map(shapeOf))].sort();
+        expect(baselineLeakObserved).toBe(false);
+        expect(positiveProved).toBe(true);
+        const path = plantMentionFile();
+        // Twin: the shared U+FF20 replacement is switched off through its test seam.
+        if (twin) setUntrustedFileMentionNeutralizingForTests(false);
+        const result = await withPrintRuntime({ env: callerPolicy() }, () =>
+          engines.get("print")!.run({
+            route: "discord.classifier",
+            isolation: "untrusted",
+            prompt: mentionPrompt(path),
+            timeoutMs: 90_000,
+          }),
+        );
+        const expanded = result.text.includes(FILE_CANARY);
         console.info(
-          `[isolation-spike] C1 ${direction}: changedDuringTurn=${JSON.stringify(shapes(changedSince(before, duringTurn)))}`,
+          `[isolation-spike] B3 PRINT ${direction}: exit=${result.exitCode}; replyLength=${result.text.length}; canaryInReply=${expanded}`,
         );
-        console.info(
-          `[isolation-spike] C1 ${direction}: holdingCanaryBeforeCleanup=${JSON.stringify(shapes(heldCanaryMidTurn))}`,
-        );
-        const remaining = filesHoldingCanary(config, PROMPT_CANARY);
-        console.info(
-          `[isolation-spike] C1 ${direction}: holdingCanaryAfterCleanup=${JSON.stringify(shapes(remaining))}`,
-        );
-        console.info(
-          `[isolation-spike] C1 ${direction}: changedAfterCleanup=${JSON.stringify(shapes(changedSince(before, after)))}`,
-        );
-        console.info(
-          `[isolation-spike] C1 ${direction}: lockShapesSeen=${JSON.stringify([...lockShapes])}`,
-        );
-        checkIsolation(
-          "C1 persistence (no file holds the prompt canary)",
-          remaining.length === 0,
-          twin,
-        );
+        expect(result.exitCode).toBe(0);
+        checkIsolation("B3 @ file mention (print)", !expanded, twin);
       },
-      BUDGET + 20_000,
+      BUDGET,
     );
   }
 
@@ -1120,4 +1020,142 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     }
     expect(hangRecords).toHaveLength(ATTEMPTS * 2);
   });
+  // C1 — everything an interactive claude leaves under its config root. Last in the file, so
+  // nothing after it can be lost to it. Path SHAPES only (uuids, the temp cwd and its encoding
+  // are masked; deep paths are cut to three segments with a count); file contents are never
+  // printed. Three snapshots (before, after the turn, after cleanup), no polling of the tree.
+  const PROMPT_CANARY = `EXAMPLE_PROMPT_CANARY_${Math.random().toString(16).slice(2, 10)}`;
+  type FileFacts = { size: number; mtimeMs: number };
+  const SNAPSHOT_CAP = 20_000;
+  function snapshot(dir: string): { files: Map<string, FileFacts>; truncated: boolean } {
+    const files = new Map<string, FileFacts>();
+    let truncated = false;
+    const walk = (current: string): void => {
+      if (truncated) return;
+      for (const entry of readdirSync(current, { withFileTypes: true })) {
+        if (files.size >= SNAPSHOT_CAP) {
+          truncated = true;
+          return;
+        }
+        const path = join(current, entry.name);
+        if (entry.isDirectory()) {
+          files.set(`${relative(dir, path)}/`, { size: 0, mtimeMs: 0 });
+          walk(path);
+        } else if (entry.isFile()) {
+          const stat = statSync(path);
+          files.set(relative(dir, path), { size: stat.size, mtimeMs: stat.mtimeMs });
+        }
+      }
+    };
+    if (existsSync(dir)) walk(dir);
+    return { files, truncated };
+  }
+  const shapeOf = (path: string): string =>
+    path
+      .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, "<uuid>")
+      .replace(/claudeclaw-oneshot-pty-[A-Za-z0-9]+/g, "<tmpcwd>")
+      .replace(/untrusted-pty-[A-Za-z0-9]+/g, "<root>")
+      .replace(/-tmp-claudeclaw-oneshot-pty-[A-Za-z0-9]+/g, "<tmpcwd-encoded>")
+      .replace(/\b\d{3,}\b/g, "<n>")
+      .split("/")
+      .slice(0, 3)
+      .join("/");
+  /** Distinct shapes with a count each, capped so one fat tree cannot flood the log. */
+  const shapeSummary = (paths: string[]): string => {
+    const counts = new Map<string, number>();
+    for (const path of paths) counts.set(shapeOf(path), (counts.get(shapeOf(path)) ?? 0) + 1);
+    const rows = [...counts.entries()].sort().map(([shape, n]) => `${shape} x${n}`);
+    return JSON.stringify(
+      rows.length > 60 ? [...rows.slice(0, 60), `...+${rows.length - 60}`] : rows,
+    );
+  };
+  const changedSince = (before: Map<string, FileFacts>, now: Map<string, FileFacts>): string[] =>
+    [...now.entries()]
+      .filter(([path, facts]) => {
+        const old = before.get(path);
+        return !old || old.size !== facts.size || old.mtimeMs !== facts.mtimeMs;
+      })
+      .map(([path]) => path);
+  const filesHoldingCanary = (dir: string, needle: string): string[] => {
+    const held: string[] = [];
+    for (const [path, facts] of snapshot(dir).files) {
+      if (path.endsWith("/") || facts.size > 5_000_000) continue;
+      try {
+        if (readFileSync(join(dir, path)).includes(needle)) held.push(path);
+      } catch {
+        /* vanished between listing and reading */
+      }
+    }
+    return held;
+  };
+
+  for (const twin of [false, true]) {
+    const direction = twin ? "CONTROL REMOVED — expected RED predicate" : "CONTROL PRESENT";
+    test(
+      `C1 persistence beyond the transcript: ${direction}`,
+      async () => {
+        console.info(`[isolation-spike] C1 ${direction}: stage=start`);
+        // The config root as a real child leaves it: onboarding seeded, nothing of this call yet.
+        const before = snapshot(config).files;
+        // Cheap and top-level only: claude's history lock, if it uses one, lives beside the file.
+        const lockNames = new Set<string>();
+        const poll = setInterval(() => {
+          try {
+            for (const name of readdirSync(config)) if (/lock/i.test(name)) lockNames.add(name);
+          } catch {
+            /* racing claude's own writes */
+          }
+        }, 20);
+        let duringTurn: Map<string, FileFacts> = new Map();
+        let heldCanaryMidTurn: string[] = [];
+        afterTurnHook = () => {
+          try {
+            duringTurn = snapshot(config).files;
+            heldCanaryMidTurn = filesHoldingCanary(config, PROMPT_CANARY);
+          } catch (error) {
+            console.info(
+              `[isolation-spike] C1 ${direction}: afterTurnHook failed: ${String(error)}`,
+            );
+          }
+          console.info(`[isolation-spike] C1 ${direction}: stage=after-turn`);
+        };
+        if (twin) {
+          cleanupSpies = [
+            spyOn(cleanup, "removeUntrustedPtyTranscripts").mockImplementation(() => {}),
+            spyOn(cleanup, "removeUntrustedHistory").mockImplementation(() => 0),
+            spyOn(cleanup, "removeUntrustedSessionFiles").mockImplementation(() => {}),
+          ];
+        }
+        try {
+          await run(`Reply with ${DONE}. Reference marker: ${PROMPT_CANARY}.`);
+        } finally {
+          clearInterval(poll);
+        }
+        console.info(`[isolation-spike] C1 ${direction}: stage=after-cleanup`);
+        const afterSnap = snapshot(config);
+        console.info(
+          `[isolation-spike] C1 ${direction}: changedDuringTurn=${shapeSummary(changedSince(before, duringTurn))}`,
+        );
+        console.info(
+          `[isolation-spike] C1 ${direction}: holdingCanaryBeforeCleanup=${shapeSummary(heldCanaryMidTurn)}`,
+        );
+        const remaining = filesHoldingCanary(config, PROMPT_CANARY);
+        console.info(
+          `[isolation-spike] C1 ${direction}: holdingCanaryAfterCleanup=${shapeSummary(remaining)}`,
+        );
+        console.info(
+          `[isolation-spike] C1 ${direction}: changedAfterCleanup=${shapeSummary(changedSince(before, afterSnap.files))}; truncated=${afterSnap.truncated}`,
+        );
+        console.info(
+          `[isolation-spike] C1 ${direction}: lockNamesSeen=${JSON.stringify([...lockNames])}`,
+        );
+        checkIsolation(
+          "C1 persistence (no file holds the prompt canary)",
+          remaining.length === 0,
+          twin,
+        );
+      },
+      BUDGET + 20_000,
+    );
+  }
 });
