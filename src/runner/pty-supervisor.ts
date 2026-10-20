@@ -67,6 +67,7 @@ import { ensureTrustAccepted } from "./pty-trust-prompt.js";
 import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";
 import { trustedToolFlags, validateIsolation } from "../oneshot/isolation.js";
 import { validateRouteEngine } from "../oneshot/config.js";
+import * as untrustedCleanup from "../oneshot/pty-cleanup.js";
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1693,8 +1694,12 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
   // Created inside the try and removed in the finally, so it never depends on
   // the turn settling (a hung turn or a spawn that never lands).
   let tempCwd: string | undefined;
+  let tempProjectDir: string | undefined;
   try {
-    if (untrusted) tempCwd = mkdtempSync(join(tmpdir(), "claudeclaw-oneshot-pty-"));
+    if (untrusted) {
+      tempCwd = mkdtempSync(join(tmpdir(), "claudeclaw-oneshot-pty-"));
+      tempProjectDir = untrustedCleanup.untrustedPtyProjectDir(tempCwd);
+    }
     const helpers = await getRunnerHelpers();
     const { PTY_OUTPUT_FORMAT_CONSTRAINT } = await import("./pty-output-format.js");
     const exec = await runEphemeralWithDeadline(
@@ -1729,11 +1734,19 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
     }
     return result(0, exec.rawStdout, exec.sessionId);
   } finally {
-    if (tempCwd) {
-      try {
-        rmSync(tempCwd, { recursive: true, force: true });
-      } catch {
-        /* best effort */
+    try {
+      // --no-session-persistence is print-only. runEphemeralWithDeadline has
+      // retired the PTY before returning; delete every transcript/sidecar in
+      // this unique temp project's directory, including on failure or abort.
+      // A cleanup failure propagates rather than reporting an isolated success.
+      if (tempProjectDir) untrustedCleanup.removeUntrustedPtyTranscripts(tempProjectDir);
+    } finally {
+      if (tempCwd) {
+        try {
+          rmSync(tempCwd, { recursive: true, force: true });
+        } catch {
+          /* best effort */
+        }
       }
     }
   }
