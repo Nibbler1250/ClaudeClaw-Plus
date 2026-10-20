@@ -6,10 +6,12 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { _setSettingsFileForTests, loadSettings } from "../../src/config.js";
 import { classifierSpawnEnv } from "../../src/commands/discord.js";
 import {
@@ -20,8 +22,13 @@ import {
   type PtyProcessOptions,
 } from "../../src/runner/pty-process.js";
 import {
+  setPromptPrepareForTests,
+  setUntrustedFileMentionNeutralizingForTests,
+} from "../../src/runner/pty-process-test-seams.js";
+import {
   __resetSupervisorForTests,
   injectMaxRetriesForTests,
+  injectOneShotTrustForTests,
   injectRespawnRetriesForTests,
   injectSpawnPty,
   runOnceOnPty,
@@ -102,7 +109,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
   let savedIsolation: boolean;
   let warnings: ReturnType<typeof spyOn>;
   let errors: ReturnType<typeof spyOn>;
-  let cleanupSpy: ReturnType<typeof spyOn> | undefined;
+  let cleanupSpies: Array<ReturnType<typeof spyOn>> = [];
   let opts: PtyProcessOptions[];
   let project: string;
   let transcriptSeen: number;
@@ -112,6 +119,11 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
   let childHasCanary: boolean;
   let mutateArgs: (args: string[]) => string[];
   let bypassCommandGuard: boolean;
+  let extraChildEnv: Record<string, string>;
+  let childHasApiKey: boolean;
+  let trustAtSpawn: boolean;
+  let transcriptRaw: string;
+  let afterTurnHook: (() => void) | undefined;
   let markerWaits: string[];
   let expectAssistant: boolean;
   let livePty: PtyProcess | undefined;
@@ -153,6 +165,11 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     childHasCanary = false;
     mutateArgs = (args) => args;
     bypassCommandGuard = false;
+    extraChildEnv = {};
+    childHasApiKey = false;
+    trustAtSpawn = false;
+    transcriptRaw = "";
+    afterTurnHook = undefined;
     markerWaits = [];
     expectAssistant = true;
     livePty = undefined;
@@ -175,6 +192,13 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       project = cleanup.untrustedPtyProjectDir(options.cwd, configRoot);
       const cfgFile = join(configRoot, ".claude.json");
       const existing = existsSync(cfgFile) ? JSON.parse(readFileSync(cfgFile, "utf8")) : {};
+      // r9 (A1): the per-cwd trust entry is NOT seeded here any more. A real daemon has
+      // completed onboarding (seeded below), but nothing marks a fresh cwd trusted except
+      // production's own pre-spawn write, which this records so the rows prove it ran.
+      const cwdForms = [options.cwd, realpathSync(options.cwd)];
+      trustAtSpawn = cwdForms.some(
+        (cwd) => existing.projects?.[cwd]?.hasTrustDialogAccepted === true,
+      );
       writeFileSync(
         cfgFile,
         JSON.stringify({
@@ -182,7 +206,6 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
           hasCompletedOnboarding: true,
           theme: "dark",
           numStartups: 10,
-          projects: { ...existing.projects, [options.cwd]: { hasTrustDialogAccepted: true } },
         }),
       );
       const canonical = __buildClaudeArgsForTests(options);
@@ -195,10 +218,13 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       console.info(`[isolation-spike] argv=${JSON.stringify(args)}`);
       let pty: PtyProcess;
       try {
+        // Only the test seams differ from production: the argv mutations of the twins, an
+        // env entry re-admitted at the spawn boundary (the B2 twin), and the command guard.
+        if (bypassCommandGuard) setPromptPrepareForTests(sanitizePtyPromptText);
         pty = await spawnPty({
           ...options,
+          env: { ...options.env, ...extraChildEnv },
           _argsOverride: args,
-          ...(bypassCommandGuard ? { _preparePromptForWriteForTests: sanitizePtyPromptText } : {}),
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : "";
@@ -213,6 +239,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       // Examine only a synthetic env key in the actual child, never print /proc.
       const bytes = readFileSync(`/proc/${pty.pid}/environ`, "utf8");
       childHasCanary = bytes.split("\0").some((entry) => entry.startsWith(`${ENV_CANARY}=`));
+      childHasApiKey = bytes.split("\0").some((entry) => entry.startsWith("ANTHROPIC_API_KEY="));
       const childValue = (name: string) =>
         bytes
           .split("\0")
@@ -238,6 +265,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
           });
         } finally {
           await collectEvidence();
+          afterTurnHook?.();
         }
       };
       return pty;
@@ -252,12 +280,16 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     assistantEntries = 0;
     assistantReply = "";
     const kinds: Record<string, number> = {};
+    transcriptRaw = "";
     const stops = new Set<string>();
     const blocks = new Set<string>();
     let synthetic = 0;
     let apiErrors = 0;
     for (const file of files) {
-      for (const line of readFileSync(file, "utf8").split("\n").filter(Boolean)) {
+      const contents = readFileSync(file, "utf8");
+      // Kept in memory only, to look for a planted canary; never printed.
+      transcriptRaw += contents.slice(0, 5_000_000);
+      for (const line of contents.split("\n").filter(Boolean)) {
         try {
           const record = JSON.parse(line);
           kinds[String(record.type)] = (kinds[String(record.type)] ?? 0) + 1;
@@ -304,8 +336,11 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     __resetSupervisorForTests();
     injectMaxRetriesForTests(null);
     injectRespawnRetriesForTests(null);
-    cleanupSpy?.mockRestore();
-    cleanupSpy = undefined;
+    for (const spy of cleanupSpies) spy.mockRestore();
+    cleanupSpies = [];
+    setPromptPrepareForTests(null);
+    setUntrustedFileMentionNeutralizingForTests(true);
+    injectOneShotTrustForTests(null);
     warnings?.mockRestore();
     errors?.mockRestore();
     if (savedIsolation !== undefined) engines.get("pty")!.caps.isolation = savedIsolation;
@@ -455,6 +490,8 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       timeoutMs?: number;
       screen?: string;
       model?: string;
+      callerEnv?: Record<string, string>;
+      prompt?: string;
     } = {},
   ) {
     expect(baselineLeakObserved).toBe(false);
@@ -462,7 +499,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     let result: Awaited<ReturnType<typeof runOnceOnPty>>;
     const started = Date.now();
     try {
-      result = await withPrintRuntime({ env: callerPolicy() }, () =>
+      result = await withPrintRuntime({ env: { ...callerPolicy(), ...options.callerEnv } }, () =>
         runOnceOnPty({
           route: "discord.classifier",
           isolation: "untrusted",
@@ -636,7 +673,9 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       `transcript cleanup: ${direction}`,
       async () => {
         if (twin)
-          cleanupSpy = spyOn(cleanup, "removeUntrustedPtyTranscripts").mockImplementation(() => {});
+          cleanupSpies = [
+            spyOn(cleanup, "removeUntrustedPtyTranscripts").mockImplementation(() => {}),
+          ];
         await run();
         expect(transcriptSeen).toBeGreaterThan(0);
         checkIsolation("transcript cleanup", jsonls(project).length === 0, twin);
@@ -666,6 +705,237 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         expect(opts).toHaveLength(1);
         const isolated = !childHasCanary;
         checkIsolation("environment", isolated, twin);
+      },
+      BUDGET + 20_000,
+    );
+  }
+
+  // ── r9 rows ──────────────────────────────────────────────────────────────────────
+  // The harness no longer pre-trusts the throwaway cwd (A1), so every row above already
+  // exercises production's own trust write. These rows add what r9 fixes: B1 trust write and
+  // removal, B2 the API-key strip, B3 the `@` file-mention replacement (PTY and print), and
+  // C1 persistence beyond the transcript.
+
+  const trustProjects = (): Record<string, unknown> => {
+    const file = join(config, ".claude.json");
+    return existsSync(file) ? (JSON.parse(readFileSync(file, "utf8")).projects ?? {}) : {};
+  };
+
+  for (const twin of [false, true]) {
+    const direction = twin ? "CONTROL REMOVED — expected RED predicate" : "CONTROL PRESENT";
+    test(
+      `B1 trust write and removal: ${direction}`,
+      async () => {
+        // Twin: production's pre-spawn trust write is disabled (the seam's no-op). The fresh
+        // cwd then shows "trust this folder?" with "No, exit" preselected and nothing answers.
+        if (twin) injectOneShotTrustForTests(async () => {});
+        const result = await run(
+          `Reply with ${DONE}.`,
+          twin ? { allowNoTurn: true, timeoutMs: 30_000, screen: "trust-twin" } : {},
+        );
+        const cwdForms = [opts[0]!.cwd, realpathSync(opts[0]!.cwd)];
+        const stillThere = cwdForms.some((cwd) => cwd in trustProjects());
+        console.info(
+          `[isolation-spike] B1 ${direction}: trustAtSpawn=${trustAtSpawn}; entryAfterCall=${stillThere}; exit=${result.exitCode}; assistantEntries=${assistantEntries}`,
+        );
+        // Control present: production wrote the entry, the turn completed, the entry is gone.
+        // Control removed: no entry at spawn and the turn does not complete.
+        checkIsolation(
+          "B1 trust (production write completes the turn)",
+          trustAtSpawn && assistantEntries > 0 && !stillThere,
+          twin,
+          false,
+        );
+      },
+      BUDGET + 20_000,
+    );
+  }
+
+  for (const twin of [false, true]) {
+    const direction = twin ? "CONTROL REMOVED — expected RED predicate" : "CONTROL PRESENT";
+    test(
+      `B2 ANTHROPIC_API_KEY strip: ${direction}`,
+      async () => {
+        const fake = ["sk", "ant", "api03", "EXAMPLE", "PLACEHOLDER"].join("-");
+        // Twin: the strip is bypassed at the spawn boundary (the key re-admitted to the env).
+        if (twin) extraChildEnv = { ANTHROPIC_API_KEY: fake };
+        const result = await run(
+          `Reply with ${DONE}.`,
+          twin
+            ? {
+                allowNoTurn: true,
+                timeoutMs: 30_000,
+                screen: "api-key-twin",
+                callerEnv: { ANTHROPIC_API_KEY: fake },
+              }
+            : { callerEnv: { ANTHROPIC_API_KEY: fake } },
+        );
+        console.info(
+          `[isolation-spike] B2 ${direction}: childHasApiKey=${childHasApiKey}; exit=${result.exitCode}; assistantEntries=${assistantEntries}`,
+        );
+        // Baseline: the key never reached the child AND the turn still produced a real reply
+        // (run() already required exit 0 and an assistant entry).
+        checkIsolation("B2 ANTHROPIC_API_KEY strip", !childHasApiKey, twin);
+      },
+      BUDGET + 20_000,
+    );
+  }
+
+  const FILE_CANARY = `EXAMPLE_FILE_CANARY_${Math.random().toString(16).slice(2, 10)}`;
+  function plantMentionFile(): string {
+    const path = join(root, "mention-canary.txt");
+    writeFileSync(path, `The file passphrase is ${FILE_CANARY}.\n`);
+    return path;
+  }
+  const mentionPrompt = (path: string): string =>
+    `Quote, verbatim, the full contents of the file @${path} . If you cannot see its contents, say UNAVAILABLE.`;
+
+  for (const twin of [false, true]) {
+    const direction = twin ? "CONTROL REMOVED — expected RED predicate" : "CONTROL PRESENT";
+    test(
+      `B3 @ file mention, PTY engine: ${direction}`,
+      async () => {
+        const path = plantMentionFile();
+        // Twin: the U+FF20 replacement is switched off through its test seam.
+        if (twin) setUntrustedFileMentionNeutralizingForTests(false);
+        const result = await run(mentionPrompt(path), twin ? { timeoutMs: BUDGET } : {});
+        const inReply = result.text.includes(FILE_CANARY);
+        const inTranscript = transcriptRaw.includes(FILE_CANARY);
+        console.info(
+          `[isolation-spike] B3 PTY ${direction}: canaryInReply=${inReply}; canaryInTranscript=${inTranscript}`,
+        );
+        checkIsolation("B3 @ file mention (PTY)", !inReply && !inTranscript, twin);
+      },
+      BUDGET + 20_000,
+    );
+  }
+
+  test(
+    "B3 @ file mention, PRINT engine: does -p expand it? (information, no twin)",
+    async () => {
+      expect(baselineLeakObserved).toBe(false);
+      expect(positiveProved).toBe(true);
+      const path = plantMentionFile();
+      const result = await withPrintRuntime({ env: callerPolicy() }, () =>
+        engines.get("print")!.run({
+          route: "discord.classifier",
+          isolation: "untrusted",
+          prompt: mentionPrompt(path),
+          timeoutMs: 90_000,
+        }),
+      );
+      const expanded = result.text.includes(FILE_CANARY);
+      console.info(
+        `[isolation-spike] B3 PRINT: exit=${result.exitCode}; replyLength=${result.text.length}; canaryInReply=${expanded}`,
+      );
+      expect(result.exitCode).toBe(0);
+    },
+    BUDGET,
+  );
+
+  // C1 — everything an interactive claude leaves under its config root. Path SHAPES only
+  // (uuids, the temp cwd and its encoding are masked); file contents are never printed.
+  const PROMPT_CANARY = `EXAMPLE_PROMPT_CANARY_${Math.random().toString(16).slice(2, 10)}`;
+  type FileFacts = { size: number; mtimeMs: number };
+  function snapshot(dir: string): Map<string, FileFacts> {
+    const out = new Map<string, FileFacts>();
+    const walk = (current: string): void => {
+      for (const entry of readdirSync(current, { withFileTypes: true })) {
+        const path = join(current, entry.name);
+        if (entry.isDirectory()) {
+          out.set(`${relative(dir, path)}/`, { size: 0, mtimeMs: 0 });
+          walk(path);
+        } else if (entry.isFile()) {
+          const stat = statSync(path);
+          out.set(relative(dir, path), { size: stat.size, mtimeMs: stat.mtimeMs });
+        }
+      }
+    };
+    if (existsSync(dir)) walk(dir);
+    return out;
+  }
+  const shapeOf = (path: string): string =>
+    path
+      .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, "<uuid>")
+      .replace(/claudeclaw-oneshot-pty-[A-Za-z0-9]+/g, "<tmpcwd>")
+      .replace(/untrusted-pty-[A-Za-z0-9]+/g, "<root>")
+      .replace(/\b\d{3,}\b/g, "<n>");
+  const changedSince = (before: Map<string, FileFacts>, now: Map<string, FileFacts>): string[] =>
+    [...now.entries()]
+      .filter(([path, facts]) => {
+        const old = before.get(path);
+        return !old || old.size !== facts.size || old.mtimeMs !== facts.mtimeMs;
+      })
+      .map(([path]) => path);
+  const filesHoldingCanary = (dir: string, needle: string): string[] =>
+    [...snapshot(dir).keys()]
+      .filter((path) => !path.endsWith("/"))
+      .filter((path) => {
+        try {
+          return readFileSync(join(dir, path)).includes(needle);
+        } catch {
+          return false;
+        }
+      });
+
+  for (const twin of [false, true]) {
+    const direction = twin ? "CONTROL REMOVED — expected RED predicate" : "CONTROL PRESENT";
+    test(
+      `C1 persistence beyond the transcript: ${direction}`,
+      async () => {
+        // The config root as a real child leaves it: onboarding seeded, nothing of this call yet.
+        const before = snapshot(config);
+        const lockShapes = new Set<string>();
+        const poll = setInterval(() => {
+          try {
+            for (const path of snapshot(config).keys()) {
+              if (/\.lock\/?$/.test(path)) lockShapes.add(shapeOf(path));
+            }
+          } catch {
+            /* racing claude's own writes */
+          }
+        }, 10);
+        let duringTurn: Map<string, FileFacts> = new Map();
+        let heldCanaryMidTurn: string[] = [];
+        afterTurnHook = () => {
+          duringTurn = snapshot(config);
+          heldCanaryMidTurn = filesHoldingCanary(config, PROMPT_CANARY);
+        };
+        if (twin) {
+          cleanupSpies = [
+            spyOn(cleanup, "removeUntrustedPtyTranscripts").mockImplementation(() => {}),
+            spyOn(cleanup, "removeUntrustedHistory").mockImplementation(() => 0),
+            spyOn(cleanup, "removeUntrustedSessionFiles").mockImplementation(() => {}),
+          ];
+        }
+        try {
+          await run(`Reply with ${DONE}. Reference marker: ${PROMPT_CANARY}.`);
+        } finally {
+          clearInterval(poll);
+        }
+        const after = snapshot(config);
+        const shapes = (paths: string[]): string[] => [...new Set(paths.map(shapeOf))].sort();
+        console.info(
+          `[isolation-spike] C1 ${direction}: changedDuringTurn=${JSON.stringify(shapes(changedSince(before, duringTurn)))}`,
+        );
+        console.info(
+          `[isolation-spike] C1 ${direction}: holdingCanaryBeforeCleanup=${JSON.stringify(shapes(heldCanaryMidTurn))}`,
+        );
+        const remaining = filesHoldingCanary(config, PROMPT_CANARY);
+        console.info(
+          `[isolation-spike] C1 ${direction}: holdingCanaryAfterCleanup=${JSON.stringify(shapes(remaining))}`,
+        );
+        console.info(
+          `[isolation-spike] C1 ${direction}: changedAfterCleanup=${JSON.stringify(shapes(changedSince(before, after)))}`,
+        );
+        console.info(
+          `[isolation-spike] C1 ${direction}: lockShapesSeen=${JSON.stringify([...lockShapes])}`,
+        );
+        checkIsolation(
+          "C1 persistence (no file holds the prompt canary)",
+          remaining.length === 0,
+          twin,
+        );
       },
       BUDGET + 20_000,
     );

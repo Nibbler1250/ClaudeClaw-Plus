@@ -14,6 +14,7 @@ import {
   injectSpawnPty,
   runOnceOnPty,
 } from "../runner/pty-supervisor.js";
+import { setPromptPrepareForTests } from "../runner/pty-process-test-seams.js";
 import { untrustedPtyProjectDir } from "./pty-cleanup.js";
 import { PRINT_ONLY_UNTRUSTED_ARGS, UNTRUSTED_CLAUDE_ARGS } from "./isolation.js";
 import { printRuntime, withPrintRuntime } from "./print.js";
@@ -90,6 +91,11 @@ const request = {
 
 it("the internal prompt-write test seam reaches the wire without changing the default sanitizer", async () => {
   let called = false;
+  // Read when the process is constructed, so it is set before the spawn.
+  setPromptPrepareForTests(() => {
+    called = true;
+    return "✻ TEST_SEAM_VISIBLE shift+tab to cycle";
+  });
   const child = await spawnPty({
     sessionId: "",
     cwd: dir,
@@ -100,16 +106,13 @@ it("the internal prompt-write test seam reaches the wire without changing the de
     _skipReadySettle: true,
     quietWindowMs: 50,
     sentinelMaxWaitMs: 1000,
-    _preparePromptForWriteForTests: () => {
-      called = true;
-      return "✻ TEST_SEAM_VISIBLE shift+tab to cycle";
-    },
   });
   try {
     const result = await child.runTurn("/probe ✻ shift+tab to cycle", { timeoutMs: 2000 });
     expect(called).toBe(true);
     expect(result.text.includes("TEST_SEAM_VISIBLE")).toBe(true);
   } finally {
+    setPromptPrepareForTests(null);
     await child.dispose();
   }
 });

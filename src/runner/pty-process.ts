@@ -53,7 +53,12 @@ import {
 // Re-export the sanitiser from its standalone home so existing callers that
 // pull it from `pty-process` (and through `runner/index`) keep working without
 // loading bun-pty just to get the helper.
-import { preparePtyPromptForWrite, sanitizePtyPromptText } from "./pty-prompt-sanitizer";
+import {
+  neutralizeFileMentions,
+  preparePtyPromptForWrite,
+  sanitizePtyPromptText,
+} from "./pty-prompt-sanitizer";
+import { promptPrepareOverride, untrustedFileMentionNeutralizing } from "./pty-process-test-seams";
 import { appendFileSync } from "node:fs";
 
 /**
@@ -115,6 +120,9 @@ export interface PtyProcessOptions {
    * — do not embed long-lived secrets in it.
    */
   appendSystemPrompt?: string;
+  /** Untrusted one-shots only: the request's `system`, passed as `--system-prompt` as the
+   *  print engine does. Trusted spawns use `appendSystemPrompt`. */
+  systemPrompt?: string;
   /** Env vars to pass to the child. Caller is responsible for a sanitised env. */
   env: Record<string, string>;
   /**
@@ -177,9 +185,6 @@ export interface PtyProcessOptions {
    * targets like /bin/cat are silent on startup). Default false.
    */
   _skipReadySettle?: boolean;
-  /** INTERNAL TEST HOOK: isolate CLI command-flag behavior from the input guard.
-   * Never forwarded by settings, OneShotRequest or the supervisor spawn builder. */
-  _preparePromptForWriteForTests?: typeof preparePtyPromptForWrite;
   /**
    * INTERNAL TEST HOOK: override the per-turn sentinel UUID. When set, the
    * supervisor uses this string instead of a fresh crypto.randomUUID(). Lets
@@ -397,6 +402,8 @@ function buildClaudeArgs(opts: PtyProcessOptions): string[] {
   if (opts.isolation === "untrusted") {
     const model = cliModelFlag(opts.modelOverride);
     if (model) args.push("--model", model);
+    // Same flag the print engine passes for `req.system`; not print-only.
+    if (opts.systemPrompt) args.push("--system-prompt", opts.systemPrompt);
     args.push(...untrustedInteractiveArgs());
     return args;
   }
@@ -522,7 +529,13 @@ class PtyProcessImpl implements PtyProcess {
     this._secretValues = collectSecretValues(opts.env);
     this.label = `${opts.agentName ?? "pty"}:${pty.pid}`;
     this._quietWindowMs = opts.quietWindowMs ?? DEFAULT_QUIET_WINDOW_MS;
-    this._preparePrompt = opts._preparePromptForWriteForTests ?? preparePtyPromptForWrite;
+    // Untrusted text also loses its `@` file mentions (see neutralizeFileMentions). The
+    // trusted path is untouched. The two seams are test-only (pty-process-test-seams).
+    const prepare = promptPrepareOverride() ?? preparePtyPromptForWrite;
+    this._preparePrompt =
+      opts.isolation === "untrusted" && untrustedFileMentionNeutralizing()
+        ? (text, writeOptions) => neutralizeFileMentions(prepare(text, writeOptions))
+        : prepare;
     this._sentinelMaxWaitMs = opts.sentinelMaxWaitMs ?? DEFAULT_SENTINEL_MAX_WAIT_MS;
     this._now = opts._now ?? (() => Date.now());
     this._setTimeout = opts._setTimeout ?? ((cb, ms) => setTimeout(cb, ms));
@@ -1185,7 +1198,10 @@ export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
       // daemon's process.env, hits claude 2.1.89's "Detected a custom API
       // key" interactive gate, and leaks the prompt + a truncated key into
       // the PTY (visible on Discord/Telegram). withCleanProcessEnv strips
-      // those keys from process.env around the synchronous FFI call.
+      // those keys from process.env around the synchronous FFI call. An untrusted
+      // spawn passes `opts.env` as the exact policy instead: every other key of the
+      // parent environment is removed for the call (and `opts.env` has already had
+      // the strip list applied, see the supervisor's untrustedChildEnv).
       pty = withCleanProcessEnv(
         () =>
           ptySpawn(cmd, args, {

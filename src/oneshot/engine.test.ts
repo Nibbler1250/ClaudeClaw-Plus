@@ -63,7 +63,7 @@ function recordingSpawn(record: { args: string[]; input: string; cwd: string }):
   }) as unknown as typeof spawn;
 }
 
-/** The PTY engine cannot take untrusted calls; open it only to exercise cleanup. */
+/** Force the PTY engine's isolation capability on, whatever the claude version gate decided. */
 async function withPtyIsolation<T>(call: () => T | Promise<T>): Promise<T> {
   const caps = engines.get("pty")!.caps;
   const previous = caps.isolation;

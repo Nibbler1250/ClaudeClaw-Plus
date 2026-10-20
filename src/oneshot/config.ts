@@ -35,6 +35,17 @@ export function isUntrustedRoute(route: string): boolean {
   return route.startsWith("tuner.") || UNTRUSTED_ROUTES.includes(route);
 }
 
+/**
+ * The engine a route gets when nothing names one: pty when the runner PTY is on, and, for an
+ * untrusted route, only while pty advertises isolation (the claude version gate, #570).
+ */
+function implicitEngine(route: string, ptyEnabled: boolean): string {
+  if (!ptyEnabled) return "print";
+  if (RESUME_ROUTES.includes(route)) return "pty";
+  if (isUntrustedRoute(route)) return engines.get("pty")?.caps.isolation ? "pty" : "print";
+  return "print";
+}
+
 export function resolveOneShotEngine(
   settings: OneShotSettings,
   route: string,
@@ -44,7 +55,7 @@ export function resolveOneShotEngine(
     settings.routes[route] ??
     settings.routes[`${route.split(".")[0]}.*`] ??
     settings.default ??
-    (ptyEnabled && (RESUME_ROUTES.includes(route) || isUntrustedRoute(route)) ? "pty" : "print")
+    implicitEngine(route, ptyEnabled)
   );
 }
 

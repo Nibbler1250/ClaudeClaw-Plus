@@ -17,11 +17,17 @@ interface TranscriptEntry {
 }
 
 function transcriptFiles(projectDir: string): string[] {
-  if (!existsSync(projectDir)) return [];
-  return readdirSync(projectDir, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
-    .map((entry) => join(projectDir, entry.name))
-    .sort();
+  // Never throws (scanTranscript's contract): a directory that vanishes or cannot be
+  // listed between the existence check and the read supplies no evidence.
+  try {
+    if (!existsSync(projectDir)) return [];
+    return readdirSync(projectDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+      .map((entry) => join(projectDir, entry.name))
+      .sort();
+  } catch {
+    return [];
+  }
 }
 
 /** The model's own text blocks, or undefined for user, synthetic and API-error entries. */
@@ -47,7 +53,11 @@ function isFailureEntry(entry: TranscriptEntry): boolean {
 export interface TranscriptScan {
   /** Text of the last real assistant message, if any. */
   reply?: string;
-  /** The transcript holds a synthetic or API-error assistant entry. */
+  /**
+   * The last assistant record is a synthetic or API-error entry. A failure that a later
+   * real reply followed (the CLI retried) does not count; a real reply with a failure
+   * AFTER it does: the turn did not end well, so the reply is not a success.
+   */
   failed: boolean;
 }
 
@@ -73,6 +83,7 @@ export function scanTranscript(projectDir: string): TranscriptScan {
         if (isFailureEntry(entry)) failed = true;
         const text = replyText(entry);
         if (text === undefined) continue;
+        failed = false; // a real reply after an earlier failure: the CLI recovered
         const id = entry.message?.id;
         replies.push({ id: typeof id === "string" ? id : undefined, text });
       } catch {
@@ -122,16 +133,19 @@ export interface AwaitReplyOptions {
 
 export interface AwaitReplyResult {
   text?: string;
-  /** Why there is no text: the CLI recorded a failure and no reply, or nothing appeared in time. */
-  failure?: "api-error" | "timeout";
+  /**
+   * Why there is no text: the CLI ended the turn on a failure record, nothing appeared in
+   * time, or the caller aborted.
+   */
+  failure?: "api-error" | "timeout" | "aborted";
 }
 
 /**
  * Poll for the reply until it appears or `waitMs` passes, then settle briefly and
  * re-read so a text entry written just after the first is not missed. If the transcript
- * already holds a synthetic or API-error entry and no real reply, the turn has failed
- * and waiting longer cannot help: return at once. The caller must never substitute
- * screen text for a missing reply.
+ * already ends on a synthetic or API-error entry, the turn has failed and waiting longer
+ * cannot help: return at once, even when a real reply came first. The caller must never
+ * substitute screen text for a missing reply.
  */
 export async function awaitLastAssistantReply(
   projectDir: string,
@@ -142,12 +156,15 @@ export async function awaitLastAssistantReply(
   const deadline = now() + (options.waitMs ?? TRANSCRIPT_WAIT_MS);
   for (;;) {
     const scan = scanTranscript(projectDir);
-    if (scan.reply !== undefined) break;
     if (scan.failed) return { failure: "api-error" };
-    if (options.signal?.aborted || now() >= deadline) return { failure: "timeout" };
+    if (scan.reply !== undefined) break;
+    if (options.signal?.aborted) return { failure: "aborted" };
+    if (now() >= deadline) return { failure: "timeout" };
     await sleep(POLL_MS);
   }
   await sleep(options.settleMs ?? SETTLE_MS);
-  const text = readLastAssistantReply(projectDir);
-  return text === undefined ? { failure: "timeout" } : { text };
+  // Re-read after the settle: an error record that landed just after the reply still fails it.
+  const settled = scanTranscript(projectDir);
+  if (settled.failed) return { failure: "api-error" };
+  return settled.reply === undefined ? { failure: "timeout" } : { text: settled.reply };
 }

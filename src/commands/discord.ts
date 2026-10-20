@@ -626,13 +626,19 @@ export function classifierSpawnEnv(
 /**
  * The classifier reads a message from any allowed guild member. It only has
  * to answer with JSON, so `runOneShot` runs it as an untrusted call: no tools at
- * all (`--tools ""`), no MCP server (`--strict-mcp-config` with no `--mcp-config`)
- * and no saved session, with the prompt on stdin (the argv comes from
- * `buildPrintArgs`, the single source of the isolation flags):
- * an instruction hidden in the message has nothing to act with. It also loads
+ * all (`--tools ""`), no MCP server (`--strict-mcp-config` with no `--mcp-config`),
  * no settings file (`--setting-sources ""`: no hooks, no user plugins) and no
- * skills, and runs from an empty temp dir so no CLAUDE.md is in its context —
- * otherwise a message can ask for that context back as "thread names".
+ * skills or commands, run from an empty temp dir so no CLAUDE.md is in its context.
+ * Otherwise a message can ask for that context back as "thread names".
+ *
+ * The route's engine decides how: on `print` the prompt goes on stdin (the argv comes
+ * from `buildPrintArgs`, the single source of the isolation flags) and no session is saved.
+ * On `pty`, the default whenever the runner PTY is on and claude is at least the measured
+ * version, the same flags drive an interactive claude (minus `--no-session-persistence`,
+ * which is print-only), the prompt is typed in with every `@` replaced so it cannot name a
+ * file, the reply is read from the transcript, and `runOnceOnPty` removes the transcript,
+ * history lines and trust entry afterwards. The `deps.spawn` seam below is print-only: it
+ * is ignored when the call lands on pty.
  */
 export async function classifyThreadIntent(
   text: string,

@@ -248,6 +248,12 @@ export { cleanSpawnEnv, shouldStripSpawnEnvKey };
  * If you find yourself wanting to wrap async work, refactor that work to
  * have the spawn as the only call inside `withCleanProcessEnv` and do the
  * rest outside.
+ *
+ * `policy` (untrusted spawns, #570): the EXACT environment the child may see. Every key of
+ * the parent environment that is not in `policy` is removed for the call, from `process.env`
+ * and from libc `environ` (native-only keys included), then restored afterwards, also when
+ * `fn` throws. Unlike the strip-list path it fails closed: when libc is unavailable it
+ * throws instead of leaving the parent environment visible to the child.
  */
 /**
  * Lazy-loaded `libc.unsetenv` / `libc.setenv` bindings.
@@ -296,10 +302,10 @@ function loadLibc(): void {
       }
     }
   } catch {
-    // bun:ffi unavailable (e.g. test env). withCleanProcessEnv will fall back
-    // to JS-only delete; that's correct for tests against /bin/cat etc. but
-    // would re-leak under real bun-pty + native fork. Surface this loudly
-    // in production via logging.
+    // bun:ffi unavailable (e.g. test env). The strip-list path of withCleanProcessEnv
+    // falls back to a JS-only delete: fine for tests against /bin/cat etc., but it would
+    // re-leak under real bun-pty + native fork. The `policy` path (untrusted spawns)
+    // does not fall back: it throws "Native environment isolation unavailable".
   }
 }
 

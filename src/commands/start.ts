@@ -27,6 +27,7 @@ import {
   registerGatewayDelivery,
   unregisterGatewayDelivery,
 } from "../event-processor";
+import { applyPtyIsolationVersionGate } from "../oneshot/claude-version.js";
 import { writeState, type StateData } from "../statusline";
 import { ensureStatuslineSetting, removeStatuslineSetting } from "../statusline-settings";
 import { nextCronMatch } from "../cron";
@@ -851,6 +852,9 @@ export async function start(args: string[] = []) {
   // logs a warning but does NOT block startup — the PTY parser also has
   // a turnIdleTimeoutMs safety net for unknown versions.
   const cliProbe = await probeClaudeCliVersion();
+  // #570: PTY isolation was measured on one claude build; below it, untrusted one-shot
+  // routes stay on print.
+  applyPtyIsolationVersionGate(cliProbe.version);
   if (cliProbe.version === null) {
     console.warn(`  Claude CLI: could not probe (claude --version failed)`);
   } else if (cliProbe.known) {

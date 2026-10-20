@@ -5,13 +5,14 @@ import { runOneShot } from "./engine.js";
 import { withPrintRuntime } from "./print.js";
 import { engines } from "./registry.js";
 
-// Explicit opt-in: consumes the operator's Claude subscription. PTY remains
-// excluded until the separate interactive isolation spike is reviewed green.
+// Explicit opt-in: consumes the operator's Claude subscription. Only `print` is
+// instrumentable here (the wire is `--output-format stream-json` on a child process).
+// The interactive PTY engine advertises isolation too, and its adversarial coverage is
+// tests/integration/untrusted-pty-isolation.test.ts, which runs on a real claude in CI.
 describe.skipIf(process.env.ONESHOT_E2E !== "1")("one-shot adversarial e2e", () => {
-  for (const engine of engines.values()) {
-    if (!engine.caps.isolation) continue;
+  for (const engine of [engines.get("print")!]) {
     it(`${engine.id}: cannot create a canary or invoke tools`, async () => {
-      expect(engine.id).toBe("print");
+      expect(engine.caps.isolation).toBe(true);
       const before = new Set(
         readdirSync("/tmp").filter((name) => name.startsWith("oneshot-canary-")),
       );

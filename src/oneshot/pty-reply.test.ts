@@ -17,6 +17,7 @@ import {
   TRANSCRIPT_WAIT_FLOOR_MS,
   TRANSCRIPT_WAIT_MS,
   awaitLastAssistantReply,
+  scanTranscript,
   transcriptWaitBudget,
 } from "./pty-transcript.js";
 
@@ -128,11 +129,13 @@ describe("#570 one-shot PTY reply extraction", () => {
     expect((await runOnceOnPty(request)).text).toBe("first part second");
   });
 
-  it("(b) ignores synthetic and API-error entries that follow the real reply", async () => {
+  it("(b) a real reply followed by an API-error entry is a failure, not a partial success", async () => {
     fakePty([userEntry(), assistant("m1", [text("the real reply")]), syntheticError()]);
     const result = await runOnceOnPty(request);
-    expect(result.exitCode).toBe(0);
-    expect(result.text).toBe("the real reply");
+    expect(result.exitCode).toBe(1);
+    expect(result.text).toBe("");
+    const logged = warn.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+    expect(logged).toContain("api-error");
   });
 
   it("(c) returns a non-zero exit and no screen text when no reply appears in time", async () => {
@@ -245,6 +248,34 @@ describe("#570 failed-turn latency", () => {
     expect(result).toEqual({ text: "recovered" });
   });
 
+  it("a real reply followed by an API-error entry fails the turn (D3)", async () => {
+    const clock = fakeClock();
+    const result = await awaitLastAssistantReply(
+      project([userEntry(), assistant("m1", [text("real")]), syntheticError()]),
+      { waitMs: 2000, ...clock },
+    );
+    expect(result).toEqual({ failure: "api-error" });
+  });
+
+  it("scanning a project dir that cannot be listed supplies no evidence and does not throw (D3)", () => {
+    // A FILE where the directory should be: existsSync is true, readdirSync throws ENOTDIR.
+    const notADir = join(dir, "not-a-dir");
+    writeFileSync(notADir, "x");
+    expect(scanTranscript(notADir)).toEqual({ failed: false });
+  });
+
+  it("an abort while waiting reports aborted, not timeout (D1)", async () => {
+    const clock = fakeClock();
+    const controller = new AbortController();
+    controller.abort();
+    const result = await awaitLastAssistantReply(project([userEntry()]), {
+      waitMs: 2000,
+      signal: controller.signal,
+      ...clock,
+    });
+    expect(result).toEqual({ failure: "aborted" });
+  });
+
   it("the transcript wait is what the turn left of timeoutMs, capped, with a floor", () => {
     expect(transcriptWaitBudget(15_000, 2_000)).toBe(13_000);
     expect(transcriptWaitBudget(60_000, 1_000)).toBe(TRANSCRIPT_WAIT_MS);
@@ -268,10 +299,32 @@ describe("#570 failed-turn latency", () => {
     injectOneShotTranscriptWaitForTests(null);
     fakePty([userEntry()]);
     const started = Date.now();
-    const result = await runOnceOnPty({ ...request, timeoutMs: 400 });
-    expect(result.exitCode).toBe(1);
+    const result = await runOnceOutcome();
+    // The caller's whole deadline is gone by the end of the wait: a timeout (124), not a failure.
+    expect(result.exitCode).toBe(124);
     expect(result.text).toBe("");
     // 15 s without the budget; the floor is 1 s.
     expect(Date.now() - started).toBeLessThan(2500);
+
+    async function runOnceOutcome() {
+      return runOnceOnPty({ ...request, timeoutMs: 400 });
+    }
+  });
+
+  it("runOnceOnPty: no reply with deadline to spare is a failure (1), not a timeout", async () => {
+    injectOneShotTranscriptWaitForTests(60);
+    fakePty([userEntry()]);
+    const result = await runOnceOnPty({ ...request, timeoutMs: 10_000 });
+    expect(result.exitCode).toBe(1);
+  });
+
+  it("runOnceOnPty: an abort during the transcript wait is exit 124, not 1 (D1)", async () => {
+    injectOneShotTranscriptWaitForTests(null);
+    fakePty([userEntry()]);
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 200);
+    const result = await runOnceOnPty({ ...request, timeoutMs: 10_000, signal: controller.signal });
+    expect(result.exitCode).toBe(124);
+    expect(result.text).toBe("");
   });
 });

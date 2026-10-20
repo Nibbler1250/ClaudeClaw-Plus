@@ -4,8 +4,11 @@ Utility calls use `runOneShot` from `src/oneshot/engine.ts`. Every request must
 declare `isolation: "untrusted"` or `isolation: "trusted-session"`, plus a positive
 `timeoutMs`. With no explicit one-shot setting, the trusted resume routes
 `compact`, `rotation.summary`, `memory.save.precompact` and `memory.save.stop`
-use `pty` when `pty.enabled` is true, and `print` when false. All other routes
-still default to `print`. `print` and `pty` are built in and
+use `pty` when `pty.enabled` is true, and `print` when false. The untrusted
+routes (`discord.classifier`, `tuner.*`, `memory.recall`) follow `pty.enabled` too, but
+only on a claude CLI at least 2.1.304, the build the interactive isolation was measured
+on; below that, or when the version cannot be read at startup, they stay on `print`
+(one startup warning). `print` and `pty` are built in and
 need no declaration. The HTTP engines below are built in too, and need their
 settings.
 
@@ -42,9 +45,11 @@ budget. Exact routes override a namespace wildcard, then an explicit
 `oneShot.default`, then the implicit route default applies. The implicit default
 is `pty` when `pty.enabled` is true (`print` otherwise, including the Windows
 default) for the trusted resume routes **and** for the untrusted routes
-(`discord.classifier`, `tuner.*`, `memory.recall`), so nothing in the default
-configuration runs `claude -p`. Unknown engines and incompatible capabilities fail
-settings load.
+(`discord.classifier`, `tuner.*`, `memory.recall`) while the claude version gate
+below holds. `claude -p` still runs in the default configuration whenever the
+gate or `pty.enabled` says print, and for the tuner's `claude_cli` backend, which
+always selects print. Unknown engines and incompatible capabilities fail settings
+load.
 
 The PTY engine advertises `caps.isolation: true` (#570). The interactive isolation
 spike ([`docs/spikes/0.7-interactive-isolation.md`](spikes/0.7-interactive-isolation.md))
@@ -57,16 +62,29 @@ rejected, and an HTTP engine stays an explicit opt-in. Reverting the flag in
 `src/oneshot/registry.ts` closes the gate again. One caveat is recorded in the
 spike: a prompt that tells a tool-less session to run a tool sometimes gets no reply.
 It is bounded by the caller's timeout (the classifier uses 15 s) and fails closed,
-since the classifier treats a non-zero exit as "not a thread command". An untrusted PTY call returns the model's reply read from the session transcript, never the rendered
-screen (which echoes the prompt); if no reply appears it exits 1. Trusted routes keep the screen text. Routes that
-carry untrusted text also reject any isolation other than `untrusted`.
+since the classifier treats a non-zero exit as "not a thread command". An untrusted
+PTY call returns the model's reply read from the session transcript, never the rendered
+screen (which echoes the prompt); if no reply appears it exits 1, or 124 when the caller
+aborted or its own deadline ran out during the wait. Trusted routes keep the screen text.
+Routes that carry untrusted text also reject any isolation other than `untrusted`.
+
+What an untrusted PTY call does that print does not need to (all measured, see the spike
+doc): it marks its throwaway cwd trusted in the child's own config root before the call and
+removes that entry afterwards; it applies the spawn strip list (`ANTHROPIC_API_KEY`,
+`CLAUDECODE`, short-lived OAuth tokens) to the caller's env, because an interactive
+claude with an API key in its env stops at a "custom API key" gate; it replaces every `@`
+in the prompt with U+FF20, because the REPL expands `@path` mentions itself, anywhere in a
+prompt, which `--tools ""` does not stop; and it removes the transcript, the lines
+it left in `history.jsonl` and its per-session files, failing closed (the call throws) if
+it cannot. The `req.system` text is passed as `--system-prompt`, as print does.
 
 Trusted calls may supply `cwd` for session lookup, including named-agent working
 directories. Both engines honour it. Untrusted calls cannot specify `cwd`, resume
 sessions or specify allowed tools. The print engine
 uses the canonical no-tools/no-MCP/no-settings flags, a fresh empty working
-directory and cleanup after exit. Untrusted prompts are always delivered on stdin,
-never in argv, so a prompt shaped like a flag cannot be parsed as one. The classifier preserves its environment
+directory and cleanup after exit. On print, untrusted prompts are always delivered on
+stdin, never in argv, so a prompt shaped like a flag cannot be parsed as one; on pty the
+prompt is typed into the REPL, never put in argv either. The classifier preserves its environment
 allowlist; the tuner preserves `cleanSpawnEnv()`. Python memory recall retains
 the #545 implementation, with a test checking exact isolation-flag parity.
 
@@ -143,5 +161,6 @@ are a closed list: a route not in `KNOWN_ROUTES` (or a family wildcard such as
 Run unit contracts with `bun test src/oneshot`. The adversarial live CLI test is
 opt-in: `ONESHOT_E2E=1 bun test src/oneshot/e2e.test.ts`. It checks actual CLI tool
 events and newly created `/tmp/oneshot-canary-*` files. It uses the operator's
-Claude authentication and can consume subscription quota. PTY isolation is
-deliberately excluded until the separate spike is green.
+Claude authentication and can consume subscription quota. It covers print only.
+PTY isolation is covered by `tests/integration/untrusted-pty-isolation.test.ts`, which
+runs on a real claude in the integration workflow.

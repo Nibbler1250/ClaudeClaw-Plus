@@ -67,6 +67,22 @@ export function neutralizeLeadingReplCommand(text: string): string {
  */
 const ALLOWED_REPL_COMMAND = /^\/compact(?: [^\n]{0,500})?$/;
 
+/**
+ * U+FF20 FULLWIDTH COMMERCIAL AT: looks like `@`, is not the character the REPL expands.
+ */
+const FULLWIDTH_AT = "\uff20";
+
+/**
+ * Keep untrusted text from naming files. The REPL expands `@path` mentions anywhere in
+ * a prompt, not only at the start, and does so itself rather than through a model tool
+ * call, so `--tools ""` does not stop it. Apply to the text that is actually written
+ * (after `sanitizePtyPromptText`), for untrusted prompts only: a trusted prompt may
+ * legitimately mention a file.
+ */
+export function neutralizeFileMentions(text: string): string {
+  return text.replaceAll("@", FULLWIDTH_AT);
+}
+
 export interface PtyPromptWriteOptions {
   /**
    * The caller is deliberately sending a REPL command. Honoured only when the sanitized
