@@ -59,6 +59,7 @@ import {
   withoutDirNames,
 } from "../../src/runner/pty-screen-signals.js";
 import { PRINT_ONLY_UNTRUSTED_ARGS, UNTRUSTED_CLAUDE_ARGS } from "../../src/oneshot/isolation.js";
+import { isHangSignature, rowRetryLine } from "../../src/runner/pty-hang-signature.js";
 
 const disposableCI =
   process.env.CI === "true" && process.env.GITHUB_ACTIONS === "true" && !!process.env.RUNNER_TEMP;
@@ -600,6 +601,11 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
        * It does not show the model read the prompt.
        */
       requireApiContact?: boolean;
+      /**
+       * A CONTROL PRESENT row's label. Run the call once more when it ends in the upstream
+       * no-reply hang (`isHangSignature`), as production does. Never set on a twin.
+       */
+      retryHang?: string;
     } = {},
   ) {
     expect(baselineLeakObserved).toBe(false);
@@ -608,33 +614,65 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     promptFragment = prompt.slice(0, 40).replaceAll("@", "\uff20");
     const policy: Record<string, string> = { ...callerPolicy(), ...options.callerEnv };
     for (const key of options.omitCallerEnv ?? []) delete policy[key];
-    let result: Awaited<ReturnType<typeof runOnceOnPty>>;
-    const started = Date.now();
-    try {
-      result = await withPrintRuntime({ env: policy }, () =>
-        runOnceOnPty({
-          route: "discord.classifier",
-          isolation: "untrusted",
-          prompt,
-          ...(options.system ? { system: options.system } : {}),
-          ...(options.model ? { model: options.model } : {}),
-          timeoutMs: options.timeoutMs ?? BUDGET,
-        }),
-      );
-    } catch (error) {
-      // A code and a timing only: the thrown message may carry a path or a screen.
-      console.info(
-        `[isolation-spike] run-threw ${options.screen ?? "-"}: reason=threw:${errorWord(error)}; elapsedMs=${Date.now() - started}`,
-      );
-      if (options.screen) await captureScreen(options.screen);
-      throw error;
-    }
-    const elapsedMs = Date.now() - started;
-    if (result.exitCode !== 0) {
-      // Every non-zero exit says why, from a fixed set of codes (never a screen, transcript or env).
-      console.info(
-        `[isolation-spike] run-exit ${options.screen ?? "-"}: exit=${result.exitCode}; reason=${result.diagnostic?.reason ?? "none"}; phasesMs=${JSON.stringify(result.diagnostic?.phasesMs ?? {})}; elapsedMs=${elapsedMs}`,
-      );
+    const attempt = async () => {
+      const started = Date.now();
+      let attempted: Awaited<ReturnType<typeof runOnceOnPty>>;
+      try {
+        attempted = await withPrintRuntime({ env: policy }, () =>
+          runOnceOnPty({
+            route: "discord.classifier",
+            isolation: "untrusted",
+            prompt,
+            ...(options.system ? { system: options.system } : {}),
+            ...(options.model ? { model: options.model } : {}),
+            timeoutMs: options.timeoutMs ?? BUDGET,
+          }),
+        );
+      } catch (error) {
+        // A code and a timing only: the thrown message may carry a path or a screen.
+        console.info(
+          `[isolation-spike] run-threw ${options.screen ?? "-"}: reason=threw:${errorWord(error)}; elapsedMs=${Date.now() - started}`,
+        );
+        if (options.screen) await captureScreen(options.screen);
+        throw error;
+      }
+      const took = Date.now() - started;
+      if (attempted.exitCode !== 0) {
+        // Every non-zero exit says why, from a fixed set of codes (never a screen, transcript or env).
+        console.info(
+          `[isolation-spike] run-exit ${options.screen ?? "-"}: exit=${attempted.exitCode}; reason=${attempted.diagnostic?.reason ?? "none"}; phasesMs=${JSON.stringify(attempted.diagnostic?.phasesMs ?? {})}; elapsedMs=${took}`,
+        );
+      }
+      return { attempted, took };
+    };
+    let { attempted: result, took: elapsedMs } = await attempt();
+    if (
+      options.retryHang !== undefined &&
+      isHangSignature({
+        exitCode: result.exitCode,
+        reason: result.diagnostic?.reason,
+        promptSeen,
+        assistantEntries,
+        apiErrors: apiErrorCount,
+      })
+    ) {
+      console.info(rowRetryLine(options.retryHang));
+      // The hung call must have cleaned up after itself before the call is made again.
+      expect(opts.every((spawned) => !existsSync(spawned.cwd))).toBe(true);
+      opts = [];
+      project = "";
+      transcriptSeen = 0;
+      assistantReply = "";
+      assistantEntries = 0;
+      toolUse = false;
+      apiErrorCount = 0;
+      syntheticCount = 0;
+      promptSeen = false;
+      transcriptRaw = "";
+      diagnostics = "";
+      livePty = undefined;
+      liveChunks = "";
+      ({ attempted: result, took: elapsedMs } = await attempt());
     }
     const hung = result.exitCode !== 0 || assistantEntries === 0;
     if (options.screen) {
@@ -728,6 +766,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
                 timeoutMs: 60_000,
                 allowNoTurn: true,
                 requireApiContact: true,
+                retryHang: "tools CONTROL PRESENT",
               },
         );
         const isolated = !existsSync(marker) && !toolUse;
@@ -748,6 +787,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         }
         await run(
           "Call the probe tool from the isolation_canary MCP server if it is available. Otherwise answer UNAVAILABLE.",
+          twin ? {} : { retryHang: "MCP CONTROL PRESENT" },
         );
         const isolated = !existsSync(marker);
         checkIsolation("MCP", isolated, twin);
@@ -760,7 +800,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       async () => {
         const marker = plantHooks();
         if (twin) drop("--setting-sources", 1);
-        await run();
+        await run(undefined, twin ? {} : { retryHang: "settings and hooks CONTROL PRESENT" });
         const isolated = !existsSync(marker);
         checkIsolation("hooks", isolated, twin);
       },
@@ -772,7 +812,10 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       async () => {
         plantMemory();
         if (twin) plainInteractive();
-        const result = await run(MEMORY_QUESTION);
+        const result = await run(
+          MEMORY_QUESTION,
+          twin ? {} : { retryHang: "user memory CONTROL PRESENT" },
+        );
         expect(toolUse).toBe(false);
         const isolated = !result.text.includes(CANARY);
         checkIsolation("memory", isolated, twin);
@@ -823,7 +866,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
           cleanupSpies = [
             spyOn(cleanup, "removeUntrustedConfigRoot").mockImplementation(async () => {}),
           ];
-        await run();
+        await run(undefined, twin ? {} : { retryHang: "transcript cleanup CONTROL PRESENT" });
         expect(transcriptSeen).toBeGreaterThan(0);
         checkIsolation("transcript cleanup", jsonls(project).length === 0, twin);
       },
@@ -874,7 +917,9 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         if (twin) stripTrust = true;
         const result = await run(
           `Reply with ${DONE}.`,
-          twin ? { allowNoTurn: true, timeoutMs: 30_000, screen: "trust-twin" } : {},
+          twin
+            ? { allowNoTurn: true, timeoutMs: 30_000, screen: "trust-twin" }
+            : { retryHang: "B1 trust seeded in the throwaway root CONTROL PRESENT" },
         );
         const completed = result.exitCode === 0 && assistantEntries > 0;
         const stalled = assistantEntries === 0 && result.exitCode !== 0;
@@ -912,7 +957,10 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
                 screen: "api-key-twin",
                 callerEnv: { ANTHROPIC_API_KEY: fake },
               }
-            : { callerEnv: { ANTHROPIC_API_KEY: fake } },
+            : {
+                callerEnv: { ANTHROPIC_API_KEY: fake },
+                retryHang: "B2 ANTHROPIC_API_KEY strip CONTROL PRESENT",
+              },
         );
         console.info(
           `[isolation-spike] B2 ${direction}: childHasApiKey=${childHasApiKey}; exit=${result.exitCode}; assistantEntries=${assistantEntries}`,
@@ -951,6 +999,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
           allowNoTurn: true,
           timeoutMs: twin ? BUDGET : 60_000,
           requireApiContact: true,
+          ...(twin ? {} : { retryHang: "B3 PTY CONTROL PRESENT" }),
         });
         const inReply = result.text.includes(FILE_CANARY);
         const inTranscript = transcriptRaw.includes(FILE_CANARY);
@@ -1070,7 +1119,12 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
           prompt,
           twin
             ? { timeoutMs: BUDGET }
-            : { allowNoTurn: true, timeoutMs: 60_000, requireApiContact: true },
+            : {
+                allowNoTurn: true,
+                timeoutMs: 60_000,
+                requireApiContact: true,
+                retryHang: "C @ look-alikes CONTROL PRESENT",
+              },
         );
         const inReply = result.text.includes(FILE_CANARY);
         const inTranscript = transcriptRaw.includes(FILE_CANARY);
@@ -1219,7 +1273,12 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
           if (twin) copyFileSync(join(seeded, ".claude.json"), join(config, ".claude.json"));
           before = byteSnapshot(config).files;
         };
-        await run(`Reply with ${DONE}.`, twin ? { allowNoTurn: true, timeoutMs: 60_000 } : {});
+        await run(
+          `Reply with ${DONE}.`,
+          twin
+            ? { allowNoTurn: true, timeoutMs: 60_000 }
+            : { retryHang: "A-untouched CONTROL PRESENT" },
+        );
         const after = byteSnapshot(config);
         const changed = bytesChanged(before, after.files);
         console.info(
@@ -1589,7 +1648,10 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
             spyOn(cleanup, "removeUntrustedConfigRoot").mockImplementation(async () => {}),
           ];
         }
-        await run(`Reply with ${DONE}. Reference marker: ${PROMPT_CANARY}.`);
+        await run(
+          `Reply with ${DONE}. Reference marker: ${PROMPT_CANARY}.`,
+          twin ? {} : { retryHang: "C1 persistence beyond the transcript CONTROL PRESENT" },
+        );
         console.info(`[isolation-spike] C1 ${direction}: stage=after-cleanup`);
         const afterSnap = snapshot(childRoot);
         console.info(
