@@ -76,6 +76,7 @@ describe("findEscapees (fake /proc)", () => {
   it("reports unknown for a process of ours whose environment cannot be read", () => {
     mkdirSync(join(proc, "5302"));
     mkdirSync(join(proc, "5302", "environ")); // reading a directory fails (EISDIR), not ENOENT
+    // Went red (unknown false) with the environ read error swallowed.
     expect(findEscapees(TARGET, { procDir: proc, selfPid: 1 })).toEqual({
       pids: [],
       unknown: true,
@@ -86,6 +87,7 @@ describe("findEscapees (fake /proc)", () => {
     mkdirSync(join(proc, "5303"));
     writeFileSync(join(proc, "5303", "environ"), "PATH=/bin\0");
     writeFileSync(join(proc, "5303", "cwd"), "not a link"); // readlink on a file fails (EINVAL)
+    // Went red (unknown false) with the cwd read error swallowed.
     expect(findEscapees(TARGET, { procDir: proc, selfPid: 1 }).unknown).toBe(true);
   });
 
@@ -94,6 +96,7 @@ describe("findEscapees (fake /proc)", () => {
     mkdirSync(join(proc, "5305"));
     mkdirSync(join(proc, "5305", "environ")); // unreadable, but not ours:
     const foreign = (process.getuid?.() ?? 0) + 1;
+    // Went red (unknown true for the foreign process) with the uid check removed.
     expect(findEscapees(TARGET, { procDir: proc, selfPid: 1, uid: foreign })).toEqual({
       pids: [],
       unknown: false,
@@ -116,6 +119,7 @@ describe("findEscapees (fake /proc)", () => {
   });
 
   it("throws when /proc cannot be listed, and finds nothing for a root nobody carries", () => {
+    // Went red (did not throw) with the readdir failure turned back into an empty list.
     expect(() => findEscapees(TARGET, { procDir: join(proc, "missing") })).toThrow();
     const scan = findEscapees({ root: `/tmp/no-such-root-${process.pid}-${Date.now()}`, cwds: [] });
     expect(scan.pids).toEqual([]);
@@ -223,6 +227,7 @@ describe("terminateEscapees (fake /proc)", () => {
     mkdirSync(join(proc, "6006"));
     mkdirSync(join(proc, "6006", "environ")); // unreadable and ours
     const k = kernel("SIGTERM");
+    // Went red (the promise resolved) with an unknown first scan read as "nothing found".
     await expect(
       terminateEscapees(TARGET, { procDir: proc, selfPid: 1, signal: k.signal, ...fast }),
     ).rejects.toBeInstanceOf(EscapeScanUnknownError);
@@ -234,6 +239,7 @@ describe("terminateEscapees (fake /proc)", () => {
     mkdirSync(join(proc, "6008"));
     mkdirSync(join(proc, "6008", "environ")); // never readable: the last scan stays unknown
     const k = kernel("SIGTERM");
+    // Went red (the promise resolved) with the final unknown scan returned as its pids.
     await expect(
       terminateEscapees(TARGET, {
         procDir: proc,

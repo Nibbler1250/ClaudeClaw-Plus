@@ -153,6 +153,7 @@ describe("retiring a PTY child", () => {
     await until(() => !child.isAlive());
     clock += 120_000; // past the window that guards the bare-pid signal
     await child.dispose();
+    // Went red (0 scans) with the scan tied to the 30 s window again.
     expect(scans).toBe(1);
   });
 
@@ -307,6 +308,7 @@ describe("retirement and the recorded identity", () => {
         },
       });
       await unknown.child.dispose();
+      // Went red with the escapee cause no longer set.
       expect(causes).toEqual(["group", "escapee", "scan-unknown"]);
     } finally {
       error.mockRestore();

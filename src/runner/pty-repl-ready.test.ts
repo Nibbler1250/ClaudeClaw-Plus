@@ -185,6 +185,7 @@ describe("the ready gate reads the current screen", () => {
     } finally {
       clearInterval(timer);
     }
+    // Went red (nothing written) with the quiet window restarted on every chunk.
     expect(received()).toContain("PROMPT_REACHED_THE_PTY");
     expect(Date.now() - started).toBeLessThan(2000);
   });

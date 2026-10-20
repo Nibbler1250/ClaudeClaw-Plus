@@ -447,6 +447,7 @@ describe("survivor.json", () => {
     const root = leftover(`${ONESHOT_CONFIG_PREFIX}record`, OLD, own());
     markGroupSurvivor(root, 4242, { startMs: 1_700_000_000_000, cwds: ["/tmp/a", "/tmp/b"] });
     const file = join(root, ONESHOT_SURVIVOR_FILE);
+    // Went red (no such file) with the write removed.
     expect(JSON.parse(readFileSync(file, "utf8"))).toMatchObject({
       pid: 4242,
       startMs: 1_700_000_000_000,
@@ -487,6 +488,7 @@ describe("survivor.json", () => {
           },
         }),
       ).toBe(0);
+      // Went red (2 removed, expected 0) with the adoption pre-pass removed.
       expect(asked).toEqual([{ pid: 4242, startMs: 7 }]); // asked with the recorded identity
     } finally {
       error.mockRestore();
@@ -511,6 +513,7 @@ describe("survivor.json", () => {
         markGroupSurvivor(root, 4242, { startMs: 7, cwds: [] });
         utimesSync(root, OLD, OLD);
         restart();
+        // Went red (1 removed, expected 0) with the scan ignored when adopting.
         expect(sweep({ groupGone: () => true, scan })).toBe(0);
         expect(existsSync(root)).toBe(true);
         expect(groupSurvivorOf(root)).toBe(4242);
@@ -536,6 +539,7 @@ describe("survivor.json", () => {
     markGroupSurvivor(root, process.ppid, { startMs: 1, cwds: [] });
     utimesSync(root, OLD, OLD);
     restart();
+    // Went red (0 removed, expected 1) with the recorded identity ignored.
     expect(sweep({ scan: () => ({ pids: [], unknown: false }) })).toBe(1);
     expect(existsSync(root)).toBe(false);
   });
@@ -564,6 +568,7 @@ describe("survivor.json", () => {
       expect(sweep({ scan: () => ({ pids: [], unknown: false }) })).toBe(0);
       expect(existsSync(root)).toBe(true);
       const logged = warn.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+      // Went red with the directory's name left out of the log.
       expect(logged).toContain(`${ONESHOT_CONFIG_PREFIX}bad-record`); // the basename
       expect(logged).not.toContain(base);
     } finally {
@@ -602,6 +607,7 @@ describe("quarantine (#570 r14, M4)", () => {
         if (target.root?.endsWith("ancient-unknown")) return { pids: [], unknown: true };
         return { pids: [4242], unknown: false };
       };
+      // Went red (3 removed, expected 0) with the scan check dropped from the 24 h removal.
       expect(sweep({ scan })).toBe(0);
       for (const path of [found, unknown, threw]) expect(existsSync(path)).toBe(true);
     } finally {
@@ -657,8 +663,10 @@ describe("retrySurvivingGroups with the real termination (#570 r14, B and E)", (
       },
       reap: async () => [],
     });
+    // Went red (cleared 0, expected 1) with the `-pid` send deleted from GroupTarget.send.
     expect(cleared).toBe(1);
     expect(sent).toEqual([[-4242, "SIGTERM"]]);
+    // Went red (a reader function) with the pass's cached reader passed to the termination again.
     expect(readers).toEqual([undefined]);
   });
 });

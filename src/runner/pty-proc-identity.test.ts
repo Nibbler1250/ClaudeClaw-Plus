@@ -23,6 +23,7 @@ describe("procStartMs (fake /proc)", () => {
 
   it("reads field 22 (ticks since boot) as milliseconds", () => {
     stat(123, `123 (sleep) ${AFTER}\n`);
+    // Went red (0) with field 21 read instead of field 22.
     expect(procStartMs(123, proc)).toBe(123_450);
   });
 

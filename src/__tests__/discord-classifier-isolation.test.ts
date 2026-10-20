@@ -160,6 +160,7 @@ describe("classifyThreadIntent: model, bound and retry", () => {
   }
 
   it("asks the haiku alias, never a dated model id", () => {
+    // Went red ("claude-sonnet-4-20250514") with the retired id put back.
     expect(CLASSIFIER_MODEL).toBe("haiku");
   });
 
@@ -174,6 +175,7 @@ describe("classifyThreadIntent: model, bound and retry", () => {
 
   it("retries once when the first attempt hangs, and succeeds when the second replies", async () => {
     const s = script([hung(), answered(REPLY)]);
+    // Went red (null; one request, expected two) with the retry deleted.
     expect(await classifyThreadIntent("hire Ada", { runOneShot: s.run })).toEqual({
       action: "hire",
       names: ["Ada"],
@@ -184,6 +186,7 @@ describe("classifyThreadIntent: model, bound and retry", () => {
   it("fails closed after two hangs, with no third attempt", async () => {
     const s = script([hung(), hung()]);
     expect(await classifyThreadIntent("hire Ada", { runOneShot: s.run })).toBeNull();
+    // Went red (3 requests) with a second retry allowed.
     expect(s.requests).toHaveLength(2);
   });
 
@@ -191,6 +194,7 @@ describe("classifyThreadIntent: model, bound and retry", () => {
     const noReply: OneShotResult = { text: "", engine: "pty", model: "haiku", exitCode: 1 };
     const s = script([noReply, noReply]);
     expect(await classifyThreadIntent("hire Ada", { runOneShot: s.run })).toBeNull();
+    // Went red (15000 twice) with the old bound put back.
     expect(s.requests.map((r) => r.timeoutMs)).toEqual([8000, 8000]);
     expect(s.requests.every((r) => r.isolation === "untrusted")).toBe(true);
     expect(s.requests.every((r) => r.model === "haiku")).toBe(true);

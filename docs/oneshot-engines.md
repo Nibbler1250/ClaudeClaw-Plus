@@ -61,8 +61,10 @@ discoverable. Any untrusted route to an engine without the capability is still
 rejected, and an HTTP engine stays an explicit opt-in. Reverting the flag in
 `src/oneshot/registry.ts` closes the gate again. One caveat is recorded in the
 spike: a prompt that tells a tool-less session to run a tool sometimes gets no reply.
-It is bounded by the caller's timeout (the classifier uses 15 s) and fails closed,
-since the classifier treats a non-zero exit as "not a thread command". An untrusted
+It is bounded by the caller's timeout and fails closed: the classifier (the `haiku` alias)
+allows 8 s per attempt and retries exactly once when an attempt times out or gets no reply,
+so a call is bounded at about 16 s, and after the retry it treats a non-zero exit as "not a
+thread command". A call that throws (a cleanup that could not remove the prompt) is not retried. An untrusted
 PTY call returns the model's reply read from the session transcript, never the rendered
 screen (which echoes the prompt); if no reply appears it exits 1, or 124 when the caller
 aborted or its own deadline ran out during the wait. Trusted routes keep the screen text.
@@ -81,15 +83,23 @@ operator; no credential is copied. Everything claude writes about the prompt (tr
 history, paste cache, session files) lands in that root, and the root is removed in the
 call's `finally` and again after a late spawn settles. The call's claude is retired with
 its whole process group (SIGTERM, then SIGKILL after 2 s, each awaited until `kill(-pid, 0)`
-answers ESRCH) before the root is removed. Before every signal the pid's start time is
-compared with the one recorded at spawn, so a pid that was reused is never signalled. On
+answers ESRCH) before the root is removed. Immediately before every signal the pid's start
+time (Linux: `/proc/<pid>/stat` field 22, which a clock step does not move; macOS: `ps`) is
+compared with the one recorded at spawn, and the group is signalled once, not the bare pid as
+well. That narrows pid reuse to the instant between the check and the `kill()`; it cannot
+close it without a native process handle, and none is built. On
 Linux a descendant that left the group (`setsid()`, `setpgid()`) is found afterwards by the
 throwaway `CLAUDE_CONFIG_DIR` in its environment, or a cwd inside the throwaway temp cwd, and
-stopped the same way. **On macOS there is no cheap equivalent: containment there is the
+stopped the same way. That scan fails closed: a `/proc` that cannot be listed, or a process
+of our uid whose environment or cwd cannot be read for any reason but its having gone, makes
+the answer "unknown", which counts as a survivor, never as "nothing escaped". **On macOS there is no cheap equivalent: containment there is the
 process group plus the remove-and-recheck loop, and a process that leaves the group and keeps
 writing is not stopped.** If the group, or anything outside it, will not die, the call fails
-and the root and temp cwd are kept; the sweeper signals the survivor again every pass and
-never sweeps them while it is recorded. The prompt is written only into a REPL that is ready
+and the root and temp cwd are kept, with a `survivor.json` (pid, start time, cwds) in the root;
+the sweeper signals the survivor again every pass and never sweeps them while it is recorded.
+After a daemon restart the sweep reads `survivor.json` before it removes anything: a recorded
+group (checked with its identity) or an escapee still running, or one it cannot tell, puts the
+root back on the survivor list instead of removing it. The prompt is written only into a REPL that is ready
 (footer on the current screen, no login, onboarding or trust screen after one quiet window);
 otherwise the spawn fails and nothing is sent. If the root cannot be created or removed the call fails (the error is logged by step
 and code, never content). Each root and temp cwd holds an owner file (daemon pid, start time,
@@ -97,7 +107,8 @@ instance). A daemon start, and then every ten minutes, removes leftover
 `claudeclaw-oneshot-cfg-*` and `claudeclaw-oneshot-pty-*` temp directories that are older
 than ten minutes, belong to this uid, are not a running call of this daemon, and whose
 owner is dead (a directory with no owner file at all falls back to the age rule; one whose
-owner file cannot be read or understood is quarantined, logged and never removed). It applies the spawn strip list (`ANTHROPIC_API_KEY`,
+owner file or `survivor.json` cannot be read or understood is quarantined: logged once by
+name, and removed only after 24 h and only if the escape scan finds nothing in it). It applies the spawn strip list (`ANTHROPIC_API_KEY`,
 `CLAUDECODE`, short-lived OAuth tokens) to the caller's env, because an interactive
 claude with an API key in its env stops at a "custom API key" gate; it replaces every `@`
 in the prompt with U+FF20, because the REPL expands `@path` mentions itself, anywhere in a

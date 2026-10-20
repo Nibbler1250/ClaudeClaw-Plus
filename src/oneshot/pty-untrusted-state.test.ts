@@ -680,6 +680,7 @@ describe("r14 D: the failed call names the real cause", () => {
           dispose: async () => opts.onGroupSurvived?.(424242, null, cause),
         } as never;
       });
+      // Went red (always "process group ... survived") with the cause no longer read.
       await expect(run()).rejects.toThrow(message);
       const root = spawned[0]!.env.CLAUDE_CONFIG_DIR!;
       try {
@@ -718,6 +719,7 @@ describe("r14 B/E: a rejected disposal records the PTY's real start time, or say
       );
       expect(cleanup.groupSurvivorOf(root)).toBe(4242);
       const record = JSON.parse(readFileSync(join(root, cleanup.ONESHOT_SURVIVOR_FILE), "utf8"));
+      // Went red (null) with the start time left out of the record.
       expect(record.startMs).toBe(1_700_000_000_000);
       expect(record.pid).toBe(4242);
     } finally {
@@ -732,6 +734,7 @@ describe("r14 B/E: a rejected disposal records the PTY's real start time, or say
       __keepRootAfterFailedDisposeForTests(stubEntry(root, cwd, null), new Error("boom"));
       expect(cleanup.groupSurvivorOf(root)).toBeUndefined();
       const logged = error.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+      // Went red with the log line removed.
       expect(logged).toContain("config root is unprotected");
     } finally {
       rmSync(cwd, { recursive: true, force: true });
@@ -752,6 +755,7 @@ describe("r14 B/E: a rejected disposal records the PTY's real start time, or say
       await expect(__landPtyForTests(stubEntry(root, cwd, null), late as never)).rejects.toThrow(
         /disposed the late PTY/,
       );
+      // Went red (undefined) with the late disposal's failure swallowed again.
       expect(cleanup.groupSurvivorOf(root)).toBe(5252);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
@@ -790,6 +794,7 @@ describe("r12 E: a REPL that never became ready fails the call with nothing sent
     expect(result.exitCode).toBe(1);
     expect(result.text).toBe("");
     // r14 D: the failure carries a safe reason code and phase timings, and nothing else.
+    // Went red ("turn-error") with the not-ready code no longer lifted out of the failure.
     expect(result.diagnostic?.reason).toBe("not-ready:login-required");
     expect(Object.keys(result.diagnostic?.phasesMs ?? {})).toContain("total");
     expect(JSON.stringify(result.diagnostic)).not.toContain(CANARY);

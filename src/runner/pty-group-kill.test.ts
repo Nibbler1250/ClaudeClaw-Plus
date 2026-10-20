@@ -110,6 +110,8 @@ describe("terminateProcessGroup", () => {
       // Went red (a SIGKILL among the signals) when the escalation reused the identity read
       // before the SIGTERM instead of reading it again.
       expect(signalled(k.calls).every(([, name]) => name === "SIGTERM")).toBe(true);
+      // Went red (2 signals) with the bare pid signalled after the group, and (a SIGKILL among
+      // them) with the identity cached instead of read again.
       expect(signalled(k.calls).length).toBe(1);
       expect(result).toBe(true); // a reused pid means the group we started is gone
     });
@@ -136,13 +138,15 @@ describe("terminateProcessGroup", () => {
         const k = fakeKernel("SIGKILL");
         const unrecorded = { ...instant, leaderStartMs: null, leaderAlive: () => false };
         // A process group id cannot be reused while the group has a member, so `-pid` is safe
-        // without a start time.
+        // without a start time. Went red (false, nothing sent) with the group refused for an
+        // unrecorded start time.
         expect(await terminateProcessGroup(PID, { signal: k.signal, ...unrecorded })).toBe(true);
         expect(signalled(k.calls).length).toBeGreaterThan(0);
         expect(signalled(k.calls).every(([target]) => target === -PID)).toBe(true);
         const logged = warn.mock.calls.filter((call: unknown[]) =>
           String(call[0]).includes("start time"),
         );
+        // Went red (2 lines) with the once-only flag removed.
         expect(logged.length).toBe(1);
       } finally {
         warn.mockRestore();
