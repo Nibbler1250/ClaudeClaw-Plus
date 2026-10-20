@@ -1330,3 +1330,115 @@ Received: "true"
 - The vocabularies are fixed lists, so a legitimate but unlisted record type, block type or subtype will print `other` on the next CI run. That is the safe direction; add the word if one shows up.
 - `errorWord` (harness-side errors) still passes a short stripped code or class name. It is not child-sourced and was not in scope.
 - H1 and H2 share a commit because `pty-group-kill.test.ts` holds both sets of tests.
+
+## r15: findings from the 5-agent code review of PR #581
+
+Branch `feat/570-untrusted-pty-isolation`, from `07f6e7db`. Commits: `b87b9e20` (A1 to A5, B, C docs, their tests), `6739f9be` (test guard, below), `793ff5d2` and `2572ad26` (A4 slot lifecycle; the README line mapping was committed inside `2572ad26`), `97da1ce4` (version 2.2.355), plus this section. No PR comment, no `@codex review`. Integration run: [39477212862](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39477212862) on `97da1ce4`, Claude 2.1.304: **55 of 56 integration rows pass and the Linux step is 83 of 83; one row, B3 (PTY, control present), timed out with no reply. Details and what I do not know are under "Integration run: results".**
+
+### What changed, per item
+
+| Item | Change | Where |
+| --- | --- | --- |
+| A1 | Every persisted Linux start time is stored with `/proc/sys/kernel/random/boot_id` (owner file and `survivor.json`; null off Linux). A record whose boot id differs, or is missing on Linux, names nothing that can be running: `isOwnerDead` says dead, and `adoptPersistedSurvivors` skips the record, so no group probe, no scan, no hold and no signal; the root is then swept as for a dead owner. If this boot's id cannot be read, nothing can be shown to differ, so the old behaviour applies. Stale comments fixed (`pty-cleanup.ts` `OwnerRecord.startMs`, `pty-proc-identity.ts` `procStartMs`). | `pty-proc-identity.ts` (`readBootId`, `currentBootId`, `recordedOnAnotherBoot`), `pty-cleanup.ts` |
+| A2 | `dispose()` and `_handleExit()` end a pending ready gate at once (`closed`, or `exited`, or the blocked boot screen's reason if one is showing) and clear its timers. A turn started on a child that is already retired or gone no longer starts a gate at all. | `pty-process.ts` (`_endReplGate`, `_blockedBootReason`, `_awaitReplReady`) |
+| A3 | `runClassifierCall` retries only on a diagnostic reason of `timeout` or `no-reply*`; on `print`, which has no diagnostic, exit 124 counts as a timeout. Everything else stands after one attempt. | `discord.ts` (`retryableClassifierFailure`) |
+| A4 | At most 2 untrusted PTY one-shots at once (`UNTRUSTED_ONESHOT_MAX_CONCURRENT`, in process, no setting). A third returns exit 1 with reason `busy` before anything is created or spawned. The slot is released when the call finishes, on throw as well; a call that returned its deadline while its claude was still landing keeps the slot until that claude is retired, at most `UNTRUSTED_LATE_SLOT_CEILING_MS` (60 s). | `pty-cleanup.ts` (`acquireUntrustedOneShotSlot`), `pty-supervisor.ts` (`runOnceOnPty`) |
+| A5 | `applyPtyIsolationVersionGate` also withholds isolation when `platform === "win32"` (third parameter, injectable); one warning; untrusted routes resolve to print. | `claude-version.ts` |
+| A6 | Documented: an API-key-only host on claude 2.1.304 or later with PTY gets `not-ready:login-required` and a null classifier; the rollback pin is the fix. | `docs/oneshot-engines.md` |
+| B | The test is pinned to print by clearing the settings cache before and after it (`_setSettingsFileForTests()`). I checked every other test that calls a real untrusted route: `e2e.test.ts` forces print, `trusted-routes.test.ts` stubs the engines, the `buildPrintArgs` tests never run a route, and `pty-reply.test.ts` is written for pty. No other test had the leak. | `discord-classifier-isolation.test.ts` |
+| C | `memory.recall` removed from the "follows `pty.enabled`" claims and from the rollback pin in `oneshot-engines.md` (three places), `pty-migration.md` and the spike doc header; Python memory recall is now named among the remaining `claude -p` users. The 15 s, `timeoutMs: 15000` and `claude-sonnet-4-20250514` statements in the spike doc are marked historical and point to `haiku`, 12 s x 1 retry (timeout and no-reply only) and the cap. Stale comments: `pty-cleanup.ts` sweep age and `retrySurvivors`, `isolation.ts`, `pty-process.ts` `onGroupSurvived`. | docs, comments |
+
+### Decisions the brief did not settle
+
+- **A3 on `print`.** The print engine reports no diagnostic, so "retry only on a diagnostic reason" would have removed the retry for a print timeout. I kept it for exit 124 with no diagnostic. A print failure that is not a timeout (exit 1) now stands after one attempt, which is what the brief says for everything else.
+- **A4, the slot after the call returns.** My first version held the slot until `lateRetire` settled; a spawn that never lands never settles it, so two such calls would have blocked the classifier until a restart. The second version freed it when the call finished, which the automated security review of the commit rightly flagged: a claude that lands late then runs uncounted. The shipped version holds it until the late claude is retired or 60 s have passed, whichever is first. `tuner.*` shares the cap, since it is the same engine path.
+- **A1, where the check sits.** The boot id is checked once, where a persisted record is read, not inside `heldProcAlive`: an in-memory hold is always from this boot, and a record from another boot is skipped before any identity probe. `heldProcAlive` carries a comment saying so.
+- **Test preload.** `scripts/test-preload.ts` sets the late-slot ceiling to 250 ms, like the root-removal quiet window, so a unit test whose fake spawn never lands cannot hold a slot into the next one.
+
+### A hazard found on the way: a survivor test could kill its own runner
+
+While injecting A4 the first time, `bun test` died with exit -9 and took my shell with it. The test `throws, logs the pid... (r13 A/G)` in `pty-untrusted-state.test.ts` ends with `process.kill(shellPid, "SIGKILL")` where `shellPid` starts at 0; when the spawn never happens (here: every call answered `busy`) it signals pid 0, which is the caller's whole process group. It is now guarded with `shellPid > 1` (`6739f9be`). The injection harness also runs each faulted `bun test` in its own session.
+
+### Fault injection, one site each, on a `git archive` copy, restored after
+
+The expected RED test for each fault was named before the run. Counts are `pass / fail` of the file(s) run. A1 uses `pty-sweep.test.ts` and `pty-proc-identity.test.ts` (68 tests, all green unfaulted); A2 `pty-repl-ready.test.ts` (19); A3 `discord-classifier-isolation.test.ts` (19); A4 the `r15 A4` describe of `pty-untrusted-state.test.ts` (8); A5 `pty-untrusted-state.test.ts` (60 at that commit).
+
+```text
+A1a  owner boot check removed in isOwnerDead                  [66 pass, 2 fail]
+     (fail) a persisted record from another boot is gone > isOwnerDead: a live pid with a matching start time is dead when the boot id differs
+     (fail) a persisted record from another boot is gone > the sweep removes a directory whose owner file is from another boot
+A1b  adoption skip for another boot removed                    [67 pass, 1 fail]
+     (fail) a persisted record from another boot is gone > survivor.json from another boot: no group probe, no scan, no hold, and the root is swept
+A1c  boot id not written into survivor.json                    [67 pass, 1 fail]
+     (fail) a persisted record from another boot is gone > writes the boot id into the owner file and into survivor.json
+A1d  record with no boot id treated as the same boot           [66 pass, 2 fail]
+     (fail) a persisted record from another boot is gone > isOwnerDead: a live pid with a matching start time is dead when the boot id differs
+     (fail) recordedOnAnotherBoot > a Linux record with no boot id predates the field: another boot
+A2a  dispose does not end the ready gate                       [18 pass, 1 fail]
+     (fail) a pending ready gate ends with the child (r15, A2) > dispose during the gate rejects the turn at once, not at the gate deadline [255 ms; the turn was still "waiting" after 3 s]
+A2b  exit does not end the ready gate                          [18 pass, 1 fail]
+     (fail) a pending ready gate ends with the child (r15, A2) > a child that exits during the gate rejects the turn at once [3099 ms]
+A2c  gate starts on an already retired child                   [18 pass, 1 fail]
+     (fail) a pending ready gate ends with the child (r15, A2) > a turn started on a child that is already retired does not start a gate [3123 ms]
+A3   retry on any non-zero exit restored                       [12 pass, 7 fail]
+     (fail) ... > fails closed after one attempt on 'not-ready:login-required' | 'not-ready:no-repl-footer' | 'config-dir' | 'config-root' | 'turn-error' | 'busy'   (six rows)
+     (fail) ... > does not retry a print failure that is not a timeout (exit 1, no diagnostic)
+A4a  slot not released when the call finishes                  [1 pass, 7 fail]   third call busy; slot frees on finish; frees on throw; late ceiling; late early-free; config-dir; trusted twin
+A4b  slot not released when the call fails before any state    [6 pass, 2 fail]
+     (fail) r15 A4 > a slot frees when the call fails before any state exists (config dir not absolute)
+A4c  cap check removed                                         [1 pass, 7 fail]
+     (fail) r15 A4 > a third call while two are in flight returns busy without spawning or creating a directory [5025 ms]
+A4d  late claude not counted after its call returned           [6 pass, 2 fail]
+     (fail) r15 A4 > a late claude stays counted after its call returned, but only up to the ceiling (a spawn that never lands)
+     (fail) r15 A4 > a late claude that lands and is retired frees its slot at once, not at the ceiling
+A4e  late slot has no ceiling                                  [4 pass, 4 fail]
+     (fail) r15 A4 > a late claude stays counted after its call returned, but only up to the ceiling (a spawn that never lands) [2345 ms]
+A4f  late slot freed only at the ceiling, not when retired     [5 pass, 3 fail]
+     (fail) r15 A4 > a late claude that lands and is retired frees its slot at once, not at the ceiling [2411 ms]
+A5   win32 no longer withholds isolation                       [59 pass, 1 fail]
+     (fail) C2: PTY isolation is advertised only on a measured claude version > win32: isolation withheld on a measured version, untrusted routes resolve to print (r15, A5)
+B    settings reset removed from the classifier test, full `src/__tests__` on an archive copy   [2156 pass, 3 fail]
+     (fail) classifyThreadIntent itself (not a hand-built request) > runs the real classifier untrusted: stdin delivery, no tools, allowlisted env, empty cwd [5002 ms]
+     plus the two pre-existing gateway failures
+```
+
+In A4a, A4b, A4c and A4f the extra reds beyond the named ones are the tests after the first leaked slot: a leaked slot makes the next call `busy`, so the remaining rows in the describe fail too. The named test is the one that fails alone in the rows where it can (A4b, A4d, A4e, A4f).
+
+The twin the brief asks for in A1, "same boot id plus matching start is still same", is `twin: the same record on the boot that wrote it is still a survivor and is kept`. It stays green in every faulted run above, as it should (none of those faults touches the same-boot path), and it asserts that the group probe is asked with the recorded pid and start time.
+
+### README `path:line` references
+
+Re-measured against the final tree by mapping every cited line from `98c84565` (the commit where #562 last re-measured them, and where I confirmed the citations were right: for example `src/runner.ts:411` was `RATE_LIMIT_PATTERN` there) through `git diff` to the working tree, then comparing the text at the first and last line of each range between the two trees. **120 citations (groups of `path:lines`), 163 individual lines or ranges, in 33 files. 76 were wrong and are fixed; 87 were still right.** For all 163 the first and last cited line have the same text in the old tree and the new one; none fell inside a rewritten block. Of the 76, the large ones are in `src/runner.ts` (+71), `src/commands/start.ts` (+10 to +13) and `src/runner/pty-supervisor.ts` (+23 to +31), all from earlier rounds; `src/commands/discord.ts:1333` is now `:1387` (earlier rounds, plus this round's `retryableClassifierFailure`). The script ran once, on the final code; the last two code edits did not move any cited line (a second run on the pristine README gave an identical file).
+
+### Gates
+
+- `bun run lint` (full repo): exit 0; **1393 warnings**, 324 infos (r14e: 1390; the three new ones are all in `pty-untrusted-state.test.ts`, 65 to 68, by a per-file comparison with `07f6e7db`). Biome's formatter fixed four of my files first.
+- `bun run typecheck`: 149 errors, baseline 149.
+- Clean `git archive` copies, `bun test src/__tests__`, output to a file: **base `feat/572`: 2143 pass, 2 fail; this head: 2157 pass, 2 fail**, the same two `gateway records the Claude session id` tests in both. `src/oneshot src/runner` at this head: **449 pass, 7 skip, 0 fail**.
+- Two one-off failures seen in my own worktree and not reproduced: `validateAgentName > accepts simple kebab-case names` in one `src/__tests__` run (it reads `process.cwd()/agents`; it passes alone and in the clean copies), and `HTTP engines > openai-compatible: a non-2xx reply` (HTTP 401 where 400 was expected) in one `src/oneshot src/runner` run (passes alone and on the next full run). Neither file is touched by this change.
+
+### Integration run: results (one row red)
+
+Run [39477212862](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39477212862) on `97da1ce4` (checked: the run's `headSha`), Claude 2.1.304. **Integration step: 56 tests across 3 files, 55 pass, 1 fail. Linux process step: 83 pass, 0 fail across 4 files** (r14c: 65; this branch added the boot-id and gate tests that run there). The job is red because of the one row. I did not dispatch a second run: the brief allows one.
+
+| Required item | Result |
+| --- | --- |
+| The 56 rows | **55 pass. `B3 @ file mention, PTY engine: CONTROL PRESENT` fails** after 75 253 ms (below). |
+| A rows | **No A row regressed.** A-login: `authenticated=true; exit=0; assistantEntries=1; apiErrors=0; storageDirIsOperatorRoot=true; childHasOauthToken=false`; twin RED (`exit=1; assistantEntries=0`). A-untouched: `filesBefore=2; filesAfter=2`; twin RED (`filesAfter=16`). A-paste: `promptLength=2834`, canary held mid-turn in `paste-cache/` and `projects/<cwd>/`, `rootGone=true; operatorRootHolds=0; tmpdirHolds=[]`; twin RED (`rootGone=false`). |
+| F3, 20 messages at 12 s | `n=20; repliedFirstTime=20; repliedOnRetry=0; failedClosed=0; p50Ms=6796; p95Ms=8088; failReasons=[]` (run 3: p50 6257, p95 7253). |
+| Hang-rate samples | `probe=baseline: hung=0/5; exit124=0`, `probe=contract: hung=0/5; exit124=0`. |
+| Linux step | 83 pass, 0 fail (escape scan, group kill, start time, group retire). |
+| "unknown" scan log lines | None: `escape scan could not read pid` and `scan-unknown:` appear 0 times. |
+
+**The B3 failure.** The log for the row: `no assistant transcript entry; files=1; records={"other":5,"user":1,"attachment":6,"ai-title":1,"cost-state":2}; synthetic=0; apiError=0`, then `run-exit -: exit=124; reason=timeout; phasesMs={"exec":75047,"total":75048}`, then `reached-api: promptSeen=true; assistant=0; apiErrors=0; synthetic=0; reached=false`, and the assertion `expect(reached).toBe(true)` at `tests/integration/untrusted-pty-isolation.test.ts:672`. So the REPL was ready, the prompt was typed and seen, and claude never answered within the row's 75 s. That is the shape of the "Intermittent no-reply" the spike doc records (one 120 s hang in about fourteen samples) and of the 35 s hangs in r14c; the same run's B3 twin ("CONTROL REMOVED", 10 s), the B3 print rows, both hang-rate samples and F3 all answered normally.
+
+What I can and cannot say. None of the r15 changes acts after the prompt has been written: A2 acts on `dispose()`, exit and a not-yet-ready gate (this gate had passed); A4 acts before any spawn and the cap was never reached here (the rows run one at a time); A3 and A5 do not touch the one-shot path of a harness row; A1 is the sweep. That is a reading of the code, not a measurement: one run cannot separate a recurrence of the known hang from something r15 introduced. The cheap test is the same run again on `97da1ce4`; the earlier run 39461249758 on `4f4ee80e` had this row green. If B3 goes red a second time, treat it as caused by r15 until shown otherwise.
+
+
+### Not done / residual
+
+- A1 is proved by injecting the boot-id reader and the platform; no real reboot and no real `/proc/sys/kernel/random/boot_id` was involved on this Mac. The Linux CI step runs the new `pty-proc-identity.test.ts` cases, which use a temp file for the reader.
+- A1 changes what an upgrade does: an owner file or `survivor.json` written by the previous build has no boot id, so on Linux it counts as another boot's. A live daemon of the previous build in the same temp dir would see its directories swept after 10 minutes. A restart replaces that daemon, so I judged it acceptable; say if you want the missing-id case kept as "unknown".
+- A4 means a burst of more than 2 simultaneous guild messages gets `busy` for the extra ones (the classifier returns null, no retry). The cap is a named constant, not a setting.
+- The late-slot ceiling (60 s) is a number I chose, not a measured one.
+- The integration job is red (B3 above). I stopped there, as the brief says, and did not retry.
