@@ -39,15 +39,26 @@ directory, uses an overall timeout, and is disposed afterwards. `/compact` is se
 as an exact bare REPL command; ordinary slash-shaped prompts retain the PTY guard.
 The no-daemon shutdown save uses the stored global session id with a 30-second
 budget. Exact routes override a namespace wildcard, then an explicit
-`oneShot.default`, then the implicit route default applies. A default of `pty`
-must also explicitly route the untrusted families to an isolated engine such as
-`print`; validation otherwise rejects it. Unknown engines and incompatible capabilities fail
-settings load. Untrusted PTY routes fail both settings validation and execution
-until the interactive CLI isolation spike is reviewed green: the PTY engine
-advertises `caps.isolation: false`, and any untrusted route to an engine without
-that capability is rejected. There is no settings switch that bypasses this gate.
-Routes that carry untrusted text (`discord.classifier`, `tuner.*`,
-`memory.recall`) also reject any isolation other than `untrusted`.
+`oneShot.default`, then the implicit route default applies. The implicit default
+is `pty` when `pty.enabled` is true (`print` otherwise, including the Windows
+default) for the trusted resume routes **and** for the untrusted routes
+(`discord.classifier`, `tuner.*`, `memory.recall`), so nothing in the default
+configuration runs `claude -p`. Unknown engines and incompatible capabilities fail
+settings load.
+
+The PTY engine advertises `caps.isolation: true` (#570). The interactive isolation
+spike ([`docs/spikes/0.7-interactive-isolation.md`](spikes/0.7-interactive-isolation.md))
+ran against Claude Code 2.1.304 and every property held with its control present and
+failed with its control removed: tools, MCP, settings/hooks, user memory, the
+slash-command flag, transcript cleanup and the child environment. A plain
+interactive spawn with no controls fired every canary, so the fixtures are
+discoverable. Any untrusted route to an engine without the capability is still
+rejected, and an HTTP engine stays an explicit opt-in. Reverting the flag in
+`src/oneshot/registry.ts` closes the gate again. One caveat is recorded in the
+spike: a prompt that tells a tool-less session to run a tool sometimes gets no reply.
+It is bounded by the caller's timeout (the classifier uses 15 s) and fails closed,
+since the classifier treats a non-zero exit as "not a thread command". Routes that
+carry untrusted text also reject any isolation other than `untrusted`.
 
 Trusted calls may supply `cwd` for session lookup, including named-agent working
 directories. Both engines honour it. Untrusted calls cannot specify `cwd`, resume

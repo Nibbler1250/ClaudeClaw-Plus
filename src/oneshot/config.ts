@@ -44,7 +44,7 @@ export function resolveOneShotEngine(
     settings.routes[route] ??
     settings.routes[`${route.split(".")[0]}.*`] ??
     settings.default ??
-    (ptyEnabled && RESUME_ROUTES.includes(route) ? "pty" : "print")
+    (ptyEnabled && (RESUME_ROUTES.includes(route) || isUntrustedRoute(route)) ? "pty" : "print")
   );
 }
 

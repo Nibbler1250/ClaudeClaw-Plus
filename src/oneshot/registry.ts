@@ -18,9 +18,12 @@ export const engines = new Map<string, OneShotEngine>([
     "pty",
     {
       id: "pty",
-      // No untrusted routing until the interactive isolation spike is reviewed
-      // green; flipping this is the only switch, so it needs that review.
-      caps: { resume: true, tools: true, isolation: false },
+      // Interactive isolation spike: every row green in both directions on claude
+      // 2.1.304, with a known intermittent no-reply on tool-instruction prompts
+      // (bounded, fails closed). See docs/spikes/0.7-interactive-isolation.md. The untrusted spawn passes
+      // untrustedInteractiveArgs() and the caller env policy, and removes its
+      // transcripts in runOnceOnPty's finally. Reverting this flag is the kill switch.
+      caps: { resume: true, tools: true, isolation: true },
       run: async (req) => (await import("../runner/pty-supervisor.js")).runOnceOnPty(req),
     },
   ],

@@ -546,9 +546,9 @@ describe("one-shot configuration", () => {
   it("rejects bad routing during settings load", async () => {
     writeFileSync(
       join(configDir, "settings.json"),
-      JSON.stringify({ oneShot: { routes: { "memory.recall": "pty" } } }),
+      JSON.stringify({ oneShot: { routes: { "memory.recall": "missing" } } }),
     );
-    await expect(reloadSettings()).rejects.toThrow("spike");
+    await expect(reloadSettings()).rejects.toThrow("Unknown");
   });
   it("routes trusted requests to the selected engine and logs once", async () => {
     const original = console.info;
@@ -622,11 +622,11 @@ describe("one-shot configuration", () => {
     { default: "pty" },
     { routes: { "tuner.*": "pty" } },
   ]) {
-    it(`rejects untrusted PTY before the isolation spike: ${JSON.stringify(settings)}`, () =>
-      expect(() => parseOneShotSettings(settings)).toThrow("spike"));
+    it(`accepts untrusted PTY now the isolation spike is green: ${JSON.stringify(settings)}`, () =>
+      expect(() => parseOneShotSettings(settings)).not.toThrow());
   }
-  it("the PTY engine does not advertise isolation until the spike is green", () =>
-    expect(engines.get("pty")!.caps.isolation).toBe(false));
+  it("the PTY engine advertises isolation (#570)", () =>
+    expect(engines.get("pty")!.caps.isolation).toBe(true));
   it("rejects untrusted routes on any engine without the isolation capability", () => {
     engines.set("noiso", {
       id: "noiso",
