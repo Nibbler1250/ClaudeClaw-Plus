@@ -660,6 +660,71 @@ describe("quarantine (#570 r14, M4)", () => {
   });
 });
 
+describe("retrySurvivingGroups with no recorded start time (r14d, H2)", () => {
+  it("is not told it is the first termination, keeps the root registered, and says so once with metadata only", async () => {
+    markGroupSurvivor("/tmp/secret-root-x", 4242, { startMs: null, cwds: ["/tmp/secret-cwd"] });
+    const told: Array<boolean | undefined> = [];
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      for (let pass = 0; pass < 3; pass++) {
+        const cleared = await retrySurvivingGroups({
+          terminate: async (_pid, opts) => {
+            told.push(opts.firstTermination);
+            return false; // the group is alive and was not signalled
+          },
+          reap: async () => [],
+        });
+        expect(cleared).toBe(0);
+      }
+      // Went red ([true, true, true]) with `firstTermination: true` added to the retry.
+      expect(told).toEqual([undefined, undefined, undefined]);
+      expect(groupSurvivorOf("/tmp/secret-root-x")).toBe(4242);
+      const logged = warn.mock.calls.map((call: unknown[]) => String(call[0]));
+      // Went red (3 lines) with the once-per-root set removed.
+      expect(logged.length).toBe(1);
+      expect(logged[0]).toContain("pid 4242");
+      expect(logged[0]).toContain("start time not recorded");
+      expect(logged[0]).toContain("secret-root-x");
+      expect(logged[0]).not.toContain("/tmp/");
+      expect(logged[0]).not.toContain("secret-cwd");
+    } finally {
+      warn.mockRestore();
+      error.mockRestore();
+    }
+  });
+
+  it("sends no signal at all to a live group with the real termination", async () => {
+    markGroupSurvivor("/tmp/root-null", 4242, { startMs: null, cwds: [] });
+    const sent: Array<[number, NodeJS.Signals | 0]> = [];
+    const kernel = (target: number, name: NodeJS.Signals | 0): void => {
+      sent.push([target, name]); // every kill(.., 0) answers: the group is there
+    };
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const cleared = await retrySurvivingGroups({
+        terminate: (pid, opts) =>
+          terminateProcessGroup(pid, {
+            ...opts,
+            signal: kernel,
+            startMs: () => null,
+            sleep: async () => {},
+            liveMembers: () => undefined,
+          }),
+        reap: async () => [],
+      });
+      expect(cleared).toBe(0);
+      // Went red (a SIGTERM to -4242 among the calls) with the first-termination check dropped.
+      expect(sent.filter(([, name]) => name !== 0)).toEqual([]);
+      expect(groupSurvivorOf("/tmp/root-null")).toBe(4242);
+    } finally {
+      warn.mockRestore();
+      error.mockRestore();
+    }
+  });
+});
+
 describe("retrySurvivingGroups with the real termination (#570 r14, B and E)", () => {
   it("signals the group of the recorded leader with a recording kernel, and no cached start time", async () => {
     markGroupSurvivor("/tmp/root-real", 4242, { startMs: 1_700_000_000_000, cwds: [] });

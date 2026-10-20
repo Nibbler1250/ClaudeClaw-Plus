@@ -128,6 +128,40 @@ describe("retiring a PTY child", () => {
     expect(alive(bg)).toBe(false);
   });
 
+  it("signals the group, not the bare pid, of a child that exited on its own with no start time recorded, during the dispose that follows", async () => {
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const sent: Array<[number, unknown]> = [];
+      // The pid still answers `kill(pid, 0)` and its start time cannot be read: the one case in
+      // which only the first-termination flag lets `-pid` go out. Nothing is really signalled.
+      const kernel = (pid: number, name: unknown): void => {
+        if (name !== 0) sent.push([pid, name]);
+      };
+      const { child } = await spawnShell("echo $$ > $BG", {
+        _groupTermination: {
+          leaderStartMs: null,
+          startMs: () => null,
+          signal: kernel as never,
+          termGraceMs: 40,
+          killGraceMs: 40,
+          pollMs: 20,
+          liveMembers: () => undefined,
+        },
+      });
+      await until(() => !child.isAlive());
+      await child.dispose();
+      // Went red ([] sent) with `firstTermination` not passed by dispose.
+      expect(sent).toEqual([
+        [-child.pid, "SIGTERM"],
+        [-child.pid, "SIGKILL"],
+      ]);
+    } finally {
+      error.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
   it("does not signal the group of a child that exited long ago (its pid may be someone else's now)", async () => {
     let clock = 1_000_000;
     const { child, bg } = await spawnShell("(trap '' HUP; exec sleep 60) & echo $! > $BG", {

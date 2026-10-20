@@ -1143,6 +1143,7 @@ class PtyProcessImpl implements PtyProcess {
       ? terminateProcessGroup(this._pid, {
           leaderStartMs: this._leaderStartMs,
           leaderAlive: () => this._alive,
+          firstTermination: true,
           ...this._groupTermination,
         })
       : Promise.resolve(true);

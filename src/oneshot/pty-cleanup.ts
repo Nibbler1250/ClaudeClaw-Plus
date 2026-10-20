@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
 import { encodeCwdForProjectsDir } from "../bus/jsonl-line-types.js";
 import {
   type EscapeScan,
@@ -232,6 +232,7 @@ interface UnknownHold {
 }
 const unknownHolds = new Map<string, UnknownHold>();
 const loggedUnknown = new Set<string>();
+const loggedUnrecorded = new Set<string>();
 
 /** Persist what a restart needs next to what it protects (mode 0600). Logged, never thrown. */
 function writeSurvivorFile(root: string): void {
@@ -377,6 +378,7 @@ export function resetGroupSurvivorsForTests(): void {
   survivingGroups.clear();
   unknownHolds.clear();
   loggedUnknown.clear();
+  loggedUnrecorded.clear();
 }
 const protectedBySurvivor = (path: string, deps: SweepDeps = {}): boolean => {
   for (const [root, survivor] of survivingGroups) {
@@ -442,6 +444,14 @@ export async function retrySurvivingGroups(deps: SurvivorRetryDeps = {}): Promis
   let cleared = 0;
   for (const [root, survivor] of [...survivingGroups]) {
     survivor.retries++;
+    // Without a recorded start time nothing is signalled (the termination below is not told it is
+    // the first): the root stays registered, and this says so once, as metadata only.
+    if (survivor.startMs === null && !loggedUnrecorded.has(root)) {
+      loggedUnrecorded.add(root);
+      console.warn(
+        `[oneshot] survivor of pid ${survivor.pid} not signalled again: start time not recorded (${basename(root)}); root kept`,
+      );
+    }
     try {
       // The start time is read fresh before every signal, not from the sweep pass's cache: this
       // runs seconds after the pass began, and a cached reading is how a reused pid is signalled.

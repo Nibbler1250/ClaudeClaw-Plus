@@ -132,14 +132,18 @@ describe("terminateProcessGroup", () => {
       expect(signalled(k.calls)).toEqual([]);
     });
 
-    it("signals the group of a pid whose start time was never recorded while it has a member, never the bare pid, and says so once", async () => {
+    it("signals the group of a pid whose start time was never recorded, during the first termination, while it has a member, never the bare pid, and says so once", async () => {
       const warn = spyOn(console, "warn").mockImplementation(() => {});
       try {
         const k = fakeKernel("SIGKILL");
-        const unrecorded = { ...instant, leaderStartMs: null, leaderAlive: () => false };
-        // A process group id cannot be reused while the group has a member, so `-pid` is safe
-        // without a start time. Went red (false, nothing sent) with the group refused for an
-        // unrecorded start time.
+        const unrecorded = {
+          ...instant,
+          leaderStartMs: null,
+          leaderAlive: () => false,
+          firstTermination: true,
+        };
+        // The leader was spawned moments ago, so a group with a member is ours. Went red (false,
+        // nothing sent) with the group refused for an unrecorded start time.
         expect(await terminateProcessGroup(PID, { signal: k.signal, ...unrecorded })).toBe(true);
         expect(signalled(k.calls).length).toBeGreaterThan(0);
         expect(signalled(k.calls).every(([target]) => target === -PID)).toBe(true);
@@ -153,6 +157,21 @@ describe("terminateProcessGroup", () => {
       }
     });
 
+    it("signals nothing for an unrecorded start time on a later retry, however live the group, and logs nothing", async () => {
+      const warn = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const k = fakeKernel("SIGKILL");
+        const retry = { ...instant, leaderStartMs: null, leaderAlive: () => false };
+        // Group membership no longer proves the group is ours minutes later. Went red (signals
+        // sent to -PID, and true) with the first-termination check dropped from sendGroup.
+        expect(await terminateProcessGroup(PID, { signal: k.signal, ...retry })).toBe(false);
+        expect(signalled(k.calls)).toEqual([]);
+        expect(warn).not.toHaveBeenCalled();
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
     it("signals nothing for an unrecorded start time when the group has no member (the bare pid may be a stranger)", async () => {
       const calls: Array<[number, NodeJS.Signals | 0]> = [];
       // The leader's pid answers (someone holds it now); the group does not exist.
@@ -160,7 +179,12 @@ describe("terminateProcessGroup", () => {
         calls.push([target, name]);
         if (target < 0) throw errno("ESRCH");
       };
-      const unrecorded = { ...instant, leaderStartMs: null, leaderAlive: () => false };
+      const unrecorded = {
+        ...instant,
+        leaderStartMs: null,
+        leaderAlive: () => false,
+        firstTermination: true,
+      };
       expect(await terminateProcessGroup(PID, { signal, ...unrecorded })).toBe(false);
       expect(signalled(calls)).toEqual([]);
     });

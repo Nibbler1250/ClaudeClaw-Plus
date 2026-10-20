@@ -49,6 +49,15 @@ export interface GroupTerminationOptions {
    * while the group still has a member.
    */
   leaderAlive?: () => boolean;
+  /**
+   * This is the first termination of a call, run while the call disposes its own PTY: the leader
+   * was spawned moments ago, so a group that has a member is ours even when no start time could
+   * be recorded for it. Only then may `-pid` be signalled for an unrecorded start time. A retry
+   * of a survivor minutes later, or the sweeper, leaves it unset: by then group membership no
+   * longer proves the group is ours, and nothing is signalled without a recorded start time
+   * (#570 r14d, H2). Passed by the caller; never inferred from timing here.
+   */
+  firstTermination?: boolean;
 }
 
 const defaultSleep = (ms: number): Promise<void> =>
@@ -134,6 +143,7 @@ class GroupTarget {
   private readonly leaderStartMs: number | null;
   private readonly read: StartMsReader;
   private readonly owned: () => boolean;
+  private readonly firstTermination: boolean;
   private loggedUnreadable = false;
 
   constructor(
@@ -145,6 +155,7 @@ class GroupTarget {
     this.leaderStartMs = opts.leaderStartMs ?? null;
     this.read = opts.startMs ?? processStartMs;
     this.owned = opts.leaderAlive ?? (() => false);
+    this.firstTermination = opts.firstTermination === true;
   }
 
   identity() {
@@ -181,10 +192,12 @@ class GroupTarget {
   private sendGroup(name: NodeJS.Signals): boolean {
     const identity = this.identity(); // read now, not earlier: this is the last look before kill()
     if (identity === "recycled") return false;
-    // A start time that was never recorded cannot tell a stranger from the leader, but a process
-    // group id cannot be reused while the group has a member, so `-pid` is still ours while
-    // `kill(-pid, 0)` shows one (#570 r14, B).
-    if (identity === "unknown" && this.leaderStartMs === null && !this.loggedUnreadable) {
+    // A start time that was never recorded cannot tell a stranger from the leader. During the
+    // first termination of a call the leader was spawned moments ago, and a process group id
+    // cannot be reused while the group has a member, so `-pid` is ours while `kill(-pid, 0)`
+    // shows one (#570 r14, B). A later retry has no such proof and signals nothing (r14d, H2).
+    const unrecordedOk = this.leaderStartMs === null && this.firstTermination;
+    if (identity === "unknown" && unrecordedOk && !this.loggedUnreadable) {
       this.loggedUnreadable = true;
       console.warn(
         `[pty-group-kill] start time of pid ${this.pid} was not recorded; signalling its group on group membership alone`,
@@ -193,7 +206,7 @@ class GroupTarget {
     const known =
       identity === "same" ||
       identity === "gone" ||
-      (identity === "unknown" && (this.owned() || this.leaderStartMs === null));
+      (identity === "unknown" && (this.owned() || unrecordedOk));
     if (!known || !exists(this.signal, -this.pid)) return false;
     try {
       this.signal(-this.pid, name);
