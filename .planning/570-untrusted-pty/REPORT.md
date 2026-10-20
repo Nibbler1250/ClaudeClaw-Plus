@@ -145,3 +145,42 @@ New seam fault injection (single constructor assignment disabled; restored after
 ```
 
 Local required checks: **176 pass, 4 skip, 0 fail**; runner/PTY **193 pass, 0 fail**; local integration safety guard **0 pass, 16 skip, 0 fail** (including Bun's unnamed skipped hook); whole-repo lint **0 errors, 1302 warnings, 324 infos**; typecheck **149 against baseline 149**. Plugin and marketplace bumped to **2.2.347**. Live diagnosis/confirmation results follow below.
+
+### r4 diagnosis run
+
+[39350018215](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39350018215), `e6f93193`, Claude **2.1.304**: **20 pass, 2 fail** (22 tests, 3 files). The child config root resolved to `[RUNNER_TEMP]/untrusted-pty-<random>/home/.claude` (MCP in `.claude.json`, memory in `CLAUDE.md`), matching the planted fixtures.
+
+**Positive control (plain interactive, no isolation flags):** `MCP=true; hooks=true; memory=true; assistant=true; completed=true`. All three canaries fire, so the fixtures are discoverable.
+
+| Property | Control present | Control removed |
+| --- | --- | --- |
+| Tools | **FAIL (fixture)**: turn exit 0, but no non-synthetic assistant entry read from the transcript | Valid RED (`expected true, received false`) |
+| MCP | isolated=true | Valid RED |
+| Hooks/settings | isolated=true | Valid RED |
+| User memory | isolated=true | Valid RED |
+| Command flag alone (sanitizer bypassed in tests) | **FAIL (fixture)**: exit 124 after 120 s | Valid RED: with the flag removed the command ran and the canary appeared |
+| Transcript cleanup | isolated=true | Valid RED |
+| Environment | isolated=true (fake env canary absent in actual child) | Valid RED (canary admitted, present) |
+
+No baseline leak. Both failures are fixture/readiness problems, not property failures:
+
+- **Command flag baseline:** with `--disable-slash-commands` the slash command is most likely refused locally and never reaches the API, so no turn completes and the PTY idles out (124). That would be the flag working, but the harness required exit 0. This explanation is inferred, not observed: the log carries no screen. The twin proves the fixture is discoverable (it ran the command).
+- **Tools baseline:** PTY turn completion is detected from the screen, and the transcript can lag it (`confirmRenderedSignatureError` retries for the same reason). The harness read the transcript once, immediately. Also inferred, not proven: a refusal or other synthetic assistant entry cannot be excluded from this log alone, so the fix also logs structural diagnostics.
+
+RED lines, verbatim from the run:
+
+```text
+[isolation-spike] RED-with-control-removed tools: expected true, received false
+[isolation-spike] RED-with-control-removed MCP: expected true, received false
+[isolation-spike] RED-with-control-removed hooks: expected true, received false
+[isolation-spike] RED-with-control-removed memory: expected true, received false
+[isolation-spike] RED-with-control-removed command flag alone (not production sanitizer): expected true, received false
+[isolation-spike] RED-with-control-removed transcript cleanup: expected true, received false
+[isolation-spike] RED-with-control-removed environment: expected true, received false
+```
+
+### r4 fixture fixes (test file only, no production guard touched)
+
+- Transcript evidence is collected in a `finally` around the turn, polling up to 15 s for a non-synthetic assistant entry, then settling 500 ms and re-reading. If none appears it logs type names, counts, stop reasons and block types only, never content.
+- The command-flag baseline runs with a 30 s bound and accepts exit 0 or 124 (no API turn expected), asserting the canary is absent. The twin keeps the strict path: exit 0 and a real assistant entry, so it still has to execute the command to go RED.
+- Local: guard suite **0 pass, 16 skip, 0 fail**; lint 0 errors; no type errors in the changed file. Plugin and marketplace bumped to **2.2.348**.

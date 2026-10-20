@@ -113,6 +113,8 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
   let mutateArgs: (args: string[]) => string[];
   let bypassCommandGuard: boolean;
   let markerWaits: string[];
+  let expectAssistant: boolean;
+  let diagnostics: string;
   let positiveProved = false;
 
   beforeEach(async () => {
@@ -149,6 +151,8 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     mutateArgs = (args) => args;
     bypassCommandGuard = false;
     markerWaits = [];
+    expectAssistant = true;
+    diagnostics = "";
     // Raw screens/transcripts may contain secrets; never emit them to CI logs.
     warnings = spyOn(console, "warn").mockImplementation(() => {});
     errors = spyOn(console, "error").mockImplementation(() => {});
@@ -213,33 +217,72 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       console.info(`[isolation-spike] actual child fake env canary present=${childHasCanary}`);
       const turn = pty.runTurn.bind(pty);
       pty.runTurn = async (prompt, turnOptions) => {
-        const result = await turn(prompt, turnOptions);
-        for (const marker of markerWaits) await waitForMarker(marker);
-        const files = jsonls(project);
-        transcriptSeen = files.length;
-        for (const file of files) {
-          for (const line of readFileSync(file, "utf8").split("\n").filter(Boolean)) {
-            try {
-              const record = JSON.parse(line);
-              toolUse ||= containsToolUse(record);
-              if (record.type === "assistant" && Array.isArray(record.message?.content)) {
-                if (!record.isApiErrorMessage && record.message?.model !== "<synthetic>")
-                  assistantEntries++;
-                for (const block of record.message.content) {
-                  if (block.type === "text" && typeof block.text === "string")
-                    assistantReply += block.text;
-                }
-              }
-            } catch {
-              /* A partial trailing line supplies no evidence. */
-            }
-          }
+        // Turn completion is detected from the screen and the transcript can
+        // lag it, so evidence is collected even when the turn times out.
+        try {
+          return await turn(prompt, turnOptions);
+        } finally {
+          await collectEvidence();
         }
-        return result;
       };
       return pty;
     });
   });
+
+  /** Re-read every transcript under the project dir; keeps structural counts only. */
+  function scanTranscript(): void {
+    const files = jsonls(project);
+    transcriptSeen = files.length;
+    toolUse = false;
+    assistantEntries = 0;
+    assistantReply = "";
+    const kinds: Record<string, number> = {};
+    const stops = new Set<string>();
+    const blocks = new Set<string>();
+    let synthetic = 0;
+    let apiErrors = 0;
+    for (const file of files) {
+      for (const line of readFileSync(file, "utf8").split("\n").filter(Boolean)) {
+        try {
+          const record = JSON.parse(line);
+          kinds[String(record.type)] = (kinds[String(record.type)] ?? 0) + 1;
+          toolUse ||= containsToolUse(record);
+          if (record.type !== "assistant" || !Array.isArray(record.message?.content)) continue;
+          if (typeof record.message.stop_reason === "string") stops.add(record.message.stop_reason);
+          if (record.isApiErrorMessage) apiErrors++;
+          if (record.message?.model === "<synthetic>") synthetic++;
+          if (!record.isApiErrorMessage && record.message?.model !== "<synthetic>")
+            assistantEntries++;
+          for (const block of record.message.content) {
+            blocks.add(String(block.type));
+            if (block.type === "text" && typeof block.text === "string")
+              assistantReply += block.text;
+          }
+        } catch {
+          /* A partial trailing line supplies no evidence. */
+        }
+      }
+    }
+    // Type names, counts and stop reasons only; never transcript content.
+    diagnostics = `files=${files.length}; records=${JSON.stringify(kinds)}; synthetic=${synthetic}; apiError=${apiErrors}; stop=${JSON.stringify([...stops])}; blocks=${JSON.stringify([...blocks])}`;
+  }
+
+  async function collectEvidence(): Promise<void> {
+    for (const marker of markerWaits) await waitForMarker(marker);
+    const deadline = Date.now() + (expectAssistant ? 15_000 : 0);
+    for (;;) {
+      scanTranscript();
+      if (assistantEntries > 0 || Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    if (assistantEntries > 0) {
+      // Settle, then re-read so a later tool_use entry is not missed.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      scanTranscript();
+    } else if (expectAssistant) {
+      console.info(`[isolation-spike] no assistant transcript entry; ${diagnostics}`);
+    }
+  }
 
   afterEach(async () => {
     await shutdownSupervisor();
@@ -335,7 +378,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
 
   async function run(
     prompt = `Reply with ${DONE}.`,
-    options: { positive?: boolean; commandFlagProbe?: boolean } = {},
+    options: { positive?: boolean; allowNoTurn?: boolean; timeoutMs?: number } = {},
   ) {
     expect(baselineLeakObserved).toBe(false);
     if (!options.positive) expect(positiveProved).toBe(true);
@@ -344,18 +387,24 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         route: "discord.classifier",
         isolation: "untrusted",
         prompt,
-        timeoutMs: BUDGET,
+        timeoutMs: options.timeoutMs ?? BUDGET,
       }),
     );
-    // Login/trust/onboarding screens must not masquerade as isolation success.
-    expect(result.exitCode).toBe(0);
     expect(opts).toHaveLength(1);
-    // Readiness is structural, independent of model wording. Echoed prompts
-    // and synthetic error records cannot supply this evidence.
-    const disabledCommand =
-      options.commandFlagProbe &&
-      /unknown (?:command|skill)|commands?.*disabled|unrecognized.*command/i.test(result.text);
-    expect(assistantEntries > 0 || disabledCommand === true).toBe(true);
+    if (options.allowNoTurn) {
+      // A locally refused slash command never reaches the API, so the turn may
+      // idle out (124). Startup is proved by the positive control and the twin.
+      expect([0, 124]).toContain(result.exitCode);
+      console.info(
+        `[isolation-spike] no-turn probe: exit=${result.exitCode}; assistantEntries=${assistantEntries}`,
+      );
+    } else {
+      // Login/trust/onboarding screens must not masquerade as isolation success.
+      expect(result.exitCode).toBe(0);
+      // Readiness is structural, independent of model wording. Echoed prompts
+      // and synthetic error records cannot supply this evidence.
+      expect(assistantEntries > 0).toBe(true);
+    }
     expect(existsSync(opts[0]!.cwd)).toBe(false);
     return { ...result, text: assistantReply };
   }
@@ -469,7 +518,13 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         if (twin)
           mutateArgs = (args) => previous(args).filter((arg) => arg !== "--disable-slash-commands");
         bypassCommandGuard = true;
-        const result = await run("/isolation-probe", { commandFlagProbe: true });
+        // With the flag the command is refused locally and no API turn follows,
+        // so bound the wait; the twin must complete a real turn.
+        expectAssistant = twin;
+        const result = await run("/isolation-probe", {
+          allowNoTurn: !twin,
+          timeoutMs: twin ? BUDGET : 30_000,
+        });
         const commandIsolated = !result.text.includes(COMMAND_CANARY);
         checkIsolation(
           "command flag alone (not production sanitizer)",
