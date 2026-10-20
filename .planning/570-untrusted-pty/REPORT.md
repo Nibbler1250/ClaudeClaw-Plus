@@ -40,8 +40,36 @@ Restored `pty-process.ts` has no diff; restored unit run: **3 pass, 0 fail, 13 a
 
 ## CI evidence
 
-Pending first dispatch. The real probe table and run URL will be recorded after the workflow settles. Authentication uses only the existing workflow's step-scoped secret environment. Raw screens, transcripts and environment contents are never emitted by the new suite. Negative controls report caught assertion failures as `RED-with-control-removed` lines.
+First run: [39345281267](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39345281267), `d6523f2eedb056954f91061f535454ea1f17f9e0`, Claude **2.1.304**. **7 existing tests passed, 14 new tests failed**, all on the setup guard (expected exit 0, received 1) before the property check. No unrelated integration tests failed. Neither direction established isolation or leakage.
+
+Second and final authorized run: [39345585640](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39345585640), `5ec2e5da76bdcc46eb29369ff5ebad2ddc8814c0`, Claude **2.1.304**. Added sanitized startup-error classification and an assistant-transcript setup guard, so a user prompt echoed by the TUI cannot pass readiness. **7 existing tests passed, 14 new tests failed**. All fourteen captured spawn errors classified as:
+
+```text
+[isolation-spike] startup rejection: printOnlyPersistence=true; auth=false
+```
+
+The interactive CLI rejects `--no-session-persistence` before the first turn. No property assertion or its twin was reached. This is a startup failure, not proof that any canary leaked or was isolated. The two runs consumed no successful spike model turns; the existing integration tests used their normal quota. No unrelated failures were found, and no further workflow was dispatched.
+
+| Property / control | Baseline result | RED with control removed |
+| --- | --- | --- |
+| Tools / `--tools ""` | Blocked, rc 1 | Unmeasured: same startup rejection |
+| MCP / `--strict-mcp-config` | Blocked, rc 1 | Unmeasured: same startup rejection |
+| Hooks / `--setting-sources ""` | Blocked, rc 1 | Unmeasured: same startup rejection |
+| Memory / source restriction + empty cwd | Blocked, rc 1 | Unmeasured: same startup rejection |
+| Commands / disable flag + slash guard | Blocked, rc 1 | Unmeasured: same startup rejection |
+| Cwd/transcript / unique temp dir + finally cleanup | Empty cwd verified before spawn; live transcript absent | Unmeasured; no real transcript to retain |
+| Environment / caller's classifier policy | Child-environment readback not reached | Unmeasured: same startup rejection |
+
+Actual captured argv (all shared flags present, including empty values):
+
+```json
+["--model","haiku","--tools","","--strict-mcp-config","--setting-sources","","--no-session-persistence","--disable-slash-commands"]
+```
+
+Authentication uses only the existing workflow's step-scoped secret environment. Raw screens, transcripts and environment contents are never emitted by the new suite. Negative controls report caught assertion failures as `RED-with-control-removed` lines only if they reach their property assertion.
 
 ## Scope and remaining work
 
-No prior-art code copied. The existing shared isolation argv and supervisor test seams were reused. Leave `.planning/559-pty-submit/`, `.serena/`, scratchpads and other pre-existing untracked state untouched. A Claude security review follows before any PR. If any live baseline or negative-control assertion fails, retain the isolation gate and stop at the spike.
+Stopped at the red spike as instructed. No measured leak can be claimed, and interactive isolation remains unproved. Exact shared argv parity currently conflicts with successful interactive startup because the CLI rejects a shared print-only flag. The new cleanup compensates for transcript persistence only once the PTY can boot; simulated unit files prove its local behavior, not the live security property. Source inspection also identifies a possible caller-environment policy gap, which remains unmeasured.
+
+Step 3 is deliberately deferred: no capability flip, untrusted default change, default-to-print mutation probe, README edit or public engine-guide claim. The Claude security review remains for the coordinator before any PR. No prior-art code copied; existing shared argv and supervisor seams reused. `.planning/559-pty-submit/`, `.serena/`, scratchpads and other pre-existing untracked state remain untouched. The cancelled option B draft is still stashed.
