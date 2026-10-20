@@ -69,17 +69,27 @@ aborted or its own deadline ran out during the wait. Trusted routes keep the scr
 Routes that carry untrusted text also reject any isolation other than `untrusted`.
 
 What an untrusted PTY call does that print does not need to (all measured, see the spike
-doc): it runs in a throwaway config root, so it never touches the operator's own
-(`~/.claude`, `~/.claude.json`). Each call makes a `claudeclaw-oneshot-cfg-*` directory
+doc): it runs in a throwaway config root, so it writes nothing about the call under the
+operator's own (`~/.claude`, `~/.claude.json`). The one write outside the throwaway root
+is claude's own refresh of the operator's OAuth token into the operator's credential store
+(no prompt data; it takes the same `.oauth_refresh.lock` as the daemon's own claude, see
+the spike doc). Each call makes a `claudeclaw-oneshot-cfg-*` directory
 (0700, next to the temp cwd) with a minimal `.claude.json` (onboarding done, the temp cwd
 trusted), sets `CLAUDE_CONFIG_DIR` to it, and sets `CLAUDE_SECURESTORAGE_CONFIG_DIR` to the
 operator's own config directory (`""` when none is set) so claude still logs in as the
 operator; no credential is copied. Everything claude writes about the prompt (transcript,
 history, paste cache, session files) lands in that root, and the root is removed in the
-call's `finally` and again after a late spawn settles. If the root cannot be created or
-removed the call fails (the error is logged by step and code, never content). A daemon
-start removes leftover `claudeclaw-oneshot-cfg-*` and `claudeclaw-oneshot-pty-*` temp
-directories older than ten minutes. It applies the spawn strip list (`ANTHROPIC_API_KEY`,
+call's `finally` and again after a late spawn settles. The call's claude is retired with
+its whole process group (SIGTERM, then SIGKILL after 2 s, each awaited until `kill(-pid, 0)`
+answers ESRCH) before the root is removed; if the group will not die the call fails and the
+root is kept for the sweep. The prompt is written only into a REPL that is ready (footer
+painted, no login, onboarding or trust screen); otherwise the spawn fails and nothing is
+sent. If the root cannot be created or removed the call fails (the error is logged by step
+and code, never content). Each root and temp cwd holds an owner file (daemon pid, start time,
+instance). A daemon start, and then every ten minutes, removes leftover
+`claudeclaw-oneshot-cfg-*` and `claudeclaw-oneshot-pty-*` temp directories that are older
+than ten minutes, belong to this uid, are not a running call of this daemon, and whose
+owner is dead (a directory without an owner file falls back to the age rule). It applies the spawn strip list (`ANTHROPIC_API_KEY`,
 `CLAUDECODE`, short-lived OAuth tokens) to the caller's env, because an interactive
 claude with an API key in its env stops at a "custom API key" gate; it replaces every `@`
 in the prompt with U+FF20, because the REPL expands `@path` mentions itself, anywhere in a

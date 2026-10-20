@@ -28,7 +28,7 @@ import {
   unregisterGatewayDelivery,
 } from "../event-processor";
 import { applyPtyIsolationVersionGate } from "../oneshot/claude-version.js";
-import { sweepStaleOneShotDirs } from "../oneshot/pty-cleanup.js";
+import { startOneShotSweeper } from "../oneshot/pty-cleanup.js";
 import { writeState, type StateData } from "../statusline";
 import { ensureStatuslineSetting, removeStatuslineSetting } from "../statusline-settings";
 import { nextCronMatch } from "../cron";
@@ -458,9 +458,10 @@ export async function start(args: string[] = []) {
   const settings = await loadSettings();
   await ensureProjectClaudeMd();
   // #570: an untrusted PTY one-shot that crashed mid-call leaves its throwaway config root
-  // and cwd in the tmpdir, and nothing retries that cleanup. Older than 10 minutes means
-  // no live call owns it.
-  const sweptOneShotDirs = sweepStaleOneShotDirs();
+  // and cwd in the tmpdir. Swept now and every 10 minutes while the daemon is up, so a late
+  // cleanup that failed is retried. Only directories older than 10 minutes whose owner is
+  // dead (or that this daemon has finished with) are removed.
+  const sweptOneShotDirs = startOneShotSweeper();
   if (sweptOneShotDirs > 0) {
     console.log(`  Removed ${sweptOneShotDirs} stale one-shot temp dir(s)`);
   }

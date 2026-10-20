@@ -76,9 +76,7 @@ import {
 } from "../oneshot/pty-transcript.js";
 import { printRuntime } from "../oneshot/print.js";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { rmSync } from "node:fs";
 import { getSettings, type SecurityConfig } from "../config.js";
 import { getSession, createSession } from "../sessions.js";
 import { getThreadSession, createThreadSession } from "../sessionManager.js";
@@ -1583,6 +1581,9 @@ async function buildSpawnOptions(
     quietWindowMs: settings.pty.quietWindowMs,
     sentinelMaxWaitMs: settings.pty.sentinelMaxWaitMs,
     ...(mcpConfigPath ? { mcpConfigPath } : {}),
+    ...(entry.scope.isolation === "untrusted" && entry.scope.untrustedConfig
+      ? untrustedGroupOptions(entry.scope.untrustedConfig.root)
+      : {}),
   };
   // Recorded on the entry in the same synchronous step as the synthesis, so a
   // retirement that starts before `spawnEntry` resumes still sees the config
@@ -1721,8 +1722,9 @@ function untrustedChildEnv(cleanEnv: Record<string, string>): Record<string, str
 /**
  * The untrusted child's env with its throwaway config root. `HOME` stays as the caller's
  * policy has it; only the config location moves, and the credential store stays the
- * operator's. A spawn without a root fails closed: the child would otherwise write the
- * prompt under the operator's own config root.
+ * operator's, so the one write outside the root is claude's own refresh of the operator's
+ * OAuth token (no prompt data). A spawn without a root fails closed: the child would
+ * otherwise write the prompt under the operator's own config root.
  */
 function untrustedChildEnvWithRoot(
   cleanEnv: Record<string, string>,
@@ -1738,6 +1740,15 @@ function untrustedChildEnvWithRoot(
     // the root is removed.
     CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1",
   };
+}
+
+/**
+ * An untrusted child is retired with its whole process group. When that group cannot be made
+ * to disappear, the root is recorded: `cleanupUntrustedOneShot` then keeps it (for the sweep)
+ * and fails the call, because a survivor may still write prompt text into it.
+ */
+function untrustedGroupOptions(root: string): Pick<PtyProcessOptions, "onGroupSurvived"> {
+  return { onGroupSurvived: (pid) => untrustedCleanup.markGroupSurvivor(root, pid) };
 }
 
 /** What an untrusted one-shot leaves on disk, and where. Fixed before the spawn. */
@@ -1766,6 +1777,14 @@ function errorCode(error: unknown): string {
 async function cleanupUntrustedOneShot(state: UntrustedOneShotState): Promise<void> {
   let failure: unknown;
   try {
+    const survivor = untrustedCleanup.groupSurvivorOf(state.configRoot);
+    if (survivor !== undefined) {
+      // Not removed: the process may still be writing into it. Left for the periodic sweep.
+      console.error(
+        `[pty-supervisor] untrusted one-shot cleanup failed: process group of pid ${survivor} survived retirement; config root kept`,
+      );
+      throw new Error(`process group ${survivor} survived retirement`);
+    }
     await untrustedCleanup.removeUntrustedConfigRoot(state.configRoot);
   } catch (error) {
     console.error(
@@ -1825,15 +1844,18 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
     if (untrusted) {
       let secureStorageDir: string;
       try {
+        const daemonEnv = helpers.cleanSpawnEnv();
         secureStorageDir = untrustedCleanup.operatorSecureStorageDir(
-          untrustedChildEnv(helpers.cleanSpawnEnv()),
+          untrustedChildEnv(daemonEnv),
+          daemonEnv,
         );
       } catch (error) {
         // Fail closed before anything is created or spawned.
         console.warn(`[pty-supervisor] one-shot ${req.route}: ${(error as Error).message}`);
         return result(1);
       }
-      const tempCwd = mkdtempSync(join(tmpdir(), untrustedCleanup.ONESHOT_CWD_PREFIX));
+      const tempCwd = untrustedCleanup.createUntrustedTempCwd();
+      untrustedCleanup.markOneShotDirActive(tempCwd);
       let configRoot: string;
       try {
         // A fresh cwd would make claude ask "trust this folder?" with "No, exit" preselected;
@@ -1843,16 +1865,17 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
         );
       } catch (error) {
         rmSync(tempCwd, { recursive: true, force: true });
+        untrustedCleanup.releaseOneShotDir(tempCwd);
         console.warn(
           `[pty-supervisor] one-shot ${req.route}: config root not created (${errorCode(error)})`,
         );
         return result(1);
       }
-      untrustedState = {
-        tempCwd,
-        configRoot,
-        projectDir: untrustedCleanup.untrustedPtyProjectDir(tempCwd, configRoot),
-      };
+      untrustedCleanup.markOneShotDirActive(configRoot);
+      // The state exists before anything else can throw, so the `finally` below removes both
+      // directories whatever happens next (the project dir needs a realpath of the cwd).
+      untrustedState = { tempCwd, configRoot, projectDir: "" };
+      untrustedState.projectDir = untrustedCleanup.untrustedPtyProjectDir(tempCwd, configRoot);
       untrustedConfig = { root: configRoot, secureStorageDir };
     }
     const { PTY_OUTPUT_FORMAT_CONSTRAINT } = await import("./pty-output-format.js");
@@ -1928,6 +1951,10 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
       // removed here, on success, failure and abort alike. The PTY is normally retired
       // before this point; when admission outlived the deadline it is retired later, so
       // the same cleanup runs again once that late retirement settles.
+      const release = (): void => {
+        untrustedCleanup.releaseOneShotDir(state.configRoot);
+        untrustedCleanup.releaseOneShotDir(state.tempCwd);
+      };
       try {
         await cleanupUntrustedOneShot(state);
       } finally {
@@ -1937,7 +1964,10 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
             .then(() => cleanupUntrustedOneShot(state))
             .catch(() => {
               /* already logged by step; there is no caller left to return to */
-            });
+            })
+            .finally(release);
+        } else {
+          release();
         }
       }
     }

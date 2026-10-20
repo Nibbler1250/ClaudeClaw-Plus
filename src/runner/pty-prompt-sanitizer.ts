@@ -88,6 +88,8 @@ export function neutralizeFileMentions(text: string): string {
  * as U+FF20, so a reply that quotes it (`@scope/pkg`, an e-mail address, a decorator) comes
  * back with U+FF20 too. A reply is never read as a prompt, so nothing expands it there. A
  * U+FF20 the model wrote on its own is mapped as well; that is the price of one rule.
+ * Known limitation (#570 r12): a genuine U+FF20 in a reply comes back as `@`, and nothing here
+ * can tell it from one we put there. Accepted; reversible escaping was considered and not built.
  */
 export function restoreFileMentions(text: string): string {
   return text.replaceAll(FULLWIDTH_AT, "@");

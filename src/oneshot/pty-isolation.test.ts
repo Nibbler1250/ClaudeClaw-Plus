@@ -138,7 +138,22 @@ it("the print-only exception is exactly the explicit compensated persistence fla
 it("untrusted PTY spawn uses the exact same caller environment policy as print", async () => {
   fakeSpawn();
   const env = { PATH: "/usr/bin:/bin", HOME: dir, ONESHOT_ALLOWED_CANARY: "EXAMPLE_PLACEHOLDER" };
-  await withPrintRuntime({ env }, () => runOnceOnPty({ ...request, model: "glm" }));
+  // The credential directory also falls back to the daemon's own env (r12), so the daemon
+  // must have none for the expected "" below, whatever shell this suite runs in.
+  const savedDaemon = {
+    CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
+    CLAUDE_SECURESTORAGE_CONFIG_DIR: process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR,
+  };
+  delete process.env.CLAUDE_CONFIG_DIR;
+  delete process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR;
+  try {
+    await withPrintRuntime({ env }, () => runOnceOnPty({ ...request, model: "glm" }));
+  } finally {
+    for (const [key, value] of Object.entries(savedDaemon)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
   expect(spawned).toHaveLength(1);
   // Compare in memory: a failed assertion must never dump a real environment.
   // Exactly print's policy, plus three variables: the throwaway root, the operator's

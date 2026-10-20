@@ -60,6 +60,7 @@ import {
 } from "./pty-prompt-sanitizer";
 import { promptPrepareOverride, untrustedFileMentionNeutralizing } from "./pty-process-test-seams";
 import { appendFileSync } from "node:fs";
+import { type GroupTerminationOptions, terminateProcessGroup } from "./pty-group-kill";
 
 /**
  * Raw PTY trace, off unless `CLAUDECLAW_PTY_DUMP=<file>` is set. Every chunk
@@ -86,6 +87,19 @@ export { sanitizePtyPromptText };
 export interface PtyProcessOptions {
   /** One-shot isolation overrides every persona, resume and permission flag. */
   isolation?: "untrusted" | "trusted-session";
+  /**
+   * Retire the child's whole process group, and wait until it is gone (pty-group-kill).
+   * Default: on for an untrusted one-shot, off otherwise. Trusted sessions keep the old
+   * retirement: tests drive them with fake pids, and a group signal to a fake pid would
+   * hit a real process.
+   */
+  terminateGroup?: boolean;
+  /** Test seam: how long an untrusted spawn waits for the REPL footer. Default 20 s. */
+  _replReadyBudgetMs?: number;
+  /** Called with the pid when retirement could not get the group to disappear. */
+  onGroupSurvived?: (pid: number) => void;
+  /** Test seam: signal function, clock and timings of the group termination. */
+  _groupTermination?: GroupTerminationOptions;
   /** Existing Claude Code session ID to resume via `claude --resume <id>`.
    *  Empty string means "no resume". */
   sessionId: string;
@@ -294,6 +308,33 @@ const MCP_DIALOG_ANSWER_DELAY_MS = 500;
  * without bloating per-PTY memory. Anything older slides off.
  */
 const SETTLE_TAIL_MAX_BYTES = 8 * 1024;
+
+/** `ok: false` carries a reason code (never screen text). */
+interface ReplReadyVerdict {
+  ok: boolean;
+  reason?: string;
+}
+
+/** An untrusted spawn waits this long for claude's REPL footer before giving up. */
+const UNTRUSTED_REPL_READY_MS = 20_000;
+
+/**
+ * Boot screens that are not a usable REPL: a login or onboarding menu, a trust dialog, or the
+ * REPL's own "Not logged in" status (the footer is painted in that state too, so it alone
+ * proves nothing). Matched on the ANSI-stripped screen with gaps allowed, because the
+ * renderer draws word gaps as cursor moves.
+ */
+const BLOCKED_BOOT_SCREENS: ReadonlyArray<readonly [string, RegExp]> = [
+  [
+    "login-required",
+    /Not\s*logged\s*in|Run\s*\/login|Select\s*login\s*method|Paste\s*code\s*here/i,
+  ],
+  ["onboarding", /Choose\s*the\s*text\s*style|Let'?s\s*get\s*started/i],
+  ["trust-dialog", /trust\s*this\s*folder|Do\s*you\s*trust\s*the\s*files/i],
+];
+
+/** A child that exited on its own is still swept for descendants for this long. */
+const GROUP_SWEEP_MAX_AGE_MS = 30_000;
 
 /**
  * Patterns redacted from `_readTailSnapshot()` before the tail is exposed
@@ -521,6 +562,20 @@ class PtyProcessImpl implements PtyProcess {
   private readonly _secretValues: string[];
   /** Untrusted one-shot: the prompt and the raw PTY output stay out of `CLAUDECLAW_PTY_DUMP`. */
   private readonly _untrustedTrace: boolean;
+  /** Retirement stops the whole process group and waits for it (pty-group-kill). */
+  private readonly _terminateGroup: boolean;
+  private readonly _onGroupSurvived?: (pid: number) => void;
+  private readonly _groupTermination?: GroupTerminationOptions;
+  /**
+   * Untrusted one-shot: the screen is watched until the REPL is ready, and the prompt is not
+   * written before that (see `_awaitReplReady`). Off when the settle wait is skipped (tests).
+   */
+  private _readyGate: boolean;
+  private _screenTail = "";
+  private _onScreen: (() => void) | null = null;
+  private readonly _replReadyBudgetMs: number;
+  /** When `_handleExit` ran; a group of a child that exited long ago is not signalled. */
+  private _exitedAt = 0;
 
   constructor(pty: IPty, opts: PtyProcessOptions) {
     this._pty = pty;
@@ -530,6 +585,11 @@ class PtyProcessImpl implements PtyProcess {
     this.cwd = opts.cwd;
     this._secretValues = collectSecretValues(opts.env);
     this._untrustedTrace = opts.isolation === "untrusted";
+    this._terminateGroup = opts.terminateGroup ?? opts.isolation === "untrusted";
+    this._readyGate = opts.isolation === "untrusted" && !opts._skipReadySettle;
+    this._replReadyBudgetMs = opts._replReadyBudgetMs ?? UNTRUSTED_REPL_READY_MS;
+    this._onGroupSurvived = opts.onGroupSurvived;
+    this._groupTermination = opts._groupTermination;
     this.label = `${opts.agentName ?? "pty"}:${pty.pid}`;
     this._quietWindowMs = opts.quietWindowMs ?? DEFAULT_QUIET_WINDOW_MS;
     // Untrusted text also loses its `@` file mentions (see neutralizeFileMentions). The
@@ -648,6 +708,10 @@ class PtyProcessImpl implements PtyProcess {
       data,
     );
     if (this._firstDataAt === 0) this._firstDataAt = now;
+    if (this._readyGate) {
+      this._screenTail = (this._screenTail + data).slice(-4000);
+      this._onScreen?.();
+    }
 
     // Buffer for the current turn (so idle-fallback can return content).
     this._turnBuf.push(bytes);
@@ -701,6 +765,7 @@ class PtyProcessImpl implements PtyProcess {
 
   private _handleExit(info: { exitCode: number; signal?: number | string }): void {
     this._alive = false;
+    this._exitedAt = this._now();
     // Issue #176: capture a diagnostic snapshot the moment the PTY exits.
     // Reading the tail ring buffer now is cheap and avoids the
     // _onDataDisposable race (data events still flush before exit on
@@ -980,6 +1045,17 @@ class PtyProcessImpl implements PtyProcess {
       this._rejectTurn(new PtyClosedError(this.label, null, "SIGTERM"));
     }
 
+    // bun-pty's kill() fires onExit synchronously, so the exit event below proves nothing
+    // about the child. The group is signalled first, while the leader is still ours, and its
+    // disappearance is awaited separately (#570 r12). A child that exited on its own is only
+    // swept shortly after: a pid that old may belong to someone else by now.
+    const sweepGroup =
+      this._terminateGroup &&
+      (this._alive || this._now() - this._exitedAt <= GROUP_SWEEP_MAX_AGE_MS);
+    const groupGone = sweepGroup
+      ? terminateProcessGroup(this._pid, this._groupTermination)
+      : Promise.resolve(true);
+
     if (this._alive) {
       const exited = new Promise<void>((resolve) => {
         if (!this._alive) {
@@ -1011,6 +1087,15 @@ class PtyProcessImpl implements PtyProcess {
       this._clearTimeout(killTimer);
     }
 
+    if (!(await groupGone)) {
+      console.error(
+        `[pty-process] ${this.label} retired but its process group is still alive (pid=${this._pid})`,
+      );
+      try {
+        this._onGroupSurvived?.(this._pid);
+      } catch {}
+    }
+
     try {
       this._onDataDisposable?.dispose();
     } catch {}
@@ -1019,6 +1104,45 @@ class PtyProcessImpl implements PtyProcess {
     } catch {}
     this._onDataDisposable = null;
     this._onExitDisposable = null;
+  }
+
+  _requiresReplReady(): boolean {
+    return this._readyGate;
+  }
+
+  /**
+   * Untrusted one-shot: resolve `ok` once claude's REPL footer is on screen with no login,
+   * onboarding or trust screen, and `!ok` with a reason code otherwise (a blocked screen, or no
+   * footer within the budget). Fails closed: the caller does not write the prompt unless this is
+   * `ok`. Only the reason code is reported, never screen text. Spawn-time only; once decided,
+   * the screen is no longer collected.
+   */
+  _awaitReplReady(): Promise<ReplReadyVerdict> {
+    return new Promise((resolve) => {
+      const finish = (verdict: ReplReadyVerdict): void => {
+        this._clearTimeout(deadline);
+        this._onScreen = null;
+        this._readyGate = false;
+        this._screenTail = "";
+        resolve(verdict);
+      };
+      const check = (): void => {
+        const screen = stripAnsi(this._screenTail);
+        for (const [reason, pattern] of BLOCKED_BOOT_SCREENS) {
+          if (pattern.test(screen)) {
+            finish({ ok: false, reason });
+            return;
+          }
+        }
+        if (/tab\s*to\s*cycle/.test(screen)) finish({ ok: true });
+      };
+      const deadline = this._setTimeout(
+        () => finish({ ok: false, reason: "no-repl-footer" }),
+        this._replReadyBudgetMs,
+      );
+      this._onScreen = check;
+      check();
+    });
   }
 
   // ─── internal: used only by spawnPty to await TUI settle ─────────────
@@ -1271,7 +1395,23 @@ export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
         reject(new Error(`PTY for ${cmd} exited before TUI settled (pid=${pty.pid})${detail}`));
         return;
       }
-      resolve(proc);
+      if (!proc._requiresReplReady()) {
+        resolve(proc);
+        return;
+      }
+      // An untrusted prompt is written only into a REPL that is ready: the footer is up and
+      // no login, onboarding or trust screen is showing. Otherwise the spawn fails with the
+      // reason, nothing has been written, and the child is retired with its process group.
+      void proc._awaitReplReady().then(async (verdict) => {
+        if (verdict.ok) {
+          resolve(proc);
+          return;
+        }
+        await proc.dispose().catch(() => {});
+        reject(
+          new Error(`untrusted PTY not ready (${verdict.reason ?? "unknown"}); nothing was sent`),
+        );
+      });
     });
   });
 }

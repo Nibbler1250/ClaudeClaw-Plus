@@ -195,6 +195,7 @@ describe("A: each untrusted call gets its own throwaway config root", () => {
   });
 
   it('uses "" (the default store) when the operator has no CLAUDE_CONFIG_DIR, empty counts as unset', async () => {
+    delete process.env.CLAUDE_CONFIG_DIR; // the daemon has none either; afterEach restores it
     fakeSpawn();
     await run({ PATH: "/usr/bin:/bin", HOME: join(dir, "home") });
     await run({ PATH: "/usr/bin:/bin", HOME: join(dir, "home"), CLAUDE_CONFIG_DIR: "" });
@@ -430,9 +431,120 @@ describe("A: startup sweep of leftovers", () => {
   it("the daemon runs it at start, before the version probe", () => {
     // Went red when start.ts stopped calling the sweep.
     const start = readFileSync(join(import.meta.dir, "../commands/start.ts"), "utf8");
-    const sweep = start.indexOf("sweepStaleOneShotDirs()");
+    const sweep = start.indexOf("startOneShotSweeper()");
     expect(sweep).toBeGreaterThan(0);
     expect(sweep).toBeLessThan(start.indexOf("probeClaudeCliVersion()"));
+  });
+});
+
+describe("r12 F2: the operator's config dir comes from the daemon when print's policy env lacks it", () => {
+  it("an operator with a custom CLAUDE_CONFIG_DIR keeps that credential store", async () => {
+    fakeSpawn();
+    // beforeEach put the operator's config dir in the daemon env; the policy env names none.
+    await run({ PATH: "/usr/bin:/bin", HOME: join(dir, "home") });
+    expect(spawned[0]!.env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe(join(dir, "parent-config"));
+    // Not the throwaway root, and the child's own config dir is still the throwaway one.
+    expect(spawned[0]!.env.CLAUDE_CONFIG_DIR).not.toBe(join(dir, "parent-config"));
+  });
+});
+
+describe("r12 B: a running call's directories are owned, registered and not swept", () => {
+  it("registers them for the call and releases them when it ends, however it ends", async () => {
+    const registered = cleanup.activeOneShotDirCount();
+    let during = 0;
+    fakeSpawn(() => {
+      during = cleanup.activeOneShotDirCount();
+    });
+    await run();
+    expect(during).toBe(registered + 2);
+    expect(cleanup.activeOneShotDirCount()).toBe(registered);
+    injectSpawnPty(async () => {
+      throw new Error("spawn refused");
+    });
+    await run();
+    expect(cleanup.activeOneShotDirCount()).toBe(registered);
+  });
+
+  it("writes the owner file into the root and the cwd, and a sweep during the turn keeps both", async () => {
+    let during: { root: boolean; cwd: boolean; owners: boolean } | undefined;
+    fakeSpawn((opts) => {
+      const root = opts.env.CLAUDE_CONFIG_DIR!;
+      const owned = (p: string): boolean => existsSync(join(p, cleanup.ONESHOT_OWNER_FILE));
+      const old = new Date(Date.now() - 60 * 60_000);
+      utimesSync(root, old, old);
+      utimesSync(opts.cwd, old, old);
+      cleanup.sweepStaleOneShotDirs(tmpdir(), Date.now());
+      during = {
+        root: existsSync(root),
+        cwd: existsSync(opts.cwd),
+        owners: owned(root) && owned(opts.cwd),
+      };
+    });
+    expect((await run()).exitCode).toBe(0);
+    expect(during).toEqual({ root: true, cwd: true, owners: true });
+  });
+});
+
+describe("r12 A: a process group that outlives retirement fails the call and keeps the root", () => {
+  it("throws, logs the pid, and leaves the root for the sweep (nothing may still be writing into a removed dir)", async () => {
+    fakeSpawn();
+    injectSpawnPty(async (opts) => {
+      spawned.push(opts);
+      return {
+        label: "state",
+        pid: 1,
+        sessionId: SID,
+        cwd: opts.cwd,
+        isAlive: () => true,
+        lastTurnEndedAt: () => 0,
+        runTurn: async () => {
+          reply(opts);
+          return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
+        },
+        dispose: async () => opts.onGroupSurvived?.(424242),
+      } as never;
+    });
+    const registered = cleanup.activeOneShotDirCount();
+    await expect(run()).rejects.toThrow(/survived retirement/);
+    const root = spawned[0]!.env.CLAUDE_CONFIG_DIR!;
+    try {
+      expect(cleanup.activeOneShotDirCount()).toBe(registered);
+      expect(existsSync(root)).toBe(true);
+      const logged = error.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+      expect(logged).toContain("pid 424242");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("r12 E: a spawn refused for want of a ready REPL fails the call with nothing sent", () => {
+  it("returns exit 1 with no reply and leaves no directory behind", async () => {
+    const before = oneShotTempDirs("claudeclaw-oneshot-");
+    injectSpawnPty(async () => {
+      throw new Error("untrusted PTY not ready (login-required); nothing was sent");
+    });
+    const result = await run();
+    expect(result.exitCode).toBe(1);
+    expect(result.text).toBe("");
+    expect(oneShotTempDirs("claudeclaw-oneshot-")).toEqual(before);
+  });
+});
+
+describe("r12 F1: a failure while building the call's state leaks nothing", () => {
+  it("removes the temp cwd and the config root when the project dir cannot be resolved", async () => {
+    fakeSpawn();
+    const before = oneShotTempDirs("claudeclaw-oneshot-");
+    const failing = spyOn(cleanup, "untrustedPtyProjectDir").mockImplementation(() => {
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    });
+    try {
+      await expect(run()).rejects.toThrow("ENOENT");
+    } finally {
+      failing.mockRestore();
+    }
+    expect(spawned).toHaveLength(0);
+    expect(oneShotTempDirs("claudeclaw-oneshot-")).toEqual(before);
   });
 });
 
@@ -567,6 +679,7 @@ describe("C3: cleanup runs again once a late-landing spawn has settled", () => {
     // Went red when the second pass after lateRetire was a no-op.
     let root = "";
     let landed = false;
+    const registered = cleanup.activeOneShotDirCount();
     injectSpawnPty(async (opts) => {
       root = opts.env.CLAUDE_CONFIG_DIR!;
       const project = cleanup.untrustedPtyProjectDir(opts.cwd, root);
@@ -580,9 +693,12 @@ describe("C3: cleanup runs again once a late-landing spawn has settled", () => {
     const result = await run(callerEnv(), { timeoutMs: 100 });
     expect([1, 124]).toContain(result.exitCode);
     expect(landed).toBe(false);
+    // The call has returned but the late claude has not landed: both dirs are still a live call's.
+    expect(cleanup.activeOneShotDirCount()).toBe(registered + 2);
     await new Promise((resolve) => setTimeout(resolve, 900));
     expect(landed).toBe(true);
     expect(existsSync(root)).toBe(false);
+    expect(cleanup.activeOneShotDirCount()).toBe(registered);
   });
 });
 

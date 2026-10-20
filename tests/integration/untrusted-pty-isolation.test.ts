@@ -60,6 +60,28 @@ async function waitForMarker(path: string, budgetMs = 15_000): Promise<boolean> 
   return existsSync(path);
 }
 
+/**
+ * How many processes of this user name `needle` in their environment or command line, from
+ * /proc. Counts only: an environ holds the token and is never logged.
+ */
+function processesNaming(needle: string): number {
+  let count = 0;
+  for (const pid of readdirSync("/proc").filter((name) => /^\d+$/.test(name))) {
+    if (Number(pid) === process.pid) continue;
+    for (const file of ["environ", "cmdline"]) {
+      try {
+        if (readFileSync(`/proc/${pid}/${file}`).includes(needle)) {
+          count++;
+          break;
+        }
+      } catch {
+        /* gone, or not ours to read */
+      }
+    }
+  }
+  return count;
+}
+
 function checkIsolation(
   property: string,
   isolated: boolean,
@@ -566,8 +588,13 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       omitCallerEnv?: string[];
       prompt?: string;
       system?: string;
-      /** Prove the call reached the model, for rows that judge a NEGATIVE predicate. */
-      requireModel?: boolean;
+      /**
+       * Prove the request reached the API, for rows that judge a NEGATIVE predicate. This is
+       * weaker than "the model answered": an API-error or synthetic record also counts, because
+       * it shows the CLI sent the request and the API (or the CLI's own handling of it) replied.
+       * It does not show the model read the prompt.
+       */
+      requireApiContact?: boolean;
     } = {},
   ) {
     expect(baselineLeakObserved).toBe(false);
@@ -618,13 +645,14 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       expect(assistantEntries > 0).toBe(true);
     }
     expect(existsSync(opts[0]!.cwd)).toBe(false);
-    if (options.requireModel) {
+    if (options.requireApiContact) {
       // A negative predicate (no tool ran, no file was read) only means something if the
-      // model actually saw this prompt and answered, or the CLI recorded an API error for it.
+      // request for this prompt reached the API: a reply, or an API-error / synthetic record
+      // the CLI wrote for it. An error record proves contact, not that the model read it.
       const reached =
         promptSeen && (assistantEntries > 0 || apiErrorCount > 0 || syntheticCount > 0);
       console.info(
-        `[isolation-spike] reached-model: promptSeen=${promptSeen}; assistant=${assistantEntries}; apiErrors=${apiErrorCount}; synthetic=${syntheticCount}; reached=${reached}`,
+        `[isolation-spike] reached-api: promptSeen=${promptSeen}; assistant=${assistantEntries}; apiErrors=${apiErrorCount}; synthetic=${syntheticCount}; reached=${reached}`,
       );
       expect(reached).toBe(true);
     }
@@ -684,7 +712,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
                 screen: "tools-baseline",
                 timeoutMs: 60_000,
                 allowNoTurn: true,
-                requireModel: true,
+                requireApiContact: true,
               },
         );
         const isolated = !existsSync(marker) && !toolUse;
@@ -902,12 +930,12 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         // Either direction: the model may try a (disabled) Read and end on an API-error record,
         // which is exit 1 (r9, D3). r11 run 39372817216 hit exactly that on the twin (exit 1 at
         // the exit-0 guard, before the predicate ran). The canary predicate below is what is
-        // judged, and requireModel proves the call reached the model. This widening of the
+        // judged, and requireApiContact proves the request reached the API. This widening of the
         // twin is not live-verified: that was the last allowed run.
         const result = await run(mentionPrompt(path), {
           allowNoTurn: true,
           timeoutMs: twin ? BUDGET : 60_000,
-          requireModel: true,
+          requireApiContact: true,
         });
         const inReply = result.text.includes(FILE_CANARY);
         const inTranscript = transcriptRaw.includes(FILE_CANARY);
@@ -1029,7 +1057,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
           prompt,
           twin
             ? { timeoutMs: BUDGET }
-            : { allowNoTurn: true, timeoutMs: 60_000, requireModel: true },
+            : { allowNoTurn: true, timeoutMs: 60_000, requireApiContact: true },
         );
         const inReply = result.text.includes(FILE_CANARY);
         const inTranscript = transcriptRaw.includes(FILE_CANARY);
@@ -1116,12 +1144,8 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         console.info(
           `[isolation-spike] A-login ${direction}: storePresent=${existsSync(store)}; storeMode=${(statSync(store).mode & 0o777).toString(8)}; tokenLength=${token.length}`,
         );
-        if (twin && !secureStorageMeasured) {
-          console.info(
-            "[isolation-spike] A-login twin skipped: the control never authenticated through the store, so the secure-storage path is UNMEASURED",
-          );
-          return;
-        }
+        // The twin only means something after a control that authenticated through the store.
+        if (twin) expect(secureStorageMeasured).toBe(true);
         // Twin: the storage dir points at an empty directory instead of the operator's root.
         if (twin) {
           const empty = join(root, "empty-store");
@@ -1149,22 +1173,11 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
           );
           return;
         }
-        if (authenticated) {
-          secureStorageMeasured = true;
-          checkIsolation("A-login (the store is what authenticates the child)", true, false);
-          return;
-        }
-        // The Linux store shape was not accepted. Say so, and show the env-token route works.
-        console.info(
-          "[isolation-spike] A-login: NOT authenticated through the secure-storage dir; the secure-storage path is UNMEASURED. Falling back to the env token.",
-        );
-        opts = [];
-        extraChildEnv = {};
-        removeChildEnv = [];
-        const fallback = await run(`Reply with ${DONE}.`);
-        console.info(
-          `[isolation-spike] A-login fallback (env token): exit=${fallback.exitCode}; assistantEntries=${assistantEntries}`,
-        );
+        // No fallback to the env token: if the store did not authenticate the child, the row
+        // is red and the secure-storage path is unmeasured, which must not read as a pass.
+        secureStorageMeasured = authenticated;
+        checkIsolation("A-login (the store is what authenticates the child)", authenticated, false);
+        expect(authenticated).toBe(true);
       },
       BUDGET + 20_000,
     );
@@ -1255,6 +1268,29 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       BUDGET + 20_000,
     );
   }
+
+  // A-proc (r12). After one classifier-shaped call, no process of this user may still name the
+  // throwaway root in its environment or command line. bun-pty's kill() reports an exit it has
+  // not waited for, so a descendant of claude could outlive the call and write into a root that
+  // had been removed. Linux only (/proc). Only counts are logged, never an environ: it holds the
+  // token. The scanner is proved first on a planted process, so a count of 0 can mean something.
+  const linuxOnly = process.platform === "linux" ? test : test.skip;
+  linuxOnly(
+    "A-proc no process still names the throwaway root after the call",
+    async () => {
+      const planted = spawn("/bin/sleep", ["30"], { env: { ...process.env, PLANTED_ROOT: root } });
+      try {
+        expect(processesNaming(root)).toBeGreaterThanOrEqual(1);
+      } finally {
+        planted.kill("SIGKILL");
+      }
+      await run(`Reply with ${DONE}.`, { model: "haiku", allowNoTurn: true, timeoutMs: 60_000 });
+      const holders = processesNaming(childRoot);
+      console.info(`[isolation-spike] A-proc: processesNamingThrowawayRoot=${holders}`);
+      expect(holders).toBe(0);
+    },
+    BUDGET + 20_000,
+  );
 
   // HANG-RATE probes. Both keep `--tools ""` and the identical isolation argv.
   // They measure an intermittent no-reply, they are not isolation proof and have
