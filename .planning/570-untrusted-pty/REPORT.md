@@ -735,3 +735,115 @@ Not injected: the 2 s and 2 s grace lengths and the 20 s footer budget (values, 
 - A survivor's root is kept for the 10-minute sweep, which removes it even if the survivor is still writing; nothing here kills a survivor that SIGKILL could not.
 - The baseline hang probe's rate across rounds (above).
 - Carried from earlier rounds: Whole-paste image-path handling, the version gate probed once at startup, bun-pty `env_clear`, a classifier rate limit, a tuner env allowlist, the retired classifier model id in `discord.ts`.
+
+## r13: survivors, pid identity, escapees, the ready gate (r12 review fixes)
+
+Commit `7b97c9e1` (code, tests, `docs/oneshot-engines.md`) and a final docs commit with this section. Codex and Opus (silent-failure) reviewed `4251b130..cf9779fc` and found nothing critical; Opus confirmed that no path lets a failed kill or a failed root removal report success. This round fixes what remained. No PR, no GitHub comment, no version bump (2.2.353). Two integration workflow runs, the maximum, both on `7b97c9e1`: [39386797939](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39386797939) (**54 pass, 1 fail**) and [39388125313](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39388125313) (**54 pass, 1 fail**), Claude **2.1.304**. The failing row differs between them and neither is an A row; see "Live results".
+
+### A. Survivors are retried, and their directories are protected
+
+- `markGroupSurvivor(root, pid, { startMs, tempCwd, cwds })` records the leader's pid, its start time from spawn, the temp cwd and its forms. `retrySurvivingGroups()` runs on every sweeper tick: it calls `terminateProcessGroup` again with `leaderStartMs` and `leaderAlive: () => false` (only `-pid`, never the bare pid), then the escapee scan, and drops the entry only when both come back clean. A retry that fails is logged as metadata (pid, retry number, how many processes), never a path.
+- `sweepStaleOneShotDirs` skips a root, and the temp cwd, while a survivor is recorded for it. The temp cwd is also kept by `cleanupUntrustedOneShot` in that case: the first version of the supervisor test failed on this (the cwd was removed under a recorded survivor), and a removed cwd shows up in `/proc/<pid>/cwd` as `<path> (deleted)`, so the escapee scan could no longer match it.
+- An owner file that exists but cannot be read or understood (I/O error, malformed JSON, no pid or instance) is **quarantined**: logged once per directory, never removed by the sweep. A directory with no owner file at all is still swept by age (pre-r12 leftover).
+- The survivor hook no longer swallows errors (`pty-process.ts`, was `try { ... } catch {}`): it logs and `dispose()` rejects after the listeners are released. The supervisor's `retireEntry` used to ignore a rejected disposal; it now records the root as a survivor (`keepRootAfterFailedDispose`), so the call fails and the root stays. Its pid identity is unknown there, so the sweeper cannot clear it: it stays until the daemon restarts.
+- Sweeper hygiene (F): the interval's `catch` logs; one `ps` per pid per pass (`cachedStartMs`, with a `startMs` seam on `SweepDeps`).
+
+### B. PID identity before every signal
+
+`pty-proc-identity.ts` holds the start-time reader (moved out of `pty-cleanup.ts`, which re-exports it, so the owner file and the signals use the same reader) and `pidIdentity`: `same`, `gone`, `recycled` (a pid with another start time) or `unknown`. `terminateProcessGroup` reads it before the SIGTERM and again before the SIGKILL:
+
+- `recycled`: nothing is signalled, and the group counts as gone (a group id cannot be reused while it has a member, so a reused leader pid means the group is long gone).
+- the bare pid is signalled only while the PTY still owns it (`_alive`) and the identity is `same` or `unknown`; once the child has exited on its own only `-pid` goes out, and only while `kill(-pid, 0)` shows a member. The 30-second post-exit window therefore cannot signal a recycled pid.
+- `unknown` identity with the PTY no longer owning the leader signals nothing and fails the call (fail closed).
+- Tolerance is the owner file's 2 s (`ps` has 1 s resolution), so a pid reused within about 2 s of the original start is not detected. Accepted, as for the owner file.
+- The poll reads the start time on the first poll and then every tenth, not every 20 ms: each read is a `ps` spawn.
+
+### C. Descendants that leave the group
+
+`pty-escape-scan.ts`. After the group is gone, `dispose()` calls `reapEscapees` (supervisor: `terminateEscapees({ root, cwds })`): on Linux it scans `/proc/*/environ` in memory for an exact `CLAUDE_CONFIG_DIR=<root>` entry and `/proc/*/cwd` for the temp cwd (either form) or anything below it; each match has its start time read when it is found and re-checked before the SIGTERM and the SIGKILL, then polled; a match that remains, or whose identity cannot be checked, makes the call fail and keeps the root as in A. Only pids and counts are logged. A scan that throws counts as a survivor.
+
+**macOS: narrowed guarantee.** There is no cheap equivalent of that scan. On macOS, containment is the process group plus the remove-and-recheck loop of `removeUntrustedConfigRoot`; **a process that calls `setsid()` or `setpgid()` and keeps writing is not stopped there**. Stated in `pty-escape-scan.ts`, `docs/oneshot-engines.md`, and here.
+
+**Not run here: the Linux real-process test.** `pty-escape-scan.test.ts` has a `describe.skipIf(process.platform !== "linux")` block (a PTY child whose helper runs `setsid sh -c 'exec sleep 60'` with `CLAUDE_CONFIG_DIR` set: dead after `dispose()` with the scan wired in; twin: with the scan off it survives). This machine is macOS, there is no Linux VM or container here, and `test.yml` runs `bun test src` only on PRs and pushes to `main`, so **that block has not been executed by anyone**; its helper pid is written to a file by the helper itself and its pgid is asserted to differ from the child's, but I cannot claim it passes. The fake-`/proc` tests (11 of them, running everywhere) cover the scan and the kill logic, and every one of those went RED under its own fault (below). First thing to run on Linux: `bun test src/runner/pty-escape-scan.test.ts`.
+
+### D. /proc visibility
+
+`procLiveMembers` returns undefined, not zero, when a `/proc/<n>/stat` cannot be read for any reason but its process having gone, and zero only on positive evidence: at least one member seen, every one `Z` or `X`, none unseen. A live member seen still returns the count.
+
+### E. The ready gate reads the current screen
+
+`pty-screen.ts` is a small VT screen (cursor moves, erase in display and line, CR/LF/BS, scrolling at the bottom row, save/restore, alternate screen as a clear). **There was no screen decoder in the tree** (only `stripAnsi`, which erases cursor moves), so this is new; `_awaitReplReady` feeds it instead of accumulating output. Once the footer (or a blocked screen) is on the current screen, one quiet window (`quietWindowMs`) must pass without the screen changing; then the blocked patterns are checked again and a blocked screen refuses, otherwise the footer makes it ready. At the budget a screen that never went quiet is judged a last time (`screen-not-settled`, or the blocked reason). I booted a real claude 2.1.304 through the production spawn path with no credentials, and the decoder gave the 15-line screen with the footer line and `Not logged in · Run /login` on its right: it would refuse `login-required` (checked by a script in the scratchpad that prints booleans only). With the operator's store the same probe also came back logged out in this sandbox (keychain not reachable), so a ready REPL was not decoded locally; run 1 is that evidence.
+
+### H. Recorded, not fixed
+
+- **Opus LOW 7 (macOS zombie case).** On macOS a PTY child that exits and is not reaped is a zombie that `kill(pid, 0)` still sees (no `/proc` to say it is dead). The group check relies on bun-pty reaping the exited child; if it does not, the group reads as alive until it does, and the call fails closed.
+- **Codex LOW (reverse `@` map).** A genuine U+FF20 the model writes still comes back as `@`. Known limitation, unchanged.
+
+### Live results
+
+Both runs: the same commit, `7b97c9e1`, 55 tests in 3 files (r12 run 2: 55 pass, 0 fail). **The four rows the brief names did not regress, in either run**, and neither did the positive control, B1 or B2.
+
+| Row | Run 1 (39386797939) | Run 2 (39388125313) |
+| --- | --- | --- |
+| Positive control | `MCP=true; hooks=true; memory=true; assistant=true; completed=true` | same |
+| **B1** trust seeded / **B2** API key | `trustAtSpawn=true; exit=0; assistantEntries=1; completed=true; stalled=false` / `childHasApiKey=false; exit=0; assistantEntries=1`; twins RED (B2 `exit=124; assistantEntries=0`) | same |
+| **A-login** | `authenticated=true; exit=0; assistantEntries=1; apiErrors=0; storageDirIsOperatorRoot=true; childHasOauthToken=false` (store `0600`, token length 108); twin RED (`authenticated=false; exit=1; assistantEntries=0`) | `authenticated=true; exit=0; assistantEntries=1; apiErrors=0`; twin RED (same values) |
+| **A-untouched** | `filesBefore=2; filesAfter=2; changed=[]` | `filesBefore=2; filesAfter=2; changed=[]` |
+| **A-paste** | `promptLength=2834`; mid-turn `paste-cache/<hash>.txt` and `projects/<cwd>/<uuid>.jsonl` hold the canary; `rootGone=true; operatorRootHolds=0; tmpdirHolds=[]`; twin RED | same |
+| **A-proc** (Linux) | `processesNamingThrowawayRoot=0` | `processesNamingThrowawayRoot=0` |
+| **B3** `@`, PTY and print | control isolated, twins RED | control isolated, twins RED |
+| **C** look-alikes, control present | **FAIL**: `exit=124; assistantEntries=0`, `promptSeen=true; assistant=0; apiErrors=0; synthetic=0; reached=false` (the harness' `reachedApi` requirement, `untrusted-pty-isolation.test.ts:658`) | pass (`canaryInReply=false; canaryInTranscript=false`) |
+| **C** look-alikes, twin (ASCII `@`, neutralising off) | pass | **FAIL**: `expect(result.exitCode).toBe(0)` received 1, at 11.2 s (harness line 643) |
+
+**What the two failures are, and are not.** They are two different sub-rows of the C family, each failing once in two runs of identical code, and each of them passed in the other run. In run 1 the prompt was written and recorded (`promptSeen=true`) and the model produced nothing for 60 s: the stall the baseline hang probes have measured since r6 (rate 1/5 in r9, 0/5 in r11, 3/5 in r12). In run 2 the twin returned exit 1 after about 11 s. Neither can be a ready-gate refusal: a refusal on a blocked screen comes one quiet window (500 ms by default) after the screen shows it, a footer that never shows or never settles is refused at the 20 s budget, and run 1 shows the prompt was written. The gate also let a real REPL through on every row that sends a prompt (positive control, B1, B2, B3, A-login, A-untouched, A-paste, A-proc), which is the evidence that the new screen decoder agrees with a real claude 2.1.304. **I cannot prove the two failures are unrelated to r13**: I have no child log for either, one sample each, and the same C family flaked in r10 (B3 print, control present) and r11 (B3 PTY twin) with no relevant change. A third run is not allowed by the brief; the useful next step is to read why the twin returns 1 (a `warn` from `runOnceOnPty` would say which of spawn failure, turn failure and no transcript reply it was, and the harness does not surface it).
+
+### Local verification
+
+- `src/oneshot src/runner`: **351 pass, 6 skip, 0 fail** (r12: 301, 4 skip). The 6 skips are the two Linux-only blocks above and four that were skipped before.
+- Lint: **0 errors**, 1377 warnings, 324 infos. Typecheck ratchet **149 against baseline 149**. Plugin and marketplace versions unchanged (2.2.353).
+- New tests: `pty-screen.test.ts` (11), `pty-escape-scan.test.ts` (11 + 2 Linux-only), blocks in `pty-group-kill.test.ts` (+9), `pty-group-retire.test.ts` (+5), `pty-repl-ready.test.ts` (+4), `pty-sweep.test.ts` (+8), `pty-untrusted-state.test.ts` (+2: the supervisor-level survivor test with the real `PtyProcess` retirement and an injected `_groupTermination` that never sees the group go, and the rejected-disposal case).
+- **Two tests of mine could not fail, and fault injection found both.** The escalation test for B ("checks again before the SIGKILL") returned before the escalation was ever reached (the poll noticed the reuse at poll 10), so reusing the first identity at the SIGKILL stayed green until the grace was shortened. The first "cleared screen" gate test stayed green with the clear ignored, because the REPL text overwrote the menu line that carried the blocked pattern by coincidence; the menu now sits below the rows the REPL is drawn on.
+
+### Fault injection, one site each, on a `git archive` copy of the worktree in the scratchpad, restored after (RED verbatim)
+
+Each injection changes one site and runs the named tests; the `(fail)` line is the first one reported. I wrote each assertion comment after seeing its line. The three brief faults are G1 (the `untrustedGroupOptions(...)` spread), G2 (the survivor throw) and A6 (the survivor hook's catch).
+
+```text
+A1   retry claims the leader (leaderAlive true)                (fail) retrySurvivingGroups > terminates each recorded survivor again, with the identity recorded at spawn and no claim on the leader
+A10  rejected dispose() does not keep the root                 (fail) r13 A6: a disposal that rejects keeps the root, as a survivor does > fails the call and leaves the config root when dispose() throws
+A2   sweep ignores recorded survivors                          (fail) group survivors > keep their root and temp cwd out of the sweep, however old and however dead the owner   [+2 more]
+A3a  unreadable owner file read as missing                     (fail) sweepStaleOneShotDirs: who may be removed > quarantines a directory whose owner file is malformed or unreadable: logged once, never removed
+A3b  malformed owner JSON read as missing                      (fail) sweepStaleOneShotDirs: who may be removed > quarantines a directory whose owner file is malformed or unreadable: logged once, never removed
+A3c  owner record without pid/instance read as missing         (fail) sweepStaleOneShotDirs: who may be removed > quarantines a directory whose owner file is malformed or unreadable: logged once, never removed
+A4   sweeper tick does not retry survivors                     (fail) startOneShotSweeper > signals recorded survivors again on every tick, and logs a retry that throws   [+1 more]
+A5   sweeper pass catch logs nothing                           (fail) startOneShotSweeper > survives a pass that throws, so the next tick still runs, and says so
+A5b  survivor retry catch logs nothing                         (fail) startOneShotSweeper > signals recorded survivors again on every tick, and logs a retry that throws
+A6   survivor hook catch swallows (brief G3)                   (fail) retirement and the recorded identity > fails closed when the survivor hook throws: it is logged and dispose rejects
+A7   temp cwd removed though a survivor is recorded            (fail) r13 A/G: a survivor keeps the call failed, the root in place, and is signalled again by the sweeper > does not resolve 0, does not delete the root, retries each tick, and sweeps only after the survivor is gone
+A8   entry cleared on group-gone OR no escapee                 (fail) retrySurvivingGroups > keeps an entry whose group is still alive, or that still has a process outside it, and logs metadata only
+A9   entry never dropped                                       (fail) group survivors > are swept once the survivor is gone   [+3 more]
+B1   no identity check in send                                 (fail) terminateProcessGroup > pid identity (#570 r13, B) > signals nothing when the pid now has a different start time   [+3 more]
+B2   bare pid signalled after the child exited                 (fail) terminateProcessGroup > pid identity (#570 r13, B) > signals only the group, never the bare pid, once the child has exited   [+2 more]
+B3   -pid signalled on unknown identity, leader not owned      (fail) terminateProcessGroup > pid identity (#570 r13, B) > does not signal a pid whose start time was never recorded unless the PTY still owns it
+B4   SIGKILL reuses the identity read before SIGTERM           (fail) terminateProcessGroup > pid identity (#570 r13, B) > checks again before the SIGKILL: a pid reused after the SIGTERM is not killed
+B5   poll ignores a reused pid                                 (fail) terminateProcessGroup > pid identity (#570 r13, B) > signals nothing when the pid now has a different start time   [+1 more]
+C1   environ matched as substring                              (fail) findEscapees (fake /proc) > finds a process that carries this root in its environment, by exact entry
+C2   cwd matched by prefix without the / boundary              (fail) findEscapees (fake /proc) > finds a process running in the temp cwd or below it, and not a sibling with the same prefix
+C3   cwd check removed                                         (fail) findEscapees (fake /proc) > finds a process running in the temp cwd or below it, and not a sibling with the same prefix   [+1 more]
+C4   escapee start-time check always true                      (fail) terminateEscapees (fake /proc) > does not signal a pid whose start time changed since it was found   [+1 more]
+C5   escapee SIGKILL escalation removed                        (fail) terminateEscapees (fake /proc) > escalates to SIGKILL for one that ignores SIGTERM
+C6   dispose does not run the escapee scan                     (fail) retirement and the recorded identity > reports a process outside the group that the scan could not stop, and a scan that threw   [+1 more]
+C7   scan that throws not counted as survivor                  (fail) retirement and the recorded identity > reports a process outside the group that the scan could not stop, and a scan that threw
+D1   unreadable /proc stat skipped                             (fail) procLiveMembers > counts an unreadable entry as unknown, so a zombie beside it does not make the group gone
+D2   zero allowed without a zombie seen                        (fail) procLiveMembers > is unknown, not zero, when no member can be seen at all
+E1b  screen decoder ignores clear-screen                       (fail) Screen > drops what a clear-screen wiped, and shows what was drawn after it   [+1 more]
+E2   ready as soon as the footer shows                         (fail) the ready gate reads the current screen > refuses a footer that is drawn first and 'Not logged in' drawn after it   [+1 more]
+E3   no blocked re-check after the quiet window                (fail) an untrusted first turn waits for a ready REPL > refuses a login menu, with the reason, and writes nothing   [+8 more]
+E4   blocked screen waits for the whole budget                 (fail) the ready gate reads the current screen > refuses a blocked screen after one quiet window, not after the whole budget
+E5   unsettled screen judged ready at the deadline             (fail) the ready gate reads the current screen > refuses a footer that is still there but a screen that never went quiet
+F1   start-time lookups not cached per pass                    (fail) retrySurvivingGroups > asks for each owner pid's start time once per sweep pass
+G1   untrustedGroupOptions(...) spread deleted (brief G1)      (fail) r12 A: a process group that outlives retirement fails the call and keeps the root > throws, logs the pid, and leaves the root for the sweep (nothing may still be writing into a removed dir)   [+1 more]
+G2   survivor !== undefined throw deleted (brief G2)           (fail) r12 A: a process group that outlives retirement fails the call and keeps the root > throws, logs the pid, and leaves the root for the sweep (nothing may still be writing into a removed dir)   [+2 more]
+```
+
+Not injected: the 2 s grace lengths (values, not branches); the `ps -o lstart=` parse (under `bun test` the `lstart` string, which `ps` prints in local time, was read 1 hour out against `Date.now()` on this BST machine; I believe `bun test` defaults `TZ` to UTC, but I did not confirm it. Both the owner file and the signals read through the same parser, so they agree, and no assertion compares the value with the clock; a daemon under `bun run` parses local time); the Linux branch of `procLiveMembers` and the scan against a real `/proc` (fake directory only, plus the unrun Linux block).
