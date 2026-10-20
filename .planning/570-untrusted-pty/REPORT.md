@@ -1539,3 +1539,52 @@ hang-rate-summary probe=c-lookalike: hung=1/5; exit124=1
 Other probes: baseline hung 1/5 (exit 124), contract 0/5.
 
 What this shows. Row C hung on its first attempt in this run too (and the probe's first attempt hung), and the retry answered in 7.9 s, so the retry is what makes the row pass. Row C has now hung in runs 5b, 6, 7 (row) and in 1 of 5 probes; counting only the unretried calls I have (runs 3 to 5 clean: 3, probe: 1 of 5), the prompt hangs on roughly 1 call in 4 to 5. Both hangs in this run were the **first** call of a fresh sequence; the 4 later probe attempts, in the same job, answered in 6.5 to 8.2 s. Five samples cannot separate a first-call effect from chance. I do not know the cause.
+
+
+## r15d: musl libc (Codex P2), retry-masking in the harness, weak assertions, stale docs
+
+Commit `37f31c01`, from `ece22a0f`, pushed to povai. No version bump, no `@codex review`.
+
+| Item | Change |
+| --- | --- |
+| A. Codex P2 (thread 4329873834) | `loadLibc` and `readNativeEnvironment` share one candidate list (`libcCandidates`) through `dlopenLibc`, which opens the first candidate `dlopen` accepts. If none opens, `readNativeEnvironment` still throws "Native environment isolation unavailable". Seam: `_readNativeEnvironmentWithDlopenForTests`. Thread replied to with the sha and resolved. |
+| B1. A-untouched baseline | `firstSpawnOnly(hook)` (pure, in `pty-hang-signature.ts`) wraps the baseline, so a retry's spawn no longer re-takes it. The other `beforeSpawn` (C1, `~1690`) snapshots the per-call throwaway root, which is new on each attempt, so it has no cross-attempt baseline to lose; left as is. |
+| B2. Post-hang cleanup | After a retry is detected, every attempt's `childRoots` entry must be gone, not only the temp cwds. Attempt 1's transcript, tool-use, canary, API-key and OAuth-token evidence is carried into the checks that run after attempt 2, so B3 and C see both attempts. |
+| C. Weak assertions | `pty-sweep.test.ts`: `"bootId" in` the raw owner JSON and in `survivor.json`. `pty-proc-identity.test.ts`: `currentBootId()` is not `TEST_BOOT_ID` when the switch is unset. `pty-repl-ready.test.ts`: new case, a child already exited before `runTurn` rejects at once with `PtyNotReadyError` matching `/exited/`. |
+| D. Docs | Every README `src/runner.ts` reference re-measured against the final tree (39 anchors checked, 0 mismatches), plus `discord.ts:1378`. Gate wording "and not Windows" in `config.ts` and `oneshot-engines.md`; `closed` and `exited` verdicts in the `_awaitReplReady` doc; `memory.recall` noted as reserved; sweep every ten minutes in the 0.7 spike doc. |
+
+B3 (testable): `firstSpawnOnly` has three unit tests, including the retry scenario (attempt 1 writes into the config, attempt 2 spawns, the baseline still lacks the write).
+
+### Gates
+
+`src/oneshot` + `src/runner` + `src/__tests__/runner.test.ts` + the new file: 510 pass / 0 fail. With `CLAUDECLAW_TEST_PLATFORM=linux`: 478 pass / 0 fail. Lint exit 0. Typecheck 149 errors, baseline 149.
+
+### Fault injection (copy of the tree outside the repo, one site each, restored after)
+
+| Injection | RED line |
+| --- | --- |
+| A: `readNativeEnvironment` hard-codes `libc.so.6` again | `reads environ when the first libc candidate does not open (musl)`: `expect(tried).toEqual([first, second])`, `- "libSystem.B.dylib"` expected, not received (this host is macOS; on Linux it is `libc.so.6`) |
+| B1: `firstSpawnOnly` runs its hook every time | 3 fail: `takes the baseline on the first spawn and keeps it when the row retries`, `passes the first call's arguments through and ignores later ones`, `keeps separate state per wrapper` (`Expected: 2, Received: 3`) |
+| repl-ready: remove `if (!this._alive)` in `_awaitReplReady` | `a turn started on a child that already exited does not start a gate`: `Expected constructor: PtyNotReadyError, Received value: "waiting"` |
+| C sweep: remove `bootId` from the owner record | `writes the boot id into the owner file and into survivor.json`: `Expected: true, Received: false`, on a plain run and under the Linux switch |
+| C identity: the switch always reports on | `off, or outside NODE_ENV=test: the real platform decides`: `Expected: null, Received: "00000000-test-boot-id"` (macOS, caught by the existing line; the new `not.toBe` line is the one that bites on Linux) |
+
+Not injected: the `childRoots` post-hang assertion and the carried-evidence fold in the integration harness. They run only on CI, and no row retried in the run below, so neither was exercised there. They are reviewed by reading only.
+
+### Integration run: results
+
+Run [39494930163](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39494930163) on `37f31c01`: **conclusion success; 61 pass / 0 fail**; Linux step 86/86.
+
+**Row-retry lines: none.** No row hit the hang signature, so the retry path, including the new `childRoots` check and the carried evidence, was not run in CI this time.
+
+Probe lines (hang-rate summaries: baseline 0/5, contract 0/5, c-lookalike 1/5):
+
+```
+hang-rate probe=c-lookalike attempt=1 exit=0 assistantEntries=1 elapsedMs=6924 hung=false
+hang-rate probe=c-lookalike attempt=2 exit=0 assistantEntries=2 elapsedMs=7563 hung=false
+hang-rate probe=c-lookalike attempt=3 exit=124 assistantEntries=0 elapsedMs=75251 hung=true
+hang-rate probe=c-lookalike attempt=4 exit=0 assistantEntries=2 elapsedMs=7986 hung=false
+hang-rate probe=c-lookalike attempt=5 exit=0 assistantEntries=4 elapsedMs=9933 hung=false
+```
+
+The c-lookalike probe hung again, this time on attempt 3 rather than the first call, so r15c's "first call of a fresh sequence" reading is not supported by this run. The cause is still unknown.
