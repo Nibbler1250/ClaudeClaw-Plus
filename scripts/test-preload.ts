@@ -36,9 +36,10 @@ applyPtyIsolationVersionGate(MIN_PTY_ISOLATION_CLAUDE_VERSION, () => {});
 // #570 r11: removing an untrusted call's throwaway config root waits 200 ms to see it stay
 // gone. Unit tests do not run a real claude that could write into it, so they wait 5 ms.
 setRootRemovalQuietMsForTests(5);
-// #570 r15 (A4): a call that returned its deadline keeps its concurrency slot while its late claude
-// lands, for at most a minute. A test whose fake spawn never lands would hold that slot into the
-// next test, so unit tests cap it at 250 ms.
+// #570 r15e: a call that returned its deadline keeps its concurrency slot until its late claude
+// has landed and been retired; the ceiling only logs that it is still waiting. Unit tests shorten
+// it to 250 ms, and a test whose fake spawn never lands resets the slots in its own `afterEach`
+// (`resetUntrustedSlotsForTests`).
 setLateSlotCeilingMsForTests(250);
 
 const need =

@@ -78,6 +78,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   cleanup.resetGroupSurvivorsForTests();
+  cleanup.resetUntrustedSlotsForTests();
   cleanup.resetOneShotSweeperForTests();
   warn.mockRestore();
   error.mockRestore();
@@ -1348,14 +1349,29 @@ describe("r15 A4: concurrent untrusted PTY one-shots are capped", () => {
     }
   }
 
-  it("a late claude stays counted after its call returned, but only up to the ceiling (a spawn that never lands)", async () => {
-    await withLateCeiling(300, async () => {
-      injectSpawnPty(() => new Promise(() => {}));
+  it("a late claude stays counted after its call returned, past the ceiling, until it is retired", async () => {
+    await withLateCeiling(50, async () => {
+      let land!: () => void;
+      injectSpawnPty(
+        () =>
+          new Promise((resolve) => {
+            land = () => resolve({ dispose: async () => {} } as never);
+          }),
+      );
       const result = await run(callerEnv(), { timeoutMs: 100 });
       expect([1, 124]).toContain(result.exitCode);
       // The call has returned, but its claude may still land: it is still counted.
       expect(cleanup.untrustedOneShotsInFlight()).toBe(1);
-      // A spawn that never lands must not hold it for ever.
+      // Past the ceiling it is still counted (a claude not confirmed retired may be running); the
+      // ceiling only says so, once.
+      await until(() =>
+        warn.mock.calls.some((c: unknown[]) =>
+          String(c[0]).includes("one-shot slot held past ceiling: retirement pending"),
+        ),
+      );
+      expect(cleanup.untrustedOneShotsInFlight()).toBe(1);
+      // It lands and is retired: the slot comes back, so a held slot is never a permanent wedge.
+      land();
       await until(() => cleanup.untrustedOneShotsInFlight() === 0);
       fakeSpawn();
       expect((await run()).exitCode).toBe(0);
@@ -1372,6 +1388,44 @@ describe("r15 A4: concurrent untrusted PTY one-shots are capped", () => {
       expect(cleanup.untrustedOneShotsInFlight()).toBe(1);
       await until(() => cleanup.untrustedOneShotsInFlight() === 0); // polls for 2 s, ceiling is 30 s
     });
+  });
+
+  it("a call whose claude survived retirement keeps its slot until the sweeper confirms the survivor gone", async () => {
+    // Each call records a survivor under its own root, as a retirement that left one does.
+    fakeSpawn((opts) => {
+      cleanup.markGroupSurvivor(opts.env.CLAUDE_CONFIG_DIR!, 4000 + spawned.length, {
+        startMs: 7,
+        tempCwd: opts.cwd,
+        cwds: [opts.cwd],
+      });
+    });
+    const MORE = cleanup.UNTRUSTED_ONESHOT_MAX_CONCURRENT + 1;
+    const outcomes: Array<{ code?: unknown; reason?: string }> = [];
+    for (let i = 0; i < MORE; i++) {
+      // The first calls fail closed on the survivor; the one past the cap is refused as busy.
+      const out = await run().then(
+        (r) => ({ reason: r.diagnostic?.reason }),
+        (e: NodeJS.ErrnoException) => ({ code: e.code, reason: "threw" }),
+      );
+      outcomes.push(out);
+    }
+    // Went red (the third call threw instead of returning busy) with the unconditional
+    // `slot.free()` restored, and again with `settle` handed the wrong root.
+    expect(outcomes.map((o) => o.reason)).toEqual(["threw", "threw", "busy"]);
+    expect(spawned).toHaveLength(cleanup.UNTRUSTED_ONESHOT_MAX_CONCURRENT);
+    expect(cleanup.untrustedOneShotsInFlight()).toBe(cleanup.UNTRUSTED_ONESHOT_MAX_CONCURRENT);
+
+    // The sweeper confirms one survivor gone: exactly one slot comes back.
+    const gone = await cleanup.retrySurvivingGroups({
+      terminate: async (pid) => pid === 4001,
+      reap: async () => [],
+    });
+    expect(gone).toBe(1);
+    expect(cleanup.untrustedOneShotsInFlight()).toBe(cleanup.UNTRUSTED_ONESHOT_MAX_CONCURRENT - 1);
+    for (const opts of spawned) {
+      rmSync(opts.env.CLAUDE_CONFIG_DIR!, { recursive: true, force: true });
+      rmSync(opts.cwd, { recursive: true, force: true });
+    }
   });
 
   it("a slot frees when the call fails before any state exists (config dir not absolute)", async () => {

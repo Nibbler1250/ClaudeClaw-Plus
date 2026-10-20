@@ -78,7 +78,15 @@ stands is treated as "not a thread command". Retiring the child (an abort, a dea
 child exiting ends the REPL-ready wait at once. A call that throws (a cleanup that could not
 remove the prompt) is not retried. At most 2 untrusted PTY one-shots run at once
 (`UNTRUSTED_ONESHOT_MAX_CONCURRENT`, in process, not a setting): a third returns `busy` without
-spawning anything, and the classifier gets null for it.
+spawning anything, and the classifier gets null for it. A slot follows the child, not the call:
+it is held while a claude of that call may still be alive and freed only on positive evidence
+that it is gone. A call whose claude is still being admitted when its deadline passes keeps the
+slot until that claude has landed and been retired (past `UNTRUSTED_LATE_SLOT_CEILING_MS` it only
+logs `one-shot slot held past ceiling: retirement pending`; it does not free). A call whose claude
+survived retirement hands its slot to the survivor record, and the sweeper's identity-checked
+retry releases it once, when the survivor is confirmed gone. Survivors a restarted daemon adopts
+from `survivor.json` count against the cap the same way. A held slot makes a new call `busy`
+(fail closed); one whose retirement never settles stays held until the daemon restarts.
 
 An API-key-only host is not covered: untrusted routes carry no API-key defaults, and the
 throwaway config root has no login, so on claude 2.1.304 or later with `pty.enabled` the

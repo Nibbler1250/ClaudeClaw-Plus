@@ -194,10 +194,10 @@ export function activeOneShotDirCount(): number {
 export const UNTRUSTED_ONESHOT_MAX_CONCURRENT = 2;
 
 /**
- * A call that returned its deadline while its claude was still being admitted keeps its slot
- * until that claude has landed and been retired, but never longer than this. Unbounded, a spawn
- * that never lands would hold the slot for ever and the cap would refuse every later call;
- * freed at once, a claude that lands late would run uncounted.
+ * How long a call that returned its deadline while its claude was still being admitted waits on
+ * that claude's retirement before saying so. The slot is NOT freed at the ceiling: a claude that
+ * has not been confirmed retired may still be running, and freeing its reservation would let the
+ * next calls start beside it. The ceiling only logs, once, that the slot is held past it. #570 r15e.
  */
 export const UNTRUSTED_LATE_SLOT_CEILING_MS = 60_000;
 let lateSlotCeilingMs = UNTRUSTED_LATE_SLOT_CEILING_MS;
@@ -211,36 +211,99 @@ export function lateSlotCeilingMsForTests(): number {
 }
 
 let untrustedInFlight = 0;
+/** Bumped by `resetUntrustedSlotsForTests`: a reservation from an earlier epoch no longer counts. */
+let slotEpoch = 0;
 /** Test seam: how many untrusted one-shots hold a slot. */
 export function untrustedOneShotsInFlight(): number {
   return untrustedInFlight;
 }
 
+/**
+ * Slots whose call has returned while its claude is a recorded survivor, keyed by config root.
+ * The reservation follows the child: it is released once, by `releaseSurvivorSlot`, when the
+ * sweeper's identity-checked retry confirms the survivor gone. Not a second counter: each entry
+ * is the `free` of a reservation already counted in `untrustedInFlight`.
+ */
+const survivorSlots = new Map<string, () => void>();
+
+/** One counted reservation. `free` is idempotent, so a second release cannot inflate capacity. */
+function reserveCount(): () => void {
+  untrustedInFlight++;
+  const epoch = slotEpoch;
+  let held = true;
+  return () => {
+    if (!held) return;
+    held = false;
+    if (epoch === slotEpoch) untrustedInFlight--;
+  };
+}
+
 export interface OneShotSlot {
-  /** The call is finished: free the slot now. Idempotent. */
+  /** No child of this call can be alive (none spawned, or it was retired): free the slot now. Idempotent. */
   free(): void;
-  /** The call returned while a late claude may still land: free once `retired` settles, or at the ceiling. */
-  freeWhen(retired: Promise<unknown>): void;
+  /**
+   * The call has returned and the slot follows its child. Waits for `retired` when a late claude
+   * may still land (never freeing at the ceiling), then keeps the slot while `root` is a recorded
+   * survivor, and frees it otherwise.
+   */
+  settle(root: string, retired?: Promise<unknown>): void;
 }
 
 /** Take a slot, or `undefined` when `UNTRUSTED_ONESHOT_MAX_CONCURRENT` calls are already running. */
 export function acquireUntrustedOneShotSlot(): OneShotSlot | undefined {
   if (untrustedInFlight >= UNTRUSTED_ONESHOT_MAX_CONCURRENT) return undefined;
-  untrustedInFlight++;
-  let held = true;
-  const free = (): void => {
-    if (!held) return;
-    held = false;
-    untrustedInFlight--;
+  const free = reserveCount();
+  // Transfer the reservation to the survivor record, or free it when nothing of the call is left.
+  const handOver = (root: string): void => {
+    if (survivingGroups.has(root) && !survivorSlots.has(root)) survivorSlots.set(root, free);
+    else free();
   };
   return {
     free,
-    freeWhen(retired) {
-      const ceiling = setTimeout(free, lateSlotCeilingMs);
+    settle(root, retired) {
+      if (!retired) return handOver(root);
+      const ceiling = setTimeout(() => {
+        console.warn("[pty-supervisor] one-shot slot held past ceiling: retirement pending");
+      }, lateSlotCeilingMs);
       ceiling.unref?.();
-      void retired.then(free, free).finally(() => clearTimeout(ceiling));
+      void retired
+        .then(
+          () => {},
+          () => {},
+        )
+        .then(() => {
+          clearTimeout(ceiling);
+          handOver(root);
+        });
     },
   };
+}
+
+/**
+ * The survivor recorded under `root` is confirmed gone: release the reservation that followed it.
+ * Once only; a root with no reservation is a no-op.
+ */
+function releaseSurvivorSlot(root: string): void {
+  const free = survivorSlots.get(root);
+  if (!free) return;
+  survivorSlots.delete(root);
+  free();
+}
+
+/**
+ * A survivor adopted from `survivor.json` after a restart counts against the cap like one this
+ * run recorded, until it is confirmed gone. It may take the count past the cap: the cap only
+ * refuses new calls.
+ */
+function reserveSurvivorSlot(root: string): void {
+  if (!survivorSlots.has(root)) survivorSlots.set(root, reserveCount());
+}
+
+/** Test seam: forget every reservation, held or in flight, so a call that never settles cannot leak into the next test. */
+export function resetUntrustedSlotsForTests(): void {
+  slotEpoch++;
+  untrustedInFlight = 0;
+  survivorSlots.clear();
 }
 
 /**
@@ -458,6 +521,7 @@ export function unknownHoldCount(): number {
 }
 /** Test seam: forget every recorded survivor and hold. */
 export function resetGroupSurvivorsForTests(): void {
+  for (const root of [...survivorSlots.keys()]) releaseSurvivorSlot(root);
   survivingGroups.clear();
   unknownHolds.clear();
   loggedUnknown.clear();
@@ -563,6 +627,7 @@ export async function retrySurvivingGroups(deps: SurvivorRetryDeps = {}): Promis
       )(target);
       if (groupGone && escapees.length === 0) {
         survivingGroups.delete(root);
+        releaseSurvivorSlot(root);
         cleared++;
       } else {
         console.error(
@@ -791,6 +856,7 @@ function adoptPersistedSurvivors(
           retries: 0,
           cause: "group",
         });
+        reserveSurvivorSlot(path);
         console.error(
           `[oneshot] survivor of pid ${record.pid} found after a restart; ${name} kept and signalled again`,
         );

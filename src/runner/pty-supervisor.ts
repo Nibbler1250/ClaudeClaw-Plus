@@ -2064,7 +2064,9 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
       // removed here, on success, failure and abort alike. The PTY is normally retired
       // before this point; when admission outlived the deadline it is retired later, so
       // the same cleanup runs again once that late retirement settles. The concurrency slot
-      // follows the late claude too, but only up to a ceiling (`acquireUntrustedOneShotSlot`).
+      // follows the child until it is confirmed gone: a late claude keeps it until retired (the
+      // ceiling only logs), and a survivor keeps it until the sweeper confirms the survivor gone
+      // (`OneShotSlot.settle`).
       const release = (): void => {
         untrustedCleanup.releaseOneShotDir(state.configRoot);
         untrustedCleanup.releaseOneShotDir(state.tempCwd);
@@ -2072,8 +2074,7 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
       try {
         await cleanupUntrustedOneShot(state);
       } finally {
-        if (lateRetire) slot?.freeWhen(lateRetire);
-        else slot?.free();
+        slot?.settle(state.configRoot, lateRetire);
         if (lateRetire) {
           void lateRetire
             .catch(() => {})
