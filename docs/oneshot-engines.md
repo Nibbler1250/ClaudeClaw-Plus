@@ -59,11 +59,18 @@ slash-command flag, transcript cleanup and the child environment. A plain
 interactive spawn with no controls fired every canary, so the fixtures are
 discoverable. Any untrusted route to an engine without the capability is still
 rejected, and an HTTP engine stays an explicit opt-in. Reverting the flag in
-`src/oneshot/registry.ts` closes the gate again. One caveat is recorded in the
+`src/oneshot/registry.ts` does not close the gate, because `applyPtyIsolationVersionGate`
+(`src/oneshot/claude-version.ts`) overwrites `pty.caps.isolation` at startup. To roll the
+untrusted routes back to print, pin them in settings and restart the daemon:
+`"oneShot": { "routes": { "discord.classifier": "print", "tuner.*": "print", "memory.recall": "print" } }`
+(an explicit route beats the implicit default, and `print` advertises isolation, so settings
+load accepts it). Alternatively, raise `MIN_PTY_ISOLATION_CLAUDE_VERSION` in
+`src/oneshot/claude-version.ts` above the installed claude and restart, which is a code
+change. One caveat is recorded in the
 spike: a prompt that tells a tool-less session to run a tool sometimes gets no reply.
 It is bounded by the caller's timeout and fails closed: the classifier (the `haiku` alias)
-allows 8 s per attempt and retries exactly once when an attempt times out or gets no reply,
-so a call is bounded at about 16 s, and after the retry it treats a non-zero exit as "not a
+allows 12 s per attempt and retries exactly once when an attempt times out or gets no reply,
+so a call is bounded at about 24 s plus teardown, and after the retry it treats a non-zero exit as "not a
 thread command". A call that throws (a cleanup that could not remove the prompt) is not retried. An untrusted
 PTY call returns the model's reply read from the session transcript, never the rendered
 screen (which echoes the prompt); if no reply appears it exits 1, or 124 when the caller
