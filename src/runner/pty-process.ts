@@ -177,6 +177,9 @@ export interface PtyProcessOptions {
    * targets like /bin/cat are silent on startup). Default false.
    */
   _skipReadySettle?: boolean;
+  /** INTERNAL TEST HOOK: isolate CLI command-flag behavior from the input guard.
+   * Never forwarded by settings, OneShotRequest or the supervisor spawn builder. */
+  _preparePromptForWriteForTests?: typeof preparePtyPromptForWrite;
   /**
    * INTERNAL TEST HOOK: override the per-turn sentinel UUID. When set, the
    * supervisor uses this string instead of a fresh crypto.randomUUID(). Lets
@@ -457,6 +460,7 @@ class PtyProcessImpl implements PtyProcess {
   private _lastTurnEndedAt: number = 0;
   private _pty: IPty;
   private readonly _quietWindowMs: number;
+  private readonly _preparePrompt: typeof preparePtyPromptForWrite;
   private readonly _sentinelMaxWaitMs: number;
   private readonly _now: () => number;
   private readonly _setTimeout: (cb: () => void, ms: number) => ReturnType<typeof setTimeout>;
@@ -518,6 +522,7 @@ class PtyProcessImpl implements PtyProcess {
     this._secretValues = collectSecretValues(opts.env);
     this.label = `${opts.agentName ?? "pty"}:${pty.pid}`;
     this._quietWindowMs = opts.quietWindowMs ?? DEFAULT_QUIET_WINDOW_MS;
+    this._preparePrompt = opts._preparePromptForWriteForTests ?? preparePtyPromptForWrite;
     this._sentinelMaxWaitMs = opts.sentinelMaxWaitMs ?? DEFAULT_SENTINEL_MAX_WAIT_MS;
     this._now = opts._now ?? (() => Date.now());
     this._setTimeout = opts._setTimeout ?? ((cb, ms) => setTimeout(cb, ms));
@@ -750,7 +755,7 @@ class PtyProcessImpl implements PtyProcess {
     try {
       dumpPtyTrace(`>> pid=${this._pid} write prompt`, `${JSON.stringify(prompt).slice(0, 80)}+CR`);
       this._pty.write(
-        `${PASTE_START}${preparePtyPromptForWrite(prompt, { allowReplCommand: opts.allowReplCommand })}${PASTE_END}\r`,
+        `${PASTE_START}${this._preparePrompt(prompt, { allowReplCommand: opts.allowReplCommand })}${PASTE_END}\r`,
       );
     } catch (err) {
       this._turnInProgress = false;

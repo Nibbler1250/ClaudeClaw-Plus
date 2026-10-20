@@ -129,3 +129,19 @@ Caught real-control assertion failures logged verbatim:
 No baseline leak was observed. Tools baseline is inconclusive because its wording guard failed despite a completed turn. MCP/memory fixture discovery and their ineffective twins remain undiagnosed; absent canaries in both directions are not isolation evidence. The command twin did not remove the existing /compact-only guard, as confirmed in the sanitizer source; no production guard was weakened to make it pass. These limitations are exposed as failing tests, not hidden skips or passing claims.
 
 **Stopped without Step 3:** all six properties and every twin were not proved. No new startup blocker occurred, so the brief's conditional startup retry was not used. No further workflow dispatch, capability flip, untrusted default change, rollout docs/README change or PR. Production keeps PTY isolation false and untrusted routes on print; HTTP stays explicit opt-in. Plugin and marketplace remain **2.2.346**. The remaining work is probe-fixture/negative-control diagnosis under a subsequent authorization, followed by security review before any PR.
+
+## r4: authorized fixture diagnosis
+
+Added a first positive-control spawn with plain interactive argv (`--model haiku` only) and the same planted child HOME/config. It requires MCP startup, hook execution and a memory-derived answer, logs each nonsecret boolean even if readiness fails, and blocks subsequent live rows if the fixtures are not proved. Both the supplied child environment and `/proc/<pid>/environ` must resolve to the fixture root; only this shape is logged: `[RUNNER_TEMP]/untrusted-pty-<random>/home/.claude`, with `.claude.json` for MCP and `CLAUDE.md` for memory. The fixture policy binds HOME explicitly instead of relying on runtime-cached homedir().
+
+The MCP stub implements initialize/tools/list/tools/call and responds over JSON-RPC. Tests request its harmless probe tool and wait up to 15 seconds for asynchronous startup. Memory is now a specific passphrase question whose value occurs only in the planted memory file, and the memory row disallows tool activity. MCP/memory twins remove the complete argv isolation policy to account for overlapping discovery controls; these prove the aggregate policy rather than attributing behavior uniquely to a single flag.
+
+Tools readiness now requires a real nonsynthetic assistant transcript entry, independent of wording. The command flag is tested with source discoverability held equal in both directions and the input sanitizer bypassed through `_preparePromptForWriteForTests`, an internal spawn-only callback not exposed through settings or OneShotRequest. Its production default still uses the original sanitizer. The existing sanitizer contracts continue to run unchanged. No production guard was weakened to make a twin red.
+
+New seam fault injection (single constructor assignment disabled; restored afterwards):
+
+```text
+(fail) the internal prompt-write test seam reaches the wire without changing the default sanitizer [134.07ms]
+```
+
+Local required checks: **176 pass, 4 skip, 0 fail**; runner/PTY **193 pass, 0 fail**; local integration safety guard **0 pass, 16 skip, 0 fail** (including Bun's unnamed skipped hook); whole-repo lint **0 errors, 1302 warnings, 324 infos**; typecheck **149 against baseline 149**. Plugin and marketplace bumped to **2.2.347**. Live diagnosis/confirmation results follow below.

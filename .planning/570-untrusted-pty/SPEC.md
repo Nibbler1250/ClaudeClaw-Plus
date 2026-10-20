@@ -51,3 +51,9 @@ The previous failure was a startup blocker, not a red isolation property. Contin
 Use the same async-local caller environment as print for untrusted PTYs, without trusted provider augmentation. Because bun-pty merges native parent environment, constrain both its supplied environment and libc inheritance during the synchronous spawn; restore the parent's JS/native state afterwards. No credentials in argv, files or logs. Capture-only and native-inheritance unit tests precede implementation.
 
 Confirm remaining flags with local help without authentication, run unit checks and fault probes, bump both versions and publish. Allow one live workflow plus one startup-blocker retry. Any measured baseline canary leak stops rollout. Only all-green properties with demonstrated red twins authorize capability/default changes and the final workflow.
+
+## r4 fixture diagnosis authorization
+
+Add an unrestricted-argv positive control on the actual ephemeral path with the same child HOME/config fixture. MCP startup, hooks and a question answered from user memory must all fire before their baseline/twin rows count as evidence. Assert the actual child config path mapping and log only its normalized shape; implement a real JSON-RPC MCP stub and bounded marker waits.
+
+Readiness is structural: an assistant transcript entry must exist, without a prescribed answer token. The command flag is probed independently of the sanitizer through an internal spawn-only test callback, never exposed through settings or OneShotRequest. The default sanitizer remains unchanged and its existing unit contracts still apply. Permit one diagnosis workflow and one confirmation after fixture fixes, then a final capability/default workflow only if all rows are proved. Any observed baseline leak stops the rollout immediately.

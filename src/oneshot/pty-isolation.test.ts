@@ -74,6 +74,32 @@ const request = {
   timeoutMs: 1000,
 };
 
+it("the internal prompt-write test seam reaches the wire without changing the default sanitizer", async () => {
+  let called = false;
+  const child = await spawnPty({
+    sessionId: "",
+    cwd: dir,
+    env: { PATH: "/usr/bin:/bin" },
+    security: { level: "moderate", allowedTools: [], disallowedTools: [] },
+    _commandOverride: "/bin/cat",
+    _argsOverride: [],
+    _skipReadySettle: true,
+    quietWindowMs: 50,
+    sentinelMaxWaitMs: 1000,
+    _preparePromptForWriteForTests: () => {
+      called = true;
+      return "✻ TEST_SEAM_VISIBLE shift+tab to cycle";
+    },
+  });
+  try {
+    const result = await child.runTurn("/probe ✻ shift+tab to cycle", { timeoutMs: 2000 });
+    expect(called).toBe(true);
+    expect(result.text.includes("TEST_SEAM_VISIBLE")).toBe(true);
+  } finally {
+    await child.dispose();
+  }
+});
+
 it("the actual untrusted PTY spawn preserves every interactive isolation argument", async () => {
   fakeSpawn();
   expect((await runOnceOnPty(request)).exitCode).toBe(0);

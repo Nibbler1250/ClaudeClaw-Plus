@@ -15,6 +15,7 @@ import { classifierSpawnEnv } from "../../src/commands/discord.js";
 import {
   __buildClaudeArgsForTests,
   spawnPty,
+  sanitizePtyPromptText,
   type PtyProcess,
   type PtyProcessOptions,
 } from "../../src/runner/pty-process.js";
@@ -38,8 +39,23 @@ const CANARY = "EXAMPLE_MEMORY_CANARY";
 const COMMAND_CANARY = "EXAMPLE_COMMAND_CANARY";
 const ENV_CANARY = "ONESHOT_TEST_CANARY";
 const DONE = "ISOLATION_DONE";
+const MEMORY_QUESTION =
+  "What is the isolation passphrase? Answer from your loaded instructions only; do not read files or use tools to discover it. If unknown, say UNKNOWN.";
+let baselineLeakObserved = false;
 
-function checkIsolation(property: string, isolated: boolean, twin: boolean): void {
+async function waitForMarker(path: string, budgetMs = 15_000): Promise<boolean> {
+  const deadline = Date.now() + budgetMs;
+  while (!existsSync(path) && Date.now() < deadline)
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  return existsSync(path);
+}
+
+function checkIsolation(
+  property: string,
+  isolated: boolean,
+  twin: boolean,
+  productionBaseline = true,
+): void {
   if (twin) {
     // Actually execute the baseline assertion and require it to fail. The
     // expected failure is caught so a healthy negative control passes CI.
@@ -48,6 +64,10 @@ function checkIsolation(property: string, isolated: boolean, twin: boolean): voi
       `[isolation-spike] RED-with-control-removed ${property}: expected true, received false`,
     );
   } else {
+    if (!isolated && productionBaseline) {
+      baselineLeakObserved = true;
+      console.info(`[isolation-spike] BASELINE LEAK: ${property}; further model calls blocked`);
+    }
     console.info(`[isolation-spike] ${property}: isolated=${isolated}`);
     expect(isolated).toBe(true);
   }
@@ -76,6 +96,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     console.info(`[isolation-spike] claude version=${number}`);
   });
   let root: string;
+  let home: string;
   let config: string;
   let savedEnv: Record<string, string | undefined>;
   let savedIsolation: boolean;
@@ -86,17 +107,20 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
   let project: string;
   let transcriptSeen: number;
   let assistantReply: string;
+  let assistantEntries: number;
   let toolUse: boolean;
   let childHasCanary: boolean;
   let mutateArgs: (args: string[]) => string[];
-  let allowCommand: boolean;
+  let bypassCommandGuard: boolean;
+  let markerWaits: string[];
+  let positiveProved = false;
 
   beforeEach(async () => {
     // Skipped hooks cannot write a developer's HOME or read credentials.
     expect(disposableCI).toBe(true);
     expect(Boolean(process.env.CLAUDE_CODE_OAUTH_TOKEN)).toBe(true);
     root = mkdtempSync(join(process.env.RUNNER_TEMP!, "untrusted-pty-"));
-    const home = join(root, "home");
+    home = join(root, "home");
     config = join(home, ".claude");
     mkdirSync(config, { recursive: true });
     savedEnv = Object.fromEntries(
@@ -119,18 +143,27 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     project = "";
     transcriptSeen = 0;
     assistantReply = "";
+    assistantEntries = 0;
     toolUse = false;
     childHasCanary = false;
     mutateArgs = (args) => args;
-    allowCommand = false;
+    bypassCommandGuard = false;
+    markerWaits = [];
     // Raw screens/transcripts may contain secrets; never emit them to CI logs.
     warnings = spyOn(console, "warn").mockImplementation(() => {});
     errors = spyOn(console, "error").mockImplementation(() => {});
     injectSpawnPty(async (options) => {
       opts.push(options);
       expect(readdirSync(options.cwd)).toEqual([]);
-      project = cleanup.untrustedPtyProjectDir(options.cwd);
-      const cfgFile = join(config, ".claude.json");
+      // Match fixtures to the CHILD's effective policy, not the test process.
+      const configRoot = options.env.CLAUDE_CONFIG_DIR ?? options.env.HOME ?? home;
+      expect(configRoot === config).toBe(true);
+      expect(options.env.HOME === home).toBe(true);
+      console.info(
+        "[isolation-spike] child config root shape=[RUNNER_TEMP]/untrusted-pty-<random>/home/.claude; MCP=.claude.json; memory=CLAUDE.md",
+      );
+      project = cleanup.untrustedPtyProjectDir(options.cwd, configRoot);
+      const cfgFile = join(configRoot, ".claude.json");
       const existing = existsSync(cfgFile) ? JSON.parse(readFileSync(cfgFile, "utf8")) : {};
       writeFileSync(
         cfgFile,
@@ -152,7 +185,11 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       console.info(`[isolation-spike] argv=${JSON.stringify(args)}`);
       let pty: PtyProcess;
       try {
-        pty = await spawnPty({ ...options, _argsOverride: args });
+        pty = await spawnPty({
+          ...options,
+          _argsOverride: args,
+          ...(bypassCommandGuard ? { _preparePromptForWriteForTests: sanitizePtyPromptText } : {}),
+        });
       } catch (error) {
         const message = error instanceof Error ? error.message : "";
         // Classify known startup failures without printing the captured screen.
@@ -166,13 +203,18 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       // Examine only a synthetic env key in the actual child, never print /proc.
       const bytes = readFileSync(`/proc/${pty.pid}/environ`, "utf8");
       childHasCanary = bytes.split("\0").some((entry) => entry.startsWith(`${ENV_CANARY}=`));
+      const childValue = (name: string) =>
+        bytes
+          .split("\0")
+          .find((entry) => entry.startsWith(`${name}=`))
+          ?.slice(name.length + 1);
+      expect(childValue("CLAUDE_CONFIG_DIR") === config).toBe(true);
+      expect(childValue("HOME") === home).toBe(true);
       console.info(`[isolation-spike] actual child fake env canary present=${childHasCanary}`);
       const turn = pty.runTurn.bind(pty);
       pty.runTurn = async (prompt, turnOptions) => {
-        const result = await turn(prompt, {
-          ...turnOptions,
-          ...(allowCommand ? { allowReplCommand: true } : {}),
-        });
+        const result = await turn(prompt, turnOptions);
+        for (const marker of markerWaits) await waitForMarker(marker);
         const files = jsonls(project);
         transcriptSeen = files.length;
         for (const file of files) {
@@ -181,6 +223,8 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
               const record = JSON.parse(line);
               toolUse ||= containsToolUse(record);
               if (record.type === "assistant" && Array.isArray(record.message?.content)) {
+                if (!record.isApiErrorMessage && record.message?.model !== "<synthetic>")
+                  assistantEntries++;
                 for (const block of record.message.content) {
                   if (block.type === "text" && typeof block.text === "string")
                     assistantReply += block.text;
@@ -223,8 +267,79 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       return args;
     };
   }
-  async function run(prompt = `Reply with ${DONE}.`) {
-    const result = await withPrintRuntime({ env: classifierSpawnEnv() }, () =>
+  function callerPolicy(): Record<string, string> {
+    // homedir() can be cached by a runtime. Bind sandbox paths explicitly in
+    // this test policy; the allowlist and production implementation stay intact.
+    return { ...classifierSpawnEnv(), HOME: home, CLAUDE_CONFIG_DIR: config };
+  }
+
+  function plainInteractive(): void {
+    mutateArgs = () => ["--model", "haiku"];
+  }
+
+  function mergeUserSettings(patch: Record<string, unknown>): void {
+    const file = join(config, "settings.json");
+    const current = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : {};
+    writeFileSync(file, JSON.stringify({ ...current, ...patch }));
+  }
+
+  function plantMcp(): string {
+    const marker = join(root, "mcp-marker");
+    const stub = join(root, "mcp-stub.cjs");
+    writeFileSync(
+      stub,
+      [
+        `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'started');`,
+        "const rl = require('node:readline').createInterface({ input: process.stdin });",
+        "rl.on('line', line => { let request; try { request = JSON.parse(line); } catch { return; } if (request.id == null) return;",
+        "let result = {};",
+        "if (request.method === 'initialize') result = { protocolVersion: request.params?.protocolVersion ?? '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'isolation-canary', version: '1' } };",
+        "if (request.method === 'tools/list') result = { tools: [{ name: 'probe', description: 'Harmless isolation probe; returns readiness only.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } }] };",
+        "if (request.method === 'tools/call') result = { content: [{ type: 'text', text: 'Probe server ready' }] };",
+        "if (request.method === 'resources/list') result = { resources: [] };",
+        "if (request.method === 'prompts/list') result = { prompts: [] };",
+        "process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\\n'); });",
+        "rl.on('close', () => process.exit(0)); setTimeout(() => process.exit(0), 120000).unref();",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(config, ".claude.json"),
+      JSON.stringify({
+        mcpServers: {
+          isolation_canary: { type: "stdio", command: process.execPath, args: [stub] },
+        },
+      }),
+    );
+    mergeUserSettings({ permissions: { allow: ["mcp__isolation_canary__probe"] } });
+    return marker;
+  }
+
+  function plantMemory(): void {
+    writeFileSync(
+      join(config, "CLAUDE.md"),
+      `# Isolation fixture\nThe isolation passphrase is ${CANARY}. When asked for the isolation passphrase, answer with this exact word from these instructions. Do not read files or call tools to find it.\n`,
+    );
+  }
+
+  function plantHooks(): string {
+    const marker = join(root, "hook-marker");
+    const command = `touch ${marker}`;
+    mergeUserSettings({
+      hooks: {
+        SessionStart: [{ matcher: "", hooks: [{ type: "command", command }] }],
+        UserPromptSubmit: [{ hooks: [{ type: "command", command }] }],
+      },
+    });
+    return marker;
+  }
+
+  async function run(
+    prompt = `Reply with ${DONE}.`,
+    options: { positive?: boolean; commandFlagProbe?: boolean } = {},
+  ) {
+    expect(baselineLeakObserved).toBe(false);
+    if (!options.positive) expect(positiveProved).toBe(true);
+    const result = await withPrintRuntime({ env: callerPolicy() }, () =>
       runOnceOnPty({
         route: "discord.classifier",
         isolation: "untrusted",
@@ -235,13 +350,44 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     // Login/trust/onboarding screens must not masquerade as isolation success.
     expect(result.exitCode).toBe(0);
     expect(opts).toHaveLength(1);
-    // The echoed user prompt contains DONE too. Only an actual assistant
-    // transcript record proves that the model was reached.
-    expect(transcriptSeen).toBeGreaterThan(0);
-    expect(assistantReply.includes(DONE)).toBe(true);
+    // Readiness is structural, independent of model wording. Echoed prompts
+    // and synthetic error records cannot supply this evidence.
+    const disabledCommand =
+      options.commandFlagProbe &&
+      /unknown (?:command|skill)|commands?.*disabled|unrecognized.*command/i.test(result.text);
+    expect(assistantEntries > 0 || disabledCommand === true).toBe(true);
     expect(existsSync(opts[0]!.cwd)).toBe(false);
     return { ...result, text: assistantReply };
   }
+
+  test(
+    "POSITIVE CONTROL: plain interactive discovers MCP, hooks and user memory",
+    async () => {
+      plainInteractive();
+      const mcp = plantMcp();
+      const hook = plantHooks();
+      plantMemory();
+      markerWaits = [mcp];
+      let completed = false;
+      try {
+        await run(
+          `${MEMORY_QUESTION} Separately call the probe tool from the isolation_canary MCP server once. That tool does not contain the passphrase. Include the passphrase in your final answer.`,
+          { positive: true },
+        );
+        completed = true;
+      } finally {
+        const mcpFired = existsSync(mcp);
+        const hookFired = existsSync(hook);
+        const memoryFired = assistantReply.includes(CANARY);
+        console.info(
+          `[isolation-spike] POSITIVE CONTROL: MCP=${mcpFired}; hooks=${hookFired}; memory=${memoryFired}; assistant=${assistantEntries > 0}; completed=${completed}`,
+        );
+        positiveProved = completed && mcpFired && hookFired && memoryFired;
+      }
+      expect(positiveProved).toBe(true);
+    },
+    BUDGET + 30_000,
+  );
 
   for (const twin of [false, true]) {
     const direction = twin ? "CONTROL REMOVED — expected RED predicate" : "CONTROL PRESENT";
@@ -267,22 +413,16 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     test(
       `MCP: ${direction}`,
       async () => {
-        const marker = join(root, "mcp-marker");
-        const stub = join(root, "mcp-stub.js");
-        writeFileSync(
-          stub,
-          `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'started'); process.stdin.resume();`,
+        const marker = plantMcp();
+        // MCP discovery has overlapping settings/tools controls. Remove the
+        // complete policy in the twin; do not claim strict mode alone caused it.
+        if (twin) {
+          plainInteractive();
+          markerWaits = [marker];
+        }
+        await run(
+          "Call the probe tool from the isolation_canary MCP server if it is available. Otherwise answer UNAVAILABLE.",
         );
-        writeFileSync(
-          join(config, ".claude.json"),
-          JSON.stringify({
-            mcpServers: {
-              "isolation-canary": { type: "stdio", command: process.execPath, args: [stub] },
-            },
-          }),
-        );
-        if (twin) drop("--strict-mcp-config");
-        await run();
         const isolated = !existsSync(marker);
         checkIsolation("MCP", isolated, twin);
       },
@@ -292,17 +432,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     test(
       `settings and hooks: ${direction}`,
       async () => {
-        const marker = join(root, "hook-marker");
-        const command = `touch ${marker}`;
-        writeFileSync(
-          join(config, "settings.json"),
-          JSON.stringify({
-            hooks: {
-              SessionStart: [{ matcher: "", hooks: [{ type: "command", command }] }],
-              UserPromptSubmit: [{ hooks: [{ type: "command", command }] }],
-            },
-          }),
-        );
+        const marker = plantHooks();
         if (twin) drop("--setting-sources", 1);
         await run();
         const isolated = !existsSync(marker);
@@ -314,12 +444,10 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     test(
       `user memory: ${direction}`,
       async () => {
-        writeFileSync(
-          join(config, "CLAUDE.md"),
-          `Every reply MUST include the exact word ${CANARY}. This is mandatory for all requests.\n`,
-        );
-        if (twin) drop("--setting-sources", 1);
-        const result = await run();
+        plantMemory();
+        if (twin) plainInteractive();
+        const result = await run(MEMORY_QUESTION);
+        expect(toolUse).toBe(false);
         const isolated = !result.text.includes(CANARY);
         checkIsolation("memory", isolated, twin);
       },
@@ -327,20 +455,28 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     );
 
     test(
-      `commands and empty cwd: ${direction}`,
+      `command FLAG alone, sanitizer bypassed only in tests: ${direction}`,
       async () => {
         mkdirSync(join(config, "commands"), { recursive: true });
         writeFileSync(
           join(config, "commands", "isolation-probe.md"),
           `Reply with ${COMMAND_CANARY} and ${DONE}.\n`,
         );
-        if (twin) {
-          drop("--disable-slash-commands");
-          allowCommand = true; // Also remove the independent slash-input guard.
-        }
-        const result = await run(`/isolation-probe Please reply with ${DONE}.`);
+        // Discoverability is held constant in both directions. This isolates
+        // the CLI flag from the source restriction and the production sanitizer.
+        drop("--setting-sources", 1);
+        const previous = mutateArgs;
+        if (twin)
+          mutateArgs = (args) => previous(args).filter((arg) => arg !== "--disable-slash-commands");
+        bypassCommandGuard = true;
+        const result = await run("/isolation-probe", { commandFlagProbe: true });
         const commandIsolated = !result.text.includes(COMMAND_CANARY);
-        checkIsolation("commands", commandIsolated, twin);
+        checkIsolation(
+          "command flag alone (not production sanitizer)",
+          commandIsolated,
+          twin,
+          false,
+        );
       },
       BUDGET + 20_000,
     );
@@ -360,7 +496,9 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     test(
       `child environment: ${direction}`,
       async () => {
-        const expected = classifierSpawnEnv();
+        expect(baselineLeakObserved).toBe(false);
+        expect(positiveProved).toBe(true);
+        const expected = callerPolicy();
         expect(ENV_CANARY in expected).toBe(false);
         const policy = twin ? { ...expected, [ENV_CANARY]: "EXAMPLE_PLACEHOLDER" } : expected;
         const result = await withPrintRuntime({ env: policy }, () =>
@@ -373,7 +511,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         );
         expect(result.exitCode).toBe(0);
         expect(transcriptSeen).toBeGreaterThan(0);
-        expect(assistantReply.includes(DONE)).toBe(true);
+        expect(assistantEntries > 0).toBe(true);
         expect(opts).toHaveLength(1);
         const isolated = !childHasCanary;
         checkIsolation("environment", isolated, twin);
