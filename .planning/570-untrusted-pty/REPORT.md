@@ -92,3 +92,13 @@ Single-site fault probes, all restored:
 The faults respectively removed strict MCP isolation, added tools to the print-only subset, bypassed the caller override, and bypassed the native policy at the FFI boundary. Environment comparisons emit only booleans on failure. No injected fault remains.
 
 Local required one-shot/session checks: **174 pass, 4 skip, 0 fail**. Runner/PTY checks (including `runner.test.ts`): **193 pass, 0 fail**. Whole-repo lint: **0 errors, 1302 warnings, 324 infos**. Typecheck ratchet **149 against baseline 149**. Both version scripts produced **2.2.346**. Live workflow results pending below.
+
+r3 run 1 dispatched: [39347652032](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39347652032), commit `d1c12fd4`.
+
+During the wait, an additional unit check found that caller environment overrides can also change the transcript root. Cleanup now derives its root from that caller policy (CLAUDE_CONFIG_DIR, then HOME), matching the actual child. Before the fix:
+
+```text
+(fail) transcript cleanup follows the caller's Claude config directory override [14.69ms]
+```
+
+After this correction the required scoped suite reports **175 pass, 4 skip, 0 fail**. One preceding run had the existing HTTP stalled-body timeout test return 1 instead of 124 in 3.64ms; it runs before the new PTY tests and passed on the unchanged rerun. No unrelated test code was changed. Lint and typecheck remain at the same passing counts. The live run above uses matching parent/caller config roots, so this additional override case is unit-only evidence.

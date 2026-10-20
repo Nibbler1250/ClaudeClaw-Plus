@@ -71,7 +71,7 @@ import * as untrustedCleanup from "../oneshot/pty-cleanup.js";
 import { printRuntime } from "../oneshot/print.js";
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { getSettings, type SecurityConfig } from "../config.js";
 import { getSession, createSession } from "../sessions.js";
@@ -1704,7 +1704,11 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
   try {
     if (untrusted) {
       tempCwd = mkdtempSync(join(tmpdir(), "claudeclaw-oneshot-pty-"));
-      tempProjectDir = untrustedCleanup.untrustedPtyProjectDir(tempCwd);
+      const callerEnv = printRuntime()?.env;
+      const configDir = callerEnv
+        ? (callerEnv.CLAUDE_CONFIG_DIR ?? join(callerEnv.HOME ?? homedir(), ".claude"))
+        : undefined;
+      tempProjectDir = untrustedCleanup.untrustedPtyProjectDir(tempCwd, configDir);
     }
     const helpers = await getRunnerHelpers();
     const { PTY_OUTPUT_FORMAT_CONSTRAINT } = await import("./pty-output-format.js");

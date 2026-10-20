@@ -110,6 +110,21 @@ it("untrusted PTY spawn uses the exact same caller environment policy as print",
   ).toBe(true);
 });
 
+it("transcript cleanup follows the caller's Claude config directory override", async () => {
+  const configDir = join(dir, "caller-config");
+  let project = "";
+  fakeSpawn((opts) => {
+    project = untrustedPtyProjectDir(opts.cwd, configDir);
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "caller-session.jsonl"), "private prompt");
+  });
+  await withPrintRuntime({ env: { PATH: "/usr/bin:/bin", CLAUDE_CONFIG_DIR: configDir } }, () =>
+    runOnceOnPty(request),
+  );
+  expect(project !== "").toBe(true);
+  expect(existsSync(project)).toBe(false);
+});
+
 it("untrusted native PTY inheritance excludes even native-only variables and restores the parent", async () => {
   const { dlopen, FFIType } = await import("bun:ffi");
   const library = dlopen(
