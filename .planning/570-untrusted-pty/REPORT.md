@@ -1217,3 +1217,116 @@ Fault injection (one site each; `M1a` adds a text sample to the signals, `M1b` m
 
 - ~~The two flaky tests above.~~ Fixed in the follow-up commit: `BG_THEN_EXIT` in `pty-group-retire.test.ts` makes the shell wait for a `.ready` file the background child creates after `trap`, for all three exit-at-once tests (the third, `sweeps the descendants`, had flaked too). Test-only. 20 consecutive runs of the file, each to its own file: 20 exit 0, 0 `(fail)` lines, `16 pass / 0 fail` in every run (baseline was 1 failure in 8).
 - The r14b items still open (cgroup or PID namespace for untrusted PTYs; `survivor.json` in a daemon-owned directory).
+
+## r14e: closing the three r14 findings properly (H1, H2, M1)
+
+Branch `feat/570-untrusted-pty-isolation`, from `33e03db3`. No integration run, no version bump (2.2.353), no PR, no GitHub comment. Codex re-reviewed r14d and found all three still open; the coordinator checked each in code. H1 was the r14d brief's own mistake ("within one clock tick"), which r14d followed.
+
+### H1. Linux start times compare exactly
+
+`processStartMs` on Linux is `ticks * 1000 / 100`: two reads of one process are identical, and a different process in the next tick differs by 10. `sameStart` on Linux is now `a === b`. `LINUX_START_TOLERANCE_MS` is deleted (`rg` finds no reference). `ps` (macOS, 1 s resolution) keeps `START_TIME_TOLERANCE_MS` = 2000. All four comparison sites already go through `sameStart` (r14d), so none needed a change.
+
+- `sameStart(10_000, 10_010, "linux")` is now `false` (`pty-proc-identity.test.ts`).
+- Through the real termination: recorded 10000, now 10010, platform `linux` gives `recycled`, no signal is sent, and the call resolves true (a recycled leader means the group we started is gone) (`pty-group-kill.test.ts`, "on Linux a start time one tick off is another process").
+
+### H2. `gone` is not a recorded start time
+
+`pidIdentity` returns `gone` before it looks at `expectedStartMs`, and `sendGroup` accepted `gone` on its own. With `leaderStartMs === null`, a later retry whose leader pid was absent still signalled a live `-pid` group, which may be someone else's. `gone` now permits a group signal only when `leaderStartMs !== null` or under `unrecordedOk` (`leaderStartMs === null && firstTermination`).
+
+Every other place `gone` could lead to a signal, checked:
+
+| Site | Verdict |
+| --- | --- |
+| `sendBare` (`pty-group-kill.ts`) | Needs `same` or `unknown`; `gone` never signals. No change. |
+| escapee path (`terminateEscapees`, `pty-escape-scan.ts`) | Signals only when the pid's start time was recorded (`then !== null`) and still matches. No `gone` branch. No change. |
+| sweeper (`retrySurvivingGroups`, `pty-cleanup.ts`) | Calls `terminateProcessGroup` without `firstTermination`, so it is the fixed `sendGroup` rule. `groupGoneNow` never signals. No change. |
+| `heldProcAlive` | Reads only. No change. |
+
+Tests (`pty-group-kill.test.ts`): `leaderStartMs: null`, `firstTermination` false, leader pid absent, group present: no signal, resolves false (root kept by the callers, as in r14d). The first-termination case with a null start, and the recorded-start case, both still signal `-pid` only.
+
+### M1. Fixed vocabularies, not a character filter
+
+`plainWord` passed any short word, so a child that wrote `PRIVMARK123` into a record `type` had it printed. In `src/runner/pty-screen-signals.ts`:
+
+- `fixedWord(value, vocabulary)`: the value when it is exactly one word of the list, else `other`.
+- Lists: `TRANSCRIPT_RECORD_TYPES` (`user`, `assistant`, `system`, `attachment`, `ai-title`, `cost-state`: the harness's own plus what CI run 3 logged), `WIRE_EVENT_TYPES` (`system`, `assistant`, `user`, `rate_limit_event`, `result`), `STOP_REASONS` (the six API stop reasons, which include the logged `tool_use` and `stop_sequence`), `BLOCK_TYPES`, `RESULT_SUBTYPES` (`success` as logged, plus the CLI's error subtypes). Anything outside a list prints `other`; widening a list is a one-line edit if a run shows a legitimate word as `other`.
+- `boolWord`: `true` / `false` only for `=== true` / `=== false`, else `other`.
+- `wireSummary(events)`: the print row's `events=`, `resultSubtype=` and `resultIsError=`, as a pure function so the unit test exercises the real path.
+- `plainWord` is renamed `configPathWord` and kept only for `shapeSummary`'s config path segments, as ruled.
+
+Harness (`tests/integration/untrusted-pty-isolation.test.ts`): the transcript scan's record kinds, stop reasons and block types use `fixedWord`; the B3 print row uses `wireSummary`; the throwaway-cwd listing assertion maps names through `fixedWord(name, [ONESHOT_OWNER_FILE])`, so a failing diff cannot print a file name. `rg` finds no raw `.subtype`, `.is_error` or `String(event|record|block…)` left in a print site. The transcript-scan lines run only on CI, so their guard is `fixedWord` itself (every list tested with `PRIVMARK123`), not the harness line.
+
+### Fault injection
+
+One site each, on a `git archive` copy with the working-tree files copied over; the file under test is reset between runs.
+
+| Inject | Fault | Result |
+| --- | --- | --- |
+| h1 | `sameStart` Linux: `Math.abs(a - b) <= 10` | RED, 2 tests |
+| h2a | `known` accepts `identity === "gone"` alone | RED, 1 test |
+| h2b | `gone` allowed on `leaderStartMs !== null` only (first termination dropped) | RED, 1 test |
+| h2c | `gone` allowed on `unrecordedOk` only (recorded start dropped) | RED, 1 test |
+| m1a | `fixedWord` returns any string | RED, 2 tests |
+| m1b | `resultSubtype: String(done?.subtype)` | RED, 1 test |
+| m1c | `resultIsError: String(done?.is_error)` | RED, 1 test |
+| m1d | event kind `String(event.type)` | RED, 1 test |
+| m1e | `boolWord` also accepts the string `"true"` | RED, 1 test |
+
+```text
+== inj-h1
+Expected: false
+Received: true
+      at pty-proc-identity.test.ts:57:48
+(fail) sameStart > compares Linux /proc start times exactly: the next tick is another process
+- []  + [ ...10 signals ]   (Expected - 1, Received + 10)
+      at pty-group-kill.test.ts:223:34
+(fail) terminateProcessGroup > pid identity (#570 r13, B) > on Linux a start time one tick off is another process: nothing is signalled (r14e, H1)
+ 29 pass / 2 fail
+== inj-h2a
+- []  + [ ...10 signals ]   (Expected - 1, Received + 10)
+      at pty-group-kill.test.ts:192:34
+(fail) terminateProcessGroup > pid identity (#570 r13, B) > signals nothing for a leader that is absent when its start time was never recorded, on a later retry, however live the group (r14e, H2)
+ 23 pass / 1 fail
+== inj-h2b
+Expected: > 0
+Received: 0
+      at pty-group-kill.test.ts:205:45
+(fail) ... > still signals the group of an absent leader during the first termination, and when the start time was recorded
+== inj-h2c
+Expected: > 0
+Received: 0
+      at pty-group-kill.test.ts:211:48
+(fail) ... > still signals the group of an absent leader during the first termination, and when the start time was recorded
+== inj-m1a
+Expected: "other"
+Received: "PRIVMARK123"
+(fail) fixedWord prints a word of the vocabulary and nothing else, a short plain marker included
+-   "resultSubtype": "other",  +   "resultSubtype": "PRIVMARK123",
+(fail) wireSummary counts known event types, and prints a marker in a type, subtype or is_error as other
+== inj-m1b
+-   "resultSubtype": "other",  +   "resultSubtype": "PRIVMARK123",
+(fail) wireSummary counts known event types, and prints a marker in a type, subtype or is_error as other
+== inj-m1c
+-   "resultIsError": "other",  +   "resultIsError": "PRIVMARK123",
+(fail) wireSummary counts known event types, and prints a marker in a type, subtype or is_error as other
+== inj-m1d
++     "PRIVMARK123": 2,  -     "other": 2,
+(fail) wireSummary counts known event types, and prints a marker in a type, subtype or is_error as other
+== inj-m1e
+Expected: "other"
+Received: "true"
+(fail) boolWord prints a word of the vocabulary and nothing else  [boolWord prints true or false for the booleans only]
+```
+
+### Gates
+
+- `bun run lint` (full repo): exit 0; 1390 warnings and 324 infos, identical to a pristine `HEAD` archive. (Biome's formatter fixed two of my files first.)
+- `bun run typecheck`: 149 errors, baseline 149, exit 0.
+- `env -u ANTHROPIC_BASE_URL bun test src/oneshot src/runner src/__tests__/discord-classifier-isolation.test.ts src/__tests__/discord-mentions.test.ts`, output to a file: 435 pass, 7 skip, 0 fail, exit 0.
+
+### Not done / residual
+
+- The integration harness was not run (brief). The transcript-scan lines of M1 and the `fixedWord` throwaway-cwd assertion are CI-only; their guard is the `fixedWord` unit test, not the harness line.
+- The vocabularies are fixed lists, so a legitimate but unlisted record type, block type or subtype will print `other` on the next CI run. That is the safe direction; add the word if one shows up.
+- `errorWord` (harness-side errors) still passes a short stripped code or class name. It is not child-sourced and was not in scope.
+- H1 and H2 share a commit because `pty-group-kill.test.ts` holds both sets of tests.
