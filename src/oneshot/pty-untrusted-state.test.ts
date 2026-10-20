@@ -616,7 +616,9 @@ describe("r13 A/G: a survivor keeps the call failed, the root in place, and is s
       }
     } finally {
       try {
-        process.kill(shellPid, "SIGKILL");
+        // Never with 0: `kill(0)` signals the caller's whole process group, which is how a run
+        // whose spawn never happened (r15: a leaked concurrency slot) killed its own runner.
+        if (shellPid > 1) process.kill(shellPid, "SIGKILL");
       } catch {
         /* gone */
       }
