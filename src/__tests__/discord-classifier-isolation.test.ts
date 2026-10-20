@@ -130,7 +130,7 @@ describe("classifyThreadIntent itself (not a hand-built request)", () => {
   });
 });
 
-// #570 r14 (F): the model alias, the 8 s bound and exactly one retry.
+// #570 r14 (F): the model alias, the 12 s bound and exactly one retry.
 describe("classifyThreadIntent: model, bound and retry", () => {
   const REPLY = '{"action":"hire","names":["Ada"]}';
   const answered = (text: string): OneShotResult => ({
@@ -190,16 +190,16 @@ describe("classifyThreadIntent: model, bound and retry", () => {
     expect(s.requests).toHaveLength(2);
   });
 
-  it("retries a no-reply exit too, and keeps both attempts untrusted with the 8 s bound", async () => {
+  it("retries a no-reply exit too, and keeps both attempts untrusted with the 12 s bound", async () => {
     const noReply: OneShotResult = { text: "", engine: "pty", model: "haiku", exitCode: 1 };
     const s = script([noReply, noReply]);
     expect(await classifyThreadIntent("hire Ada", { runOneShot: s.run })).toBeNull();
-    // Went red (15000 twice) with the old bound put back.
-    expect(s.requests.map((r) => r.timeoutMs)).toEqual([8000, 8000]);
+    // Went red ([8000, 8000] received) with the 8 s bound put back.
+    expect(s.requests.map((r) => r.timeoutMs)).toEqual([12000, 12000]);
     expect(s.requests.every((r) => r.isolation === "untrusted")).toBe(true);
     expect(s.requests.every((r) => r.model === "haiku")).toBe(true);
-    // The whole call is bounded at two attempts: 16 s plus overhead, never more.
-    expect(s.requests.reduce((total, r) => total + r.timeoutMs, 0)).toBeLessThanOrEqual(16_000);
+    // The whole call is bounded at two attempts: 24 s plus overhead, never more.
+    expect(s.requests.reduce((total, r) => total + r.timeoutMs, 0)).toBeLessThanOrEqual(24_000);
   });
 
   it("does not retry a call that threw (a prompt that could not be removed from disk)", async () => {

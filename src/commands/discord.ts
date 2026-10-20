@@ -645,7 +645,7 @@ export const classifierInput = (text: string): string =>
 /** The `haiku` alias: the dated sonnet id this used to name was retired on 15 Jun 2026. */
 export const CLASSIFIER_MODEL = "haiku";
 /** One attempt's bound. With the single retry the whole call is bounded at twice this. */
-export const CLASSIFIER_ATTEMPT_TIMEOUT_MS = 8000;
+export const CLASSIFIER_ATTEMPT_TIMEOUT_MS = 12000;
 
 export interface ClassifierCall {
   call: OneShotResult;

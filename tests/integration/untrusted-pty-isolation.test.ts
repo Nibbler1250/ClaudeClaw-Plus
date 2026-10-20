@@ -1447,7 +1447,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
 
   // ONE attempt on the retired model id. It must fail closed FAST: the
   // transcript holds only an API-error entry, so runOnceOnPty returns exit 1 at once
-  // instead of waiting out the transcript bound, inside the classifier's 15 s deadline.
+  // instead of waiting out the transcript bound, inside this row's own 15 s deadline.
   test(
     "RETIRED model id fails closed fast (15 s deadline)",
     async () => {
@@ -1633,7 +1633,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
   }
   // ── r14 F3: the classifier's real traffic ────────────────────────────────────────────────
   // About twenty ordinary, classifier-shaped messages through the real untrusted PTY path, with
-  // the classifier's 8 s bound and single retry. The counts are for Terry to read before the PR
+  // the classifier's 12 s bound and single retry. The counts are for Terry to read before the PR
   // leaves draft; the row fails only when more than two of them fail closed after the retry.
   test(
     "F3 classifier traffic: replied first time / on retry / failed closed, and latency",
@@ -1698,6 +1698,6 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       );
       expect(outcome.closed).toBeLessThanOrEqual(2);
     },
-    20 * 20_000 + 60_000,
+    20 * 30_000 + 60_000,
   );
 });
