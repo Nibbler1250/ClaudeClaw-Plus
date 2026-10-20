@@ -1,81 +1,51 @@
 import {
+  chmodSync,
   existsSync,
   lstatSync,
-  mkdirSync,
-  readFileSync,
+  mkdtempSync,
   readdirSync,
   realpathSync,
-  renameSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { encodeCwdForProjectsDir } from "../bus/jsonl-line-types.js";
 
-/** Where an interactive claude with this env keeps its state. */
-export interface ChildConfigRoot {
-  /** `CLAUDE_CONFIG_DIR`, else `$HOME/.claude`: holds `projects/`, `history.jsonl`, `sessions/`... */
-  configDir: string;
-  /** `CLAUDE_CONFIG_DIR`, else `$HOME`: holds the global `.claude.json` (trust entries). */
-  globalDir: string;
-}
+/**
+ * An untrusted PTY one-shot never touches the operator's Claude config root. Each call gets
+ * its own throwaway `CLAUDE_CONFIG_DIR`, so everything an interactive claude writes about the
+ * prompt (transcript, history, paste cache, session files) lands there and goes with it.
+ * Credentials are not copied: `CLAUDE_SECURESTORAGE_CONFIG_DIR` points claude at the
+ * operator's own credential store (read out of claude 2.1.304; see the spike doc).
+ */
+
+/** Prefix of the per-call throwaway config root, a sibling of the temp cwd. */
+export const ONESHOT_CONFIG_PREFIX = "claudeclaw-oneshot-cfg-";
+/** Prefix of the per-call temp cwd. */
+export const ONESHOT_CWD_PREFIX = "claudeclaw-oneshot-pty-";
+
+/** Leftovers older than this are removed at daemon start. */
+export const ONESHOT_SWEEP_MAX_AGE_MS = 10 * 60_000;
 
 const nonEmpty = (value: string | undefined): string | undefined =>
   value === undefined || value === "" ? undefined : value;
 
 /**
- * The config root the CHILD will use, from the env it is spawned with (not the
- * parent's `homedir()`). An empty `CLAUDE_CONFIG_DIR` or `HOME` counts as unset,
- * as it does for claude. A relative root would resolve against whatever cwd the
- * caller happens to have, so it fails closed before any spawn.
+ * The directory claude should read credentials from, so the throwaway config root
+ * authenticates as the operator does. An explicit `CLAUDE_SECURESTORAGE_CONFIG_DIR` in the
+ * caller's env is passed through as given. Otherwise it is the operator's
+ * `CLAUDE_CONFIG_DIR`, or `""` when that is unset or empty: `""` means the default
+ * (`~/.claude`, and the unsuffixed keychain service name on macOS). A relative directory
+ * would resolve against whatever cwd the caller has, so it fails closed before any spawn.
  */
-export function resolveChildConfigRoot(env: Record<string, string | undefined>): ChildConfigRoot {
-  const explicit = nonEmpty(env.CLAUDE_CONFIG_DIR);
-  const home = nonEmpty(env.HOME) ?? homedir();
-  const configDir = explicit ?? join(home, ".claude");
-  const globalDir = explicit ?? home;
-  if (!isAbsolute(configDir) || !isAbsolute(globalDir)) {
+export function operatorSecureStorageDir(env: Record<string, string | undefined>): string {
+  const explicit = env.CLAUDE_SECURESTORAGE_CONFIG_DIR;
+  const dir = explicit !== undefined ? explicit : (nonEmpty(env.CLAUDE_CONFIG_DIR) ?? "");
+  if (dir !== "" && !isAbsolute(dir)) {
     throw new Error("untrusted PTY one-shot requires an absolute Claude config root");
   }
-  return { configDir, globalDir };
-}
-
-/** Only called for the unique mkdtemp cwd owned by an untrusted one-shot. */
-export function untrustedPtyProjectDir(
-  cwd: string,
-  configDir = nonEmpty(process.env.CLAUDE_CONFIG_DIR) ?? join(homedir(), ".claude"),
-): string {
-  return join(configDir, "projects", encodeCwdForProjectsDir(realpathSync(cwd)));
-}
-
-/** Interactive Claude ignores --no-session-persistence; retire it before cleanup. */
-export function removeUntrustedPtyTranscripts(projectDir: string): void {
-  rmSync(projectDir, { recursive: true, force: true });
-}
-
-/** A claude session id (a UUID). Anything else never reaches a path: ids come off disk. */
-const SESSION_ID = /^[0-9A-Za-z][0-9A-Za-z_-]{7,63}$/;
-
-/**
- * Session ids an interactive claude used in `projectDir`: the `<id>.jsonl` names it wrote,
- * plus any the caller already knows. Read BEFORE the transcripts are removed.
- */
-export function untrustedSessionIds(
-  projectDir: string,
-  known: Array<string | undefined> = [],
-): string[] {
-  const ids = new Set<string>();
-  for (const id of known) if (id !== undefined && SESSION_ID.test(id)) ids.add(id);
-  if (existsSync(projectDir)) {
-    for (const entry of readdirSync(projectDir)) {
-      if (!entry.endsWith(".jsonl")) continue;
-      const id = entry.slice(0, -".jsonl".length);
-      if (SESSION_ID.test(id)) ids.add(id);
-    }
-  }
-  return [...ids];
+  return dir;
 }
 
 /** The cwd as given and as resolved: claude may record either. */
@@ -89,132 +59,77 @@ export function untrustedCwdForms(cwd: string): string[] {
   return [...forms];
 }
 
-const HISTORY_LOCK_WAIT_MS = 3_000;
-const HISTORY_LOCK_STALE_MS = 10_000;
-
-function sleepSync(ms: number): void {
-  try {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-  } catch {
-    // Not allowed on this thread: a short bounded spin instead.
-    const until = Date.now() + ms;
-    while (Date.now() < until) {
-      /* wait */
-    }
-  }
+/** Where an interactive claude with this config root keeps the transcripts of `cwd`. */
+export function untrustedPtyProjectDir(cwd: string, configRoot: string): string {
+  return join(configRoot, "projects", encodeCwdForProjectsDir(realpathSync(cwd)));
 }
 
 /**
- * `mkdir <file>.lock` is the lock convention of `proper-lockfile`, which claude is
- * believed to use for this file (see the spike doc for what the live run saw). A lock older
- * than the library's default stale window is taken over. Holding it for the
- * read-modify-rename keeps a concurrent claude's append from being lost in between.
- * Every path through the loop is bounded by the deadline, so a lock that cannot be taken
- * or cleared fails closed instead of spinning.
+ * Create the per-call config root (mode 0700, next to the temp cwd) with the smallest
+ * `.claude.json` that gets an interactive claude to its prompt: onboarding done, and the
+ * throwaway cwd trusted in both of its forms. Throws if the root cannot be written; the
+ * caller fails the call before any spawn. A root that was created is removed again on error.
  */
-function withFileLock<T>(file: string, fn: () => T): T {
-  const lock = `${file}.lock`;
-  const deadline = Date.now() + HISTORY_LOCK_WAIT_MS;
-  for (;;) {
-    try {
-      mkdirSync(lock);
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (Date.now() >= deadline) throw new Error("history.jsonl lock is held");
-      try {
-        if (Date.now() - lstatSync(lock).mtimeMs > HISTORY_LOCK_STALE_MS) {
-          rmSync(lock, { recursive: true, force: true });
-          continue;
-        }
-      } catch {
-        // released (or unreadable) between the mkdir and the stat: pause, then retry
-      }
-      sleepSync(50);
-    }
-  }
+export function createUntrustedConfigRoot(cwds: string[]): string {
+  const root = mkdtempSync(join(tmpdir(), ONESHOT_CONFIG_PREFIX));
   try {
-    return fn();
-  } finally {
-    rmSync(lock, { recursive: true, force: true });
+    chmodSync(root, 0o700);
+    const projects: Record<string, unknown> = {};
+    for (const cwd of cwds) {
+      projects[cwd] = { hasTrustDialogAccepted: true, projectOnboardingSeenCount: 1 };
+    }
+    writeFileSync(
+      join(root, ".claude.json"),
+      `${JSON.stringify({ hasCompletedOnboarding: true, theme: "dark", numStartups: 10, projects })}\n`,
+      { mode: 0o600 },
+    );
+  } catch (error) {
+    rmSync(root, { recursive: true, force: true });
+    throw error;
   }
+  return root;
 }
 
 /**
- * Drop this one-shot's lines from `<configDir>/history.jsonl`: those whose `project` is the
- * throwaway cwd or whose `sessionId` is one of its sessions. Interactive claude writes the
- * submitted prompt there. Other lines, and lines that do not parse, are kept as they are.
- * Returns the number of lines removed.
+ * Remove the throwaway config root. Throws if it is still there afterwards, so a call never
+ * reports an isolated success while prompt text sits on disk.
  */
-export function removeUntrustedHistory(
-  configDir: string,
-  cwds: string[],
-  sessionIds: string[],
+export function removeUntrustedConfigRoot(root: string): void {
+  rmSync(root, { recursive: true, force: true });
+  if (existsSync(root)) throw new Error("throwaway config root was not removed");
+}
+
+/**
+ * Daemon start: remove `claudeclaw-oneshot-cfg-*` and `claudeclaw-oneshot-pty-*` directories
+ * under `dir` that are older than `maxAgeMs`. A crash between create and cleanup leaves one
+ * behind and nothing else would ever retry it. Symlinks and plain files with the prefix are
+ * left alone. Returns how many were removed; a failure on one entry does not stop the rest.
+ */
+export function sweepStaleOneShotDirs(
+  dir = tmpdir(),
+  now = Date.now(),
+  maxAgeMs = ONESHOT_SWEEP_MAX_AGE_MS,
 ): number {
-  const file = join(configDir, "history.jsonl");
-  if (!existsSync(file)) return 0;
-  return withFileLock(file, () => {
-    const lines = readFileSync(file, "utf8").split("\n");
-    let removed = 0;
-    const kept = lines.filter((line) => {
-      if (line.trim() === "") return true;
-      try {
-        const entry = JSON.parse(line) as { project?: unknown; sessionId?: unknown };
-        const mine =
-          (typeof entry.project === "string" && cwds.includes(entry.project)) ||
-          (typeof entry.sessionId === "string" && sessionIds.includes(entry.sessionId));
-        if (mine) removed++;
-        return !mine;
-      } catch {
-        return true;
-      }
-    });
-    if (removed === 0) return 0;
-    const mode = statSync(file).mode & 0o777;
-    const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
-    writeFileSync(tmp, kept.join("\n"), { mode });
-    renameSync(tmp, file);
-    return removed;
-  });
-}
-
-/**
- * Remove the per-session state an interactive claude keeps under the config root, by
- * session id (and, for `sessions/*.json`, by cwd): `session-env/<id>`, `file-history/<id>`,
- * `debug/<id>.txt`, `todos/<id>*`. Only ever called with ids that passed `SESSION_ID`.
- */
-export function removeUntrustedSessionFiles(
-  configDir: string,
-  cwds: string[],
-  sessionIds: string[],
-): void {
-  for (const id of sessionIds) {
-    if (!SESSION_ID.test(id)) continue;
-    rmSync(join(configDir, "session-env", id), { recursive: true, force: true });
-    rmSync(join(configDir, "file-history", id), { recursive: true, force: true });
-    rmSync(join(configDir, "debug", `${id}.txt`), { force: true });
-    const todos = join(configDir, "todos");
-    if (existsSync(todos)) {
-      for (const name of readdirSync(todos)) {
-        if (name.startsWith(id)) rmSync(join(todos, name), { recursive: true, force: true });
-      }
-    }
+  let removed = 0;
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return 0;
   }
-  const sessions = join(configDir, "sessions");
-  if (!existsSync(sessions)) return;
-  for (const name of readdirSync(sessions)) {
-    const path = join(sessions, name);
+  for (const name of names) {
+    if (!name.startsWith(ONESHOT_CONFIG_PREFIX) && !name.startsWith(ONESHOT_CWD_PREFIX)) continue;
+    const path = join(dir, name);
     try {
-      const entry = JSON.parse(readFileSync(path, "utf8")) as {
-        sessionId?: unknown;
-        cwd?: unknown;
-      };
-      const mine =
-        (typeof entry.sessionId === "string" && sessionIds.includes(entry.sessionId)) ||
-        (typeof entry.cwd === "string" && cwds.includes(entry.cwd));
-      if (mine) rmSync(path, { recursive: true, force: true });
-    } catch {
-      /* not a session record */
+      const stat = lstatSync(path);
+      if (!stat.isDirectory() || now - stat.mtimeMs <= maxAgeMs) continue;
+      rmSync(path, { recursive: true, force: true });
+      removed++;
+    } catch (error) {
+      console.warn(
+        `[oneshot] stale temp dir not removed (${(error as NodeJS.ErrnoException).code ?? "error"})`,
+      );
     }
   }
+  return removed;
 }

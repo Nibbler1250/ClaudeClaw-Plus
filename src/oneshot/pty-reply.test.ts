@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { _setSettingsFileForTests, loadSettings } from "../config.js";
@@ -62,9 +62,7 @@ function fakePty(entries: Entry[] | undefined, screen = SCREEN_WITH_EXAMPLE): vo
       lastTurnEndedAt: () => 0,
       runTurn: async () => {
         if (entries) {
-          const configDir =
-            opts.env.CLAUDE_CONFIG_DIR ?? join(opts.env.HOME ?? homedir(), ".claude");
-          const project = untrustedPtyProjectDir(opts.cwd, configDir);
+          const project = untrustedPtyProjectDir(opts.cwd, opts.env.CLAUDE_CONFIG_DIR!);
           mkdirSync(project, { recursive: true });
           writeFileSync(
             join(project, "reply-session.jsonl"),
@@ -178,7 +176,7 @@ describe("#570 one-shot PTY reply extraction", () => {
   it("removes the transcript after extracting the reply", async () => {
     let project = "";
     injectSpawnPty(async (opts: PtyProcessOptions) => {
-      project = untrustedPtyProjectDir(opts.cwd, dir);
+      project = untrustedPtyProjectDir(opts.cwd, opts.env.CLAUDE_CONFIG_DIR!);
       mkdirSync(project, { recursive: true });
       writeFileSync(join(project, "s.jsonl"), `${JSON.stringify(assistant("m1", [text("ok")]))}\n`);
       return {
@@ -254,6 +252,25 @@ describe("#570 failed-turn latency", () => {
       project([userEntry(), assistant("m1", [text("real")]), syntheticError()]),
       { waitMs: 2000, ...clock },
     );
+    expect(result).toEqual({ failure: "api-error" });
+  });
+
+  it("an error record that lands during the settle still fails the reply (E: the post-settle re-read)", async () => {
+    const projectDir = project([userEntry(), assistant("m1", [text("real")])]);
+    const file = join(projectDir, "s.jsonl");
+    const sleeps: number[] = [];
+    // The reply is already on disk when the first read happens, so the only sleep is the
+    // settle; the error record is appended exactly then.
+    const result = await awaitLastAssistantReply(projectDir, {
+      waitMs: 2000,
+      settleMs: 50,
+      now: () => 0,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        appendFileSync(file, `\n${JSON.stringify(syntheticError())}\n`);
+      },
+    });
+    expect(sleeps).toEqual([50]);
     expect(result).toEqual({ failure: "api-error" });
   });
 

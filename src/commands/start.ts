@@ -28,6 +28,7 @@ import {
   unregisterGatewayDelivery,
 } from "../event-processor";
 import { applyPtyIsolationVersionGate } from "../oneshot/claude-version.js";
+import { sweepStaleOneShotDirs } from "../oneshot/pty-cleanup.js";
 import { writeState, type StateData } from "../statusline";
 import { ensureStatuslineSetting, removeStatuslineSetting } from "../statusline-settings";
 import { nextCronMatch } from "../cron";
@@ -456,6 +457,13 @@ export async function start(args: string[] = []) {
   await initConfig();
   const settings = await loadSettings();
   await ensureProjectClaudeMd();
+  // #570: an untrusted PTY one-shot that crashed mid-call leaves its throwaway config root
+  // and cwd in the tmpdir, and nothing retries that cleanup. Older than 10 minutes means
+  // no live call owns it.
+  const sweptOneShotDirs = sweepStaleOneShotDirs();
+  if (sweptOneShotDirs > 0) {
+    console.log(`  Removed ${sweptOneShotDirs} stale one-shot temp dir(s)`);
+  }
 
   // #230: per-plugin kill switch on the plugin-tool bridge. Applied before any
   // plugin registers or is called, and again on every hot-reload below.

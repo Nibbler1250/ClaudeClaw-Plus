@@ -1,18 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import {
-  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
-import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { _setSettingsFileForTests, loadSettings } from "../config.js";
 import {
   __buildClaudeArgsForTests,
@@ -20,20 +23,20 @@ import {
   type PtyProcessOptions,
 } from "../runner/pty-process.js";
 import { setUntrustedFileMentionNeutralizingForTests } from "../runner/pty-process-test-seams.js";
+import { neutralizeFileMentions } from "../runner/pty-prompt-sanitizer.js";
 import {
   __resetSupervisorForTests,
   injectOneShotTrustForTests,
   injectSpawnPty,
   runOnceOnPty,
 } from "../runner/pty-supervisor.js";
-import { removeTrustEntry } from "../runner/pty-trust-prompt.js";
 import { applyPtyIsolationVersionGate, claudeVersionAtLeast } from "./claude-version.js";
 import { resolveOneShotEngine } from "./config.js";
 import * as cleanup from "./pty-cleanup.js";
 import { withPrintRuntime } from "./print.js";
 import { engines } from "./registry.js";
 
-/** #570 r9: what an untrusted PTY one-shot writes, where, and what it leaves behind. */
+/** #570 r11: what an untrusted PTY one-shot writes, where, and what it leaves behind. */
 
 let dir: string;
 let savedConfig: string | undefined;
@@ -63,8 +66,6 @@ beforeEach(async () => {
   savedIsolation = engines.get("pty")!.caps.isolation;
   engines.get("pty")!.caps.isolation = true;
   spawned = [];
-  // Real trust write and removal: the config root is always the caller env's, never ~.
-  injectOneShotTrustForTests(null);
   warn = spyOn(console, "warn").mockImplementation((...a: unknown[]) => {
     process.stderr.write(`WARN ${String(a[0])}\n`);
   });
@@ -96,12 +97,13 @@ function callerEnv(extra: Record<string, string> = {}): Record<string, string> {
   };
 }
 
-function reply(opts: PtyProcessOptions, configDir: string, sessionId = SID): void {
-  const project = cleanup.untrustedPtyProjectDir(opts.cwd, configDir);
+/** What the child's claude writes: a transcript under ITS config root (the throwaway one). */
+function reply(opts: PtyProcessOptions, sessionId = SID, text = "ok"): void {
+  const project = cleanup.untrustedPtyProjectDir(opts.cwd, opts.env.CLAUDE_CONFIG_DIR!);
   mkdirSync(project, { recursive: true });
   writeFileSync(
     join(project, `${sessionId}.jsonl`),
-    `${JSON.stringify({ type: "assistant", message: { id: "m", model: "haiku", content: [{ type: "text", text: "ok" }] } })}\n`,
+    `${JSON.stringify({ type: "assistant", message: { id: "m", model: "haiku", content: [{ type: "text", text }] } })}\n`,
   );
 }
 
@@ -117,7 +119,7 @@ function fakeSpawn(onTurn: (opts: PtyProcessOptions) => void | Promise<void> = (
       lastTurnEndedAt: () => 0,
       runTurn: async () => {
         await onTurn(opts);
-        reply(opts, cleanup.resolveChildConfigRoot(opts.env).configDir);
+        reply(opts);
         return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
       },
       dispose: async () => {},
@@ -128,104 +130,273 @@ function fakeSpawn(onTurn: (opts: PtyProcessOptions) => void | Promise<void> = (
 const run = (env: Record<string, string> = callerEnv(), req: Record<string, unknown> = {}) =>
   withPrintRuntime({ env }, () => runOnceOnPty({ ...request, ...req }));
 
-describe("B1: the throwaway cwd is trusted in the child's config root, then unmarked", () => {
-  it("writes the trust entry where the child's CLAUDE_CONFIG_DIR points, during the turn", async () => {
-    const config = join(dir, "config");
-    let during: Record<string, { hasTrustDialogAccepted?: boolean }> | undefined;
+/** path, size and sha256 of every file and directory under `root`: a full byte snapshot. */
+function snapshot(root: string): string[] {
+  const out: string[] = [];
+  const walk = (current: string): void => {
+    for (const name of readdirSync(current).sort()) {
+      const path = join(current, name);
+      const rel = relative(root, path);
+      if (statSync(path).isDirectory()) {
+        out.push(`${rel}/`);
+        walk(path);
+      } else {
+        const bytes = readFileSync(path);
+        out.push(`${rel}:${bytes.length}:${createHash("sha256").update(bytes).digest("hex")}`);
+      }
+    }
+  };
+  walk(root);
+  return out;
+}
+
+const oneShotTempDirs = (prefix: string): string[] =>
+  readdirSync(tmpdir()).filter((name) => name.startsWith(prefix));
+
+describe("A: each untrusted call gets its own throwaway config root", () => {
+  it("is a 0700 sibling of the temp cwd, seeded with onboarding and trust for both cwd forms", async () => {
+    let mode = 0;
+    let seeded: Record<string, any> = {};
+    let fileMode = 0;
+    let forms: string[] = [];
     fakeSpawn((opts) => {
-      during = JSON.parse(readFileSync(join(config, ".claude.json"), "utf8")).projects;
-      expect(opts.cwd).toBeTruthy();
+      forms = [opts.cwd, realpathSync(opts.cwd)];
+      const root = opts.env.CLAUDE_CONFIG_DIR!;
+      mode = statSync(root).mode & 0o777;
+      fileMode = statSync(join(root, ".claude.json")).mode & 0o777;
+      seeded = JSON.parse(readFileSync(join(root, ".claude.json"), "utf8"));
     });
     expect((await run()).exitCode).toBe(0);
-    const cwd = spawned[0]!.cwd;
-    expect(during?.[cwd]?.hasTrustDialogAccepted).toBe(true);
+    const env = spawned[0]!.env;
+    expect(env.CLAUDE_CONFIG_DIR!.startsWith(join(tmpdir(), "claudeclaw-oneshot-cfg-"))).toBe(true);
+    expect(env.CLAUDE_CONFIG_DIR === join(dir, "config")).toBe(false);
+    expect(mode).toBe(0o700);
+    expect(fileMode).toBe(0o600);
+    expect(seeded.hasCompletedOnboarding).toBe(true);
+    expect(forms.length).toBeGreaterThan(0);
+    for (const cwd of forms) expect(seeded.projects[cwd]?.hasTrustDialogAccepted).toBe(true);
+    // HOME is the caller's, untouched: only the config location moves.
+    expect(env.HOME).toBe(join(dir, "home"));
   });
 
-  it("uses HOME/.claude.json when CLAUDE_CONFIG_DIR is not set", async () => {
-    const home = join(dir, "home-only");
-    mkdirSync(home, { recursive: true });
-    let seen = false;
-    fakeSpawn((opts) => {
-      const file = join(home, ".claude.json");
-      seen = existsSync(file) && opts.cwd in JSON.parse(readFileSync(file, "utf8")).projects;
-    });
-    await run({ PATH: "/usr/bin:/bin", HOME: home });
-    expect(seen).toBe(true);
-  });
-
-  it("removes only its own entry afterwards and keeps every other key", async () => {
-    const config = join(dir, "config");
-    mkdirSync(config, { recursive: true });
-    writeFileSync(
-      join(config, ".claude.json"),
-      JSON.stringify({
-        hasCompletedOnboarding: true,
-        projects: { "/keep/me": { hasTrustDialogAccepted: true } },
-      }),
-    );
+  it("two calls get two different roots", async () => {
     fakeSpawn();
     await run();
-    const after = JSON.parse(readFileSync(join(config, ".claude.json"), "utf8"));
-    expect(after.hasCompletedOnboarding).toBe(true);
-    expect(Object.keys(after.projects)).toEqual(["/keep/me"]);
+    await run();
+    expect(spawned[0]!.env.CLAUDE_CONFIG_DIR).not.toBe(spawned[1]!.env.CLAUDE_CONFIG_DIR);
   });
 
-  it("removes the entry after a failed turn as well", async () => {
+  it("keeps the operator's login: credentials are read from the operator's config dir", async () => {
+    fakeSpawn();
+    await run();
+    expect(spawned[0]!.env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe(join(dir, "config"));
+  });
+
+  it('uses "" (the default store) when the operator has no CLAUDE_CONFIG_DIR, empty counts as unset', async () => {
+    fakeSpawn();
+    await run({ PATH: "/usr/bin:/bin", HOME: join(dir, "home") });
+    await run({ PATH: "/usr/bin:/bin", HOME: join(dir, "home"), CLAUDE_CONFIG_DIR: "" });
+    expect(spawned[0]!.env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe("");
+    expect(spawned[1]!.env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe("");
+  });
+
+  it("passes an explicit CLAUDE_SECURESTORAGE_CONFIG_DIR through as given", async () => {
+    fakeSpawn();
+    await run(callerEnv({ CLAUDE_SECURESTORAGE_CONFIG_DIR: join(dir, "store") }));
+    await run(callerEnv({ CLAUDE_SECURESTORAGE_CONFIG_DIR: "" }));
+    expect(spawned[0]!.env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe(join(dir, "store"));
+    expect(spawned[1]!.env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe("");
+  });
+});
+
+describe("A: nothing on the untrusted path writes under the operator's config root", () => {
+  /** Plant a fake operator root and HOME with the files a real login would have. */
+  function operatorFiles(): { config: string; home: string } {
+    const env = callerEnv();
+    const config = env.CLAUDE_CONFIG_DIR!;
+    const home = env.HOME!;
+    writeFileSync(join(config, ".credentials.json"), "{}", { mode: 0o600 });
+    writeFileSync(
+      join(config, ".claude.json"),
+      JSON.stringify({ hasCompletedOnboarding: true, projects: { "/keep/me": {} } }),
+    );
+    writeFileSync(join(config, "history.jsonl"), `${JSON.stringify({ display: "mine" })}\n`);
+    mkdirSync(join(config, "projects", "-keep"), { recursive: true });
+    writeFileSync(join(config, "projects", "-keep", "a.jsonl"), "{}\n");
+    writeFileSync(join(home, ".claude.json"), "{}");
+    return { config, home };
+  }
+
+  /** What claude writes about a call, all of it under ITS config root. */
+  const writeLikeClaude = (opts: PtyProcessOptions): void => {
+    const root = opts.env.CLAUDE_CONFIG_DIR!;
+    writeFileSync(join(root, "history.jsonl"), `${JSON.stringify({ display: CANARY })}\n`);
+    mkdirSync(join(root, "paste-cache"), { recursive: true });
+    writeFileSync(join(root, "paste-cache", "p.txt"), CANARY);
+    mkdirSync(join(root, "sessions"), { recursive: true });
+    writeFileSync(join(root, "sessions", "1.json"), CANARY);
+  };
+
+  for (const [label, turn] of [
+    ["a successful turn", (): void => {}],
+    [
+      "a failed turn",
+      (): void => {
+        throw new Error("turn failed");
+      },
+    ],
+  ] as const) {
+    it(`leaves the operator's root and HOME byte-identical after ${label}`, async () => {
+      const { config, home } = operatorFiles();
+      const before = { config: snapshot(config), home: snapshot(home) };
+      let wroteInRoot = false;
+      fakeSpawn((opts) => {
+        writeLikeClaude(opts);
+        wroteInRoot =
+          readFileSync(join(opts.env.CLAUDE_CONFIG_DIR!, "paste-cache", "p.txt"), "utf8") ===
+          CANARY;
+        turn();
+      });
+      await run();
+      // The fake did write the prompt somewhere: the root it was given, not the operator's.
+      expect(wroteInRoot).toBe(true);
+      expect(snapshot(config)).toEqual(before.config);
+      expect(snapshot(home)).toEqual(before.home);
+    });
+  }
+});
+
+describe("A: the root and the cwd are removed whatever the turn did", () => {
+  const gone = (opts: PtyProcessOptions): boolean =>
+    !existsSync(opts.env.CLAUDE_CONFIG_DIR!) && !existsSync(opts.cwd);
+
+  it("after a successful turn, with the prompt canary written into it", async () => {
+    fakeSpawn((opts) => {
+      mkdirSync(join(opts.env.CLAUDE_CONFIG_DIR!, "paste-cache"), { recursive: true });
+      writeFileSync(join(opts.env.CLAUDE_CONFIG_DIR!, "paste-cache", "p.txt"), CANARY);
+    });
+    expect((await run()).exitCode).toBe(0);
+    expect(gone(spawned[0]!)).toBe(true);
+  });
+
+  it("after a failed turn", async () => {
     fakeSpawn(() => {
       throw new Error("turn failed");
     });
     await run();
-    const file = join(dir, "config", ".claude.json");
-    const after = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : { projects: {} };
-    expect(Object.keys(after.projects ?? {})).toEqual([]);
+    expect(gone(spawned[0]!)).toBe(true);
   });
 
-  it("concurrent calls neither lose each other's entry nor leave one behind", async () => {
-    const config = join(dir, "config");
-    fakeSpawn(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 30));
+  it("after a spawn that throws", async () => {
+    let seen: PtyProcessOptions | undefined;
+    injectSpawnPty(async (opts) => {
+      seen = opts;
+      throw new Error("spawn failed");
     });
-    const results = await Promise.all([run(), run(), run()]);
-    expect(results.map((r) => r.exitCode)).toEqual([0, 0, 0]);
-    const after = JSON.parse(readFileSync(join(config, ".claude.json"), "utf8"));
-    expect(Object.keys(after.projects)).toEqual([]);
-  });
-
-  it("removeTrustEntry is a no-op for a missing file or entry and refuses malformed JSON", async () => {
-    const configPath = join(dir, "x", ".claude.json");
-    expect((await removeTrustEntry("/a", { configPath })).changed).toBe(false);
-    mkdirSync(join(dir, "x"), { recursive: true });
-    writeFileSync(configPath, "{not json");
-    const result = await removeTrustEntry("/a", { configPath });
-    expect(result.ok).toBe(false);
-    expect(readFileSync(configPath, "utf8")).toBe("{not json");
+    await run();
+    expect(seen).toBeDefined();
+    expect(gone(seen!)).toBe(true);
   });
 });
 
-describe("D2: the config root must be absolute; empty means unset", () => {
-  it("treats an empty CLAUDE_CONFIG_DIR as unset", () => {
-    const root = cleanup.resolveChildConfigRoot({ CLAUDE_CONFIG_DIR: "", HOME: "/h" });
-    expect(root).toEqual({ configDir: "/h/.claude", globalDir: "/h" });
+describe("A: fail closed", () => {
+  it("a root that cannot be created fails the call before any spawn and leaves nothing", async () => {
+    fakeSpawn();
+    const before = oneShotTempDirs("claudeclaw-oneshot-pty-");
+    const failing = spyOn(cleanup, "createUntrustedConfigRoot").mockImplementation(() => {
+      throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+    });
+    try {
+      expect((await run()).exitCode).toBe(1);
+    } finally {
+      failing.mockRestore();
+    }
+    expect(spawned).toHaveLength(0);
+    expect(oneShotTempDirs("claudeclaw-oneshot-pty-")).toEqual(before);
   });
 
+  it("D6: a root that cannot be removed is logged by step and code, and the call throws", async () => {
+    fakeSpawn((opts) => writeFileSync(join(opts.env.CLAUDE_CONFIG_DIR!, "history.jsonl"), CANARY));
+    const failing = spyOn(cleanup, "removeUntrustedConfigRoot").mockImplementation(() => {
+      throw Object.assign(new Error(`EACCES: ${CANARY}`), { code: "EACCES" });
+    });
+    try {
+      await expect(run()).rejects.toThrow();
+    } finally {
+      failing.mockRestore();
+      rmSync(spawned[0]!.env.CLAUDE_CONFIG_DIR!, { recursive: true, force: true });
+    }
+    const logged = error.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+    expect(logged).toContain("config root (EACCES)");
+    expect(logged.includes(CANARY)).toBe(false);
+  });
+});
+
+describe("A: startup sweep of leftovers", () => {
+  const MIN = 60_000;
+  const NOW = 1_800_000_000_000;
+  const age = (path: string, minutes: number): void => {
+    const when = new Date(NOW - minutes * MIN);
+    utimesSync(path, when, when);
+  };
+
+  it("removes oneshot dirs older than 10 minutes, and only those", () => {
+    const base = mkdtempSync(join(dir, "sweep-"));
+    const outside = join(dir, "outside");
+    mkdirSync(outside);
+    writeFileSync(join(outside, "keep.txt"), "x");
+    const mk = (name: string, minutes: number): void => {
+      mkdirSync(join(base, name));
+      writeFileSync(join(base, name, "f"), CANARY);
+      age(join(base, name), minutes);
+    };
+    mk("claudeclaw-oneshot-cfg-old", 10.1);
+    mk("claudeclaw-oneshot-pty-old", 11);
+    mk("claudeclaw-oneshot-cfg-fresh", 9.9);
+    mk("claudeclaw-oneshot-pty-fresh", 1);
+    mk("claudeclaw-oneshot-unrelated-old", 60);
+    mk("other-old", 60);
+    writeFileSync(join(base, "claudeclaw-oneshot-cfg-file"), "x");
+    age(join(base, "claudeclaw-oneshot-cfg-file"), 60);
+    symlinkSync(outside, join(base, "claudeclaw-oneshot-pty-link"));
+
+    expect(cleanup.sweepStaleOneShotDirs(base, NOW)).toBe(2);
+    expect(readdirSync(base).sort()).toEqual([
+      "claudeclaw-oneshot-cfg-file",
+      "claudeclaw-oneshot-cfg-fresh",
+      "claudeclaw-oneshot-pty-fresh",
+      "claudeclaw-oneshot-pty-link",
+      "claudeclaw-oneshot-unrelated-old",
+      "other-old",
+    ]);
+    // A symlink with the prefix is left alone and never followed.
+    expect(existsSync(join(outside, "keep.txt"))).toBe(true);
+  });
+
+  it("a missing directory is not an error", () => {
+    expect(cleanup.sweepStaleOneShotDirs(join(dir, "nope"), NOW)).toBe(0);
+  });
+
+  it("the daemon runs it at start, before the version probe", () => {
+    const start = readFileSync(join(import.meta.dir, "../commands/start.ts"), "utf8");
+    const sweep = start.indexOf("sweepStaleOneShotDirs()");
+    expect(sweep).toBeGreaterThan(0);
+    expect(sweep).toBeLessThan(start.indexOf("probeClaudeCliVersion()"));
+  });
+});
+
+describe("D2: the credential directory must be absolute; empty means unset", () => {
   it("fails closed before any spawn on a relative root", async () => {
     fakeSpawn();
-    const before = new Set(
-      (await import("node:fs"))
-        .readdirSync(tmpdir())
-        .filter((n) => n.startsWith("claudeclaw-oneshot-pty-")),
-    );
-    const result = await run({
-      PATH: "/usr/bin:/bin",
-      HOME: "/h",
-      CLAUDE_CONFIG_DIR: "relative/dir",
-    });
-    expect(result.exitCode).toBe(1);
+    const before = oneShotTempDirs("claudeclaw-oneshot-");
+    for (const env of [
+      { PATH: "/usr/bin:/bin", HOME: "/h", CLAUDE_CONFIG_DIR: "relative/dir" },
+      { PATH: "/usr/bin:/bin", HOME: "/h", CLAUDE_SECURESTORAGE_CONFIG_DIR: "relative/store" },
+    ]) {
+      expect((await run(env)).exitCode).toBe(1);
+    }
     expect(spawned).toHaveLength(0);
-    const after = (await import("node:fs"))
-      .readdirSync(tmpdir())
-      .filter((n) => n.startsWith("claudeclaw-oneshot-pty-") && !before.has(n));
-    expect(after).toEqual([]);
+    expect(oneShotTempDirs("claudeclaw-oneshot-")).toEqual(before);
   });
 });
 
@@ -298,125 +469,6 @@ describe("B3: `@` file mentions are neutralised for untrusted prompts only", () 
   });
 });
 
-describe("C1: persistence beyond the transcript is removed", () => {
-  const history = (lines: unknown[]): string =>
-    `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`;
-
-  function plant(opts: PtyProcessOptions, configDir: string): void {
-    writeFileSync(
-      join(configDir, "history.jsonl"),
-      history([
-        { display: "other", project: "/somewhere/else", sessionId: "other-session-id" },
-        { display: CANARY, project: opts.cwd, sessionId: SID },
-      ]),
-    );
-    mkdirSync(join(configDir, "session-env", SID), { recursive: true });
-    writeFileSync(join(configDir, "session-env", SID, "env"), CANARY);
-    mkdirSync(join(configDir, "todos"), { recursive: true });
-    writeFileSync(join(configDir, "todos", `${SID}-agent-${SID}.json`), "[]");
-    mkdirSync(join(configDir, "sessions"), { recursive: true });
-    writeFileSync(
-      join(configDir, "sessions", "4242.json"),
-      JSON.stringify({ sessionId: SID, cwd: opts.cwd }),
-    );
-    writeFileSync(
-      join(configDir, "sessions", "9999.json"),
-      JSON.stringify({ sessionId: "other", cwd: "/x" }),
-    );
-  }
-
-  it("removes this call's history lines and per-session files, and nothing else", async () => {
-    const config = join(dir, "config");
-    mkdirSync(config, { recursive: true });
-    fakeSpawn((opts) => plant(opts, config));
-    expect((await run()).exitCode).toBe(0);
-    const lines = readFileSync(join(config, "history.jsonl"), "utf8");
-    expect(lines.includes(CANARY)).toBe(false);
-    expect(lines).toContain("other");
-    expect(existsSync(join(config, "session-env", SID))).toBe(false);
-    expect(existsSync(join(config, "todos", `${SID}-agent-${SID}.json`))).toBe(false);
-    expect(existsSync(join(config, "sessions", "4242.json"))).toBe(false);
-    expect(existsSync(join(config, "sessions", "9999.json"))).toBe(true);
-  });
-
-  it("no file under the config root holds the canary afterwards", async () => {
-    const config = join(dir, "config");
-    mkdirSync(config, { recursive: true });
-    fakeSpawn((opts) => plant(opts, config));
-    await run();
-    const all: string[] = [];
-    const walk = (d: string): void => {
-      for (const name of (require("node:fs") as typeof import("node:fs")).readdirSync(d)) {
-        const p = join(d, name);
-        if (statSync(p).isDirectory()) walk(p);
-        else all.push(readFileSync(p, "utf8"));
-      }
-    };
-    walk(config);
-    expect(all.some((text) => text.includes(CANARY))).toBe(false);
-  });
-
-  it("history rewrite keeps the file mode and leaves unparseable lines alone", () => {
-    const config = join(dir, "hist");
-    mkdirSync(config, { recursive: true });
-    const file = join(config, "history.jsonl");
-    writeFileSync(file, `not json\n${JSON.stringify({ project: "/a", sessionId: "s" })}\n`);
-    chmodSync(file, 0o600);
-    expect(cleanup.removeUntrustedHistory(config, ["/a"], [])).toBe(1);
-    expect(readFileSync(file, "utf8")).toContain("not json");
-    expect(statSync(file).mode & 0o777).toBe(0o600);
-    expect(existsSync(`${file}.lock`)).toBe(false);
-  });
-
-  it("history rewrite waits for a held lock, then fails closed", () => {
-    const config = join(dir, "locked");
-    mkdirSync(config, { recursive: true });
-    const file = join(config, "history.jsonl");
-    writeFileSync(file, `${JSON.stringify({ project: "/a" })}\n`);
-    mkdirSync(`${file}.lock`);
-    expect(() => cleanup.removeUntrustedHistory(config, ["/a"], [])).toThrow("lock is held");
-    // The line is still there: nothing was rewritten without the lock.
-    expect(readFileSync(file, "utf8")).toContain("/a");
-  });
-
-  it("a lock path that can be neither taken nor stat'ed (dangling symlink) fails closed in bounded time", () => {
-    const config = join(dir, "dangling");
-    mkdirSync(config, { recursive: true });
-    const file = join(config, "history.jsonl");
-    writeFileSync(file, `${JSON.stringify({ project: "/a" })}\n`);
-    symlinkSync(join(config, "nowhere"), `${file}.lock`);
-    const started = Date.now();
-    expect(() => cleanup.removeUntrustedHistory(config, ["/a"], [])).toThrow("lock is held");
-    expect(Date.now() - started).toBeLessThan(6000);
-  });
-
-  it("an id that is not a session id never reaches a path", () => {
-    const config = join(dir, "ids");
-    mkdirSync(join(config, "session-env", "sibling"), { recursive: true });
-    cleanup.removeUntrustedSessionFiles(config, [], ["../session-env/sibling"]);
-    expect(existsSync(join(config, "session-env", "sibling"))).toBe(true);
-  });
-
-  it("D6: a failing step is logged by step and code, still attempts the rest, then throws", async () => {
-    const config = join(dir, "config");
-    mkdirSync(config, { recursive: true });
-    fakeSpawn((opts) => plant(opts, config));
-    const failing = spyOn(cleanup, "removeUntrustedPtyTranscripts").mockImplementation(() => {
-      throw Object.assign(new Error(`EACCES: ${CANARY}`), { code: "EACCES" });
-    });
-    try {
-      await expect(run()).rejects.toThrow();
-    } finally {
-      failing.mockRestore();
-    }
-    // The other prompt-bearing steps still ran.
-    expect(readFileSync(join(config, "history.jsonl"), "utf8").includes(CANARY)).toBe(false);
-    const logged = error.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
-    expect(logged).toContain("transcripts (EACCES)");
-    expect(logged.includes(CANARY)).toBe(false);
-  });
-});
-
 describe("C2: PTY isolation is advertised only on a measured claude version", () => {
   it("compares versions numerically", () => {
     expect(claudeVersionAtLeast("2.1.304", "2.1.304")).toBe(true);
@@ -460,11 +512,12 @@ describe("C2: PTY isolation is advertised only on a measured claude version", ()
 });
 
 describe("C3: cleanup runs again once a late-landing spawn has settled", () => {
-  it("removes state a claude wrote after the call had already returned", async () => {
-    let project = "";
+  it("removes the root a claude wrote into after the call had already returned", async () => {
+    let root = "";
     let landed = false;
     injectSpawnPty(async (opts) => {
-      project = cleanup.untrustedPtyProjectDir(opts.cwd, join(dir, "config"));
+      root = opts.env.CLAUDE_CONFIG_DIR!;
+      const project = cleanup.untrustedPtyProjectDir(opts.cwd, root);
       // Slower than the call's deadline: lands after runOnceOnPty has returned.
       await new Promise((resolve) => setTimeout(resolve, 400));
       mkdirSync(project, { recursive: true });
@@ -477,7 +530,7 @@ describe("C3: cleanup runs again once a late-landing spawn has settled", () => {
     expect(landed).toBe(false);
     await new Promise((resolve) => setTimeout(resolve, 900));
     expect(landed).toBe(true);
-    expect(existsSync(project)).toBe(false);
+    expect(existsSync(root)).toBe(false);
   });
 });
 
@@ -542,5 +595,83 @@ describe("B3 (print): `claude -p` expands @ mentions too, so the same replacemen
     } finally {
       setUntrustedFileMentionNeutralizingForTests(true);
     }
+  });
+});
+
+describe("C: the reply gets its `@` back, on both engines, in one place", () => {
+  // A tuner-shaped prompt: a skill file with a scoped package, an e-mail and a decorator.
+  const SKILL = "use @anthropic-ai/sdk, write to me@example.com, mark it @decorator";
+
+  it("pty: a model that echoes the neutralised prompt returns the original text", async () => {
+    let modelSaw = "";
+    injectSpawnPty(async (opts) => {
+      spawned.push(opts);
+      return {
+        label: "state",
+        pid: 1,
+        sessionId: SID,
+        cwd: opts.cwd,
+        isAlive: () => true,
+        lastTurnEndedAt: () => 0,
+        runTurn: async (prompt: string) => {
+          // The real process writes the prompt through this same helper.
+          modelSaw = neutralizeFileMentions(prompt);
+          reply(opts, SID, modelSaw);
+          return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
+        },
+        dispose: async () => {},
+      } as never;
+    });
+    const result = await withPrintRuntime({ env: callerEnv() }, () =>
+      engines
+        .get("pty")!
+        .run({ route: "tuner.propose", prompt: SKILL, isolation: "untrusted", timeoutMs: 2000 }),
+    );
+    // Not vacuous: the model really was handed fullwidth characters.
+    expect(modelSaw.includes("\uff20")).toBe(true);
+    expect(result.text).toBe(SKILL);
+  });
+
+  async function printEcho(
+    isolation: "untrusted" | "trusted-session",
+    output?: string,
+  ): Promise<string> {
+    const spawnFn = (() => {
+      let input = "";
+      const child = Object.assign(new EventEmitter(), {
+        stdin: Object.assign(new EventEmitter(), {
+          end: (text: string) => {
+            input = text;
+          },
+        }),
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+        kill: () => true,
+      });
+      queueMicrotask(() => {
+        child.stdout.emit("data", Buffer.from(output ?? input));
+        child.emit("close", 0);
+      });
+      return child;
+    }) as never;
+    const result = await withPrintRuntime(
+      { spawn: spawnFn, env: callerEnv(), stdinPrompt: true },
+      () =>
+        engines.get("print")!.run({
+          route: isolation === "untrusted" ? "tuner.propose" : "compact",
+          isolation,
+          prompt: SKILL,
+          timeoutMs: 1000,
+        }),
+    );
+    return result.text;
+  }
+
+  it("print: the echoed prompt comes back with its @", async () => {
+    expect(await printEcho("untrusted")).toBe(SKILL);
+  });
+
+  it("a trusted call's reply is left exactly as the model wrote it", async () => {
+    expect(await printEcho("trusted-session", "a\uff20b")).toBe("a\uff20b");
   });
 });

@@ -62,14 +62,8 @@ function fakeSpawn(onTurn: (opts: PtyProcessOptions) => void = () => {}): void {
       runTurn: async () => {
         onTurn(opts);
         // An untrusted one-shot returns the transcript reply (#570), so the
-        // double writes one where the caller's config root points.
-        const caller = printRuntime()?.env;
-        const project = untrustedPtyProjectDir(
-          opts.cwd,
-          caller
-            ? (caller.CLAUDE_CONFIG_DIR ?? join(caller.HOME ?? homedir(), ".claude"))
-            : undefined,
-        );
+        // double writes one under the child's (throwaway) config root.
+        const project = untrustedPtyProjectDir(opts.cwd, opts.env.CLAUDE_CONFIG_DIR!);
         mkdirSync(project, { recursive: true });
         writeFileSync(
           join(project, "reply.jsonl"),
@@ -147,17 +141,28 @@ it("untrusted PTY spawn uses the exact same caller environment policy as print",
   await withPrintRuntime({ env }, () => runOnceOnPty({ ...request, model: "glm" }));
   expect(spawned).toHaveLength(1);
   // Compare in memory: a failed assertion must never dump a real environment.
+  // Exactly print's policy, plus the two variables that move the config location: the
+  // throwaway root, and the operator's credential store ("" = the default, as none is set).
+  const childRoot = spawned[0]!.env.CLAUDE_CONFIG_DIR ?? "";
+  expect(childRoot.includes("claudeclaw-oneshot-cfg-")).toBe(true);
+  const expected = {
+    ...env,
+    CLAUDE_CONFIG_DIR: childRoot,
+    CLAUDE_SECURESTORAGE_CONFIG_DIR: "",
+  };
   expect(
     JSON.stringify(Object.entries(spawned[0]!.env).sort()) ===
-      JSON.stringify(Object.entries(env).sort()),
+      JSON.stringify(Object.entries(expected).sort()),
   ).toBe(true);
 });
 
-it("transcript cleanup follows the caller's Claude config directory override", async () => {
+it("the transcript lives under the throwaway root, never under the caller's Claude config directory", async () => {
   const configDir = join(dir, "caller-config");
   let project = "";
+  let root = "";
   fakeSpawn((opts) => {
-    project = untrustedPtyProjectDir(opts.cwd, configDir);
+    root = opts.env.CLAUDE_CONFIG_DIR!;
+    project = untrustedPtyProjectDir(opts.cwd, root);
     mkdirSync(project, { recursive: true });
     writeFileSync(join(project, "caller-session.jsonl"), "private prompt");
   });
@@ -165,7 +170,11 @@ it("transcript cleanup follows the caller's Claude config directory override", a
     runOnceOnPty(request),
   );
   expect(project !== "").toBe(true);
+  expect(root === configDir).toBe(false);
   expect(existsSync(project)).toBe(false);
+  expect(existsSync(root)).toBe(false);
+  // The caller's directory was never even created.
+  expect(existsSync(configDir)).toBe(false);
 });
 
 it("untrusted native PTY inheritance excludes even native-only variables and restores the parent", async () => {
@@ -235,7 +244,7 @@ for (const failure of [false, true]) {
     mkdirSync(join(dir, "projects", "another-project"), { recursive: true });
     writeFileSync(sibling, "keep");
     fakeSpawn((opts) => {
-      project = untrustedPtyProjectDir(opts.cwd);
+      project = untrustedPtyProjectDir(opts.cwd, opts.env.CLAUDE_CONFIG_DIR!);
       mkdirSync(project, { recursive: true });
       writeFileSync(join(project, "probe-session.jsonl"), "private prompt");
       if (failure) throw new Error("probe failure");

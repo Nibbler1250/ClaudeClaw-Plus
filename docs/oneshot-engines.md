@@ -69,14 +69,29 @@ aborted or its own deadline ran out during the wait. Trusted routes keep the scr
 Routes that carry untrusted text also reject any isolation other than `untrusted`.
 
 What an untrusted PTY call does that print does not need to (all measured, see the spike
-doc): it marks its throwaway cwd trusted in the child's own config root before the call and
-removes that entry afterwards; it applies the spawn strip list (`ANTHROPIC_API_KEY`,
+doc): it runs in a throwaway config root, so it never touches the operator's own
+(`~/.claude`, `~/.claude.json`). Each call makes a `claudeclaw-oneshot-cfg-*` directory
+(0700, next to the temp cwd) with a minimal `.claude.json` (onboarding done, the temp cwd
+trusted), sets `CLAUDE_CONFIG_DIR` to it, and sets `CLAUDE_SECURESTORAGE_CONFIG_DIR` to the
+operator's own config directory (`""` when none is set) so claude still logs in as the
+operator; no credential is copied. Everything claude writes about the prompt (transcript,
+history, paste cache, session files) lands in that root, and the root is removed in the
+call's `finally` and again after a late spawn settles. If the root cannot be created or
+removed the call fails (the error is logged by step and code, never content). A daemon
+start removes leftover `claudeclaw-oneshot-cfg-*` and `claudeclaw-oneshot-pty-*` temp
+directories older than ten minutes. It applies the spawn strip list (`ANTHROPIC_API_KEY`,
 `CLAUDECODE`, short-lived OAuth tokens) to the caller's env, because an interactive
 claude with an API key in its env stops at a "custom API key" gate; it replaces every `@`
 in the prompt with U+FF20, because the REPL expands `@path` mentions itself, anywhere in a
-prompt, which `--tools ""` does not stop; and it removes the transcript, the lines
-it left in `history.jsonl` and its per-session files, failing closed (the call throws) if
-it cannot. The `req.system` text is passed as `--system-prompt`, as print does.
+prompt, which `--tools ""` does not stop. The reply gets its `@` back (U+FF20 becomes `@`)
+for every untrusted call on print and pty, in one place, so a skill file the tuner proposes
+keeps `@scope/pkg`, e-mail addresses and decorators. With `CLAUDECLAW_PTY_DUMP` set, an
+untrusted PTY traces metadata only (tag and length), never the prompt or the screen. The
+`req.system` text is passed as `--system-prompt`, as print does.
+
+Settings load does not depend on the startup probe: an explicit `pty` route for an untrusted
+route is accepted at load, and refused at the call while the version gate has not enabled
+isolation (the gate needs claude 2.1.304 or newer and runs once, at startup).
 
 Trusted calls may supply `cwd` for session lookup, including named-agent working
 directories. Both engines honour it. Untrusted calls cannot specify `cwd`, resume

@@ -83,6 +83,16 @@ export function neutralizeFileMentions(text: string): string {
   return text.replaceAll("@", FULLWIDTH_AT);
 }
 
+/**
+ * The inverse, for the model's reply: an untrusted prompt reaches the model with every `@`
+ * as U+FF20, so a reply that quotes it (`@scope/pkg`, an e-mail address, a decorator) comes
+ * back with U+FF20 too. A reply is never read as a prompt, so nothing expands it there. A
+ * U+FF20 the model wrote on its own is mapped as well; that is the price of one rule.
+ */
+export function restoreFileMentions(text: string): string {
+  return text.replaceAll(FULLWIDTH_AT, "@");
+}
+
 export interface PtyPromptWriteOptions {
   /**
    * The caller is deliberately sending a REPL command. Honoured only when the sanitized

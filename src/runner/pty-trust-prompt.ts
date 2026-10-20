@@ -26,7 +26,7 @@
 import { existsSync, lstatSync, readlinkSync, statSync } from "node:fs";
 import { chmod, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir as defaultHomedir } from "node:os";
-import { dirname, join, resolve as resolvePath } from "node:path";
+import { dirname, resolve as resolvePath } from "node:path";
 
 export interface TrustHealResult {
   ok: boolean;
@@ -95,71 +95,35 @@ function defaultProjectEntry(): Record<string, unknown> {
  */
 const _writeQueues = new Map<string, Promise<TrustHealResult | void>>();
 
-export interface TrustFileOptions {
-  /** Override the homedir lookup. Used by tests for tmp dirs. */
-  homedir?: () => string;
-  /** Override the config-file path entirely. Used by tests. */
-  configPath?: string;
-  /**
-   * Directory that holds the child's global `.claude.json`: its `CLAUDE_CONFIG_DIR`,
-   * else its `HOME`. For a spawn whose env differs from this process's (#570), where
-   * `homedir()` would heal a file the child never reads.
-   */
-  configRoot?: string;
-}
-
-function resolveConfigPath(opts?: TrustFileOptions): string {
+export async function ensureTrustAccepted(
+  cwd: string,
+  opts?: {
+    /** Override the homedir lookup. Used by tests for tmp dirs. */
+    homedir?: () => string;
+    /** Override the config-file path entirely. Used by tests. */
+    configPath?: string;
+  },
+): Promise<TrustHealResult> {
   // #304: `PLUS_CLAUDE_CONFIG_PATH` overrides the DEFAULT file this heals —
   // the test preload points it at a temp file so synthetic PTY spawns (every
   // test cwd is a temp dir) stop adding `projects[<tmp>]` entries to the
   // operator's real ~/.claude.json, which claude parses and backs up on every
-  // launch. An explicit `configPath`, `configRoot` or `homedir` from the caller
-  // still wins.
-  return (
+  // launch. An explicit `configPath` or `homedir` from the caller still wins.
+  const configPath =
     opts?.configPath ??
-    (opts?.configRoot
-      ? join(resolvePath(opts.configRoot), ".claude.json")
-      : opts?.homedir
-        ? resolvePath(opts.homedir(), ".claude.json")
-        : process.env.PLUS_CLAUDE_CONFIG_PATH
-          ? resolvePath(process.env.PLUS_CLAUDE_CONFIG_PATH)
-          : resolvePath(defaultHomedir(), ".claude.json"))
-  );
-}
+    (opts?.homedir
+      ? resolvePath(opts.homedir(), ".claude.json")
+      : process.env.PLUS_CLAUDE_CONFIG_PATH
+        ? resolvePath(process.env.PLUS_CLAUDE_CONFIG_PATH)
+        : resolvePath(defaultHomedir(), ".claude.json"));
+  const absoluteCwd = resolvePath(cwd);
 
-/** Run `job` after every earlier job on the same config file, whatever their outcome. */
-function serialised(
-  configPath: string,
-  job: () => Promise<TrustHealResult>,
-): Promise<TrustHealResult> {
   const prev = _writeQueues.get(configPath) ?? Promise.resolve();
-  const next = prev.catch(() => undefined).then(job);
+  const next = prev
+    .catch(() => undefined)
+    .then(() => _doEnsureTrustAccepted(configPath, absoluteCwd));
   _writeQueues.set(configPath, next);
   return next;
-}
-
-export async function ensureTrustAccepted(
-  cwd: string,
-  opts?: TrustFileOptions,
-): Promise<TrustHealResult> {
-  const configPath = resolveConfigPath(opts);
-  const absoluteCwd = resolvePath(cwd);
-  return serialised(configPath, () => _doEnsureTrustAccepted(configPath, absoluteCwd));
-}
-
-/**
- * Remove `projects[<absoluteCwd>]` again, under the same per-file queue as the write.
- * For a throwaway cwd (#570): without it `~/.claude.json` gains one entry per
- * untrusted one-shot and grows without bound (#304). A missing file or entry is not a
- * failure; malformed JSON is left untouched and reported.
- */
-export async function removeTrustEntry(
-  cwd: string,
-  opts?: TrustFileOptions,
-): Promise<TrustHealResult> {
-  const configPath = resolveConfigPath(opts);
-  const absoluteCwd = resolvePath(cwd);
-  return serialised(configPath, () => _doRemoveTrustEntry(configPath, absoluteCwd));
 }
 
 async function _doEnsureTrustAccepted(
@@ -202,7 +166,25 @@ async function _doEnsureTrustAccepted(
       ? { ...existing, hasTrustDialogAccepted: true }
       : defaultProjectEntry();
 
-    await _writeConfigAtomically(configPath, { ...raw, projects: next });
+    const updated = { ...raw, projects: next };
+    const payload = `${JSON.stringify(updated, null, 2)}\n`;
+
+    // Atomic-ish write: write a temp file then rename, so a process dying
+    // mid-write never leaves the file half-written. The rename lands on the
+    // symlink's target (a ~/.claude.json linked into a persisted volume stays
+    // a link) and the temp file carries the original mode: the file holds
+    // account state and is 0600, a fresh one is created 0600 too.
+    const target = writeTarget(configPath);
+    const mode = existsSync(target) ? statSync(target).mode & 0o777 : 0o600;
+    const tmpPath = `${target}.tmp-${process.pid}-${Date.now()}`;
+    try {
+      await writeFile(tmpPath, payload, { mode });
+      await chmod(tmpPath, mode); // `mode` above is filtered by the umask
+      await rename(tmpPath, target);
+    } catch (err) {
+      await unlink(tmpPath).catch(() => undefined);
+      throw err;
+    }
 
     return { ok: true, changed: true, configPath };
   } catch (err) {
@@ -212,70 +194,5 @@ async function _doEnsureTrustAccepted(
       configPath,
       reason: `failed to write ~/.claude.json: ${(err as Error).message}`,
     };
-  }
-}
-
-async function _doRemoveTrustEntry(
-  configPath: string,
-  absoluteCwd: string,
-): Promise<TrustHealResult> {
-  try {
-    if (!existsSync(configPath)) return { ok: true, changed: false, configPath };
-    const trimmed = (await Bun.file(configPath).text()).trim();
-    if (trimmed.length === 0) return { ok: true, changed: false, configPath };
-    let raw: Record<string, unknown>;
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        return { ok: true, changed: false, configPath };
-      }
-      raw = parsed as Record<string, unknown>;
-    } catch (err) {
-      return {
-        ok: false,
-        changed: false,
-        configPath,
-        reason: `~/.claude.json is malformed JSON: ${(err as Error).message}`,
-      };
-    }
-    const projects = raw.projects as Record<string, unknown> | undefined;
-    if (!projects || typeof projects !== "object" || !Object.hasOwn(projects, absoluteCwd)) {
-      return { ok: true, changed: false, configPath };
-    }
-    const { [absoluteCwd]: _removed, ...rest } = projects;
-    await _writeConfigAtomically(configPath, { ...raw, projects: rest });
-    return { ok: true, changed: true, configPath };
-  } catch (err) {
-    return {
-      ok: false,
-      changed: false,
-      configPath,
-      reason: `failed to update ~/.claude.json: ${(err as Error).message}`,
-    };
-  }
-}
-
-/**
- * Atomic-ish write: write a temp file then rename, so a process dying
- * mid-write never leaves the file half-written. The rename lands on the
- * symlink's target (a ~/.claude.json linked into a persisted volume stays
- * a link) and the temp file carries the original mode: the file holds
- * account state and is 0600, a fresh one is created 0600 too.
- */
-async function _writeConfigAtomically(
-  configPath: string,
-  updated: Record<string, unknown>,
-): Promise<void> {
-  const payload = `${JSON.stringify(updated, null, 2)}\n`;
-  const target = writeTarget(configPath);
-  const mode = existsSync(target) ? statSync(target).mode & 0o777 : 0o600;
-  const tmpPath = `${target}.tmp-${process.pid}-${Date.now()}`;
-  try {
-    await writeFile(tmpPath, payload, { mode });
-    await chmod(tmpPath, mode); // `mode` above is filtered by the umask
-    await rename(tmpPath, target);
-  } catch (err) {
-    await unlink(tmpPath).catch(() => undefined);
-    throw err;
   }
 }

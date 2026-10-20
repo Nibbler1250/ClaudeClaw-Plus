@@ -636,8 +636,8 @@ export function classifierSpawnEnv(
  * On `pty`, the default whenever the runner PTY is on and claude is at least the measured
  * version, the same flags drive an interactive claude (minus `--no-session-persistence`,
  * which is print-only), the prompt is typed in with every `@` replaced so it cannot name a
- * file, the reply is read from the transcript, and `runOnceOnPty` removes the transcript,
- * history lines and trust entry afterwards. The `deps.spawn` seam below is print-only: it
+ * file, the reply is read from the transcript, and the whole call runs in a throwaway
+ * Claude config root and cwd that `runOnceOnPty` removes afterwards. The `deps.spawn` seam below is print-only: it
  * is ignored when the call lands on pty.
  */
 export async function classifyThreadIntent(

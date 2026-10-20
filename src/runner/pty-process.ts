@@ -519,6 +519,8 @@ class PtyProcessImpl implements PtyProcess {
   private _exitInfo: PtyExitInfo | null = null;
   /** Credential values in the child env, redacted from the tail snapshot. */
   private readonly _secretValues: string[];
+  /** Untrusted one-shot: the prompt and the raw PTY output stay out of `CLAUDECLAW_PTY_DUMP`. */
+  private readonly _untrustedTrace: boolean;
 
   constructor(pty: IPty, opts: PtyProcessOptions) {
     this._pty = pty;
@@ -527,6 +529,7 @@ class PtyProcessImpl implements PtyProcess {
       opts.sessionId && opts.sessionId.length > 0 ? opts.sessionId : (opts.newSessionId ?? "");
     this.cwd = opts.cwd;
     this._secretValues = collectSecretValues(opts.env);
+    this._untrustedTrace = opts.isolation === "untrusted";
     this.label = `${opts.agentName ?? "pty"}:${pty.pid}`;
     this._quietWindowMs = opts.quietWindowMs ?? DEFAULT_QUIET_WINDOW_MS;
     // Untrusted text also loses its `@` file mentions (see neutralizeFileMentions). The
@@ -624,11 +627,23 @@ class PtyProcessImpl implements PtyProcess {
 
   // ─── data flow ────────────────────────────────────────────────────────
 
+  /**
+   * A trace line that can carry prompt or reply text. An untrusted one-shot's PTY writes
+   * metadata only (tag and length): the screen echoes the prompt, and the trace file lives
+   * outside the throwaway config root that is removed after the call (A in r11).
+   */
+  private _trace(tag: string, payload: string): void {
+    dumpPtyTrace(
+      tag,
+      this._untrustedTrace ? `[withheld: untrusted, ${payload.length} chars]` : payload,
+    );
+  }
+
   private _handleData(data: string): void {
     // bun-pty delivers strings; re-encode for the byte-level parser.
     const bytes = new TextEncoder().encode(data);
     const now = this._now();
-    dumpPtyTrace(
+    this._trace(
       `<< pid=${this._pid} state=${this._parser.state} turn=${this._turnInProgress} n=${bytes.length}`,
       data,
     );
@@ -766,7 +781,7 @@ class PtyProcessImpl implements PtyProcess {
     // CR after them is a keypress whatever the length. The sanitizer strips
     // ESC, so the prompt cannot close the paste early.
     try {
-      dumpPtyTrace(`>> pid=${this._pid} write prompt`, `${JSON.stringify(prompt).slice(0, 80)}+CR`);
+      this._trace(`>> pid=${this._pid} write prompt`, `${JSON.stringify(prompt).slice(0, 80)}+CR`);
       this._pty.write(
         `${PASTE_START}${this._preparePrompt(prompt, { allowReplCommand: opts.allowReplCommand })}${PASTE_END}\r`,
       );

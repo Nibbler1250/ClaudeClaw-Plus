@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { _setSettingsFileForTests, loadSettings, reloadSettings } from "../config.js";
 import { runOneShot, type OneShotRequest } from "./engine.js";
+import { applyPtyIsolationVersionGate } from "./claude-version.js";
 import { engines } from "./registry.js";
 import { KNOWN_ROUTES, UNTRUSTED_ROUTES, parseOneShotSettings } from "./config.js";
 import { PRINT_ONLY_UNTRUSTED_ARGS, UNTRUSTED_CLAUDE_ARGS } from "./isolation.js";
@@ -455,7 +456,7 @@ describe("one-shot isolation contract", () => {
         return {
           runTurn: async () => {
             // The untrusted result is the transcript reply (#570), not the screen.
-            const project = untrustedPtyProjectDir(opts.cwd, configDir);
+            const project = untrustedPtyProjectDir(opts.cwd, opts.env.CLAUDE_CONFIG_DIR!);
             mkdirSync(project, { recursive: true });
             writeFileSync(
               join(project, "s.jsonl"),
@@ -644,9 +645,27 @@ describe("one-shot configuration", () => {
   ]) {
     it(`accepts untrusted PTY now the isolation spike is green: ${JSON.stringify(settings)}`, () =>
       expect(() => parseOneShotSettings(settings)).not.toThrow());
+    it(`loads before the startup gate has run, with isolation still off: ${JSON.stringify(settings)}`, () => {
+      const saved = engines.get("pty")!.caps.isolation;
+      engines.get("pty")!.caps.isolation = false;
+      try {
+        expect(() => parseOneShotSettings(settings)).not.toThrow();
+      } finally {
+        engines.get("pty")!.caps.isolation = saved;
+      }
+    });
   }
-  it("the PTY engine advertises isolation (#570)", () =>
-    expect(engines.get("pty")!.caps.isolation).toBe(true));
+  it("the PTY engine advertises isolation once the startup gate has seen a measured claude (#570)", () => {
+    const saved = engines.get("pty")!.caps.isolation;
+    try {
+      applyPtyIsolationVersionGate("2.1.304", () => {});
+      expect(engines.get("pty")!.caps.isolation).toBe(true);
+      applyPtyIsolationVersionGate("2.1.303", () => {});
+      expect(engines.get("pty")!.caps.isolation).toBe(false);
+    } finally {
+      engines.get("pty")!.caps.isolation = saved;
+    }
+  });
   it("rejects untrusted routes on any engine without the isolation capability", () => {
     engines.set("noiso", {
       id: "noiso",
