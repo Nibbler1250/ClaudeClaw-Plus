@@ -13,6 +13,12 @@ import {
   runOnceOnPty,
 } from "../runner/pty-supervisor.js";
 import { untrustedPtyProjectDir } from "./pty-cleanup.js";
+import {
+  TRANSCRIPT_WAIT_FLOOR_MS,
+  TRANSCRIPT_WAIT_MS,
+  awaitLastAssistantReply,
+  transcriptWaitBudget,
+} from "./pty-transcript.js";
 
 /** #570: an untrusted one-shot returns the model's transcript reply, never screen text. */
 const SCREEN_WITH_EXAMPLE = [
@@ -184,5 +190,88 @@ describe("#570 one-shot PTY reply extraction", () => {
     });
     expect((await runOnceOnPty(request)).text).toBe("ok");
     expect(await Bun.file(join(project, "s.jsonl")).exists()).toBe(false);
+  });
+});
+
+describe("#570 failed-turn latency", () => {
+  /** A project dir holding the given transcript entries, no PTY involved. */
+  function project(entries: Entry[]): string {
+    const projectDir = join(dir, "latency-project");
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(
+      join(projectDir, "s.jsonl"),
+      entries.map((entry) => JSON.stringify(entry)).join("\n"),
+    );
+    return projectDir;
+  }
+  /** A fake clock: sleeping advances time, so latency is measured without waiting. */
+  function fakeClock() {
+    let time = 0;
+    return {
+      now: () => time,
+      sleep: async (ms: number) => {
+        time += ms;
+      },
+      elapsed: () => time,
+    };
+  }
+
+  it("an API-error-only transcript fails at once, far under the bound", async () => {
+    const clock = fakeClock();
+    const result = await awaitLastAssistantReply(project([userEntry(), syntheticError()]), {
+      waitMs: TRANSCRIPT_WAIT_MS,
+      ...clock,
+    });
+    expect(result).toEqual({ failure: "api-error" });
+    expect(clock.elapsed()).toBeLessThan(TRANSCRIPT_WAIT_MS / 10);
+  });
+
+  it("an empty transcript still waits out the bound, then reports a timeout", async () => {
+    const clock = fakeClock();
+    const result = await awaitLastAssistantReply(project([userEntry()]), {
+      waitMs: 2000,
+      ...clock,
+    });
+    expect(result).toEqual({ failure: "timeout" });
+    expect(clock.elapsed()).toBeGreaterThanOrEqual(2000);
+  });
+
+  it("a real reply wins over an earlier API-error entry", async () => {
+    const clock = fakeClock();
+    const result = await awaitLastAssistantReply(
+      project([userEntry(), syntheticError(), assistant("m2", [text("recovered")])]),
+      { waitMs: 2000, ...clock },
+    );
+    expect(result).toEqual({ text: "recovered" });
+  });
+
+  it("the transcript wait is what the turn left of timeoutMs, capped, with a floor", () => {
+    expect(transcriptWaitBudget(15_000, 2_000)).toBe(13_000);
+    expect(transcriptWaitBudget(60_000, 1_000)).toBe(TRANSCRIPT_WAIT_MS);
+    expect(transcriptWaitBudget(15_000, 14_500)).toBe(TRANSCRIPT_WAIT_FLOOR_MS);
+    expect(transcriptWaitBudget(15_000, 20_000)).toBe(TRANSCRIPT_WAIT_FLOOR_MS);
+  });
+
+  it("runOnceOnPty: an API-error-only transcript returns exit 1 straight away", async () => {
+    injectOneShotTranscriptWaitForTests(null);
+    fakePty([userEntry(), syntheticError()]);
+    const started = Date.now();
+    const result = await runOnceOnPty({ ...request, timeoutMs: 10_000 });
+    expect(result.exitCode).toBe(1);
+    expect(result.text).toBe("");
+    expect(Date.now() - started).toBeLessThan(1500);
+    const logged = warn.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+    expect(logged).toContain("api-error");
+  });
+
+  it("runOnceOnPty: an exhausted budget bounds the transcript wait to the floor", async () => {
+    injectOneShotTranscriptWaitForTests(null);
+    fakePty([userEntry()]);
+    const started = Date.now();
+    const result = await runOnceOnPty({ ...request, timeoutMs: 400 });
+    expect(result.exitCode).toBe(1);
+    expect(result.text).toBe("");
+    // 15 s without the budget; the floor is 1 s.
+    expect(Date.now() - started).toBeLessThan(2500);
   });
 });

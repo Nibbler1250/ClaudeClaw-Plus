@@ -36,14 +36,29 @@ function replyText(entry: TranscriptEntry): string | undefined {
   return text === "" ? undefined : text;
 }
 
+/** A synthetic or API-error assistant entry: the CLI's own failure record, not a model reply. */
+function isFailureEntry(entry: TranscriptEntry): boolean {
+  return (
+    entry.type === "assistant" &&
+    (entry.isApiErrorMessage === true || entry.message?.model === "<synthetic>")
+  );
+}
+
+export interface TranscriptScan {
+  /** Text of the last real assistant message, if any. */
+  reply?: string;
+  /** The transcript holds a synthetic or API-error assistant entry. */
+  failed: boolean;
+}
+
 /**
- * Text of the last real assistant message in the transcripts under `projectDir`.
- * One API message can span several entries (thinking, then text); entries sharing
- * the last reply's `message.id` are joined. A partial trailing line is skipped.
- * Never throws: an unreadable file simply supplies no evidence.
+ * Scan the transcripts under `projectDir`. One API message can span several entries
+ * (thinking, then text); entries sharing the last reply's `message.id` are joined.
+ * A partial trailing line is skipped. Never throws: an unreadable file supplies no evidence.
  */
-export function readLastAssistantReply(projectDir: string): string | undefined {
+export function scanTranscript(projectDir: string): TranscriptScan {
   const replies: Array<{ id: string | undefined; text: string }> = [];
+  let failed = false;
   for (const file of transcriptFiles(projectDir)) {
     let raw: string;
     try {
@@ -55,6 +70,7 @@ export function readLastAssistantReply(projectDir: string): string | undefined {
       if (line.trim() === "") continue;
       try {
         const entry = JSON.parse(line) as TranscriptEntry;
+        if (isFailureEntry(entry)) failed = true;
         const text = replyText(entry);
         if (text === undefined) continue;
         const id = entry.message?.id;
@@ -65,36 +81,73 @@ export function readLastAssistantReply(projectDir: string): string | undefined {
     }
   }
   const last = replies.at(-1);
-  if (!last) return undefined;
-  if (last.id === undefined) return last.text;
-  return replies
-    .filter((reply) => reply.id === last.id)
-    .map((reply) => reply.text)
-    .join("");
+  if (!last) return { failed };
+  if (last.id === undefined) return { reply: last.text, failed };
+  return {
+    reply: replies
+      .filter((reply) => reply.id === last.id)
+      .map((reply) => reply.text)
+      .join(""),
+    failed,
+  };
+}
+
+/** Text of the last real assistant message under `projectDir`, if any. */
+export function readLastAssistantReply(projectDir: string): string | undefined {
+  return scanTranscript(projectDir).reply;
+}
+
+/**
+ * How long the transcript wait may take: what is left of the caller's `timeoutMs` after
+ * the turn, capped at `capMs`, never below a small floor so a turn that used its whole
+ * budget still gets one look at a transcript that is about to land.
+ */
+export const TRANSCRIPT_WAIT_FLOOR_MS = 1_000;
+export function transcriptWaitBudget(
+  timeoutMs: number,
+  elapsedMs: number,
+  capMs = TRANSCRIPT_WAIT_MS,
+): number {
+  return Math.min(capMs, Math.max(TRANSCRIPT_WAIT_FLOOR_MS, timeoutMs - elapsedMs));
 }
 
 export interface AwaitReplyOptions {
   waitMs?: number;
   settleMs?: number;
   signal?: AbortSignal;
+  /** Injectable clock and sleep, so latency is testable without real time. */
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+export interface AwaitReplyResult {
+  text?: string;
+  /** Why there is no text: the CLI recorded a failure and no reply, or nothing appeared in time. */
+  failure?: "api-error" | "timeout";
 }
 
 /**
  * Poll for the reply until it appears or `waitMs` passes, then settle briefly and
- * re-read so a text entry written just after the first is not missed. Returns
- * undefined when none appears: the caller must not substitute screen text.
+ * re-read so a text entry written just after the first is not missed. If the transcript
+ * already holds a synthetic or API-error entry and no real reply, the turn has failed
+ * and waiting longer cannot help: return at once. The caller must never substitute
+ * screen text for a missing reply.
  */
 export async function awaitLastAssistantReply(
   projectDir: string,
   options: AwaitReplyOptions = {},
-): Promise<string | undefined> {
-  const deadline = Date.now() + (options.waitMs ?? TRANSCRIPT_WAIT_MS);
-  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+): Promise<AwaitReplyResult> {
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const deadline = now() + (options.waitMs ?? TRANSCRIPT_WAIT_MS);
   for (;;) {
-    if (readLastAssistantReply(projectDir) !== undefined) break;
-    if (options.signal?.aborted || Date.now() >= deadline) return undefined;
+    const scan = scanTranscript(projectDir);
+    if (scan.reply !== undefined) break;
+    if (scan.failed) return { failure: "api-error" };
+    if (options.signal?.aborted || now() >= deadline) return { failure: "timeout" };
     await sleep(POLL_MS);
   }
   await sleep(options.settleMs ?? SETTLE_MS);
-  return readLastAssistantReply(projectDir);
+  const text = readLastAssistantReply(projectDir);
+  return text === undefined ? { failure: "timeout" } : { text };
 }

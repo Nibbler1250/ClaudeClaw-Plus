@@ -68,7 +68,11 @@ import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";
 import { trustedToolFlags, validateIsolation } from "../oneshot/isolation.js";
 import { validateRouteEngine } from "../oneshot/config.js";
 import * as untrustedCleanup from "../oneshot/pty-cleanup.js";
-import { TRANSCRIPT_WAIT_MS, awaitLastAssistantReply } from "../oneshot/pty-transcript.js";
+import {
+  TRANSCRIPT_WAIT_MS,
+  awaitLastAssistantReply,
+  transcriptWaitBudget,
+} from "../oneshot/pty-transcript.js";
 import { printRuntime } from "../oneshot/print.js";
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -1708,6 +1712,7 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
   // the turn settling (a hung turn or a spawn that never lands).
   let tempCwd: string | undefined;
   let tempProjectDir: string | undefined;
+  const startedAt = Date.now();
   try {
     if (untrusted) {
       tempCwd = mkdtempSync(join(tmpdir(), "claudeclaw-oneshot-pty-"));
@@ -1753,12 +1758,20 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
       // The rendered screen carries the echoed prompt (for the classifier, its
       // example JSON), so an untrusted caller must never parse it. Return the
       // model's own reply from the transcript, which the finally below removes.
-      const reply = await awaitLastAssistantReply(tempProjectDir, {
-        waitMs: oneShotTranscriptWaitMs,
+      // The wait counts against the caller's deadline: what the turn left of timeoutMs.
+      const waited = await awaitLastAssistantReply(tempProjectDir, {
+        waitMs: transcriptWaitBudget(
+          req.timeoutMs,
+          Date.now() - startedAt,
+          oneShotTranscriptWaitMs,
+        ),
         signal: req.signal,
       });
+      const reply = waited.text;
       if (reply === undefined) {
-        console.warn(`[pty-supervisor] one-shot ${req.route}: no assistant reply in transcript`);
+        console.warn(
+          `[pty-supervisor] one-shot ${req.route}: no assistant reply in transcript (${waited.failure ?? "timeout"})`,
+        );
         return result(1, "", exec.sessionId);
       }
       return result(0, reply, exec.sessionId);

@@ -782,40 +782,64 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     );
   }
 
-  // GENUINE thread-management message, parsed the way production parses it.
-  // Reports whether the real runOnceOnPty result is the intent the model chose.
-  const genuineCompleted: boolean[] = [];
+  // GENUINE thread-management message on Haiku, parsed the way production parses it.
+  // Haiku only: the classifier's own model id is retired (reported separately).
   for (let attempt = 1; attempt <= 2; attempt++) {
-    for (const fallback of [false, true]) {
-      test(
-        `GENUINE message ${fallback ? "haiku fallback" : "production model"}: attempt ${attempt}/2`,
-        async () => {
-          if (fallback && genuineCompleted[attempt - 1]) {
-            console.info(`[isolation-spike] genuine attempt=${attempt} haiku-fallback=skipped`);
-            return;
-          }
-          const model = fallback ? "haiku" : PRODUCTION_MODEL;
-          expect(model).not.toBe("");
-          const prompt = `${classifierContract}\n\n---\nUser message: please create a thread called release-notes`;
-          evidenceWaitMs = 5_000;
-          const result = await run(prompt, {
-            allowNoTurn: true,
-            timeoutMs: 30_000,
-            model,
-            screen: `genuine-${attempt}-${fallback ? "haiku" : "prod"}`,
-          });
-          const parsed = productionParse(result.rawText);
-          const completed = result.exitCode === 0 && !result.hung;
-          if (!fallback) genuineCompleted[attempt - 1] = completed;
-          console.info(
-            `[isolation-spike] genuine attempt=${attempt} model=${fallback ? "haiku" : "production"} exit=${result.exitCode} completed=${completed} elapsedMs=${result.elapsedMs} ${replyShape(result.rawText)}; expectedIntent=${parsed.outcome === "intent" && parsed.action === "hire" && (parsed.names ?? []).some((name) => /release-notes/i.test(name))}`,
-          );
-          expect(toolUse).toBe(false);
-        },
-        BUDGET,
-      );
-    }
+    test(
+      `GENUINE message (haiku): attempt ${attempt}/2`,
+      async () => {
+        const prompt = `${classifierContract}\n\n---\nUser message: please create a thread called release-notes`;
+        evidenceWaitMs = 5_000;
+        const result = await run(prompt, {
+          allowNoTurn: true,
+          timeoutMs: 30_000,
+          model: "haiku",
+          screen: `genuine-${attempt}`,
+        });
+        const parsed = productionParse(result.rawText);
+        console.info(
+          `[isolation-spike] genuine attempt=${attempt} model=haiku exit=${result.exitCode} elapsedMs=${result.elapsedMs} ${replyShape(result.rawText)}; expectedIntent=${parsed.outcome === "intent" && parsed.action === "hire" && (parsed.names ?? []).some((name) => /release-notes/i.test(name))}`,
+        );
+        expect(toolUse).toBe(false);
+      },
+      BUDGET,
+    );
   }
+
+  // ONE attempt on the production model id (retired). It must fail closed FAST: the
+  // transcript holds only an API-error entry, so runOnceOnPty returns exit 1 at once
+  // instead of waiting out the transcript bound, inside the classifier's 15 s deadline.
+  test(
+    "PRODUCTION model id fails closed fast (retired model, 15 s classifier deadline)",
+    async () => {
+      expect(PRODUCTION_MODEL).not.toBe("");
+      const prompt = `${classifierContract}\n\n---\nUser message: please create a thread called release-notes`;
+      // The harness's own evidence poll would add its wait to the measured latency.
+      expectAssistant = false;
+      const started = Date.now();
+      const warned: string[] = [];
+      warnings.mockImplementation((...args: unknown[]) => {
+        warned.push(String(args[0]));
+      });
+      const result = await withPrintRuntime({ env: callerPolicy() }, () =>
+        runOnceOnPty({
+          route: "discord.classifier",
+          isolation: "untrusted",
+          prompt,
+          model: PRODUCTION_MODEL,
+          timeoutMs: 15_000,
+        }),
+      );
+      const elapsedMs = Date.now() - started;
+      console.info(
+        `[isolation-spike] production-model attempt exit=${result.exitCode} elapsedMs=${elapsedMs} textLength=${result.text.length} warnedApiError=${warned.some((line) => line.includes("(api-error)"))} warnedTimeout=${warned.some((line) => line.includes("(timeout)"))}`,
+      );
+      expect(result.exitCode).toBe(1);
+      expect(result.text).toBe("");
+      expect(elapsedMs).toBeLessThan(15_000);
+    },
+    BUDGET,
+  );
 
   test("HANG RATE summary", () => {
     for (const probe of ["baseline", "contract"]) {
