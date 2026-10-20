@@ -273,6 +273,37 @@ let _libcUnsetEnv: ((name: Buffer) => number) | null = null;
 let _libcSetEnv: ((name: Buffer, value: Buffer, overwrite: number) => number) | null = null;
 let _libcLoadAttempted = false;
 
+/** The libc names `dlopen` is tried with, in order. One list: loadLibc and readNativeEnvironment share it. */
+export function libcCandidates(): string[] {
+  return process.platform === "darwin"
+    ? ["libSystem.B.dylib", "/usr/lib/libSystem.B.dylib"]
+    : ["libc.so.6", "libc.so"];
+}
+
+/**
+ * Open the first libc candidate `dlopen` accepts (glibc has `libc.so.6`, musl does not).
+ * Throws the last dlopen error when none opens, so callers stay fail-closed.
+ * `dlopen` and `candidates` are parameters only so a test can drive the fallthrough.
+ */
+export function dlopenLibc(
+  // biome-ignore lint/suspicious/noExplicitAny: Bun FFI dlopen and its symbol table are untyped here
+  dlopen: (path: string, symbols: any) => any,
+  // biome-ignore lint/suspicious/noExplicitAny: see above
+  symbols: any,
+  candidates: string[] = libcCandidates(),
+  // biome-ignore lint/suspicious/noExplicitAny: see above
+): any {
+  let lastError: unknown = new Error("No libc candidate to open");
+  for (const candidate of candidates) {
+    try {
+      return dlopen(candidate, symbols);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
+}
+
 function loadLibc(): void {
   if (_libcLoadAttempted) return;
   _libcLoadAttempted = true;
@@ -281,48 +312,66 @@ function loadLibc(): void {
     // up under tsc / non-Bun tooling.
     // biome-ignore lint/suspicious/noExplicitAny: dynamic Bun runtime import
     const { dlopen, FFIType } = require("bun:ffi") as any;
-    const candidates =
-      process.platform === "darwin"
-        ? ["libSystem.B.dylib", "/usr/lib/libSystem.B.dylib"]
-        : ["libc.so.6", "libc.so"];
-    for (const candidate of candidates) {
-      try {
-        const lib = dlopen(candidate, {
-          unsetenv: { args: [FFIType.cstring], returns: FFIType.i32 },
-          setenv: {
-            args: [FFIType.cstring, FFIType.cstring, FFIType.i32],
-            returns: FFIType.i32,
-          },
-        });
-        _libcUnsetEnv = lib.symbols.unsetenv;
-        _libcSetEnv = lib.symbols.setenv;
-        return;
-      } catch {
-        // try next candidate
-      }
-    }
+    const lib = dlopenLibc(dlopen, {
+      unsetenv: { args: [FFIType.cstring], returns: FFIType.i32 },
+      setenv: {
+        args: [FFIType.cstring, FFIType.cstring, FFIType.i32],
+        returns: FFIType.i32,
+      },
+    });
+    _libcUnsetEnv = lib.symbols.unsetenv;
+    _libcSetEnv = lib.symbols.setenv;
   } catch {
-    // bun:ffi unavailable (e.g. test env). The strip-list path of withCleanProcessEnv
-    // falls back to a JS-only delete: fine for tests against /bin/cat etc., but it would
-    // re-leak under real bun-pty + native fork. The `policy` path (untrusted spawns)
-    // does not fall back: it throws "Native environment isolation unavailable".
+    // bun:ffi unavailable (e.g. test env), or no libc candidate opened. The strip-list path
+    // of withCleanProcessEnv falls back to a JS-only delete: fine for tests against /bin/cat
+    // etc., but it would re-leak under real bun-pty + native fork. The `policy` path
+    // (untrusted spawns) does not fall back: it throws "Native environment isolation
+    // unavailable".
   }
 }
 
 let _readNativeEnvironment: (() => Map<string, string>) | undefined;
 
+// biome-ignore lint/suspicious/noExplicitAny: Bun FFI dlopen is untyped here
+let _dlopenForTests: ((path: string, symbols: any) => any) | undefined;
+
+/**
+ * Test seam (#570 r15d): read the native environment with `dlopen` replaced, on a fresh
+ * cache, then put the real cache back. Lets a test make the first libc candidate fail.
+ */
+export function _readNativeEnvironmentWithDlopenForTests(
+  // biome-ignore lint/suspicious/noExplicitAny: Bun FFI dlopen is untyped here
+  dlopen: (path: string, symbols: any) => any,
+): Map<string, string> {
+  const cached = _readNativeEnvironment;
+  _readNativeEnvironment = undefined;
+  _dlopenForTests = dlopen;
+  try {
+    return readNativeEnvironment();
+  } finally {
+    _dlopenForTests = undefined;
+    _readNativeEnvironment = cached;
+  }
+}
+
 /** Enumerate libc, not process.env: Bun may have deleted a key only on the JS side. */
 function readNativeEnvironment(): Map<string, string> {
   if (!_readNativeEnvironment) {
     // biome-ignore lint/suspicious/noExplicitAny: platform-specific Bun FFI symbols
-    const { dlopen, FFIType, read, CString } = require("bun:ffi") as any;
+    const { dlopen: bunDlopen, FFIType, read, CString } = require("bun:ffi") as any;
+    const dlopen = _dlopenForTests ?? bunDlopen;
     const darwin = process.platform === "darwin";
-    const lib = dlopen(
-      darwin ? "/usr/lib/libSystem.B.dylib" : "libc.so.6",
-      darwin
-        ? { _NSGetEnviron: { args: [], returns: FFIType.ptr } }
-        : { dlsym: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.ptr } },
-    );
+    let lib: any;
+    try {
+      lib = dlopenLibc(
+        dlopen,
+        darwin
+          ? { _NSGetEnviron: { args: [], returns: FFIType.ptr } }
+          : { dlsym: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.ptr } },
+      );
+    } catch {
+      throw new Error("Native environment isolation unavailable");
+    }
     _readNativeEnvironment = () => {
       const address = darwin
         ? lib.symbols._NSGetEnviron()

@@ -60,6 +60,7 @@ import {
 } from "../../src/runner/pty-screen-signals.js";
 import { PRINT_ONLY_UNTRUSTED_ARGS, UNTRUSTED_CLAUDE_ARGS } from "../../src/oneshot/isolation.js";
 import {
+  firstSpawnOnly,
   isHangSignature,
   retryRowTimeoutMs,
   rowRetryLine,
@@ -657,6 +658,13 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       return { attempted, took };
     };
     let { attempted: result, took: elapsedMs } = await attempt();
+    let carried = {
+      transcriptRaw: "",
+      toolUse: false,
+      childHasCanary: false,
+      childHasApiKey: false,
+      childHasOauthToken: false,
+    };
     if (
       options.retryHang !== undefined &&
       isHangSignature({
@@ -668,8 +676,20 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       })
     ) {
       console.info(rowRetryLine(options.retryHang));
-      // The hung call must have cleaned up after itself before the call is made again.
+      // The hung call must have cleaned up after itself before the call is made again: its
+      // temp cwd AND its throwaway config root. (afterEach removes leftover roots, so without
+      // this a root attempt 1 leaked would go unseen once attempt 2 ran.)
       expect(opts.every((spawned) => !existsSync(spawned.cwd))).toBe(true);
+      expect(childRoots.every((spawnedRoot) => !existsSync(spawnedRoot))).toBe(true);
+      // Attempt 1's evidence is kept: a negative check below (canary, tool use, env) must
+      // hold for BOTH attempts, not just the one that happened to reply.
+      carried = {
+        transcriptRaw: carried.transcriptRaw + transcriptRaw,
+        toolUse: carried.toolUse || toolUse,
+        childHasCanary: carried.childHasCanary || childHasCanary,
+        childHasApiKey: carried.childHasApiKey || childHasApiKey,
+        childHasOauthToken: carried.childHasOauthToken || childHasOauthToken,
+      };
       opts = [];
       project = "";
       transcriptSeen = 0;
@@ -693,6 +713,12 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         ),
       );
     }
+    // Fold attempt 1's evidence back in (empty when the row did not retry).
+    transcriptRaw = carried.transcriptRaw + transcriptRaw;
+    toolUse ||= carried.toolUse;
+    childHasCanary ||= carried.childHasCanary;
+    childHasApiKey ||= carried.childHasApiKey;
+    childHasOauthToken ||= carried.childHasOauthToken;
     const hung = result.exitCode !== 0 || assistantEntries === 0;
     if (options.screen) {
       if (hung) await captureScreen(options.screen);
@@ -1287,10 +1313,15 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         );
         let before = new Map<string, ByteFact>();
         if (twin) extraChildEnv = { CLAUDE_CONFIG_DIR: config };
+        // Once per row (r15d): a retry's spawn must not re-take the baseline, or it would
+        // already hold whatever attempt 1 wrote into the operator config.
+        const takeBaseline = firstSpawnOnly(() => {
+          before = byteSnapshot(config).files;
+        });
         beforeSpawn = (seeded) => {
           // The twin's child must reach its prompt in the operator root, so it gets the seed.
           if (twin) copyFileSync(join(seeded, ".claude.json"), join(config, ".claude.json"));
-          before = byteSnapshot(config).files;
+          takeBaseline();
         };
         await run(
           `Reply with ${DONE}.`,

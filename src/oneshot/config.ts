@@ -21,7 +21,10 @@ export const UNTRUSTED_ROUTES = [
   "memory.recall",
 ];
 
-/** Every route a caller passes to `runOneShot`; the only keys `oneShot.routes` accepts. */
+/**
+ * Every route a caller passes to `runOneShot`; the only keys `oneShot.routes` accepts.
+ * `memory.recall` is reserved: it is accepted here but has no `runOneShot` caller yet.
+ */
 export const KNOWN_ROUTES: readonly string[] = [...RESUME_ROUTES, ...UNTRUSTED_ROUTES];
 /** `resolveOneShotEngine` falls back on `<first segment>.*`, so only those wildcards bind. */
 const ROUTE_FAMILIES = new Set(KNOWN_ROUTES.map((route) => route.split(".")[0]));
@@ -104,7 +107,7 @@ export function validateRouteEngine(
     throw new Error(
       `oneShot untrusted route '${route}' cannot use '${id}': engine does not advertise isolation` +
         (engineType(id, declarations) === "pty"
-          ? ` (the interactive engine is isolated only on claude ${MIN_PTY_ISOLATION_CLAUDE_VERSION} or newer, checked once at startup)`
+          ? ` (the interactive engine is isolated only on claude ${MIN_PTY_ISOLATION_CLAUDE_VERSION} or newer, and not on Windows, checked once at startup)`
           : ""),
     );
   }

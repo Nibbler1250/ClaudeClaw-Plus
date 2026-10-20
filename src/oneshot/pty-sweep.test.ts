@@ -1031,12 +1031,16 @@ describe("a persisted record from another boot is gone", () => {
     const cwd = createUntrustedTempCwd();
     const root = createUntrustedConfigRoot([cwd]);
     try {
-      // null off Linux (nothing to compare), the kernel's id on Linux. Either way the field is there.
+      // null off Linux (nothing to compare), the kernel's id on Linux. Either way the key is
+      // there: on a plain Mac run both sides are null, so `toBe` alone cannot see it missing.
       const owner = readOwnerFile(root);
       expect(typeof owner).toBe("object");
+      const rawOwner = JSON.parse(readFileSync(join(root, ONESHOT_OWNER_FILE), "utf8"));
+      expect("bootId" in rawOwner).toBe(true);
       expect((owner as OwnerRecord).bootId).toBe(currentBootId());
       markGroupSurvivor(root, 4242, { startMs: 7, cwds: [cwd] });
       const record = JSON.parse(readFileSync(join(root, ONESHOT_SURVIVOR_FILE), "utf8"));
+      expect("bootId" in record).toBe(true);
       expect(record.bootId).toBe(currentBootId());
     } finally {
       rmSync(root, { recursive: true, force: true });

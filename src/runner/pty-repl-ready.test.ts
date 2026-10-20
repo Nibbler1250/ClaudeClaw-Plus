@@ -283,6 +283,20 @@ describe("a pending ready gate ends with the child (r15, A2)", () => {
     expect(clock.pending.size).toBe(0);
   });
 
+  it("a turn started on a child that already exited does not start a gate", async () => {
+    const clock = gateClock();
+    // spawnPty rejects a child that dies before the screen settles, so it exits just after.
+    const child = await spawnWithClock(clock, "sleep 0.3; exit 3");
+    // Wait for the exit to be seen: runTurn must find the child gone, not catch it dying.
+    for (let waited = 0; child.isAlive() && waited < 3000; waited += 50) await settled(50);
+    expect(child.isAlive()).toBe(false);
+    const result = await outcome(turn(child, GATE_MS));
+    expect(result).toBeInstanceOf(PtyNotReadyError);
+    expect((result as Error).message).toMatch(/\(exited\)/);
+    expect(clock.pending.size).toBe(0);
+    expect(received()).toBe("");
+  });
+
   it("a turn started on a child that is already retired does not start a gate", async () => {
     const clock = gateClock();
     const child = await spawnWithClock(clock);

@@ -147,7 +147,7 @@ untrusted PTY traces metadata only (tag and length), never the prompt or the scr
 
 Settings load does not depend on the startup probe: an explicit `pty` route for an untrusted
 route is accepted at load, and refused at the call while the version gate has not enabled
-isolation (the gate needs claude 2.1.304 or newer and runs once, at startup).
+isolation (the gate needs claude 2.1.304 or newer, and not Windows, and runs once, at startup).
 
 Trusted calls may supply `cwd` for session lookup, including named-agent working
 directories. Both engines honour it. Untrusted calls cannot specify `cwd`, resume

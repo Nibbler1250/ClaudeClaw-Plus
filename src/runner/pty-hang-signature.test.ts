@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
   ATTEMPT_OVERHEAD_MS,
+  firstSpawnOnly,
   type HangObservation,
   isHangSignature,
   RETRY_MARGIN_MS,
@@ -71,5 +72,39 @@ describe("retryRowTimeoutMs", () => {
     const hungFirst = 60_000 + ATTEMPT_OVERHEAD_MS; // 75 s
     expect(retryRowTimeoutMs(60_000)).toBeGreaterThanOrEqual(2 * hungFirst + RETRY_MARGIN_MS);
     expect(retryRowTimeoutMs(60_000)).toBeGreaterThan(140_000);
+  });
+});
+
+describe("firstSpawnOnly", () => {
+  // The A-untouched row takes `before = byteSnapshot(config)` in a beforeSpawn hook. On a retry
+  // the hook fires again; it must not re-take the baseline once attempt 1 has written to config.
+  it("takes the baseline on the first spawn and keeps it when the row retries", () => {
+    const operatorConfig = new Map<string, string>([["history.jsonl", "operator line"]]);
+    let before = new Map<string, string>();
+    const takeBaseline = firstSpawnOnly(() => {
+      before = new Map(operatorConfig);
+    });
+    takeBaseline(); // attempt 1 spawns
+    operatorConfig.set("leaked.json", "written by attempt 1"); // a regression, then a hang
+    takeBaseline(); // attempt 2 spawns
+    expect([...before.keys()]).toEqual(["history.jsonl"]);
+  });
+
+  it("passes the first call's arguments through and ignores later ones", () => {
+    const seen: string[] = [];
+    const hook = firstSpawnOnly((root: string) => seen.push(root));
+    hook("root-1");
+    hook("root-2");
+    expect(seen).toEqual(["root-1"]);
+  });
+
+  it("keeps separate state per wrapper", () => {
+    let count = 0;
+    const a = firstSpawnOnly(() => count++);
+    const b = firstSpawnOnly(() => count++);
+    a();
+    b();
+    a();
+    expect(count).toBe(2);
   });
 });

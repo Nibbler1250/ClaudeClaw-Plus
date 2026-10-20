@@ -1248,7 +1248,9 @@ class PtyProcessImpl implements PtyProcess {
    * Untrusted one-shot: resolve `ok` once claude's REPL footer is on screen with no login,
    * onboarding or trust screen, and `!ok` with a reason code otherwise (a blocked screen, or no
    * footer within the budget). Fails closed: the caller does not write the prompt unless this is
-   * `ok`. Only the reason code is reported, never screen text. Spawn-time only; once decided,
+   * `ok`. Only the reason code is reported, never screen text. Two more verdicts end the wait
+   * without a footer: `closed` (the child was retired, now or while waiting) and `exited` (it
+   * died, now or while waiting, with no blocked screen to name). Spawn-time only; once decided,
    * the screen is no longer collected.
    */
   _awaitReplReady(budgetMs: number): Promise<ReplReadyVerdict> {

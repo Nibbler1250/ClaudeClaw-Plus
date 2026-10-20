@@ -57,3 +57,20 @@ export function rowRetryResultLine(
 ): string {
   return `[isolation-spike] row-retry ${rowLabel}: attempt=2 exit=${exitCode} reason=${reason ?? "none"} elapsedMs=${elapsedMs}`;
 }
+
+/**
+ * Wrap a per-spawn hook so it runs on a row's FIRST spawn only. A baseline taken in a
+ * `beforeSpawn` hook must not be taken again when the row retries: attempt 2's "before" would
+ * already contain whatever attempt 1 wrote into the operator config, and the row would compare
+ * attempt 2 against a baseline that hides attempt 1's regression (#570 r15d).
+ */
+export function firstSpawnOnly<A extends unknown[]>(
+  hook: (...args: A) => void,
+): (...args: A) => void {
+  let done = false;
+  return (...args: A) => {
+    if (done) return;
+    done = true;
+    hook(...args);
+  };
+}

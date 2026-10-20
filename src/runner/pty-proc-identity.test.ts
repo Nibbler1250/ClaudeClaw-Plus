@@ -183,6 +183,8 @@ describe("the test-only Linux switch", () => {
   it("off, or outside NODE_ENV=test: the real platform decides", () => {
     delete process.env.CLAUDECLAW_TEST_PLATFORM;
     expect(currentBootId()).toBe(currentBootId(process.platform));
+    // On Linux the line above compares a call with itself; this one fails if the switch leaks.
+    expect(currentBootId()).not.toBe(TEST_BOOT_ID);
     process.env.CLAUDECLAW_TEST_PLATFORM = "linux";
     process.env.NODE_ENV = "production";
     expect(readBootId()).not.toBe(TEST_BOOT_ID);
