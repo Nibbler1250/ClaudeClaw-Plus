@@ -235,3 +235,65 @@ So all seven rows pass in both directions in this run. **The tools row is nevert
 **Typecheck discrepancy (item 4):** resolved, not a regression. `bun run typecheck` (the ratchet) reports **149 against baseline 149** on this branch HEAD and **149 against baseline 149** on `povai/feat/572-oneshot-pty-routes` (checked from an isolated `git archive`). My earlier 154 came from counting `error TS` lines in raw `tsc --noEmit`, which gives 154 on both branches. This branch adds none.
 
 **Next:** Step 3 was not done, as instructed. Two things worth deciding before it: (1) whether an intermittent hang on a tools-disabled injection prompt is acceptable given the 15 s bound and fail-closed fallback, and (2) a rerun to measure the hang rate, with the capture fixed (compute flags before redaction, redact per matched token not per line, and read the live screen before disposal). Each costs a workflow run.
+
+### r6: Step 3 and the final run
+
+Commit `0966990e`, run [39355199935](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39355199935), Claude **2.1.304**: **33 pass, 0 fail**. This was the single r6 run. Positive control `MCP=true; hooks=true; memory=true; assistant=true; completed=true`.
+
+| Row | Control present | Control removed |
+| --- | --- | --- |
+| Tools, MCP, hooks, memory, command flag, transcript cleanup, environment | all `isolated=true` | all seven RED |
+
+RED lines, verbatim:
+
+```text
+[isolation-spike] RED-with-control-removed tools: expected true, received false
+[isolation-spike] RED-with-control-removed MCP: expected true, received false
+[isolation-spike] RED-with-control-removed hooks: expected true, received false
+[isolation-spike] RED-with-control-removed memory: expected true, received false
+[isolation-spike] RED-with-control-removed command flag alone (not production sanitizer): expected true, received false
+[isolation-spike] RED-with-control-removed transcript cleanup: expected true, received false
+[isolation-spike] RED-with-control-removed environment: expected true, received false
+```
+
+**Hang rate (`--tools ""`, 30 s bound, sequential, every attempt asserted no marker and no tool_use):**
+
+| Probe | Attempts | Hung (exit 124 or no assistant record) | Exit codes | Elapsed |
+| --- | --- | --- | --- | --- |
+| Tools-baseline prompt | 5 | **0** | all 0 | 4.8, 4.9, 5.3, 6.4, 7.0 s |
+| Classifier-contract variant | 5 | **0** | all 0 | 6.1, 6.8, 7.2, 8.0, 10.8 s |
+
+No hang means no hang screen: the fixed capture (live chunk stream read before disposal, flags computed before redaction, per-token masking) only emits on a hang, so it was **not exercised** and is verified by typecheck and lint only. Across all samples of these prompts on the branch there is one confirmed hang (run 39351240090) in about fourteen, plus one ambiguous no-assistant-record exit 0, so the intermittent no-reply is real but rare, and still unexplained.
+
+**Reply shape, classifier-contract variant (booleans and lengths only):**
+
+| Attempt | Production text (what `classifyThreadIntent` parses) | Transcript assistant text |
+| --- | --- | --- |
+| 1 | not null, not JSON, 5372 chars | 301 chars, same |
+| 2 | not null, not JSON, 11145 chars | 630 chars, same |
+| 3 | not null, not JSON, 5278 chars | 326 chars, same |
+| 4 | not null, not JSON, 9796 chars | 603 chars, same |
+| 5 | not null, not JSON, 5349 chars | 364 chars, same |
+
+`productionParseOk=false` in 5/5. The right answer to the injected message was `null`, so the model's prose was wrong for the contract. Separately, `runOnceOnPty` returns `exec.rawStdout` (terminal text, 5 to 11 k chars), not the model's reply. If that raw text carries the echoed prompt, the classifier's greedy `{...}` match would also fail for a genuine hire/fire message. That second part is inferred from code and these shapes, not measured: no probe sent a real hire/fire message, and the probe used Haiku where production uses `claude-sonnet-4-20250514`. **Because `pty.enabled` defaults to true off Windows, the default flip makes this the default path, so classification may silently degrade to `null` on PTY. Settle this before any PR.**
+
+**Step 3 as built:**
+- `pty` `caps.isolation: true` (`src/oneshot/registry.ts`), comment cites the spike doc.
+- `resolveOneShotEngine` (`src/oneshot/config.ts`): implicit default is `pty` when `pty.enabled` for resume routes and untrusted routes, else `print`. Explicit `oneShot.routes` / `oneShot.default` still win. `parseOneShotSettings` still resolves with `pty.enabled` false, so settings validation is unchanged.
+- Tests: trusted-routes (per untrusted route: default, overrides, explicit pty accepted; win32 default via `defaultPtyEnabled("win32")`; `runOneShot` dispatch across `pty.enabled` true/false/true; an untrusted request still cannot pass cwd, tools, allowedTools or resumeSessionId). Four obsolete "rejects untrusted PTY" assertions in `engine.test.ts` and `trusted-routes.test.ts` were rewritten to the new behaviour.
+- Docs: `docs/spikes/0.7-interactive-isolation.md` rewritten from this report (per-row table, positive control, print-only flag and compensating control, env policy, intermittent no-reply, version); `docs/oneshot-engines.md` replaced the "until the spike is reviewed green" paragraph.
+- **README: no edit.** There is no "Still on print" line in `README.md` on this branch (it presumably lives in #576, which also touches the README). Adding one here would only create a conflict.
+
+Fault injection, one site at a time, restored after each:
+
+```text
+(a) caps.isolation back to false -> 13 failures, e.g.
+(fail) one-shot configuration > the PTY engine advertises isolation (#570)
+(fail) one-shot configuration > accepts untrusted PTY now the isolation spike is green: {"default":"pty"}
+(fail) #570 untrusted PTY dispatch > runOneShot sends the classifier to the pty engine only when pty.enabled
+(b) untrusted default reverted to print -> 5 failures
+(fail) #572 trusted route defaults > discord.classifier: pty.enabled selects pty, otherwise print (#570)
+(fail) #570 untrusted PTY dispatch > runOneShot sends the classifier to the pty engine only when pty.enabled
+```
+
+Local: `src/oneshot` + `session-actions-argv` **187 pass, 5 skip, 0 fail**; all PTY-related test files plus `runner.test.ts` **535 pass, 0 fail**; integration guard **0 pass, 27 skip, 0 fail**; lint 0 errors; typecheck ratchet **149 against baseline 149**. Plugin and marketplace **2.2.350**. No PR opened.
