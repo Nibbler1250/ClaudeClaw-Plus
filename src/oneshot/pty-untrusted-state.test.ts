@@ -27,6 +27,7 @@ import { setUntrustedFileMentionNeutralizingForTests } from "../runner/pty-proce
 import { neutralizeFileMentions } from "../runner/pty-prompt-sanitizer.js";
 import {
   __keepRootAfterFailedDisposeForTests,
+  __untrustedGroupOptionsForTests,
   __landPtyForTests,
   __resetSupervisorForTests,
   injectOneShotTrustForTests,
@@ -828,6 +829,24 @@ describe("r14b: an unreadable process is a hold on the root, not a failure", () 
         rmSync(o.cwd, { recursive: true, force: true });
       }
     }
+  });
+
+  it("hands the scan the leader's start time, and turns what it could not read into a hold on the root", async () => {
+    const seen: Array<{ target: unknown; leader: unknown }> = [];
+    const options = __untrustedGroupOptionsForTests(
+      "/tmp/root-wired",
+      "/tmp/cwd-wired",
+      async (target, opts) => {
+        seen.push({ target, leader: undefined });
+        opts?.onUnknown?.([unreadable(5151, 123_450)]);
+        return [];
+      },
+    );
+    const left = await options.reapEscapees!({ pid: 4242, startMs: 98_760 });
+    expect(left).toEqual([]);
+    expect((seen[0]!.target as { leaderStartMs?: number }).leaderStartMs).toBe(98_760);
+    expect(cleanup.unknownHoldCount()).toBe(1);
+    expect(cleanup.unknownHoldActive("/tmp/root-wired")).toBe(false); // pid 5151 is not alive here
   });
 
   it("still fails the call for a positively matched escapee that will not die", async () => {

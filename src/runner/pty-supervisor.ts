@@ -1753,6 +1753,7 @@ function untrustedChildEnvWithRoot(
 function untrustedGroupOptions(
   root: string,
   tempCwd: string,
+  reap: typeof terminateEscapees = terminateEscapees,
 ): Pick<PtyProcessOptions, "onGroupSurvived" | "reapEscapees"> {
   const cwds = untrustedCleanup.untrustedCwdForms(tempCwd);
   return {
@@ -1761,7 +1762,7 @@ function untrustedGroupOptions(
     // Processes the scan could not read are kept as a hold on the root, not as a failure: the
     // reply was already obtained, and the only risk is removing a directory under a live writer.
     reapEscapees: (leader) =>
-      terminateEscapees(
+      reap(
         { root, cwds, leaderStartMs: leader.startMs },
         {
           onUnknown: (unknown) =>
@@ -1800,6 +1801,9 @@ function keepRootAfterFailedDispose(
     });
   }
 }
+
+/** Test seam: the options an untrusted call's PTY gets, with the scan replaced. */
+export const __untrustedGroupOptionsForTests = untrustedGroupOptions;
 
 /** Test seams for the failed-disposal paths (#570 r14). */
 export const __keepRootAfterFailedDisposeForTests = keepRootAfterFailedDispose;
