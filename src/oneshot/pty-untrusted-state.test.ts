@@ -74,6 +74,8 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  cleanup.resetGroupSurvivorsForTests();
+  cleanup.resetOneShotSweeperForTests();
   warn.mockRestore();
   error.mockRestore();
   injectSpawnPty(null);
@@ -502,7 +504,7 @@ describe("r12 A: a process group that outlives retirement fails the call and kee
           reply(opts);
           return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
         },
-        dispose: async () => opts.onGroupSurvived?.(424242),
+        dispose: async () => opts.onGroupSurvived?.(424242, null),
       } as never;
     });
     const registered = cleanup.activeOneShotDirCount();
@@ -515,6 +517,136 @@ describe("r12 A: a process group that outlives retirement fails the call and kee
       expect(logged).toContain("pid 424242");
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// #570 r13 (G): the real PtyProcess retirement, with a kernel that never sees the group go.
+describe("r13 A/G: a survivor keeps the call failed, the root in place, and is signalled again by the sweeper", () => {
+  const stubborn = {
+    signal: ((_pid: number, _name: unknown): void => {}) as never, // every probe says "still there"
+    termGraceMs: 40,
+    killGraceMs: 40,
+    pollMs: 10,
+    liveMembers: () => undefined,
+  };
+
+  it("does not resolve 0, does not delete the root, retries each tick, and sweeps only after the survivor is gone", async () => {
+    let shellPid = 0;
+    injectSpawnPty(async (opts) => {
+      spawned.push(opts);
+      const real = await spawnPty({
+        ...opts,
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", "sleep 60"],
+        _skipReadySettle: true,
+        _groupTermination: stubborn,
+      });
+      shellPid = real.pid;
+      // Only the turn is faked: the claude transcript. Retirement is the real one.
+      return Object.assign(real, {
+        runTurn: async () => {
+          reply(opts);
+          return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
+        },
+      });
+    });
+    try {
+      // 1. the call fails: it never reports an isolated success.
+      await expect(run()).rejects.toThrow(/survived retirement/);
+      const root = spawned[0]!.env.CLAUDE_CONFIG_DIR!;
+      const tempCwd = spawned[0]!.cwd;
+      try {
+        // 2. the root is still there, and recorded with the identity read at spawn.
+        expect(existsSync(root)).toBe(true);
+        expect(cleanup.groupSurvivorOf(root)).toBe(shellPid);
+
+        // 3. a sweep of an old root does not delete it while the survivor is alive.
+        const old = new Date(Date.now() - 60 * 60_000);
+        utimesSync(root, old, old);
+        utimesSync(tempCwd, old, old);
+        cleanup.sweepStaleOneShotDirs(tmpdir(), Date.now());
+        expect(existsSync(root)).toBe(true);
+        expect(existsSync(tempCwd)).toBe(true);
+
+        // 4. each sweeper tick terminates the survivor again, with the recorded identity.
+        const attempts: Array<{ pid: number; start: number | null | undefined }> = [];
+        let groupGone = false;
+        let tick: (() => void) | undefined;
+        cleanup.startOneShotSweeper({
+          sweep: () => cleanup.sweepStaleOneShotDirs(tmpdir(), Date.now()),
+          retrySurvivors: () =>
+            cleanup.retrySurvivingGroups({
+              terminate: async (pid, opts) => {
+                attempts.push({ pid, start: opts.leaderStartMs });
+                return groupGone;
+              },
+              reap: async () => [],
+            }),
+          setInterval: (callback) => {
+            tick = callback;
+            return {};
+          },
+        });
+        tick?.();
+        await new Promise((r) => setTimeout(r, 20));
+        tick?.();
+        await new Promise((r) => setTimeout(r, 20));
+        expect(attempts.map((a) => a.pid)).toEqual([shellPid, shellPid]);
+        expect(attempts[0]!.start).not.toBeNull();
+        expect(existsSync(root)).toBe(true); // alive: still protected after two ticks
+
+        // 5. once the group is gone the entry is dropped, and the next pass sweeps the root.
+        groupGone = true;
+        tick?.();
+        await new Promise((r) => setTimeout(r, 20));
+        expect(cleanup.groupSurvivorOf(root)).toBeUndefined();
+        tick?.();
+        await new Promise((r) => setTimeout(r, 20));
+        expect(existsSync(root)).toBe(false);
+        expect(existsSync(tempCwd)).toBe(false);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+        rmSync(tempCwd, { recursive: true, force: true });
+      }
+    } finally {
+      try {
+        process.kill(shellPid, "SIGKILL");
+      } catch {
+        /* gone */
+      }
+    }
+  });
+});
+
+describe("r13 A6: a disposal that rejects keeps the root, as a survivor does", () => {
+  it("fails the call and leaves the config root when dispose() throws", async () => {
+    injectSpawnPty(async (opts) => {
+      spawned.push(opts);
+      return {
+        label: "state",
+        pid: 4242,
+        sessionId: SID,
+        cwd: opts.cwd,
+        isAlive: () => true,
+        lastTurnEndedAt: () => 0,
+        runTurn: async () => {
+          reply(opts);
+          return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
+        },
+        dispose: async () => {
+          throw new Error("survivor hook failed");
+        },
+      } as never;
+    });
+    await expect(run()).rejects.toThrow(/survived retirement/);
+    const root = spawned[0]!.env.CLAUDE_CONFIG_DIR!;
+    try {
+      expect(existsSync(root)).toBe(true);
+      expect(cleanup.groupSurvivorOf(root)).toBe(4242);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(spawned[0]!.cwd, { recursive: true, force: true });
     }
   });
 });

@@ -30,7 +30,10 @@ function fakeKernel(diesOn: NodeJS.Signals | null, { visible = true } = {}) {
   return { signal, calls };
 }
 
-const instant = { sleep: async () => {}, liveMembers: () => undefined, pollMs: 100 };
+/** The leader is ours: the PTY still owns it, and its start time is the one recorded at spawn. */
+const START = 1_700_000_000_000;
+const ours = { leaderStartMs: START, startMs: () => START, leaderAlive: () => true };
+const instant = { sleep: async () => {}, liveMembers: () => undefined, pollMs: 100, ...ours };
 
 describe("terminateProcessGroup", () => {
   it("SIGTERMs the group and the leader, and is done once both answer ESRCH", async () => {
@@ -83,6 +86,63 @@ describe("terminateProcessGroup", () => {
     expect(processGroupGone(PID, zombie, () => undefined)).toBe(false);
   });
 
+  describe("pid identity (#570 r13, B)", () => {
+    const signalled = (calls: Array<[number, NodeJS.Signals | 0]>) =>
+      calls.filter(([, name]) => name !== 0);
+
+    it("signals nothing when the pid now has a different start time", async () => {
+      const k = fakeKernel("SIGKILL");
+      // Went red with the start-time check removed from `send` (signals went to the stranger),
+      // and with the poll not noticing the reuse (false, the call waited out and failed).
+      const reused = { ...instant, startMs: () => START + 3_600_000 };
+      expect(await terminateProcessGroup(PID, { signal: k.signal, ...reused })).toBe(true);
+      expect(signalled(k.calls)).toEqual([]);
+    });
+
+    it("checks again before the SIGKILL: a pid reused after the SIGTERM is not killed", async () => {
+      const k = fakeKernel(null);
+      let reads = 0;
+      // The first readings (before SIGTERM) are ours; every later one is a stranger's.
+      const startMs = () => (reads++ < 2 ? START : START + 3_600_000);
+      // A short SIGTERM grace, so the escalation is reached before any poll can notice the reuse.
+      const result = await terminateProcessGroup(PID, {
+        signal: k.signal,
+        ...instant,
+        startMs,
+        termGraceMs: 100,
+      });
+      // Went red (a SIGKILL among the signals) when the escalation reused the identity read
+      // before the SIGTERM instead of reading it again.
+      expect(signalled(k.calls).every(([, name]) => name === "SIGTERM")).toBe(true);
+      expect(signalled(k.calls).length).toBe(2);
+      expect(result).toBe(true); // a reused pid means the group we started is gone
+    });
+
+    it("signals only the group, never the bare pid, once the child has exited", async () => {
+      const k = fakeKernel("SIGKILL");
+      const exited = { ...instant, leaderAlive: () => false };
+      await terminateProcessGroup(PID, { signal: k.signal, ...exited });
+      // Went red ([PID, ...] among the signals) with the ownership check removed.
+      expect(signalled(k.calls).length).toBeGreaterThan(0);
+      expect(signalled(k.calls).every(([target]) => target === -PID)).toBe(true);
+    });
+
+    it("signals nothing when the leader is gone and the group has no member either", async () => {
+      const k = fakeKernel("SIGKILL", { visible: false });
+      // Went red with the identity check removed, and with the bare pid signalled after "gone".
+      expect(await terminateProcessGroup(PID, { signal: k.signal, ...instant })).toBe(true);
+      expect(signalled(k.calls)).toEqual([]);
+    });
+
+    it("does not signal a pid whose start time was never recorded unless the PTY still owns it", async () => {
+      const k = fakeKernel("SIGKILL");
+      const unrecorded = { ...instant, leaderStartMs: null, leaderAlive: () => false };
+      // Went red (true, with signals sent) with the unknown identity read as "same".
+      expect(await terminateProcessGroup(PID, { signal: k.signal, ...unrecorded })).toBe(false);
+      expect(signalled(k.calls)).toEqual([]);
+    });
+  });
+
   it("never signals a pid that could reach init, itself, or every process", async () => {
     for (const pid of [0, 1, -1, -PID, Number.NaN, 1.5, process.pid]) {
       const k = fakeKernel("SIGTERM");
@@ -124,6 +184,33 @@ describe("procLiveMembers", () => {
 
   it("is zero when only zombies are left", () => {
     entry(PID, "sh", "Z", PID);
+    expect(procLiveMembers(PID, proc)).toBe(0);
+  });
+
+  it("is unknown, not zero, when no member can be seen at all", () => {
+    entry(PID + 2, "other", "S", 777);
+    // Went red (0) with zero allowed without a zombie having been seen.
+    expect(procLiveMembers(PID, proc)).toBeUndefined();
+  });
+
+  // #570 r13, D: an entry whose stat cannot be read may be a live member.
+  it("counts an unreadable entry as unknown, so a zombie beside it does not make the group gone", () => {
+    entry(PID, "sh", "Z", PID);
+    mkdirSync(join(proc, String(PID + 1)));
+    mkdirSync(join(proc, String(PID + 1), "stat")); // reading a directory fails with EISDIR
+    // Went red (0, "gone") with a failed read skipped, as before r13.
+    expect(procLiveMembers(PID, proc)).toBeUndefined();
+  });
+
+  it("still counts a live member it can see when another entry is unreadable", () => {
+    entry(PID + 1, "sleep", "S", PID);
+    mkdirSync(join(proc, String(PID + 2)));
+    mkdirSync(join(proc, String(PID + 2), "stat"));
+    expect(procLiveMembers(PID, proc)).toBe(1);
+  });
+
+  it("does not take X (dead) state for alive", () => {
+    entry(PID, "sh", "X", PID);
     expect(procLiveMembers(PID, proc)).toBe(0);
   });
 });

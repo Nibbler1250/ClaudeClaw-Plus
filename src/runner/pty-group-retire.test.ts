@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type PtyProcessOptions, spawnPty } from "./pty-process.js";
+import { processStartMs } from "./pty-proc-identity.js";
 
 /**
  * #570 r12 (A): retiring a PTY child stops its whole process group and proves it. These run a
@@ -165,5 +166,112 @@ describe("retiring a PTY child", () => {
     });
     await child.dispose();
     expect(survived).toEqual([]);
+  });
+});
+
+// #570 r13 (A, B, C): what retirement does with the recorded identity, a failing hook and the scan.
+describe("retirement and the recorded identity", () => {
+  it("signals nothing through the group path when the pid's start time is not the one recorded at spawn", async () => {
+    const sent: Array<[number, unknown]> = [];
+    const recorder = (pid: number, name: unknown): void => {
+      if (name !== 0) sent.push([pid, name]);
+      else process.kill(pid, 0);
+    };
+    const { child, bg } = await spawnShell(HUP_PROOF_BG, {
+      _groupTermination: {
+        signal: recorder as never,
+        startMs: () => 1, // the pid "now" belongs to a process that started in 1970
+        termGraceMs: 200,
+        killGraceMs: 200,
+        pollMs: 20,
+      },
+    });
+    await child.dispose();
+    expect(sent).toEqual([]);
+    expect(alive(bg)).toBe(true); // nothing signalled it; cleaned up in afterEach
+  });
+
+  it("hands the survivor hook the start time recorded at spawn", async () => {
+    const seen: Array<[number, number | null]> = [];
+    const { child } = await spawnShell(HUP_PROOF_BG, {
+      onGroupSurvived: (pid, startMs) => seen.push([pid, startMs]),
+      _groupTermination: {
+        signal: ((_pid: number, _name: unknown): void => {}) as never,
+        termGraceMs: 60,
+        killGraceMs: 60,
+        pollMs: 20,
+        liveMembers: () => undefined,
+      },
+    });
+    const readNow = processStartMs(child.pid); // the same reader, while the child is alive
+    await child.dispose();
+    expect(seen.length).toBe(1);
+    const [pid, startMs] = seen[0] as [number, number | null];
+    expect(pid).toBe(child.pid);
+    expect(startMs).not.toBeNull();
+    expect(startMs).toBe(readNow);
+  });
+
+  it("fails closed when the survivor hook throws: it is logged and dispose rejects", async () => {
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { child } = await spawnShell(HUP_PROOF_BG, {
+        onGroupSurvived: () => {
+          throw new Error("could not record");
+        },
+        _groupTermination: {
+          signal: ((_pid: number, _name: unknown): void => {}) as never,
+          termGraceMs: 60,
+          killGraceMs: 60,
+          pollMs: 20,
+          liveMembers: () => undefined,
+        },
+      });
+      await expect(child.dispose()).rejects.toThrow(/survivor hook failed/);
+      const logged = error.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+      expect(logged).toContain("survivor hook threw");
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("reports a process outside the group that the scan could not stop, and a scan that threw", async () => {
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const reported: number[] = [];
+      const left = await spawnShell(HUP_PROOF_BG, {
+        onGroupSurvived: (pid) => reported.push(pid),
+        reapEscapees: async () => [7777],
+      });
+      await left.child.dispose();
+      expect(reported).toEqual([left.child.pid]);
+
+      reported.length = 0;
+      const threw = await spawnShell(HUP_PROOF_BG, {
+        onGroupSurvived: (pid) => reported.push(pid),
+        reapEscapees: async () => {
+          throw new Error("scan failed");
+        },
+      });
+      await threw.child.dispose();
+      expect(reported).toEqual([threw.child.pid]);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("calls no survivor hook when the group is gone and the scan finds nothing", async () => {
+    const reported: number[] = [];
+    let scans = 0;
+    const { child } = await spawnShell(HUP_PROOF_BG, {
+      onGroupSurvived: (pid) => reported.push(pid),
+      reapEscapees: async () => {
+        scans++;
+        return [];
+      },
+    });
+    await child.dispose();
+    expect(scans).toBe(1);
+    expect(reported).toEqual([]);
   });
 });

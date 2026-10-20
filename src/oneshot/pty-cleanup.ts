@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
@@ -14,6 +13,16 @@ import {
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { encodeCwdForProjectsDir } from "../bus/jsonl-line-types.js";
+import { type EscapeScanTarget, terminateEscapees } from "../runner/pty-escape-scan.js";
+import { type GroupTerminationOptions, terminateProcessGroup } from "../runner/pty-group-kill.js";
+import {
+  START_TIME_TOLERANCE_MS,
+  type StartMsReader,
+  cachedStartMs,
+  processStartMs,
+} from "../runner/pty-proc-identity.js";
+
+export { processStartMs };
 
 /**
  * An untrusted PTY one-shot writes nothing about the call under the operator's Claude config
@@ -97,21 +106,6 @@ export interface OwnerRecord {
   instance: string;
 }
 
-/** Start time of `pid` from `ps -o lstart=` (1 s resolution), or null when it cannot be read. */
-export function processStartMs(pid: number): number | null {
-  try {
-    const out = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
-      encoding: "utf8",
-      timeout: 2000,
-    });
-    if (out.status !== 0) return null;
-    const ms = Date.parse(out.stdout.trim());
-    return Number.isNaN(ms) ? null : ms;
-  } catch {
-    return null;
-  }
-}
-
 let selfOwner: OwnerRecord | undefined;
 function selfOwnerRecord(): OwnerRecord {
   selfOwner ??= {
@@ -129,17 +123,31 @@ export function writeOwnerFile(dir: string): void {
   });
 }
 
-function readOwnerFile(dir: string): OwnerRecord | undefined {
+/**
+ * What a directory's owner file says: a record, `missing` (no such file: a directory made before
+ * the owner file existed), or `unreadable` (the file is there but cannot be read or understood).
+ * The two must not be confused: a leftover with no owner file is swept by age, but one whose
+ * owner file is damaged may belong to a live call, so it is quarantined (#570 r13, A).
+ */
+export type OwnerFile = OwnerRecord | "missing" | "unreadable";
+
+export function readOwnerFile(dir: string): OwnerFile {
+  let raw: string;
   try {
-    const parsed = JSON.parse(readFileSync(join(dir, ONESHOT_OWNER_FILE), "utf8")) as OwnerRecord;
-    if (!Number.isInteger(parsed.pid) || typeof parsed.instance !== "string") return undefined;
+    raw = readFileSync(join(dir, ONESHOT_OWNER_FILE), "utf8");
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unreadable";
+  }
+  try {
+    const parsed = JSON.parse(raw) as OwnerRecord;
+    if (!Number.isInteger(parsed.pid) || typeof parsed.instance !== "string") return "unreadable";
     return {
       pid: parsed.pid,
       startMs: typeof parsed.startMs === "number" ? parsed.startMs : null,
       instance: parsed.instance,
     };
   } catch {
-    return undefined;
+    return "unreadable";
   }
 }
 
@@ -157,15 +165,98 @@ export function activeOneShotDirCount(): number {
 }
 
 /**
- * Roots whose claude process group could not be stopped (the root may still be written into).
- * Keyed by root path; the value is the pid that outlived SIGKILL.
+ * What is needed to stop a claude that outlived its retirement, and to keep its directories safe
+ * meanwhile: the leader's pid with the start time it had at spawn, the temp cwd and its forms.
  */
-const survivingGroups = new Map<string, number>();
-export function markGroupSurvivor(root: string, pid: number): void {
-  survivingGroups.set(root, pid);
+export interface GroupSurvivor {
+  pid: number;
+  /** The leader's start time at spawn, null when it could not be read. */
+  startMs: number | null;
+  tempCwd?: string;
+  cwds: string[];
+  /** Retries made by the sweeper so far. */
+  retries: number;
+}
+
+/**
+ * Roots whose claude process group could not be stopped (the root may still be written into).
+ * Keyed by root path. The sweeper signals them again every pass and drops an entry only once
+ * the group, and anything that left it, is gone; until then neither directory is swept.
+ */
+const survivingGroups = new Map<string, GroupSurvivor>();
+export function markGroupSurvivor(
+  root: string,
+  pid: number,
+  extra: { startMs?: number | null; tempCwd?: string; cwds?: string[] } = {},
+): void {
+  survivingGroups.set(root, {
+    pid,
+    startMs: extra.startMs ?? null,
+    tempCwd: extra.tempCwd,
+    cwds: extra.cwds ?? [],
+    retries: survivingGroups.get(root)?.retries ?? 0,
+  });
 }
 export function groupSurvivorOf(root: string): number | undefined {
-  return survivingGroups.get(root);
+  return survivingGroups.get(root)?.pid;
+}
+/** Test seam: how many roots have an unstopped survivor. */
+export function groupSurvivorCount(): number {
+  return survivingGroups.size;
+}
+/** Test seam: forget every recorded survivor. */
+export function resetGroupSurvivorsForTests(): void {
+  survivingGroups.clear();
+}
+const protectedBySurvivor = (path: string): boolean => {
+  for (const [root, survivor] of survivingGroups) {
+    if (root === path || survivor.tempCwd === path) return true;
+  }
+  return false;
+};
+
+export interface SurvivorRetryDeps {
+  terminate?: (pid: number, opts: GroupTerminationOptions) => Promise<boolean>;
+  reap?: (target: EscapeScanTarget) => Promise<number[]>;
+  startMs?: StartMsReader;
+}
+
+/**
+ * Signal every recorded survivor again. Each is checked against the start time recorded at
+ * spawn before any signal, so a pid that was reused is never touched; the leader is no longer
+ * ours, so only its group is signalled. An entry is dropped once the group and everything that
+ * left it are gone. A retry that fails is logged as metadata (pid, retry count, how many
+ * processes), never paths or environment. Returns how many entries were cleared.
+ */
+export async function retrySurvivingGroups(deps: SurvivorRetryDeps = {}): Promise<number> {
+  const terminate = deps.terminate ?? terminateProcessGroup;
+  const reap = deps.reap ?? ((target: EscapeScanTarget) => terminateEscapees(target));
+  const startMs = deps.startMs ?? cachedStartMs();
+  let cleared = 0;
+  for (const [root, survivor] of [...survivingGroups]) {
+    survivor.retries++;
+    try {
+      const groupGone = await terminate(survivor.pid, {
+        leaderStartMs: survivor.startMs,
+        startMs,
+        leaderAlive: () => false,
+      });
+      const escapees = await reap({ root, cwds: survivor.cwds });
+      if (groupGone && escapees.length === 0) {
+        survivingGroups.delete(root);
+        cleared++;
+      } else {
+        console.error(
+          `[oneshot] survivor of pid ${survivor.pid} still alive after retry ${survivor.retries} (group ${groupGone ? "gone" : "alive"}, ${escapees.length} outside it)`,
+        );
+      }
+    } catch (error) {
+      console.error(
+        `[oneshot] survivor retry for pid ${survivor.pid} failed (${(error as NodeJS.ErrnoException)?.code ?? "error"})`,
+      );
+    }
+  }
+  return cleared;
 }
 
 /** The owner is gone: no such pid, or the pid now belongs to a process that started later. */
@@ -182,7 +273,7 @@ export function isOwnerDead(
   }
   const now = (deps.startMs ?? processStartMs)(owner.pid);
   if (owner.startMs === null || now === null) return false; // cannot tell: assume it is the owner
-  return Math.abs(now - owner.startMs) > 2000;
+  return Math.abs(now - owner.startMs) > START_TIME_TOLERANCE_MS;
 }
 
 /** Create the per-call temp cwd (mode 0700, owner file inside). Removed again on error. */
@@ -274,16 +365,20 @@ export interface SweepDeps {
   /** Replaces `process.getuid()`. */
   uid?: number;
   isOwnerDead?: (owner: OwnerRecord) => boolean;
+  /** Replaces `ps` for the owners' start times; asked once per pid per pass. */
+  startMs?: StartMsReader;
 }
 
 /**
  * Remove `claudeclaw-oneshot-cfg-*` and `claudeclaw-oneshot-pty-*` directories under `dir`
  * that a crashed or failed call left behind. A directory is swept only when ALL hold:
  * it is older than `maxAgeMs`; it belongs to this uid; no call of this daemon is still using
- * it; and its owner (the daemon whose pid and start time its owner file names) is dead. A
- * directory without a readable owner file (made before the owner file existed) falls back to
- * the age rule. Symlinks and plain files with the prefix are left alone. Returns how many
- * were removed; a failure on one entry does not stop the rest.
+ * it; no claude of this daemon that outlived its retirement may still write into it; and its
+ * owner (the daemon whose pid and start time its owner file names) is dead. A directory with
+ * no owner file at all (made before the owner file existed) falls back to the age rule. One
+ * whose owner file is there but cannot be read or understood is quarantined: logged once, never
+ * removed here, because it may belong to a live call. Symlinks and plain files with the prefix
+ * are left alone. Returns how many were removed; a failure on one entry does not stop the rest.
  */
 export function sweepStaleOneShotDirs(
   dir = tmpdir(),
@@ -292,7 +387,9 @@ export function sweepStaleOneShotDirs(
   deps: SweepDeps = {},
 ): number {
   const uid = deps.uid ?? process.getuid?.();
-  const ownerDead = deps.isOwnerDead ?? isOwnerDead;
+  // One `ps` per pid for the whole pass: the same owner pid names many directories.
+  const startMs = cachedStartMs(deps.startMs);
+  const ownerDead = deps.isOwnerDead ?? ((owner: OwnerRecord) => isOwnerDead(owner, { startMs }));
   let removed = 0;
   let names: string[];
   try {
@@ -307,11 +404,18 @@ export function sweepStaleOneShotDirs(
       const stat = lstatSync(path);
       if (!stat.isDirectory() || now - stat.mtimeMs <= maxAgeMs) continue;
       if (uid !== undefined && stat.uid !== uid) continue; // not ours to remove
-      if (activeDirs.has(path)) continue;
+      if (activeDirs.has(path) || protectedBySurvivor(path)) continue;
       // Another live daemon's call is kept. This daemon's own finished call (not `activeDirs`)
       // whose removal failed is a leftover too, so its owner file does not protect it.
       const owner = readOwnerFile(path);
-      if (owner && owner.instance !== DAEMON_INSTANCE && !ownerDead(owner)) continue;
+      if (owner === "unreadable") {
+        if (!quarantined.has(path)) {
+          quarantined.add(path);
+          console.warn("[oneshot] temp dir quarantined: owner file unreadable, not removed");
+        }
+        continue;
+      }
+      if (owner !== "missing" && owner.instance !== DAEMON_INSTANCE && !ownerDead(owner)) continue;
       rmSync(path, { recursive: true, force: true });
       removed++;
     } catch (error) {
@@ -323,12 +427,17 @@ export function sweepStaleOneShotDirs(
   return removed;
 }
 
+/** Directories already reported as quarantined, so a pass every ten minutes does not repeat itself. */
+const quarantined = new Set<string>();
+
 /** How often a running daemon looks for leftovers. */
 export const ONESHOT_SWEEP_INTERVAL_MS = 10 * 60_000;
 
 export interface SweeperDeps {
   setInterval?: (callback: () => void, ms: number) => { unref?: () => unknown };
   sweep?: () => number;
+  /** Signals recorded survivors again; runs before each timed sweep. */
+  retrySurvivors?: () => Promise<number>;
 }
 
 let sweeper: { unref?: () => unknown } | undefined;
@@ -344,12 +453,25 @@ export function startOneShotSweeper(deps: SweeperDeps = {}): number {
   const first = sweep();
   if (sweeper === undefined) {
     const register = deps.setInterval ?? ((callback, ms) => setInterval(callback, ms));
+    const retry = deps.retrySurvivors ?? (() => retrySurvivingGroups());
+    const failed = (what: string, error: unknown): void =>
+      console.error(
+        `[oneshot] ${what} failed (${(error as NodeJS.ErrnoException)?.code ?? (error as Error)?.name ?? "error"})`,
+      );
     const timer = register(() => {
+      // Survivors are signalled again on every pass. A root with a recorded survivor is skipped
+      // by the sweep below, so the two need not run in order.
+      void retry()
+        .then((stopped) => {
+          if (stopped > 0) console.log(`[oneshot] stopped ${stopped} surviving claude group(s)`);
+        })
+        .catch((error) => failed("survivor retry", error));
       try {
         const n = sweep();
         if (n > 0) console.log(`[oneshot] removed ${n} stale one-shot temp dir(s)`);
-      } catch {
-        /* next pass retries */
+      } catch (error) {
+        // The next pass retries it; this says so instead of staying silent.
+        failed("sweeper pass", error);
       }
     }, ONESHOT_SWEEP_INTERVAL_MS);
     timer.unref?.();
@@ -361,4 +483,5 @@ export function startOneShotSweeper(deps: SweeperDeps = {}): number {
 /** Test seam: forget the registered timer so the next `startOneShotSweeper` registers again. */
 export function resetOneShotSweeperForTests(): void {
   sweeper = undefined;
+  quarantined.clear();
 }

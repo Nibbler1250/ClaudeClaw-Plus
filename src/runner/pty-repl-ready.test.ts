@@ -25,7 +25,11 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-async function spawnScreen(lines: string[], budgetMs = 1500): Promise<PtyProcess> {
+async function spawnScreen(
+  lines: string[],
+  budgetMs = 1500,
+  quietWindowMs = 50,
+): Promise<PtyProcess> {
   const printed = lines.map((l) => `'${l}'`).join(" ");
   const child = await spawnPty({
     sessionId: "",
@@ -35,7 +39,7 @@ async function spawnScreen(lines: string[], budgetMs = 1500): Promise<PtyProcess
     security: { level: "moderate", allowedTools: [], disallowedTools: [] },
     _commandOverride: "/bin/sh",
     _argsOverride: ["-c", `printf '%s\\n' ${printed}; exec cat > '${sink}'`],
-    quietWindowMs: 50,
+    quietWindowMs,
     _replReadyBudgetMs: budgetMs,
   });
   spawned.push(child);
@@ -127,5 +131,57 @@ describe("an untrusted first turn waits for a ready REPL", () => {
     await child.runTurn("PROMPT_REACHED_THE_PTY", { timeoutMs: 600 }).catch(() => {});
     // The sink records writes, so the empty files above mean something.
     expect(received()).toContain("PROMPT_REACHED_THE_PTY");
+  });
+});
+
+/** Bytes the child "wrote": the same path real output takes, fed after the spawn has settled. */
+const paint = (child: PtyProcess, data: string): void =>
+  (child as unknown as { _handleData(data: string): void })._handleData(data);
+
+// #570 r13 (E): readiness is judged on the screen as it is now.
+describe("the ready gate reads the current screen", () => {
+  it("is ready when a login screen was cleared and replaced by the REPL", async () => {
+    const child = await spawnScreen(["Starting"]);
+    // The menu sits below the rows the REPL is drawn on, so a clear that did not happen would
+    // leave it on the screen.
+    paint(
+      child,
+      "Welcome to Claude Code\r\n\r\nSelect login method:\r\n1. Claude account\r\n2. Anthropic Console\r\n",
+    );
+    paint(child, `\x1b[2J\x1b[HClaude Code v2.1.304\r\n${FOOTER}`);
+    await child.runTurn("PROMPT_REACHED_THE_PTY", { timeoutMs: 600 }).catch(() => {});
+    expect(received()).toContain("PROMPT_REACHED_THE_PTY");
+  });
+
+  it("refuses a footer that is drawn first and 'Not logged in' drawn after it", async () => {
+    const child = await spawnScreen(["Starting"], 1500, 150);
+    paint(child, FOOTER);
+    const turned = turn(child);
+    setTimeout(() => paint(child, "\r\nNot logged in"), 40); // inside the quiet window
+    await expect(turned).rejects.toThrow(/not ready \(login-required\); nothing was sent/);
+    await settled();
+    expect(received()).toBe("");
+  });
+
+  it("refuses a blocked screen after one quiet window, not after the whole budget", async () => {
+    const child = await spawnScreen(["Starting"], 20_000, 100);
+    paint(child, "Select login method:\r\n");
+    const started = Date.now();
+    await expect(turn(child, 20_000)).rejects.toThrow(/login-required/);
+    expect(Date.now() - started).toBeLessThan(3000);
+  });
+
+  it("refuses a footer that is still there but a screen that never went quiet", async () => {
+    const child = await spawnScreen(["Starting"], 600, 400);
+    paint(child, FOOTER);
+    const turned = turn(child, 600);
+    // Repaints every 100 ms: the 400 ms quiet window never completes.
+    const timer = setInterval(() => paint(child, "."), 100);
+    try {
+      await expect(turned).rejects.toThrow(/screen-not-settled/);
+    } finally {
+      clearInterval(timer);
+    }
+    expect(received()).toBe("");
   });
 });

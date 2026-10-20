@@ -81,15 +81,23 @@ operator; no credential is copied. Everything claude writes about the prompt (tr
 history, paste cache, session files) lands in that root, and the root is removed in the
 call's `finally` and again after a late spawn settles. The call's claude is retired with
 its whole process group (SIGTERM, then SIGKILL after 2 s, each awaited until `kill(-pid, 0)`
-answers ESRCH) before the root is removed; if the group will not die the call fails and the
-root is kept for the sweep. The prompt is written only into a REPL that is ready (footer
-painted, no login, onboarding or trust screen); otherwise the spawn fails and nothing is
-sent. If the root cannot be created or removed the call fails (the error is logged by step
+answers ESRCH) before the root is removed. Before every signal the pid's start time is
+compared with the one recorded at spawn, so a pid that was reused is never signalled. On
+Linux a descendant that left the group (`setsid()`, `setpgid()`) is found afterwards by the
+throwaway `CLAUDE_CONFIG_DIR` in its environment, or a cwd inside the throwaway temp cwd, and
+stopped the same way. **On macOS there is no cheap equivalent: containment there is the
+process group plus the remove-and-recheck loop, and a process that leaves the group and keeps
+writing is not stopped.** If the group, or anything outside it, will not die, the call fails
+and the root and temp cwd are kept; the sweeper signals the survivor again every pass and
+never sweeps them while it is recorded. The prompt is written only into a REPL that is ready
+(footer on the current screen, no login, onboarding or trust screen after one quiet window);
+otherwise the spawn fails and nothing is sent. If the root cannot be created or removed the call fails (the error is logged by step
 and code, never content). Each root and temp cwd holds an owner file (daemon pid, start time,
 instance). A daemon start, and then every ten minutes, removes leftover
 `claudeclaw-oneshot-cfg-*` and `claudeclaw-oneshot-pty-*` temp directories that are older
 than ten minutes, belong to this uid, are not a running call of this daemon, and whose
-owner is dead (a directory without an owner file falls back to the age rule). It applies the spawn strip list (`ANTHROPIC_API_KEY`,
+owner is dead (a directory with no owner file at all falls back to the age rule; one whose
+owner file cannot be read or understood is quarantined, logged and never removed). It applies the spawn strip list (`ANTHROPIC_API_KEY`,
 `CLAUDECODE`, short-lived OAuth tokens) to the caller's env, because an interactive
 claude with an API key in its env stops at a "custom API key" gate; it replaces every `@`
 in the prompt with U+FF20, because the REPL expands `@path` mentions itself, anywhere in a

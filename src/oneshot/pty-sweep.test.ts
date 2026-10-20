@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
@@ -23,13 +23,16 @@ import {
   type OwnerRecord,
   createUntrustedConfigRoot,
   createUntrustedTempCwd,
+  groupSurvivorCount,
   groupSurvivorOf,
   markGroupSurvivor,
   markOneShotDirActive,
   operatorSecureStorageDir,
   processStartMs,
   releaseOneShotDir,
+  resetGroupSurvivorsForTests,
   resetOneShotSweeperForTests,
+  retrySurvivingGroups,
   startOneShotSweeper,
   sweepStaleOneShotDirs,
 } from "./pty-cleanup.js";
@@ -54,6 +57,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   resetOneShotSweeperForTests();
+  resetGroupSurvivorsForTests();
   rmSync(base, { recursive: true, force: true });
 });
 
@@ -125,14 +129,33 @@ describe("sweepStaleOneShotDirs: who may be removed", () => {
     expect(existsSync(path)).toBe(true);
   });
 
-  it("falls back to the age rule without a readable owner file", () => {
+  it("falls back to the age rule for a directory with no owner file at all (made before r12)", () => {
     const none = leftover(`${ONESHOT_CONFIG_PREFIX}none`, OLD);
-    const broken = leftover(`${ONESHOT_CWD_PREFIX}broken`, OLD, "garbage");
     const young = leftover(`${ONESHOT_CWD_PREFIX}young-none`, YOUNG);
-    expect(sweep()).toBe(2);
+    expect(sweep()).toBe(1);
     expect(existsSync(none)).toBe(false);
-    expect(existsSync(broken)).toBe(false);
     expect(existsSync(young)).toBe(true);
+  });
+
+  // #570 r13 (A5): an owner file that is there but cannot be understood may belong to a live call.
+  it("quarantines a directory whose owner file is malformed or unreadable: logged once, never removed", () => {
+    const broken = leftover(`${ONESHOT_CWD_PREFIX}broken`, OLD, "garbage");
+    const noPid = leftover(`${ONESHOT_CWD_PREFIX}no-pid`, OLD);
+    writeFileSync(join(noPid, ONESHOT_OWNER_FILE), JSON.stringify({ instance: "x" }));
+    const unreadable = leftover(`${ONESHOT_CWD_PREFIX}unreadable`, OLD);
+    mkdirSync(join(unreadable, ONESHOT_OWNER_FILE)); // a directory where the file should be
+    for (const dir of [noPid, unreadable]) utimesSync(dir, OLD, OLD); // writing touched them
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(sweep()).toBe(0);
+      expect(sweep()).toBe(0);
+      for (const dir of [broken, noPid, unreadable]) expect(existsSync(dir)).toBe(true);
+      const logged = warn.mock.calls.map((call: unknown[]) => String(call[0]));
+      expect(logged.filter((line) => line.includes("quarantined")).length).toBe(3); // once each
+      expect(logged.join("\n")).not.toContain(base);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("keeps a call of this daemon that is still running, and removes one it has finished with", () => {
@@ -204,23 +227,58 @@ describe("startOneShotSweeper", () => {
     expect(passes).toBe(3); // two starts and one timer tick
   });
 
-  it("survives a pass that throws, so the next tick still runs", () => {
+  it("survives a pass that throws, so the next tick still runs, and says so", () => {
     let tick: (() => void) | undefined;
     let passes = 0;
-    startOneShotSweeper({
-      sweep: () => {
-        passes++;
-        if (passes === 2) throw new Error("boom");
-        return 0;
-      },
-      setInterval: (callback) => {
-        tick = callback;
-        return {};
-      },
-    });
-    expect(() => tick?.()).not.toThrow();
-    tick?.();
-    expect(passes).toBe(3);
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      startOneShotSweeper({
+        sweep: () => {
+          passes++;
+          if (passes === 2) throw new Error("boom");
+          return 0;
+        },
+        retrySurvivors: async () => 0,
+        setInterval: (callback) => {
+          tick = callback;
+          return {};
+        },
+      });
+      expect(() => tick?.()).not.toThrow();
+      tick?.();
+      expect(passes).toBe(3);
+      const logged = error.mock.calls.map((call: unknown[]) => String(call[0]));
+      expect(logged.some((line) => line.includes("sweeper pass failed"))).toBe(true);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("signals recorded survivors again on every tick, and logs a retry that throws", async () => {
+    let tick: (() => void) | undefined;
+    let retries = 0;
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      startOneShotSweeper({
+        sweep: () => 0,
+        retrySurvivors: async () => {
+          retries++;
+          throw new Error("boom");
+        },
+        setInterval: (callback) => {
+          tick = callback;
+          return {};
+        },
+      });
+      tick?.();
+      tick?.();
+      await new Promise((r) => setTimeout(r, 10));
+      expect(retries).toBe(2);
+      const logged = error.mock.calls.map((call: unknown[]) => String(call[0]));
+      expect(logged.filter((line) => line.includes("survivor retry failed")).length).toBe(2);
+    } finally {
+      error.mockRestore();
+    }
   });
 });
 
@@ -268,5 +326,107 @@ describe("group survivors", () => {
     markGroupSurvivor("/tmp/root-a", 4242);
     expect(groupSurvivorOf("/tmp/root-a")).toBe(4242);
     expect(groupSurvivorOf("/tmp/root-b")).toBeUndefined();
+  });
+
+  // #570 r13 (A4): the root of a call whose claude could not be stopped is not swept from under it.
+  it("keep their root and temp cwd out of the sweep, however old and however dead the owner", () => {
+    const own = live({ pid: process.pid, instance: DAEMON_INSTANCE });
+    const root = leftover(`${ONESHOT_CONFIG_PREFIX}survived`, OLD, own);
+    const cwd = leftover(`${ONESHOT_CWD_PREFIX}survived`, OLD, own);
+    const other = leftover(`${ONESHOT_CONFIG_PREFIX}finished`, OLD, own);
+    markGroupSurvivor(root, 4242, { tempCwd: cwd, startMs: 1, cwds: [cwd] });
+    expect(sweep()).toBe(1);
+    expect(existsSync(root)).toBe(true);
+    expect(existsSync(cwd)).toBe(true);
+    expect(existsSync(other)).toBe(false);
+  });
+
+  it("are swept once the survivor is gone", async () => {
+    const own = live({ pid: process.pid, instance: DAEMON_INSTANCE });
+    const root = leftover(`${ONESHOT_CONFIG_PREFIX}later`, OLD, own);
+    markGroupSurvivor(root, 4242, { startMs: 1 });
+    expect(sweep()).toBe(0);
+    await retrySurvivingGroups({ terminate: async () => true, reap: async () => [] });
+    expect(groupSurvivorCount()).toBe(0);
+    expect(sweep()).toBe(1);
+    expect(existsSync(root)).toBe(false);
+  });
+});
+
+describe("retrySurvivingGroups", () => {
+  it("terminates each recorded survivor again, with the identity recorded at spawn and no claim on the leader", async () => {
+    markGroupSurvivor("/tmp/root-a", 4242, { startMs: 1_700_000_000_000, cwds: ["/tmp/cwd-a"] });
+    const seen: Array<{ pid: number; start: number | null | undefined; owned: boolean }> = [];
+    const reaped: Array<{ root: string; cwds: string[] }> = [];
+    const cleared = await retrySurvivingGroups({
+      terminate: async (pid, opts) => {
+        seen.push({ pid, start: opts.leaderStartMs, owned: opts.leaderAlive?.() ?? true });
+        return true;
+      },
+      reap: async (target) => {
+        reaped.push(target);
+        return [];
+      },
+    });
+    expect(cleared).toBe(1);
+    expect(seen).toEqual([{ pid: 4242, start: 1_700_000_000_000, owned: false }]);
+    expect(reaped).toEqual([{ root: "/tmp/root-a", cwds: ["/tmp/cwd-a"] }]);
+    expect(groupSurvivorOf("/tmp/root-a")).toBeUndefined();
+  });
+
+  it("keeps an entry whose group is still alive, or that still has a process outside it, and logs metadata only", async () => {
+    markGroupSurvivor("/tmp/secret-root-a", 4242, { startMs: 1, cwds: ["/tmp/secret-cwd"] });
+    markGroupSurvivor("/tmp/secret-root-b", 4343, { startMs: 1, cwds: ["/tmp/secret-cwd"] });
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const cleared = await retrySurvivingGroups({
+        terminate: async (pid) => pid === 4343, // 4242's group survives again
+        reap: async (target) => (target.root.endsWith("-b") ? [999] : []),
+      });
+      expect(cleared).toBe(0);
+      expect(groupSurvivorCount()).toBe(2);
+      const logged = error.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+      expect(logged).toContain("pid 4242");
+      expect(logged).toContain("pid 4343");
+      expect(logged).not.toContain("secret");
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("keeps going when one retry throws, and keeps that entry", async () => {
+    markGroupSurvivor("/tmp/root-a", 4242, { startMs: 1 });
+    markGroupSurvivor("/tmp/root-b", 4343, { startMs: 1 });
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const cleared = await retrySurvivingGroups({
+        terminate: async (pid) => {
+          if (pid === 4242) throw new Error("boom");
+          return true;
+        },
+        reap: async () => [],
+      });
+      expect(cleared).toBe(1);
+      expect(groupSurvivorOf("/tmp/root-a")).toBe(4242);
+      expect(groupSurvivorOf("/tmp/root-b")).toBeUndefined();
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  // #570 r13 (F): the same owner pid names many directories; ask `ps` about it once per pass.
+  it("asks for each owner pid's start time once per sweep pass", () => {
+    const own = { pid: process.pid, startMs: selfStart, instance: "another-daemon" };
+    for (const n of [1, 2, 3]) leftover(`${ONESHOT_CWD_PREFIX}same-owner-${n}`, OLD, own);
+    const asked: number[] = [];
+    const startMs = (pid: number): number | null => {
+      asked.push(pid);
+      return selfStart;
+    };
+    expect(sweep({ startMs })).toBe(0); // the owner is alive: all three are kept
+    expect(asked).toEqual([process.pid]);
+    asked.length = 0;
+    sweep({ startMs }); // a new pass asks again
+    expect(asked).toEqual([process.pid]);
   });
 });

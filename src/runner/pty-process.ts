@@ -61,6 +61,8 @@ import {
 import { promptPrepareOverride, untrustedFileMentionNeutralizing } from "./pty-process-test-seams";
 import { appendFileSync } from "node:fs";
 import { type GroupTerminationOptions, terminateProcessGroup } from "./pty-group-kill";
+import { processStartMs } from "./pty-proc-identity";
+import { Screen } from "./pty-screen";
 
 /**
  * Raw PTY trace, off unless `CLAUDECLAW_PTY_DUMP=<file>` is set. Every chunk
@@ -96,8 +98,19 @@ export interface PtyProcessOptions {
   terminateGroup?: boolean;
   /** Test seam: how long an untrusted spawn waits for the REPL footer. Default 20 s. */
   _replReadyBudgetMs?: number;
-  /** Called with the pid when retirement could not get the group to disappear. */
-  onGroupSurvived?: (pid: number) => void;
+  /**
+   * Called with the pid, and the leader's start time recorded at spawn (null when `ps` could not
+   * say), when retirement could not get the group to disappear. It must not throw: if it does,
+   * the error is logged and `dispose()` rejects, so the caller keeps whatever the child may
+   * still be writing into.
+   */
+  onGroupSurvived?: (pid: number, startMs: number | null) => void;
+  /**
+   * Called once the group is gone: stop descendants that left it (Linux, see pty-escape-scan).
+   * Resolves the pids that are still alive; a rejection counts as "could not tell" and fails
+   * closed like a survivor.
+   */
+  reapEscapees?: () => Promise<number[]>;
   /** Test seam: signal function, clock and timings of the group termination. */
   _groupTermination?: GroupTerminationOptions;
   /** Existing Claude Code session ID to resume via `claude --resume <id>`.
@@ -584,14 +597,18 @@ class PtyProcessImpl implements PtyProcess {
   private readonly _untrustedTrace: boolean;
   /** Retirement stops the whole process group and waits for it (pty-group-kill). */
   private readonly _terminateGroup: boolean;
-  private readonly _onGroupSurvived?: (pid: number) => void;
+  private readonly _onGroupSurvived?: (pid: number, startMs: number | null) => void;
+  private readonly _reapEscapees?: () => Promise<number[]>;
   private readonly _groupTermination?: GroupTerminationOptions;
+  /** The leader's start time at spawn: every later signal checks that the pid still has it. */
+  private readonly _leaderStartMs: number | null;
   /**
    * Untrusted one-shot: the screen is watched until the REPL is ready, and the prompt is not
    * written before that (see `_awaitReplReady`). Off when the settle wait is skipped (tests).
    */
   private _readyGate: boolean;
-  private _screenTail = "";
+  /** The reconstructed current screen, collected while the ready gate is on. */
+  private _screen: Screen;
   /** Why the REPL was refused, once it has been: later turns are refused without waiting. */
   private _notReady: string | null = null;
   private _onScreen: (() => void) | null = null;
@@ -611,7 +628,10 @@ class PtyProcessImpl implements PtyProcess {
     this._readyGate = opts.isolation === "untrusted" && !opts._skipReadySettle;
     this._replReadyBudgetMs = opts._replReadyBudgetMs ?? UNTRUSTED_REPL_READY_MS;
     this._onGroupSurvived = opts.onGroupSurvived;
+    this._reapEscapees = opts.reapEscapees;
     this._groupTermination = opts._groupTermination;
+    this._leaderStartMs = this._terminateGroup ? processStartMs(pty.pid) : null;
+    this._screen = new Screen(opts.cols ?? DEFAULT_COLS, opts.rows ?? DEFAULT_ROWS);
     this.label = `${opts.agentName ?? "pty"}:${pty.pid}`;
     this._quietWindowMs = opts.quietWindowMs ?? DEFAULT_QUIET_WINDOW_MS;
     // Untrusted text also loses its `@` file mentions (see neutralizeFileMentions). The
@@ -731,7 +751,7 @@ class PtyProcessImpl implements PtyProcess {
     );
     if (this._firstDataAt === 0) this._firstDataAt = now;
     if (this._readyGate) {
-      this._screenTail = (this._screenTail + data).slice(-4000);
+      this._screen.feed(data);
       this._onScreen?.();
     }
 
@@ -1102,7 +1122,11 @@ class PtyProcessImpl implements PtyProcess {
       this._terminateGroup &&
       (this._alive || this._now() - this._exitedAt <= GROUP_SWEEP_MAX_AGE_MS);
     const groupGone = sweepGroup
-      ? terminateProcessGroup(this._pid, this._groupTermination)
+      ? terminateProcessGroup(this._pid, {
+          leaderStartMs: this._leaderStartMs,
+          leaderAlive: () => this._alive,
+          ...this._groupTermination,
+        })
       : Promise.resolve(true);
 
     if (this._alive) {
@@ -1136,13 +1160,34 @@ class PtyProcessImpl implements PtyProcess {
       this._clearTimeout(killTimer);
     }
 
-    if (!(await groupGone)) {
+    let survived = !(await groupGone);
+    let escapees: number[] = [];
+    if (sweepGroup && this._reapEscapees) {
+      try {
+        escapees = await this._reapEscapees();
+      } catch (error) {
+        // Could not tell whether a descendant that left the group is still running: not a success.
+        console.error(
+          `[pty-process] ${this.label} escapee scan failed (${(error as NodeJS.ErrnoException)?.code ?? "error"})`,
+        );
+        survived = true;
+      }
+    }
+    let hookError: unknown;
+    if (survived || escapees.length > 0) {
       console.error(
-        `[pty-process] ${this.label} retired but its process group is still alive (pid=${this._pid})`,
+        `[pty-process] ${this.label} retired but ${survived ? "its process group is still alive" : `${escapees.length} process(es) outside its group are still alive`} (pid=${this._pid})`,
       );
       try {
-        this._onGroupSurvived?.(this._pid);
-      } catch {}
+        this._onGroupSurvived?.(this._pid, this._leaderStartMs);
+      } catch (error) {
+        // Fail closed: if the caller could not record the survivor it cannot protect what the
+        // survivor may write into, so the disposal does not report success.
+        console.error(
+          `[pty-process] ${this.label} survivor hook threw (${(error as NodeJS.ErrnoException)?.code ?? (error as Error)?.name ?? "error"})`,
+        );
+        hookError = error;
+      }
     }
 
     try {
@@ -1153,6 +1198,9 @@ class PtyProcessImpl implements PtyProcess {
     } catch {}
     this._onDataDisposable = null;
     this._onExitDisposable = null;
+    if (hookError !== undefined) {
+      throw new Error(`survivor hook failed for ${this.label}`, { cause: hookError });
+    }
   }
 
   /**
@@ -1164,27 +1212,45 @@ class PtyProcessImpl implements PtyProcess {
    */
   _awaitReplReady(budgetMs: number): Promise<ReplReadyVerdict> {
     return new Promise((resolve) => {
+      let quiet: ReturnType<typeof setTimeout> | null = null;
       const finish = (verdict: ReplReadyVerdict): void => {
         this._clearTimeout(deadline);
+        if (quiet !== null) this._clearTimeout(quiet);
         this._onScreen = null;
         this._readyGate = false;
-        this._screenTail = "";
+        this._screen = new Screen(1, 1); // nothing more is collected
         resolve(verdict);
       };
-      const check = (): void => {
-        const screen = stripAnsi(this._screenTail);
-        for (const [reason, pattern] of BLOCKED_BOOT_SCREENS) {
-          if (pattern.test(screen)) {
-            finish({ ok: false, reason });
-            return;
-          }
-        }
-        if (REPL_FOOTER.test(screen)) finish({ ok: true });
+      const blockedReason = (): string | undefined => {
+        const screen = stripAnsi(this._screen.text());
+        return BLOCKED_BOOT_SCREENS.find(([, pattern]) => pattern.test(screen))?.[0];
       };
-      const deadline = this._setTimeout(
-        () => finish({ ok: false, reason: "no-repl-footer" }),
-        budgetMs,
-      );
+      // Judged on the screen as it is now, not on what was ever written: a login menu that was
+      // cleared and replaced by the REPL is gone, and a status painted after the footer is there.
+      // Once the footer (or a blocked screen) shows, one quiet window must pass without the
+      // screen changing, and the blocked screens are looked for again on what is left.
+      const hasFooter = (): boolean => REPL_FOOTER.test(stripAnsi(this._screen.text()));
+      const onQuiet = (): void => {
+        quiet = null;
+        const reason = blockedReason();
+        if (reason !== undefined) finish({ ok: false, reason });
+        else if (hasFooter()) finish({ ok: true });
+      };
+      const check = (): void => {
+        if (quiet !== null) this._clearTimeout(quiet);
+        quiet =
+          hasFooter() || blockedReason() !== undefined
+            ? this._setTimeout(onQuiet, this._quietWindowMs)
+            : null;
+      };
+      const deadline = this._setTimeout(() => {
+        // A screen that never went quiet is judged a last time, as it stands.
+        const reason = blockedReason();
+        finish({
+          ok: false,
+          reason: reason ?? (hasFooter() ? "screen-not-settled" : "no-repl-footer"),
+        });
+      }, budgetMs);
       this._onScreen = check;
       check();
     });

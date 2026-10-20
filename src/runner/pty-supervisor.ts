@@ -69,6 +69,7 @@ import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";
 import { trustedToolFlags, validateIsolation } from "../oneshot/isolation.js";
 import { validateRouteEngine } from "../oneshot/config.js";
 import * as untrustedCleanup from "../oneshot/pty-cleanup.js";
+import { terminateEscapees } from "./pty-escape-scan.js";
 import {
   TRANSCRIPT_WAIT_MS,
   awaitLastAssistantReply,
@@ -1582,7 +1583,7 @@ async function buildSpawnOptions(
     sentinelMaxWaitMs: settings.pty.sentinelMaxWaitMs,
     ...(mcpConfigPath ? { mcpConfigPath } : {}),
     ...(entry.scope.isolation === "untrusted" && entry.scope.untrustedConfig
-      ? untrustedGroupOptions(entry.scope.untrustedConfig.root)
+      ? untrustedGroupOptions(entry.scope.untrustedConfig.root, cwd)
       : {}),
   };
   // Recorded on the entry in the same synchronous step as the synthesis, so a
@@ -1743,12 +1744,39 @@ function untrustedChildEnvWithRoot(
 }
 
 /**
- * An untrusted child is retired with its whole process group. When that group cannot be made
- * to disappear, the root is recorded: `cleanupUntrustedOneShot` then keeps it (for the sweep)
- * and fails the call, because a survivor may still write prompt text into it.
+ * An untrusted child is retired with its whole process group, and then anything that left the
+ * group is looked for (Linux). When either cannot be made to disappear, the root is recorded:
+ * `cleanupUntrustedOneShot` then keeps it and fails the call, because a survivor may still write
+ * prompt text into it, and the sweeper signals the survivor again until it is gone.
  */
-function untrustedGroupOptions(root: string): Pick<PtyProcessOptions, "onGroupSurvived"> {
-  return { onGroupSurvived: (pid) => untrustedCleanup.markGroupSurvivor(root, pid) };
+function untrustedGroupOptions(
+  root: string,
+  tempCwd: string,
+): Pick<PtyProcessOptions, "onGroupSurvived" | "reapEscapees"> {
+  const cwds = untrustedCleanup.untrustedCwdForms(tempCwd);
+  return {
+    onGroupSurvived: (pid, startMs) =>
+      untrustedCleanup.markGroupSurvivor(root, pid, { startMs, tempCwd, cwds }),
+    reapEscapees: () => terminateEscapees({ root, cwds }),
+  };
+}
+
+/**
+ * A disposal that rejected leaves it unknown whether the child is gone, so an untrusted one-shot's
+ * root is kept as for a survivor (fail closed). The pid's identity is not known here, so the
+ * sweeper cannot stop it; the root stays until the daemon restarts.
+ */
+function keepRootAfterFailedDispose(entry: PtyEntry, reason: unknown): void {
+  console.error(`[pty-supervisor] ${entry.sessionKey} disposal failed (${errorCode(reason)})`);
+  const config = entry.scope.untrustedConfig;
+  const pid = entry.pty?.pid;
+  if (entry.scope.isolation !== "untrusted" || !config || pid === undefined) return;
+  if (untrustedCleanup.groupSurvivorOf(config.root) === undefined) {
+    untrustedCleanup.markGroupSurvivor(config.root, pid, {
+      tempCwd: entry.spawnOpts?.cwd,
+      cwds: entry.spawnOpts ? untrustedCleanup.untrustedCwdForms(entry.spawnOpts.cwd) : [],
+    });
+  }
 }
 
 /** What an untrusted one-shot leaves on disk, and where. Fixed before the spawn. */
@@ -1776,8 +1804,8 @@ function errorCode(error: unknown): string {
  */
 async function cleanupUntrustedOneShot(state: UntrustedOneShotState): Promise<void> {
   let failure: unknown;
+  const survivor = untrustedCleanup.groupSurvivorOf(state.configRoot);
   try {
-    const survivor = untrustedCleanup.groupSurvivorOf(state.configRoot);
     if (survivor !== undefined) {
       // Not removed: the process may still be writing into it. Left for the periodic sweep.
       console.error(
@@ -1792,10 +1820,14 @@ async function cleanupUntrustedOneShot(state: UntrustedOneShotState): Promise<vo
     );
     failure = error;
   }
-  try {
-    rmSync(state.tempCwd, { recursive: true, force: true });
-  } catch {
-    /* best effort */
+  // The temp cwd stays while a survivor may be running in it: its path is how the escapee scan
+  // recognises such a process, and a removed cwd shows up as "<path> (deleted)".
+  if (survivor === undefined) {
+    try {
+      rmSync(state.tempCwd, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
   }
   if (failure !== undefined) throw failure;
 }
@@ -2098,11 +2130,12 @@ function retireEntry(entry: PtyEntry): Promise<void> {
     // while the old process is still being torn down.
     try {
       const disposal = entry.disposing ?? entry.pty?.dispose() ?? Promise.resolve();
-      await Promise.allSettled([
+      const [disposed] = await Promise.allSettled([
         disposal,
         // Release multiplexer identity + delete synthesized config (SPEC §4.5).
         releaseMcpIdentityFor(entry),
       ]);
+      if (disposed.status === "rejected") keepRootAfterFailedDispose(entry, disposed.reason);
     } finally {
       // Unconditional: an entry left in the map with `retiring` settled would
       // spin every admission on its key (and the shutdown loop) forever.
