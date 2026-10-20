@@ -110,11 +110,12 @@ export interface PtyProcessOptions {
    */
   onGroupSurvived?: (pid: number, startMs: number | null, cause: SurvivorCause) => void;
   /**
-   * Called once the group is gone: stop descendants that left it (Linux, see pty-escape-scan).
-   * Resolves the pids that are still alive; a rejection counts as "could not tell" and fails
-   * closed like a survivor.
+   * Called once the group is gone: stop descendants that left it (Linux, see pty-escape-scan),
+   * given the leader's pid and the start time recorded at spawn (a process older than that
+   * cannot be ours). Resolves the pids that are still alive; a rejection (`/proc` could not be
+   * listed) counts as "could not tell" and fails closed like a survivor.
    */
-  reapEscapees?: () => Promise<number[]>;
+  reapEscapees?: (leader: { pid: number; startMs: number | null }) => Promise<number[]>;
   /** Test seam: signal function, clock and timings of the group termination. */
   _groupTermination?: GroupTerminationOptions;
   /** Existing Claude Code session ID to resume via `claude --resume <id>`.
@@ -608,7 +609,10 @@ class PtyProcessImpl implements PtyProcess {
     startMs: number | null,
     cause: SurvivorCause,
   ) => void;
-  private readonly _reapEscapees?: () => Promise<number[]>;
+  private readonly _reapEscapees?: (leader: {
+    pid: number;
+    startMs: number | null;
+  }) => Promise<number[]>;
   private readonly _groupTermination?: GroupTerminationOptions;
   /** The leader's start time at spawn: every later signal checks that the pid still has it. */
   private readonly _leaderStartMs: number | null;
@@ -1182,7 +1186,7 @@ class PtyProcessImpl implements PtyProcess {
     // child is (#570 r14, A).
     if (this._terminateGroup && this._reapEscapees) {
       try {
-        escapees = await this._reapEscapees();
+        escapees = await this._reapEscapees({ pid: this._pid, startMs: this._leaderStartMs });
       } catch (error) {
         // Could not tell whether a descendant that left the group is still running: not a success.
         console.error(

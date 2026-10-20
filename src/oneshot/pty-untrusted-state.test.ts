@@ -764,6 +764,97 @@ describe("r14 B/E: a rejected disposal records the PTY's real start time, or say
   });
 });
 
+// #570 r14b: a process the escape scan could not read keeps the root but does not fail the call.
+describe("r14b: an unreadable process is a hold on the root, not a failure", () => {
+  const unreadable = (pid: number, startMs: number | null) => ({
+    pid,
+    startMs,
+    envErrno: "EACCES",
+    cwdErrno: "EACCES",
+    descendant: false,
+    ageMs: 40,
+  });
+
+  it("returns the reply, keeps the root and temp cwd, records no group survivor, and the sweeper removes them once the process is gone", async () => {
+    const stray = Bun.spawn(["sleep", "30"], { stdout: "ignore", stderr: "ignore" });
+    try {
+      injectSpawnPty(async (opts) => {
+        spawned.push(opts);
+        return {
+          label: "state",
+          pid: 1,
+          sessionId: SID,
+          cwd: opts.cwd,
+          isAlive: () => true,
+          lastTurnEndedAt: () => 0,
+          runTurn: async () => {
+            reply(opts);
+            return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
+          },
+          // What the supervisor's escape-scan hook does with a process it could not read.
+          dispose: async () =>
+            cleanup.markUnknownProcs(
+              opts.env.CLAUDE_CONFIG_DIR!,
+              { pid: 4242, startMs: 7 },
+              [unreadable(stray.pid, cleanup.processStartMs(stray.pid))],
+              { tempCwd: opts.cwd, cwds: [opts.cwd] },
+            ),
+        } as never;
+      });
+      const result = await run();
+      expect(result.exitCode).toBe(0);
+      expect(result.text).toBe("ok");
+      const root = spawned[0]!.env.CLAUDE_CONFIG_DIR!;
+      const tempCwd = spawned[0]!.cwd;
+      expect(existsSync(root)).toBe(true);
+      expect(existsSync(tempCwd)).toBe(true);
+      expect(cleanup.groupSurvivorCount()).toBe(0);
+      expect(cleanup.unknownHoldCount()).toBe(1);
+
+      const old = new Date(Date.now() - 60 * 60_000);
+      for (const path of [root, tempCwd]) utimesSync(path, old, old);
+      cleanup.sweepStaleOneShotDirs(tmpdir(), Date.now());
+      expect(existsSync(root)).toBe(true); // the process lives
+
+      stray.kill("SIGKILL");
+      await stray.exited;
+      cleanup.sweepStaleOneShotDirs(tmpdir(), Date.now());
+      expect(existsSync(root)).toBe(false);
+      expect(existsSync(tempCwd)).toBe(false);
+    } finally {
+      stray.kill("SIGKILL");
+      for (const o of spawned) {
+        rmSync(o.env.CLAUDE_CONFIG_DIR!, { recursive: true, force: true });
+        rmSync(o.cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("still fails the call for a positively matched escapee that will not die", async () => {
+    injectSpawnPty(async (opts) => {
+      spawned.push(opts);
+      return {
+        label: "state",
+        pid: 1,
+        sessionId: SID,
+        cwd: opts.cwd,
+        isAlive: () => true,
+        lastTurnEndedAt: () => 0,
+        runTurn: async () => {
+          reply(opts);
+          return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
+        },
+        dispose: async () => opts.onGroupSurvived?.(424242, null, "escapee"),
+      } as never;
+    });
+    await expect(run()).rejects.toThrow(/outside the process group of pid 424242 survived/);
+    const root = spawned[0]!.env.CLAUDE_CONFIG_DIR!;
+    expect(existsSync(root)).toBe(true);
+    rmSync(root, { recursive: true, force: true });
+    rmSync(spawned[0]!.cwd, { recursive: true, force: true });
+  });
+});
+
 describe("r12 E: a REPL that never became ready fails the call with nothing sent", () => {
   it("returns exit 1 with no reply, tries once, retires the child and leaves no directory behind", async () => {
     const before = oneShotTempDirs("claudeclaw-oneshot-");

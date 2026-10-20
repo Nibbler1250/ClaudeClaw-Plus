@@ -1758,7 +1758,16 @@ function untrustedGroupOptions(
   return {
     onGroupSurvived: (pid, startMs, cause) =>
       untrustedCleanup.markGroupSurvivor(root, pid, { startMs, tempCwd, cwds, cause }),
-    reapEscapees: () => terminateEscapees({ root, cwds }),
+    // Processes the scan could not read are kept as a hold on the root, not as a failure: the
+    // reply was already obtained, and the only risk is removing a directory under a live writer.
+    reapEscapees: (leader) =>
+      terminateEscapees(
+        { root, cwds, leaderStartMs: leader.startMs },
+        {
+          onUnknown: (unknown) =>
+            untrustedCleanup.markUnknownProcs(root, leader, unknown, { tempCwd, cwds }),
+        },
+      ),
   };
 }
 
@@ -1846,6 +1855,14 @@ async function cleanupUntrustedOneShot(state: UntrustedOneShotState): Promise<vo
         `[pty-supervisor] untrusted one-shot cleanup failed: ${reason}; config root kept`,
       );
       throw new Error(reason);
+    }
+    if (untrustedCleanup.unknownHoldActive(state.configRoot)) {
+      // The escape scan could not read a process born after the child. The call succeeded; the
+      // root stays, and the sweeper removes it once that process is gone.
+      console.warn(
+        "[pty-supervisor] untrusted one-shot: config root kept while a process the escape scan could not read is alive",
+      );
+      return;
     }
     await untrustedCleanup.removeUntrustedConfigRoot(state.configRoot);
   } catch (error) {

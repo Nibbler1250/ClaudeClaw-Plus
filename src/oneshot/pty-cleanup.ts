@@ -16,6 +16,7 @@ import { encodeCwdForProjectsDir } from "../bus/jsonl-line-types.js";
 import {
   type EscapeScan,
   type EscapeScanTarget,
+  type UnknownProc,
   findEscapees,
   terminateEscapees,
 } from "../runner/pty-escape-scan.js";
@@ -194,11 +195,20 @@ export interface GroupSurvivor {
 /** Written into a survivor's config root, so a daemon restart still knows what to keep and stop. */
 export const ONESHOT_SURVIVOR_FILE = "survivor.json";
 
+/** A process the escape scan could not read: kept while it lives with the same start time. */
+export interface HeldProc {
+  pid: number;
+  startMs: number | null;
+}
+
 interface SurvivorFileRecord {
+  /** The PTY leader. Its group is checked (with `startMs`) when a restart reads this. */
   pid: number;
   startMs: number | null;
   cwds: string[];
   tempCwd?: string;
+  /** Processes the scan could not read (#570 r14b); the root stays while any of them lives. */
+  unknown?: HeldProc[];
 }
 
 /**
@@ -208,14 +218,37 @@ interface SurvivorFileRecord {
  */
 const survivingGroups = new Map<string, GroupSurvivor>();
 
-/** Persist the record next to what it protects (mode 0600). A failure is logged, never thrown. */
-function writeSurvivorFile(root: string, survivor: GroupSurvivor): void {
-  const record: SurvivorFileRecord = {
-    pid: survivor.pid,
-    startMs: survivor.startMs,
-    cwds: survivor.cwds,
-    tempCwd: survivor.tempCwd,
-  };
+/**
+ * Roots kept only because the escape scan could not read some process born after the leader
+ * (#570 r14b). Not a failure: the call returned its reply. Nothing is signalled; the sweep drops
+ * the hold once none of the processes is alive with the same start time.
+ */
+interface UnknownHold {
+  leaderPid: number;
+  leaderStartMs: number | null;
+  tempCwd?: string;
+  cwds: string[];
+  procs: HeldProc[];
+}
+const unknownHolds = new Map<string, UnknownHold>();
+const loggedUnknown = new Set<string>();
+
+/** Persist what a restart needs next to what it protects (mode 0600). Logged, never thrown. */
+function writeSurvivorFile(root: string): void {
+  const survivor = survivingGroups.get(root);
+  const hold = unknownHolds.get(root);
+  const base = survivor
+    ? {
+        pid: survivor.pid,
+        startMs: survivor.startMs,
+        cwds: survivor.cwds,
+        tempCwd: survivor.tempCwd,
+      }
+    : hold
+      ? { pid: hold.leaderPid, startMs: hold.leaderStartMs, cwds: hold.cwds, tempCwd: hold.tempCwd }
+      : undefined;
+  if (!base) return;
+  const record: SurvivorFileRecord = { ...base, ...(hold ? { unknown: hold.procs } : {}) };
   try {
     writeFileSync(join(root, ONESHOT_SURVIVOR_FILE), `${JSON.stringify(record)}\n`, {
       mode: 0o600,
@@ -224,7 +257,7 @@ function writeSurvivorFile(root: string, survivor: GroupSurvivor): void {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") return; // no root: nothing for a restart to protect
     console.error(
-      `[oneshot] survivor of pid ${survivor.pid} not persisted (${code ?? "error"}): a daemon restart will not know to keep its root`,
+      `[oneshot] survivor of pid ${base.pid} not persisted (${code ?? "error"}): a daemon restart will not know to keep its root`,
     );
   }
 }
@@ -248,7 +281,81 @@ export function markGroupSurvivor(
     cause: extra.cause ?? "group",
   };
   survivingGroups.set(root, survivor);
-  writeSurvivorFile(root, survivor);
+  writeSurvivorFile(root);
+}
+
+/**
+ * Keep `root` (and the temp cwd) while any of these processes lives, without failing the call.
+ * Writes them into `survivor.json` for a restart. Logs metadata only, once per process: pid, the
+ * errno of each read, whether it descends from the daemon, and its age relative to the leader.
+ */
+export function markUnknownProcs(
+  root: string,
+  leader: { pid: number; startMs: number | null },
+  procs: readonly UnknownProc[],
+  extra: { tempCwd?: string; cwds?: string[] } = {},
+): void {
+  if (procs.length === 0) return;
+  const known = unknownHolds.get(root)?.procs ?? [];
+  const merged = [...known];
+  for (const proc of procs) {
+    if (!merged.some((m) => m.pid === proc.pid && m.startMs === proc.startMs)) {
+      merged.push({ pid: proc.pid, startMs: proc.startMs });
+    }
+    const key = `${root}:${proc.pid}:${proc.startMs}`;
+    if (!loggedUnknown.has(key)) {
+      loggedUnknown.add(key);
+      console.warn(
+        `[oneshot] escape scan could not read pid ${proc.pid} (environ ${proc.envErrno}, cwd ${proc.cwdErrno}, descendant of the daemon: ${proc.descendant ? "yes" : "no"}, started ${proc.ageMs === null ? "unknown" : `${proc.ageMs} ms`} after the leader); config root kept while it lives`,
+      );
+    }
+  }
+  unknownHolds.set(root, {
+    leaderPid: leader.pid,
+    leaderStartMs: leader.startMs,
+    tempCwd: extra.tempCwd ?? unknownHolds.get(root)?.tempCwd,
+    cwds: extra.cwds ?? unknownHolds.get(root)?.cwds ?? [],
+    procs: merged,
+  });
+  writeSurvivorFile(root);
+}
+
+/** The process is alive with the start time recorded for it. A dead or recycled pid is gone. */
+function heldProcAlive(
+  proc: HeldProc,
+  deps: { kill?: (pid: number, signal: 0) => void; startMs?: StartMsReader } = {},
+): boolean {
+  try {
+    (deps.kill ?? process.kill)(proc.pid, 0);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    // EPERM: it exists, and is not ours to signal; fall through to the identity check
+  }
+  const now = (deps.startMs ?? processStartMs)(proc.pid);
+  if (proc.startMs === null || now === null) return true; // cannot tell: assume it is the same
+  return Math.abs(now - proc.startMs) <= START_TIME_TOLERANCE_MS;
+}
+
+/** Drop the dead processes of a hold, and the hold itself when none is left. True while it stands. */
+function holdStands(root: string, deps: SweepDeps = {}): boolean {
+  const hold = unknownHolds.get(root);
+  if (!hold) return false;
+  const alive = deps.heldAlive ?? ((p: HeldProc) => heldProcAlive(p));
+  const procs = hold.procs.filter((p) => alive(p));
+  if (procs.length === 0) {
+    unknownHolds.delete(root);
+    return false;
+  }
+  if (procs.length !== hold.procs.length) {
+    unknownHolds.set(root, { ...hold, procs });
+    writeSurvivorFile(root);
+  }
+  return true;
+}
+
+/** Whether `root` is kept only for processes the scan could not read (and that still live). */
+export function unknownHoldActive(root: string): boolean {
+  return holdStands(root);
 }
 export function groupSurvivorOf(root: string): number | undefined {
   return survivingGroups.get(root)?.pid;
@@ -261,13 +368,22 @@ export function groupSurvivorCauseOf(root: string): SurvivorCause | undefined {
 export function groupSurvivorCount(): number {
   return survivingGroups.size;
 }
-/** Test seam: forget every recorded survivor. */
+/** Test seam: how many roots are held for unreadable processes. */
+export function unknownHoldCount(): number {
+  return unknownHolds.size;
+}
+/** Test seam: forget every recorded survivor and hold. */
 export function resetGroupSurvivorsForTests(): void {
   survivingGroups.clear();
+  unknownHolds.clear();
+  loggedUnknown.clear();
 }
-const protectedBySurvivor = (path: string): boolean => {
+const protectedBySurvivor = (path: string, deps: SweepDeps = {}): boolean => {
   for (const [root, survivor] of survivingGroups) {
     if (root === path || survivor.tempCwd === path) return true;
+  }
+  for (const [root, hold] of [...unknownHolds]) {
+    if ((root === path || hold.tempCwd === path) && holdStands(root, deps)) return true;
   }
   return false;
 };
@@ -283,12 +399,24 @@ function readSurvivorFile(root: string): SurvivorFileRecord | "missing" | "unrea
   try {
     const parsed = JSON.parse(raw) as SurvivorFileRecord;
     const cwdsOk = Array.isArray(parsed.cwds) && parsed.cwds.every((c) => typeof c === "string");
-    if (!isSignalablePid(parsed.pid) || !cwdsOk) return "unreadable";
+    const unknownOk =
+      parsed.unknown === undefined ||
+      (Array.isArray(parsed.unknown) &&
+        parsed.unknown.every(
+          (u) =>
+            Number.isInteger(u?.pid) &&
+            u.pid > 1 &&
+            (u.startMs === null || typeof u.startMs === "number"),
+        ));
+    if (!isSignalablePid(parsed.pid) || !cwdsOk || !unknownOk) return "unreadable";
     return {
       pid: parsed.pid,
       startMs: typeof parsed.startMs === "number" ? parsed.startMs : null,
       cwds: parsed.cwds,
       tempCwd: typeof parsed.tempCwd === "string" ? parsed.tempCwd : undefined,
+      ...(parsed.unknown
+        ? { unknown: parsed.unknown.map((u) => ({ pid: u.pid, startMs: u.startMs })) }
+        : {}),
     };
   } catch {
     return "unreadable";
@@ -311,7 +439,6 @@ export interface SurvivorRetryDeps {
  */
 export async function retrySurvivingGroups(deps: SurvivorRetryDeps = {}): Promise<number> {
   const terminate = deps.terminate ?? terminateProcessGroup;
-  const reap = deps.reap ?? ((target: EscapeScanTarget) => terminateEscapees(target));
   let cleared = 0;
   for (const [root, survivor] of [...survivingGroups]) {
     survivor.retries++;
@@ -323,7 +450,23 @@ export async function retrySurvivingGroups(deps: SurvivorRetryDeps = {}): Promis
         startMs: deps.startMs,
         leaderAlive: () => false,
       });
-      const escapees = await reap({ root, cwds: survivor.cwds });
+      const target: EscapeScanTarget = {
+        root,
+        cwds: survivor.cwds,
+        leaderStartMs: survivor.startMs,
+      };
+      // Unreadable processes are not a failure here either: they become a hold on the root.
+      const escapees = await (
+        deps.reap ??
+        ((t: EscapeScanTarget) =>
+          terminateEscapees(t, {
+            onUnknown: (unknown) =>
+              markUnknownProcs(root, { pid: survivor.pid, startMs: survivor.startMs }, unknown, {
+                tempCwd: survivor.tempCwd,
+                cwds: survivor.cwds,
+              }),
+          }))
+      )(target);
       if (groupGone && escapees.length === 0) {
         survivingGroups.delete(root);
         cleared++;
@@ -453,30 +596,23 @@ export interface SweepDeps {
   groupGone?: (survivor: { pid: number; startMs: number | null }) => boolean;
   /** Replaces the escape scan (Linux). May throw. */
   scan?: (target: EscapeScanTarget) => EscapeScan;
+  /** Replaces the check that a held unreadable process is still alive with the same start time. */
+  heldAlive?: (proc: HeldProc) => boolean;
 }
 
 /** A quarantined directory is considered for removal only once it is this old. */
 export const ONESHOT_QUARANTINE_MAX_AGE_MS = 24 * 60 * 60_000;
 
 /**
- * True when something of a recorded survivor is alive or cannot be told: its group (checked with
- * identity, zombies excepted), anything that left the group (Linux scan), or a scan that failed.
+ * True when the scan finds a process that positively matches, or throws (cannot list `/proc`).
+ * Processes it could not read are not counted: a quarantined directory has no leader time to tell
+ * a stranger from a candidate, and would otherwise be kept for ever on a host with any
+ * non-dumpable process of our uid.
  */
-function survivorMayBeAlive(root: string, record: SurvivorFileRecord, deps: SweepDeps): boolean {
-  try {
-    const gone = deps.groupGone ?? ((s) => groupGoneNow(s.pid, { leaderStartMs: s.startMs }));
-    if (!gone(record)) return true;
-    return scanFindsSomething({ root, cwds: record.cwds }, deps);
-  } catch {
-    return true; // cannot tell: not gone
-  }
-}
-
-/** True when the scan finds a process, cannot say, or throws. */
 function scanFindsSomething(target: EscapeScanTarget, deps: SweepDeps): boolean {
   try {
     const scan = (deps.scan ?? ((t: EscapeScanTarget) => findEscapees(t)))(target);
-    return scan.pids.length > 0 || scan.unknown;
+    return scan.pids.length > 0;
   } catch {
     return true;
   }
@@ -485,8 +621,10 @@ function scanFindsSomething(target: EscapeScanTarget, deps: SweepDeps): boolean 
 /**
  * Before anything is removed: a config root with a `survivor.json` whose group, or whose escapees,
  * may still be running goes back into the in-memory survivor map, so the timer keeps signalling it
- * and neither it nor its temp cwd is swept (#570 r14, C). This ignores age: a restart a minute
- * after a failed disposal must not lose the record.
+ * and neither it nor its temp cwd is swept (#570 r14, C). A recorded process the scan could not
+ * read (r14b) that is still alive with its recorded start time, or one the scan cannot read now,
+ * puts the root back as a hold instead, which signals nothing. This ignores age: a restart a
+ * minute after a failed disposal must not lose the record.
  */
 function adoptPersistedSurvivors(
   dir: string,
@@ -494,27 +632,67 @@ function adoptPersistedSurvivors(
   uid: number | undefined,
   deps: SweepDeps,
 ): void {
+  const alive = deps.heldAlive ?? ((p: HeldProc) => heldProcAlive(p));
   for (const name of names) {
     if (!name.startsWith(ONESHOT_CONFIG_PREFIX)) continue;
     const path = join(dir, name);
     try {
       const stat = lstatSync(path);
       if (!stat.isDirectory() || (uid !== undefined && stat.uid !== uid)) continue;
-      if (survivingGroups.has(path) || activeDirs.has(path)) continue;
+      if (survivingGroups.has(path) || unknownHolds.has(path) || activeDirs.has(path)) continue;
       const record = readSurvivorFile(path);
       if (record === "missing" || record === "unreadable") continue; // unreadable: quarantined below
-      if (!survivorMayBeAlive(path, record, deps)) continue;
-      survivingGroups.set(path, {
-        pid: record.pid,
-        startMs: record.startMs,
-        tempCwd: record.tempCwd,
-        cwds: record.cwds,
-        retries: 0,
-        cause: "group",
-      });
-      console.error(
-        `[oneshot] survivor of pid ${record.pid} found after a restart; ${name} kept and signalled again`,
-      );
+
+      // The group of the recorded leader (with identity), and what the scan sees now.
+      let groupAlive = true; // cannot tell: not gone
+      try {
+        const gone = deps.groupGone ?? ((r) => groupGoneNow(r.pid, { leaderStartMs: r.startMs }));
+        groupAlive = !gone(record);
+      } catch {
+        /* stays alive */
+      }
+      let scan: EscapeScan | undefined;
+      try {
+        scan = (deps.scan ?? ((t: EscapeScanTarget) => findEscapees(t)))({
+          root: path,
+          cwds: record.cwds,
+          leaderStartMs: record.startMs,
+        });
+      } catch {
+        /* /proc could not be listed: cannot tell, so it is a survivor */
+      }
+      const survivor = groupAlive || scan === undefined || scan.pids.length > 0;
+      const procs: HeldProc[] = [...(record.unknown ?? []).filter((p) => alive(p))];
+      for (const proc of scan?.unknown ?? []) {
+        if (!procs.some((p) => p.pid === proc.pid))
+          procs.push({ pid: proc.pid, startMs: proc.startMs });
+      }
+
+      if (survivor) {
+        survivingGroups.set(path, {
+          pid: record.pid,
+          startMs: record.startMs,
+          tempCwd: record.tempCwd,
+          cwds: record.cwds,
+          retries: 0,
+          cause: "group",
+        });
+        console.error(
+          `[oneshot] survivor of pid ${record.pid} found after a restart; ${name} kept and signalled again`,
+        );
+      }
+      if (procs.length > 0) {
+        unknownHolds.set(path, {
+          leaderPid: record.pid,
+          leaderStartMs: record.startMs,
+          tempCwd: record.tempCwd,
+          cwds: record.cwds,
+          procs,
+        });
+        console.warn(
+          `[oneshot] ${procs.length} unreadable process(es) of ${name} still alive after a restart; root kept while they live`,
+        );
+      }
     } catch (error) {
       console.warn(
         `[oneshot] survivor record not checked (${(error as NodeJS.ErrnoException).code ?? "error"})`,
@@ -561,7 +739,7 @@ export function sweepStaleOneShotDirs(
       const stat = lstatSync(path);
       if (!stat.isDirectory() || now - stat.mtimeMs <= maxAgeMs) continue;
       if (uid !== undefined && stat.uid !== uid) continue; // not ours to remove
-      if (activeDirs.has(path) || protectedBySurvivor(path)) continue;
+      if (activeDirs.has(path) || protectedBySurvivor(path, deps)) continue;
       // Another live daemon's call is kept. This daemon's own finished call (not `activeDirs`)
       // whose removal failed is a leftover too, so its owner file does not protect it.
       const owner = readOwnerFile(path);

@@ -422,6 +422,14 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     cleanupSpies = [];
     setPromptPrepareForTests(null);
     setUntrustedFileMentionNeutralizingForTests(true);
+    // The harness hides every warning (they can carry paths). The escape scan's unknowns are
+    // metadata only by construction (pid, errno, ancestry, age), so those lines are shown.
+    for (const call of warnings?.mock.calls ?? []) {
+      const line = String(call[0]);
+      if (/^\[oneshot\] (escape scan could not read pid|\d+ unreadable process)/.test(line)) {
+        console.info(`[isolation-spike] scan-unknown: ${line}`);
+      }
+    }
     warnings?.mockRestore();
     errors?.mockRestore();
     if (savedIsolation !== undefined) engines.get("pty")!.caps.isolation = savedIsolation;

@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { EscapeScan } from "../runner/pty-escape-scan.js";
 import { terminateProcessGroup } from "../runner/pty-group-kill.js";
 import {
   DAEMON_INSTANCE,
@@ -24,11 +25,13 @@ import {
   ONESHOT_SWEEP_INTERVAL_MS,
   ONESHOT_SWEEP_MAX_AGE_MS,
   type OwnerRecord,
+  unknownHoldCount,
   createUntrustedConfigRoot,
   createUntrustedTempCwd,
   groupSurvivorCount,
   groupSurvivorOf,
   markGroupSurvivor,
+  markUnknownProcs,
   markOneShotDirActive,
   operatorSecureStorageDir,
   processStartMs,
@@ -361,7 +364,8 @@ describe("retrySurvivingGroups", () => {
   it("terminates each recorded survivor again, with the identity recorded at spawn and no claim on the leader", async () => {
     markGroupSurvivor("/tmp/root-a", 4242, { startMs: 1_700_000_000_000, cwds: ["/tmp/cwd-a"] });
     const seen: Array<{ pid: number; start: number | null | undefined; owned: boolean }> = [];
-    const reaped: Array<{ root: string; cwds: string[] }> = [];
+    const reaped: Array<{ root: string | null; cwds: string[]; leaderStartMs?: number | null }> =
+      [];
     const cleared = await retrySurvivingGroups({
       terminate: async (pid, opts) => {
         seen.push({ pid, start: opts.leaderStartMs, owned: opts.leaderAlive?.() ?? true });
@@ -374,7 +378,9 @@ describe("retrySurvivingGroups", () => {
     });
     expect(cleared).toBe(1);
     expect(seen).toEqual([{ pid: 4242, start: 1_700_000_000_000, owned: false }]);
-    expect(reaped).toEqual([{ root: "/tmp/root-a", cwds: ["/tmp/cwd-a"] }]);
+    expect(reaped).toEqual([
+      { root: "/tmp/root-a", cwds: ["/tmp/cwd-a"], leaderStartMs: 1_700_000_000_000 },
+    ]);
     expect(groupSurvivorOf("/tmp/root-a")).toBeUndefined();
   });
 
@@ -498,12 +504,11 @@ describe("survivor.json", () => {
     expect(groupSurvivorOf(root)).toBe(4242); // the timer will signal it again
   });
 
-  it("keeps a root when the group is gone but the escape scan finds a process, cannot say, or throws", () => {
+  it("keeps a root, as a survivor, when the group is gone but the escape scan finds a process or throws", () => {
     const error = errorSpy();
     try {
-      const scans: Record<string, () => { pids: number[]; unknown: boolean }> = {
-        found: () => ({ pids: [999], unknown: false }),
-        unknown: () => ({ pids: [], unknown: true }),
+      const scans: Record<string, () => EscapeScan> = {
+        found: () => ({ pids: [999], unknown: [] }),
         threw: () => {
           throw new Error("no /proc");
         },
@@ -513,7 +518,6 @@ describe("survivor.json", () => {
         markGroupSurvivor(root, 4242, { startMs: 7, cwds: [] });
         utimesSync(root, OLD, OLD);
         restart();
-        // Went red (1 removed, expected 0) with the scan ignored when adopting.
         expect(sweep({ groupGone: () => true, scan })).toBe(0);
         expect(existsSync(root)).toBe(true);
         expect(groupSurvivorOf(root)).toBe(4242);
@@ -528,7 +532,7 @@ describe("survivor.json", () => {
     markGroupSurvivor(root, 4242, { startMs: 7, cwds: [] });
     utimesSync(root, OLD, OLD);
     restart();
-    expect(sweep({ groupGone: () => true, scan: () => ({ pids: [], unknown: false }) })).toBe(1);
+    expect(sweep({ groupGone: () => true, scan: () => ({ pids: [], unknown: [] }) })).toBe(1);
     expect(existsSync(root)).toBe(false);
     expect(groupSurvivorCount()).toBe(0);
   });
@@ -540,7 +544,7 @@ describe("survivor.json", () => {
     utimesSync(root, OLD, OLD);
     restart();
     // Went red (0 removed, expected 1) with the recorded identity ignored.
-    expect(sweep({ scan: () => ({ pids: [], unknown: false }) })).toBe(1);
+    expect(sweep({ scan: () => ({ pids: [], unknown: [] }) })).toBe(1);
     expect(existsSync(root)).toBe(false);
   });
 
@@ -551,7 +555,7 @@ describe("survivor.json", () => {
     restart();
     const error = errorSpy();
     try {
-      expect(sweep({ scan: () => ({ pids: [], unknown: false }) })).toBe(0);
+      expect(sweep({ scan: () => ({ pids: [], unknown: [] }) })).toBe(0);
     } finally {
       error.mockRestore();
     }
@@ -565,7 +569,7 @@ describe("survivor.json", () => {
     utimesSync(root, OLD, OLD);
     const warn = warnSpy();
     try {
-      expect(sweep({ scan: () => ({ pids: [], unknown: false }) })).toBe(0);
+      expect(sweep({ scan: () => ({ pids: [], unknown: [] }) })).toBe(0);
       expect(existsSync(root)).toBe(true);
       const logged = warn.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
       // Went red with the directory's name left out of the log.
@@ -589,27 +593,43 @@ describe("quarantine (#570 r14, M4)", () => {
     const warn = spyOn(console, "warn").mockImplementation(() => {});
     try {
       const path = broken(`${ONESHOT_CWD_PREFIX}ancient-clean`, ancient);
-      expect(sweep({ scan: () => ({ pids: [], unknown: false }) })).toBe(1);
+      expect(sweep({ scan: () => ({ pids: [], unknown: [] }) })).toBe(1);
       expect(existsSync(path)).toBe(false);
     } finally {
       warn.mockRestore();
     }
   });
 
-  it("is kept after 24 h when the scan finds a process, cannot say, or throws", () => {
+  it("is kept after 24 h when the scan finds a process or throws", () => {
     const warn = spyOn(console, "warn").mockImplementation(() => {});
     try {
       const found = broken(`${ONESHOT_CWD_PREFIX}ancient-found`, ancient);
-      const unknown = broken(`${ONESHOT_CONFIG_PREFIX}ancient-unknown`, ancient);
       const threw = broken(`${ONESHOT_CONFIG_PREFIX}ancient-threw`, ancient);
       const scan = (target: { root: string | null }) => {
         if (target.root?.endsWith("ancient-threw")) throw new Error("no /proc");
-        if (target.root?.endsWith("ancient-unknown")) return { pids: [], unknown: true };
-        return { pids: [4242], unknown: false };
+        return { pids: [4242], unknown: [] };
       };
-      // Went red (3 removed, expected 0) with the scan check dropped from the 24 h removal.
       expect(sweep({ scan })).toBe(0);
-      for (const path of [found, unknown, threw]) expect(existsSync(path)).toBe(true);
+      for (const path of [found, threw]) expect(existsSync(path)).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("is not kept for ever by a process the scan merely could not read (it cannot be attributed)", () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const path = broken(`${ONESHOT_CONFIG_PREFIX}ancient-unreadable`, ancient);
+      const unreadable = {
+        pid: 4242,
+        startMs: 1,
+        envErrno: "EACCES",
+        cwdErrno: "EACCES",
+        descendant: false,
+        ageMs: null,
+      };
+      expect(sweep({ scan: () => ({ pids: [], unknown: [unreadable] }) })).toBe(1);
+      expect(existsSync(path)).toBe(false);
     } finally {
       warn.mockRestore();
     }
@@ -624,10 +644,10 @@ describe("quarantine (#570 r14, M4)", () => {
       sweep({
         scan: (target) => {
           seen.push(target);
-          return { pids: [], unknown: false };
+          return { pids: [], unknown: [] };
         },
       });
-      expect(seen.find((t) => t.root === root)).toEqual({ root, cwds: [] });
+      expect(seen.find((t) => t.root === root)?.cwds).toEqual([]);
       const forCwd = seen.find((t) => t.root === null);
       expect(forCwd?.cwds).toContain(cwd);
     } finally {
@@ -668,5 +688,139 @@ describe("retrySurvivingGroups with the real termination (#570 r14, B and E)", (
     expect(sent).toEqual([[-4242, "SIGTERM"]]);
     // Went red (a reader function) with the pass's cached reader passed to the termination again.
     expect(readers).toEqual([undefined]);
+  });
+});
+
+// #570 r14b: a process the escape scan could not read keeps the root while it lives, and is not a failure.
+describe("unknown holds (r14b)", () => {
+  const own = (): OwnerRecord =>
+    live({ pid: deadPid(), instance: "the-daemon-before-the-restart" });
+  const unreadable = (pid: number, startMs: number | null) => ({
+    pid,
+    startMs,
+    envErrno: "EACCES",
+    cwdErrno: "EACCES",
+    descendant: false,
+    ageMs: 120,
+  });
+  const leader = { pid: 4242, startMs: 7 };
+  const spawned: ReturnType<typeof Bun.spawn>[] = [];
+  afterEach(() => {
+    for (const child of spawned.splice(0)) child.kill("SIGKILL");
+  });
+  const stray = (): { pid: number; startMs: number | null } => {
+    const child = Bun.spawn(["sleep", "30"], { stdout: "ignore", stderr: "ignore" });
+    spawned.push(child);
+    return { pid: child.pid, startMs: processStartMs(child.pid) };
+  };
+  async function died(child: ReturnType<typeof Bun.spawn>): Promise<void> {
+    child.kill("SIGKILL");
+    await child.exited;
+  }
+
+  it("keeps the root and the temp cwd while the unreadable process lives with the same start time, then removes them", async () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const root = leftover(
+        `${ONESHOT_CONFIG_PREFIX}held`,
+        OLD,
+        live({ instance: DAEMON_INSTANCE }),
+      );
+      const cwd = leftover(`${ONESHOT_CWD_PREFIX}held`, OLD, live({ instance: DAEMON_INSTANCE }));
+      const proc = stray();
+      markUnknownProcs(root, leader, [unreadable(proc.pid, proc.startMs)], {
+        tempCwd: cwd,
+        cwds: [cwd],
+      });
+      for (const dir of [root, cwd]) utimesSync(dir, OLD, OLD);
+
+      expect(groupSurvivorCount()).toBe(0); // an unknown is not a group survivor
+      expect(unknownHoldCount()).toBe(1);
+      expect(sweep()).toBe(0);
+      expect(existsSync(root)).toBe(true);
+      expect(existsSync(cwd)).toBe(true);
+
+      await died(spawned[0] as never);
+      expect(sweep()).toBe(2);
+      expect(existsSync(root)).toBe(false);
+      expect(existsSync(cwd)).toBe(false);
+      expect(unknownHoldCount()).toBe(0);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("counts a recycled pid as gone: the same pid with another start time does not keep the root", () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const root = leftover(
+        `${ONESHOT_CONFIG_PREFIX}recycled-hold`,
+        OLD,
+        live({ instance: DAEMON_INSTANCE }),
+      );
+      const proc = stray();
+      markUnknownProcs(root, leader, [unreadable(proc.pid, (proc.startMs ?? 0) - 3_600_000)]);
+      utimesSync(root, OLD, OLD);
+      expect(sweep()).toBe(1);
+      expect(existsSync(root)).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("writes the unknown pids and their start times into survivor.json, with the leader", () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const root = leftover(`${ONESHOT_CONFIG_PREFIX}persisted`, OLD, own());
+      markUnknownProcs(root, leader, [unreadable(5151, 123_450)], { cwds: ["/tmp/c"] });
+      const record = JSON.parse(readFileSync(join(root, ONESHOT_SURVIVOR_FILE), "utf8"));
+      expect(record).toMatchObject({
+        pid: 4242,
+        startMs: 7,
+        cwds: ["/tmp/c"],
+        unknown: [{ pid: 5151, startMs: 123_450 }],
+      });
+      expect(JSON.stringify(record)).not.toContain("EACCES");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("is re-registered after a restart while a recorded process lives, and removed once it is gone", () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const root = leftover(`${ONESHOT_CONFIG_PREFIX}restart-hold`, OLD, own());
+      markUnknownProcs(root, leader, [unreadable(5151, 123_450)]);
+      utimesSync(root, OLD, OLD);
+      resetGroupSurvivorsForTests(); // the daemon restarted
+      const quiet = { groupGone: () => true, scan: () => ({ pids: [], unknown: [] }) };
+      expect(sweep({ ...quiet, heldAlive: () => true })).toBe(0);
+      expect(existsSync(root)).toBe(true);
+      expect(unknownHoldCount()).toBe(1);
+      expect(groupSurvivorCount()).toBe(0);
+
+      resetGroupSurvivorsForTests();
+      expect(sweep({ ...quiet, heldAlive: () => false })).toBe(1);
+      expect(existsSync(root)).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("logs metadata only: pid, errnos, ancestry and age, and nothing else", () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      markUnknownProcs("/tmp/secret-root-path", leader, [unreadable(5151, 123_450)]);
+      markUnknownProcs("/tmp/secret-root-path", leader, [unreadable(5151, 123_450)]);
+      const logged = warn.mock.calls.map((call: unknown[]) => String(call[0]));
+      expect(logged).toHaveLength(1); // once per process
+      expect(logged[0]).toContain("pid 5151");
+      expect(logged[0]).toContain("environ EACCES, cwd EACCES");
+      expect(logged[0]).toContain("descendant of the daemon: no");
+      expect(logged[0]).toContain("120 ms after the leader");
+      expect(logged[0]).not.toContain("secret");
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
