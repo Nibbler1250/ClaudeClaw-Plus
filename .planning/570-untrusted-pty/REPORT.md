@@ -1485,3 +1485,19 @@ RED lines, switch on, fixtures reverted:
 (The first three are the cases Codex named; the log compressor dropped some words from the names. The fourth has the same missing boot id.)
 
 One unrelated failure seen once: `HTTP engines > openai-compatible: the timeout aborts the request` (`http.test.ts:213`, expected 124, got 1) in one of seven Linux-switch runs. It uses a 50 ms timeout and no boot-id code; it passed in four isolated runs with the switch on and in the full rerun. I take it for a timing flake under load, and have not shown that.
+
+### r15b integration run: results
+
+Run [39485100730](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39485100730) on `de7f9aaf`, Claude 2.1.304, one run as the addendum says. **55 of 56 rows pass; the Linux step is 86 of 86 (it ran the new boot-id and hang-signature tests).** B3 PTY CONTROL PRESENT, the row that failed in the last run, passed with no retry. The one failure is row C.
+
+Every `row-retry` line in the run (one):
+
+```
+[isolation-spike] row-retry C @ look-alikes CONTROL PRESENT: reason=hang-signature
+```
+
+**Row C failed after its retry, and the retry never finished.** First attempt: `run-exit -: exit=124; reason=timeout; phasesMs={"exec":75044}; elapsedMs=75247`, then the retry line. Then `(fail) ... C @ look-alikes ... CONTROL PRESENT [140004.65ms]` with `this test timed out after 140000ms`. The row's own test timeout is `BUDGET + 20_000` = 140 s. The first attempt used about 75 s, which left the retry about 65 s, less than its own 60 s turn budget plus REPL startup. So bun killed the row mid-retry. This is a flaw in my change, not evidence of a second hang: **I do not know whether the retry would have answered.** The `run-exit -: exit=124 ... exec 70521` and `expect(received).toBe(expected)` lines that follow in the log are the abandoned body of that test still running while the twin starts; the twin passed (RED as expected, `7094.77ms`).
+
+Not fixed, as the addendum says to stop when a row fails after its retry. The likely fix is to give every `retryHang` row a test timeout of twice its call budget plus margin (the retry can use the whole budget again). Say if you want that and another integration run.
+
+Every other row, including A-login, A-untouched, A-paste, F3 and the hang-rate samples, passed. Other non-zero exits seen and not retried (expected, they are twins or `allowNoTurn` rows): `trust-twin` exit 1 `not-ready:trust-dialog`, `api-key-twin` exit 124, `a-login-twin` exit 1 `not-ready:login-required`, `hang-baseline-3` exit 124 (a hang-rate sample, `allowNoTurn`, not a CONTROL PRESENT row).
