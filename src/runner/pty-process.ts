@@ -60,7 +60,11 @@ import {
 } from "./pty-prompt-sanitizer";
 import { promptPrepareOverride, untrustedFileMentionNeutralizing } from "./pty-process-test-seams";
 import { appendFileSync } from "node:fs";
-import { type GroupTerminationOptions, terminateProcessGroup } from "./pty-group-kill";
+import {
+  type GroupTerminationOptions,
+  type SurvivorCause,
+  terminateProcessGroup,
+} from "./pty-group-kill";
 import { processStartMs } from "./pty-proc-identity";
 import { Screen } from "./pty-screen";
 
@@ -104,7 +108,7 @@ export interface PtyProcessOptions {
    * the error is logged and `dispose()` rejects, so the caller keeps whatever the child may
    * still be writing into.
    */
-  onGroupSurvived?: (pid: number, startMs: number | null) => void;
+  onGroupSurvived?: (pid: number, startMs: number | null, cause: SurvivorCause) => void;
   /**
    * Called once the group is gone: stop descendants that left it (Linux, see pty-escape-scan).
    * Resolves the pids that are still alive; a rejection counts as "could not tell" and fails
@@ -245,6 +249,8 @@ export interface PtyExitInfo {
 export interface PtyProcess {
   readonly label: string;
   readonly pid: number;
+  /** The leader's start time recorded at spawn (untrusted children only); null when not read. */
+  readonly leaderStartMs?: number | null;
   readonly sessionId: string;
   readonly cwd: string;
   isAlive(): boolean;
@@ -597,7 +603,11 @@ class PtyProcessImpl implements PtyProcess {
   private readonly _untrustedTrace: boolean;
   /** Retirement stops the whole process group and waits for it (pty-group-kill). */
   private readonly _terminateGroup: boolean;
-  private readonly _onGroupSurvived?: (pid: number, startMs: number | null) => void;
+  private readonly _onGroupSurvived?: (
+    pid: number,
+    startMs: number | null,
+    cause: SurvivorCause,
+  ) => void;
   private readonly _reapEscapees?: () => Promise<number[]>;
   private readonly _groupTermination?: GroupTerminationOptions;
   /** The leader's start time at spawn: every later signal checks that the pid still has it. */
@@ -657,6 +667,10 @@ class PtyProcessImpl implements PtyProcess {
 
   get pid(): number {
     return this._pid;
+  }
+  /** The leader's start time recorded at spawn, for a group that outlives it. Null: not read. */
+  get leaderStartMs(): number | null {
+    return this._leaderStartMs;
   }
   get sessionId(): string {
     return this._sessionId;
@@ -1161,8 +1175,12 @@ class PtyProcessImpl implements PtyProcess {
     }
 
     let survived = !(await groupGone);
+    let cause: SurvivorCause = "group";
     let escapees: number[] = [];
-    if (sweepGroup && this._reapEscapees) {
+    // The window above guards only the signal to the bare pid. A descendant that left the group is
+    // found by what it inherited, not by the leader's pid, so it is looked for however old the
+    // child is (#570 r14, A).
+    if (this._terminateGroup && this._reapEscapees) {
       try {
         escapees = await this._reapEscapees();
       } catch (error) {
@@ -1170,16 +1188,18 @@ class PtyProcessImpl implements PtyProcess {
         console.error(
           `[pty-process] ${this.label} escapee scan failed (${(error as NodeJS.ErrnoException)?.code ?? "error"})`,
         );
+        if (!survived) cause = "scan-unknown";
         survived = true;
       }
     }
+    if (!survived && escapees.length > 0) cause = "escapee";
     let hookError: unknown;
     if (survived || escapees.length > 0) {
       console.error(
         `[pty-process] ${this.label} retired but ${survived ? "its process group is still alive" : `${escapees.length} process(es) outside its group are still alive`} (pid=${this._pid})`,
       );
       try {
-        this._onGroupSurvived?.(this._pid, this._leaderStartMs);
+        this._onGroupSurvived?.(this._pid, this._leaderStartMs, cause);
       } catch (error) {
         // Fail closed: if the caller could not record the survivor it cannot protect what the
         // survivor may write into, so the disposal does not report success.
@@ -1236,12 +1256,22 @@ class PtyProcessImpl implements PtyProcess {
         if (reason !== undefined) finish({ ok: false, reason });
         else if (hasFooter()) finish({ ok: true });
       };
+      // The quiet window restarts only when the reconstructed screen text changed: a REPL that
+      // keeps moving its cursor or repainting identical text is not a screen that is still
+      // changing (#570 r14, D). The blocked screens are looked for on every chunk.
+      let lastText: string | null = null;
       const check = (): void => {
+        const text = this._screen.text();
+        const changed = text !== lastText;
+        lastText = text;
+        if (!hasFooter() && blockedReason() === undefined) {
+          if (quiet !== null) this._clearTimeout(quiet);
+          quiet = null;
+          return;
+        }
+        if (quiet !== null && !changed) return; // the window already running keeps running
         if (quiet !== null) this._clearTimeout(quiet);
-        quiet =
-          hasFooter() || blockedReason() !== undefined
-            ? this._setTimeout(onQuiet, this._quietWindowMs)
-            : null;
+        quiet = this._setTimeout(onQuiet, this._quietWindowMs);
       };
       const deadline = this._setTimeout(() => {
         // A screen that never went quiet is judged a last time, as it stands.

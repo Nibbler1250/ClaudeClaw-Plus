@@ -70,6 +70,7 @@ import { trustedToolFlags, validateIsolation } from "../oneshot/isolation.js";
 import { validateRouteEngine } from "../oneshot/config.js";
 import * as untrustedCleanup from "../oneshot/pty-cleanup.js";
 import { terminateEscapees } from "./pty-escape-scan.js";
+import type { SurvivorCause } from "./pty-group-kill.js";
 import {
   TRANSCRIPT_WAIT_MS,
   awaitLastAssistantReply,
@@ -1755,27 +1756,56 @@ function untrustedGroupOptions(
 ): Pick<PtyProcessOptions, "onGroupSurvived" | "reapEscapees"> {
   const cwds = untrustedCleanup.untrustedCwdForms(tempCwd);
   return {
-    onGroupSurvived: (pid, startMs) =>
-      untrustedCleanup.markGroupSurvivor(root, pid, { startMs, tempCwd, cwds }),
+    onGroupSurvived: (pid, startMs, cause) =>
+      untrustedCleanup.markGroupSurvivor(root, pid, { startMs, tempCwd, cwds, cause }),
     reapEscapees: () => terminateEscapees({ root, cwds }),
   };
 }
 
 /**
  * A disposal that rejected leaves it unknown whether the child is gone, so an untrusted one-shot's
- * root is kept as for a survivor (fail closed). The pid's identity is not known here, so the
- * sweeper cannot stop it; the root stays until the daemon restarts.
+ * root is kept as for a survivor (fail closed), with the leader's start time recorded at spawn so
+ * the sweeper can signal it with an identity check, and `survivor.json` so a daemon restart keeps
+ * it too. With no PTY to name, nothing can be signalled and nothing is recorded: that is logged.
  */
-function keepRootAfterFailedDispose(entry: PtyEntry, reason: unknown): void {
+function keepRootAfterFailedDispose(
+  entry: PtyEntry,
+  reason: unknown,
+  pty: PtyProcess | null = entry.pty,
+): void {
   console.error(`[pty-supervisor] ${entry.sessionKey} disposal failed (${errorCode(reason)})`);
   const config = entry.scope.untrustedConfig;
-  const pid = entry.pty?.pid;
-  if (entry.scope.isolation !== "untrusted" || !config || pid === undefined) return;
+  if (entry.scope.isolation !== "untrusted" || !config) return;
+  if (pty === null) {
+    console.error(
+      `[pty-supervisor] ${entry.sessionKey} disposal failed with no PTY to name: its config root is unprotected`,
+    );
+    return;
+  }
   if (untrustedCleanup.groupSurvivorOf(config.root) === undefined) {
-    untrustedCleanup.markGroupSurvivor(config.root, pid, {
+    untrustedCleanup.markGroupSurvivor(config.root, pty.pid, {
+      startMs: pty.leaderStartMs ?? null,
       tempCwd: entry.spawnOpts?.cwd,
       cwds: entry.spawnOpts ? untrustedCleanup.untrustedCwdForms(entry.spawnOpts.cwd) : [],
+      cause: "dispose-rejected",
     });
+  }
+}
+
+/** Test seams for the failed-disposal paths (#570 r14). */
+export const __keepRootAfterFailedDisposeForTests = keepRootAfterFailedDispose;
+
+/** What a failed untrusted one-shot says about why its root was kept. */
+function survivorReason(pid: number, cause: SurvivorCause | undefined): string {
+  switch (cause) {
+    case "escapee":
+      return `a process outside the process group of pid ${pid} survived retirement`;
+    case "scan-unknown":
+      return `the escape scan after retirement of pid ${pid} could not tell whether a process survived`;
+    case "dispose-rejected":
+      return `disposal of pid ${pid} rejected, so whether it survived is unknown`;
+    default:
+      return `process group of pid ${pid} survived retirement`;
   }
 }
 
@@ -1808,10 +1838,14 @@ async function cleanupUntrustedOneShot(state: UntrustedOneShotState): Promise<vo
   try {
     if (survivor !== undefined) {
       // Not removed: the process may still be writing into it. Left for the periodic sweep.
-      console.error(
-        `[pty-supervisor] untrusted one-shot cleanup failed: process group of pid ${survivor} survived retirement; config root kept`,
+      const reason = survivorReason(
+        survivor,
+        untrustedCleanup.groupSurvivorCauseOf(state.configRoot),
       );
-      throw new Error(`process group ${survivor} survived retirement`);
+      console.error(
+        `[pty-supervisor] untrusted one-shot cleanup failed: ${reason}; config root kept`,
+      );
+      throw new Error(reason);
     }
     await untrustedCleanup.removeUntrustedConfigRoot(state.configRoot);
   } catch (error) {
@@ -1858,19 +1892,28 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
   const settings = getSettings();
   const untrusted = req.isolation === "untrusted";
   const model = req.model ?? settings.model;
-  const result = (exitCode: number, text = "", sessionId?: string): OneShotResult => ({
+  const startedAt = Date.now();
+  const phasesMs: Record<string, number> = {};
+  const result = (
+    exitCode: number,
+    text = "",
+    sessionId?: string,
+    reason?: string,
+  ): OneShotResult => ({
     text,
     engine: "pty",
     model,
     exitCode,
     ...(sessionId ? { sessionId } : {}),
+    ...(exitCode !== 0 && reason
+      ? { diagnostic: { reason, phasesMs: { ...phasesMs, total: Date.now() - startedAt } } }
+      : {}),
   });
   // Created inside the try and removed in the finally, so it never depends on
   // the turn settling (a hung turn or a spawn that never lands).
   let untrustedState: UntrustedOneShotState | undefined;
   let untrustedConfig: PtyRunScope["untrustedConfig"];
   let lateRetire: Promise<void> | undefined;
-  const startedAt = Date.now();
   try {
     const helpers = await getRunnerHelpers();
     if (untrusted) {
@@ -1884,7 +1927,7 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
       } catch (error) {
         // Fail closed before anything is created or spawned.
         console.warn(`[pty-supervisor] one-shot ${req.route}: ${(error as Error).message}`);
-        return result(1);
+        return result(1, "", undefined, "config-dir");
       }
       const tempCwd = untrustedCleanup.createUntrustedTempCwd();
       untrustedCleanup.markOneShotDirActive(tempCwd);
@@ -1901,7 +1944,7 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
         console.warn(
           `[pty-supervisor] one-shot ${req.route}: config root not created (${errorCode(error)})`,
         );
-        return result(1);
+        return result(1, "", undefined, "config-root");
       }
       untrustedCleanup.markOneShotDirActive(configRoot);
       // The state exists before anything else can throw, so the `finally` below removes both
@@ -1911,6 +1954,7 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
       untrustedConfig = { root: configRoot, secureStorageDir };
     }
     const { PTY_OUTPUT_FORMAT_CONSTRAINT } = await import("./pty-output-format.js");
+    const execStartedAt = Date.now();
     const exec = await runEphemeralWithDeadline(
       `oneshot:${req.route}:${randomUUID()}`,
       req.prompt,
@@ -1941,10 +1985,13 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
       req.signal,
     );
     lateRetire = exec.lateRetire;
-    if (exec.timedOut || exec.aborted) return result(124);
+    phasesMs.exec = Date.now() - execStartedAt;
+    if (exec.timedOut || exec.aborted) {
+      return result(124, "", undefined, exec.timedOut ? "timeout" : "aborted");
+    }
     if (exec.exitCode !== 0) {
       console.warn(`[pty-supervisor] one-shot ${req.route} failed: ${exec.stderr}`);
-      return result(exec.exitCode);
+      return result(exec.exitCode, "", undefined, execFailureReason(exec.stderr));
     }
     if (untrustedState) {
       // The rendered screen carries the echoed prompt (for the classifier, its
@@ -1952,6 +1999,7 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
       // model's own reply from the transcript, which the finally below removes.
       // The wait counts against the caller's deadline: what the turn left of timeoutMs,
       // capped, with a 1 s floor so a turn that used its whole budget still gets one look.
+      const transcriptStartedAt = Date.now();
       const waited = await awaitLastAssistantReply(untrustedState.projectDir, {
         waitMs: transcriptWaitBudget(
           req.timeoutMs,
@@ -1960,6 +2008,7 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
         ),
         signal: req.signal,
       });
+      phasesMs.transcript = Date.now() - transcriptStartedAt;
       const reply = waited.text;
       if (reply === undefined) {
         // Abort, or the caller's own deadline running out during the wait, is a timeout
@@ -1969,7 +2018,7 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
         console.warn(
           `[pty-supervisor] one-shot ${req.route}: no assistant reply in transcript (${waited.failure ?? "timeout"})`,
         );
-        return result(code, "", exec.sessionId);
+        return result(code, "", exec.sessionId, `no-reply:${waited.failure ?? "timeout"}`);
       }
       return result(0, reply, exec.sessionId);
     }
@@ -2004,6 +2053,21 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
       }
     }
   }
+}
+
+/**
+ * A code, from a fixed set, for why a one-shot's turn failed: what a harness may print. The
+ * message itself is never forwarded; only the not-ready reason code is lifted out of it, and only
+ * when it has the shape of a code.
+ */
+function execFailureReason(stderr: string): string {
+  const notReady = /untrusted PTY not ready \(([a-z-]{1,40})\)/.exec(stderr);
+  if (notReady) return `not-ready:${notReady[1]}`;
+  if (stderr.includes(" aborted")) return "aborted";
+  if (stderr.includes("respawn failed")) return "spawn-failed";
+  if (stderr.includes("max retries")) return "turn-failed";
+  if (stderr.includes("non-retryable error")) return "turn-error";
+  return "exec-failed";
 }
 
 /**
@@ -2092,11 +2156,15 @@ async function landPty(entry: PtyEntry, pty: PtyProcess): Promise<void> {
   }
   try {
     await pty.dispose();
-  } catch {
-    // best-effort
+  } catch (error) {
+    // The late PTY is not `entry.pty`, so it is named explicitly: a rejected disposal keeps the
+    // root here as on every other path (#570 r14, E).
+    keepRootAfterFailedDispose(entry, error, pty);
   }
   throw new EntryRemovedError(entry.sessionKey, "disposed the late PTY");
 }
+
+export const __landPtyForTests = landPty;
 
 /** True while `entry` is the live entry for its key: tracked in `state.ptys`
  *  and not being retired. Every removal path sets `retiring` synchronously

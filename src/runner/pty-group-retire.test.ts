@@ -140,6 +140,22 @@ describe("retiring a PTY child", () => {
     expect(alive(bg)).toBe(true); // cleaned up in afterEach
   });
 
+  it("still looks for descendants that left the group when the child exited long ago", async () => {
+    let clock = 1_000_000;
+    let scans = 0;
+    const { child } = await spawnShell("(trap '' HUP; exec sleep 60) & echo $! > $BG", {
+      _now: () => clock,
+      reapEscapees: async () => {
+        scans++;
+        return [];
+      },
+    });
+    await until(() => !child.isAlive());
+    clock += 120_000; // past the window that guards the bare-pid signal
+    await child.dispose();
+    expect(scans).toBe(1);
+  });
+
   it("reports the pid when the group cannot be made to disappear, and does not claim success", async () => {
     const survived: number[] = [];
     // A kernel that always answers "still there" and ignores every signal.
@@ -255,6 +271,43 @@ describe("retirement and the recorded identity", () => {
       });
       await threw.child.dispose();
       expect(reported).toEqual([threw.child.pid]);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("names the cause to the survivor hook: group, escapee, or a scan that could not tell", async () => {
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const causes: string[] = [];
+      const hook = (_pid: number, _start: number | null, cause: string): void => {
+        causes.push(cause);
+      };
+      const stubborn = {
+        signal: ((_pid: number, _name: unknown): void => {}) as never,
+        termGraceMs: 60,
+        killGraceMs: 60,
+        pollMs: 20,
+        liveMembers: () => undefined,
+      };
+      const group = await spawnShell(HUP_PROOF_BG, {
+        onGroupSurvived: hook,
+        _groupTermination: stubborn,
+      });
+      await group.child.dispose();
+      const escapee = await spawnShell(HUP_PROOF_BG, {
+        onGroupSurvived: hook,
+        reapEscapees: async () => [7777],
+      });
+      await escapee.child.dispose();
+      const unknown = await spawnShell(HUP_PROOF_BG, {
+        onGroupSurvived: hook,
+        reapEscapees: async () => {
+          throw new Error("could not read /proc");
+        },
+      });
+      await unknown.child.dispose();
+      expect(causes).toEqual(["group", "escapee", "scan-unknown"]);
     } finally {
       error.mockRestore();
     }

@@ -16,7 +16,7 @@ import { readFile } from "node:fs/promises";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import type { spawn } from "node:child_process";
-import { runOneShot } from "../oneshot/engine.js";
+import { type OneShotResult, runOneShot } from "../oneshot/engine.js";
 import { withPrintRuntime } from "../oneshot/print.js";
 import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
@@ -623,6 +623,66 @@ export function classifierSpawnEnv(
   return out;
 }
 
+const CLASSIFIER_SYSTEM_PROMPT = `You classify user messages into thread management intents.
+
+If the user wants to CREATE/SPAWN/DEPLOY threads (e.g. "hire X", "派出 X", "叫 X 出來", "派 X 去打", "開 X", "建立 X"):
+Return: {"action":"hire","names":["name1","name2"]}
+
+If the user wants to DELETE/REMOVE threads (e.g. "fire X", "撤回 X", "把 X 叫回來", "刪 X", "關 X"):
+Return: {"action":"fire","names":["name1","name2"]}
+
+If the message is NOT about thread management, return: null
+
+Rules:
+- Extract individual names. "桃園三結義" = ["劉備","關羽","張飛"]. "五虎將" = ["關羽","張飛","趙雲","馬超","黃忠"].
+- Common patterns: 派/派出/出征/上陣/迎戰/出戰 = hire. 撤/撤回/收回/叫回來/滾 = fire.
+- Return ONLY valid JSON or the word null. No explanation.`;
+
+/** What the classifier is sent for a member's message. */
+export const classifierInput = (text: string): string =>
+  `${CLASSIFIER_SYSTEM_PROMPT}\n\n---\nUser message: ${text}`;
+
+/** The `haiku` alias: the dated sonnet id this used to name was retired on 15 Jun 2026. */
+export const CLASSIFIER_MODEL = "haiku";
+/** One attempt's bound. With the single retry the whole call is bounded at twice this. */
+export const CLASSIFIER_ATTEMPT_TIMEOUT_MS = 8000;
+
+export interface ClassifierCall {
+  call: OneShotResult;
+  /** 1 when the first attempt answered or the failure was not a no-reply, 2 after the retry. */
+  attempts: number;
+}
+
+/**
+ * One classifier call: `CLASSIFIER_ATTEMPT_TIMEOUT_MS` per attempt, and exactly one retry when the
+ * first attempt timed out or produced no reply (a non-zero exit). The retry changes nothing about
+ * the call, so it is as isolated as the first. A throw (a cleanup that could not remove the
+ * prompt from disk) is not retried: it is a security signal, not a flaky reply. After the retry a
+ * failure stands: the caller fails closed.
+ */
+export async function runClassifierCall(
+  input: string,
+  deps: { spawn?: typeof spawn; runOneShot?: typeof runOneShot } = {},
+): Promise<ClassifierCall> {
+  const run = deps.runOneShot ?? runOneShot;
+  let call!: OneShotResult;
+  for (let attempts = 1; attempts <= 2; attempts++) {
+    call = await withPrintRuntime(
+      { env: classifierSpawnEnv(), stdinPrompt: true, spawn: deps.spawn },
+      () =>
+        run({
+          route: "discord.classifier",
+          prompt: input,
+          model: CLASSIFIER_MODEL,
+          isolation: "untrusted",
+          timeoutMs: CLASSIFIER_ATTEMPT_TIMEOUT_MS,
+        }),
+    );
+    if (call.exitCode === 0 || attempts === 2) return { call, attempts };
+  }
+  return { call, attempts: 2 };
+}
+
 /**
  * The classifier reads a message from any allowed guild member. It only has
  * to answer with JSON, so `runOneShot` runs it as an untrusted call: no tools at
@@ -642,36 +702,10 @@ export function classifierSpawnEnv(
  */
 export async function classifyThreadIntent(
   text: string,
-  deps: { spawn?: typeof spawn } = {},
+  deps: { spawn?: typeof spawn; runOneShot?: typeof runOneShot } = {},
 ): Promise<ThreadIntent | null> {
-  const systemPrompt = `You classify user messages into thread management intents.
-
-If the user wants to CREATE/SPAWN/DEPLOY threads (e.g. "hire X", "派出 X", "叫 X 出來", "派 X 去打", "開 X", "建立 X"):
-Return: {"action":"hire","names":["name1","name2"]}
-
-If the user wants to DELETE/REMOVE threads (e.g. "fire X", "撤回 X", "把 X 叫回來", "刪 X", "關 X"):
-Return: {"action":"fire","names":["name1","name2"]}
-
-If the message is NOT about thread management, return: null
-
-Rules:
-- Extract individual names. "桃園三結義" = ["劉備","關羽","張飛"]. "五虎將" = ["關羽","張飛","趙雲","馬超","黃忠"].
-- Common patterns: 派/派出/出征/上陣/迎戰/出戰 = hire. 撤/撤回/收回/叫回來/滾 = fire.
-- Return ONLY valid JSON or the word null. No explanation.`;
-
   try {
-    const input = `${systemPrompt}\n\n---\nUser message: ${text}`;
-    const call = await withPrintRuntime(
-      { env: classifierSpawnEnv(), stdinPrompt: true, spawn: deps.spawn },
-      () =>
-        runOneShot({
-          route: "discord.classifier",
-          prompt: input,
-          model: "claude-sonnet-4-20250514",
-          isolation: "untrusted",
-          timeoutMs: 15000,
-        }),
-    );
+    const { call } = await runClassifierCall(classifierInput(text), deps);
     if (call.exitCode !== 0) throw new Error(`classifier exited ${call.exitCode}`);
     const result = call.text.trim();
 

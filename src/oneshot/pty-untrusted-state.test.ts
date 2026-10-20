@@ -26,6 +26,8 @@ import {
 import { setUntrustedFileMentionNeutralizingForTests } from "../runner/pty-process-test-seams.js";
 import { neutralizeFileMentions } from "../runner/pty-prompt-sanitizer.js";
 import {
+  __keepRootAfterFailedDisposeForTests,
+  __landPtyForTests,
   __resetSupervisorForTests,
   injectOneShotTrustForTests,
   injectSpawnPty,
@@ -504,7 +506,7 @@ describe("r12 A: a process group that outlives retirement fails the call and kee
           reply(opts);
           return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
         },
-        dispose: async () => opts.onGroupSurvived?.(424242, null),
+        dispose: async () => opts.onGroupSurvived?.(424242, null, "group"),
       } as never;
     });
     const registered = cleanup.activeOneShotDirCount();
@@ -639,14 +641,121 @@ describe("r13 A6: a disposal that rejects keeps the root, as a survivor does", (
         },
       } as never;
     });
-    await expect(run()).rejects.toThrow(/survived retirement/);
+    await expect(run()).rejects.toThrow(/disposal of pid 4242 rejected/);
     const root = spawned[0]!.env.CLAUDE_CONFIG_DIR!;
     try {
       expect(existsSync(root)).toBe(true);
       expect(cleanup.groupSurvivorOf(root)).toBe(4242);
+      expect(cleanup.groupSurvivorCauseOf(root)).toBe("dispose-rejected");
     } finally {
       rmSync(root, { recursive: true, force: true });
       rmSync(spawned[0]!.cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// #570 r14 (D): the failure says why the root was kept, not always "process group survived".
+describe("r14 D: the failed call names the real cause", () => {
+  const causes = [
+    ["group", /process group of pid 424242 survived retirement/],
+    ["escapee", /process outside the process group of pid 424242 survived retirement/],
+    ["scan-unknown", /escape scan after retirement of pid 424242 could not tell/],
+  ] as const;
+
+  for (const [cause, message] of causes) {
+    it(`reports '${cause}' in the thrown error and the log`, async () => {
+      injectSpawnPty(async (opts) => {
+        spawned.push(opts);
+        return {
+          label: "state",
+          pid: 1,
+          sessionId: SID,
+          cwd: opts.cwd,
+          isAlive: () => true,
+          lastTurnEndedAt: () => 0,
+          runTurn: async () => {
+            reply(opts);
+            return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
+          },
+          dispose: async () => opts.onGroupSurvived?.(424242, null, cause),
+        } as never;
+      });
+      await expect(run()).rejects.toThrow(message);
+      const root = spawned[0]!.env.CLAUDE_CONFIG_DIR!;
+      try {
+        const logged = error.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+        expect(logged).toMatch(message);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+        rmSync(spawned[0]!.cwd, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+// #570 r14 (B, E): what a rejected disposal records.
+describe("r14 B/E: a rejected disposal records the PTY's real start time, or says the root is unprotected", () => {
+  const stubEntry = (root: string, cwd: string, pty: unknown) =>
+    ({
+      sessionKey: "oneshot:test",
+      scope: { isolation: "untrusted", untrustedConfig: { root, secureStorageDir: "" } },
+      spawnOpts: { cwd },
+      pty,
+    }) as never;
+
+  const makeDirs = () => {
+    const cwd = cleanup.createUntrustedTempCwd();
+    const root = cleanup.createUntrustedConfigRoot([cwd]);
+    return { cwd, root };
+  };
+
+  it("keeps the leader's start time read at spawn, in memory and in survivor.json", () => {
+    const { cwd, root } = makeDirs();
+    try {
+      __keepRootAfterFailedDisposeForTests(
+        stubEntry(root, cwd, { pid: 4242, leaderStartMs: 1_700_000_000_000 }),
+        new Error("boom"),
+      );
+      expect(cleanup.groupSurvivorOf(root)).toBe(4242);
+      const record = JSON.parse(readFileSync(join(root, cleanup.ONESHOT_SURVIVOR_FILE), "utf8"));
+      expect(record.startMs).toBe(1_700_000_000_000);
+      expect(record.pid).toBe(4242);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("logs that the root is unprotected when there is no PTY to name, and records nothing", () => {
+    const { cwd, root } = makeDirs();
+    try {
+      __keepRootAfterFailedDisposeForTests(stubEntry(root, cwd, null), new Error("boom"));
+      expect(cleanup.groupSurvivorOf(root)).toBeUndefined();
+      const logged = error.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
+      expect(logged).toContain("config root is unprotected");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the root when a late-landing PTY's disposal rejects, and still refuses the spawn", async () => {
+    const { cwd, root } = makeDirs();
+    try {
+      const late = {
+        pid: 5252,
+        leaderStartMs: 1_700_000_000_001,
+        dispose: async () => {
+          throw new Error("survivor hook failed");
+        },
+      };
+      await expect(__landPtyForTests(stubEntry(root, cwd, null), late as never)).rejects.toThrow(
+        /disposed the late PTY/,
+      );
+      expect(cleanup.groupSurvivorOf(root)).toBe(5252);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });
@@ -680,6 +789,10 @@ describe("r12 E: a REPL that never became ready fails the call with nothing sent
     // exec no longer returned as the call's result.
     expect(result.exitCode).toBe(1);
     expect(result.text).toBe("");
+    // r14 D: the failure carries a safe reason code and phase timings, and nothing else.
+    expect(result.diagnostic?.reason).toBe("not-ready:login-required");
+    expect(Object.keys(result.diagnostic?.phasesMs ?? {})).toContain("total");
+    expect(JSON.stringify(result.diagnostic)).not.toContain(CANARY);
     // One attempt: a refused screen is not retried, and the child is not left running.
     expect(spawns).toBe(1);
     expect(turns).toBe(1);

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -36,13 +36,12 @@ const ours = { leaderStartMs: START, startMs: () => START, leaderAlive: () => tr
 const instant = { sleep: async () => {}, liveMembers: () => undefined, pollMs: 100, ...ours };
 
 describe("terminateProcessGroup", () => {
-  it("SIGTERMs the group and the leader, and is done once both answer ESRCH", async () => {
+  it("SIGTERMs the group once, not the bare pid as well, and is done once both answer ESRCH", async () => {
     const k = fakeKernel("SIGTERM");
     expect(await terminateProcessGroup(PID, { signal: k.signal, ...instant })).toBe(true);
-    expect(k.calls.filter(([, n]) => n === "SIGTERM")).toEqual([
-      [-PID, "SIGTERM"],
-      [PID, "SIGTERM"],
-    ]);
+    // The leader is a member of its own group: a second signal to the bare pid adds nothing and
+    // is one more chance to hit a reused pid (#570 r14, B).
+    expect(k.calls.filter(([, n]) => n === "SIGTERM")).toEqual([[-PID, "SIGTERM"]]);
     expect(k.calls.some(([, n]) => n === "SIGKILL")).toBe(false);
   });
 
@@ -50,10 +49,7 @@ describe("terminateProcessGroup", () => {
     const k = fakeKernel("SIGKILL");
     // Went red (false, then no SIGKILL calls) with the escalation removed.
     expect(await terminateProcessGroup(PID, { signal: k.signal, ...instant })).toBe(true);
-    expect(k.calls.filter(([, n]) => n === "SIGKILL")).toEqual([
-      [-PID, "SIGKILL"],
-      [PID, "SIGKILL"],
-    ]);
+    expect(k.calls.filter(([, n]) => n === "SIGKILL")).toEqual([[-PID, "SIGKILL"]]);
   });
 
   it("reports failure, never success, when the group survives SIGKILL", async () => {
@@ -114,7 +110,7 @@ describe("terminateProcessGroup", () => {
       // Went red (a SIGKILL among the signals) when the escalation reused the identity read
       // before the SIGTERM instead of reading it again.
       expect(signalled(k.calls).every(([, name]) => name === "SIGTERM")).toBe(true);
-      expect(signalled(k.calls).length).toBe(2);
+      expect(signalled(k.calls).length).toBe(1);
       expect(result).toBe(true); // a reused pid means the group we started is gone
     });
 
@@ -134,12 +130,35 @@ describe("terminateProcessGroup", () => {
       expect(signalled(k.calls)).toEqual([]);
     });
 
-    it("does not signal a pid whose start time was never recorded unless the PTY still owns it", async () => {
-      const k = fakeKernel("SIGKILL");
+    it("signals the group of a pid whose start time was never recorded while it has a member, never the bare pid, and says so once", async () => {
+      const warn = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const k = fakeKernel("SIGKILL");
+        const unrecorded = { ...instant, leaderStartMs: null, leaderAlive: () => false };
+        // A process group id cannot be reused while the group has a member, so `-pid` is safe
+        // without a start time.
+        expect(await terminateProcessGroup(PID, { signal: k.signal, ...unrecorded })).toBe(true);
+        expect(signalled(k.calls).length).toBeGreaterThan(0);
+        expect(signalled(k.calls).every(([target]) => target === -PID)).toBe(true);
+        const logged = warn.mock.calls.filter((call: unknown[]) =>
+          String(call[0]).includes("start time"),
+        );
+        expect(logged.length).toBe(1);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("signals nothing for an unrecorded start time when the group has no member (the bare pid may be a stranger)", async () => {
+      const calls: Array<[number, NodeJS.Signals | 0]> = [];
+      // The leader's pid answers (someone holds it now); the group does not exist.
+      const signal: SignalFn = (target, name) => {
+        calls.push([target, name]);
+        if (target < 0) throw errno("ESRCH");
+      };
       const unrecorded = { ...instant, leaderStartMs: null, leaderAlive: () => false };
-      // Went red (true, with signals sent) with the unknown identity read as "same".
-      expect(await terminateProcessGroup(PID, { signal: k.signal, ...unrecorded })).toBe(false);
-      expect(signalled(k.calls)).toEqual([]);
+      expect(await terminateProcessGroup(PID, { signal, ...unrecorded })).toBe(false);
+      expect(signalled(calls)).toEqual([]);
     });
   });
 

@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { findEscapees, terminateEscapees } from "./pty-escape-scan.js";
+import { EscapeScanUnknownError, findEscapees, terminateEscapees } from "./pty-escape-scan.js";
 import { type PtyProcessOptions, spawnPty } from "./pty-process.js";
 
 /**
@@ -45,7 +45,7 @@ describe("findEscapees (fake /proc)", () => {
     process_(5003, { env: [`X_CLAUDE_CONFIG_DIR=${ROOT}`] }); // another variable
     process_(5004, { env: [`CLAUDE_CONFIG_DIR=${ROOT.slice(0, -1)}`] }); // a shorter path
     process_(5005, { env: ["PATH=/bin"] });
-    expect(findEscapees(TARGET, { procDir: proc, selfPid: 1 })).toEqual([5001]);
+    expect(findEscapees(TARGET, { procDir: proc, selfPid: 1 }).pids).toEqual([5001]);
   });
 
   it("finds a process running in the temp cwd or below it, and not a sibling with the same prefix", () => {
@@ -53,30 +53,72 @@ describe("findEscapees (fake /proc)", () => {
     process_(5102, { cwd: `${CWD}/sub/dir` });
     process_(5103, { cwd: `${CWD}-sibling` });
     process_(5104, { cwd: "/" });
-    expect(findEscapees(TARGET, { procDir: proc, selfPid: 1 }).sort()).toEqual([5101, 5102]);
+    expect(findEscapees(TARGET, { procDir: proc, selfPid: 1 }).pids.sort()).toEqual([5101, 5102]);
   });
 
   it("matches the temp cwd in either of its forms", () => {
     process_(5201, { cwd: "/private/tmp/claudeclaw-oneshot-pty-BBBB" });
     const target = { root: ROOT, cwds: [CWD, "/private/tmp/claudeclaw-oneshot-pty-BBBB"] };
-    expect(findEscapees(target, { procDir: proc, selfPid: 1 })).toEqual([5201]);
+    expect(findEscapees(target, { procDir: proc, selfPid: 1 }).pids).toEqual([5201]);
   });
 
-  it("skips the daemon itself, pids that cannot be signalled, and entries it cannot read", () => {
+  it("skips the daemon itself and pids that cannot be signalled", () => {
     process_(5301, { env: [`CLAUDE_CONFIG_DIR=${ROOT}`] });
     process_(1, { env: [`CLAUDE_CONFIG_DIR=${ROOT}`] });
-    mkdirSync(join(proc, "5302"));
-    mkdirSync(join(proc, "5302", "environ")); // reading a directory fails
     mkdirSync(join(proc, "self"));
-    expect(findEscapees(TARGET, { procDir: proc, selfPid: 5301 })).toEqual([]);
-    expect(findEscapees(TARGET, { procDir: proc, selfPid: 1 })).toEqual([5301]);
+    expect(findEscapees(TARGET, { procDir: proc, selfPid: 5301 })).toEqual({
+      pids: [],
+      unknown: false,
+    });
+    expect(findEscapees(TARGET, { procDir: proc, selfPid: 1 }).pids).toEqual([5301]);
   });
 
-  it("finds nothing when /proc cannot be listed, and nothing for a root nobody carries", () => {
-    expect(findEscapees(TARGET, { procDir: join(proc, "missing") })).toEqual([]);
-    expect(
-      findEscapees({ root: `/tmp/no-such-root-${process.pid}-${Date.now()}`, cwds: [] }),
-    ).toEqual([]);
+  it("reports unknown for a process of ours whose environment cannot be read", () => {
+    mkdirSync(join(proc, "5302"));
+    mkdirSync(join(proc, "5302", "environ")); // reading a directory fails (EISDIR), not ENOENT
+    expect(findEscapees(TARGET, { procDir: proc, selfPid: 1 })).toEqual({
+      pids: [],
+      unknown: true,
+    });
+  });
+
+  it("reports unknown for a process of ours whose cwd cannot be read", () => {
+    mkdirSync(join(proc, "5303"));
+    writeFileSync(join(proc, "5303", "environ"), "PATH=/bin\0");
+    writeFileSync(join(proc, "5303", "cwd"), "not a link"); // readlink on a file fails (EINVAL)
+    expect(findEscapees(TARGET, { procDir: proc, selfPid: 1 }).unknown).toBe(true);
+  });
+
+  it("does not report unknown for a process that is gone, or one owned by another uid", () => {
+    mkdirSync(join(proc, "5304")); // no environ, no cwd: both reads fail with ENOENT
+    mkdirSync(join(proc, "5305"));
+    mkdirSync(join(proc, "5305", "environ")); // unreadable, but not ours:
+    const foreign = (process.getuid?.() ?? 0) + 1;
+    expect(findEscapees(TARGET, { procDir: proc, selfPid: 1, uid: foreign })).toEqual({
+      pids: [],
+      unknown: false,
+    });
+    rmSync(join(proc, "5305"), { recursive: true });
+    expect(findEscapees(TARGET, { procDir: proc, selfPid: 1 })).toEqual({
+      pids: [],
+      unknown: false,
+    });
+  });
+
+  it("still names a match when another process could not be read", () => {
+    process_(5306, { env: [`CLAUDE_CONFIG_DIR=${ROOT}`] });
+    mkdirSync(join(proc, "5307"));
+    mkdirSync(join(proc, "5307", "environ"));
+    expect(findEscapees(TARGET, { procDir: proc, selfPid: 1 })).toEqual({
+      pids: [5306],
+      unknown: true,
+    });
+  });
+
+  it("throws when /proc cannot be listed, and finds nothing for a root nobody carries", () => {
+    expect(() => findEscapees(TARGET, { procDir: join(proc, "missing") })).toThrow();
+    const scan = findEscapees({ root: `/tmp/no-such-root-${process.pid}-${Date.now()}`, cwds: [] });
+    expect(scan.pids).toEqual([]);
   });
 });
 
@@ -177,6 +219,39 @@ describe("terminateEscapees (fake /proc)", () => {
     expect(left).toEqual([6005]);
   });
 
+  it("throws, never reports success, when nothing was found but a process could not be read", async () => {
+    mkdirSync(join(proc, "6006"));
+    mkdirSync(join(proc, "6006", "environ")); // unreadable and ours
+    const k = kernel("SIGTERM");
+    await expect(
+      terminateEscapees(TARGET, { procDir: proc, selfPid: 1, signal: k.signal, ...fast }),
+    ).rejects.toBeInstanceOf(EscapeScanUnknownError);
+    expect(k.sent).toEqual([]);
+  });
+
+  it("throws when the escapee dies but a process of ours still could not be read afterwards", async () => {
+    spawnFake(6007);
+    mkdirSync(join(proc, "6008"));
+    mkdirSync(join(proc, "6008", "environ")); // never readable: the last scan stays unknown
+    const k = kernel("SIGTERM");
+    await expect(
+      terminateEscapees(TARGET, {
+        procDir: proc,
+        selfPid: 1,
+        signal: k.signal,
+        startMs: () => START,
+        ...fast,
+      }),
+    ).rejects.toBeInstanceOf(EscapeScanUnknownError);
+    expect(k.sent.map(([pid]) => pid)).toContain(6007); // the known one was still stopped
+  });
+
+  it("throws when /proc cannot be listed", async () => {
+    await expect(
+      terminateEscapees(TARGET, { procDir: join(proc, "missing"), ...fast }),
+    ).rejects.toThrow();
+  });
+
   it("is a no-op when there is nothing to stop", async () => {
     const k = kernel("SIGTERM");
     expect(
@@ -200,7 +275,7 @@ describe.skipIf(process.platform !== "linux")("a descendant that calls setsid() 
   });
   afterEach(() => {
     const target = { root, cwds: [] as string[] };
-    for (const pid of [...strays.splice(0), ...findEscapees(target)]) {
+    for (const pid of [...strays.splice(0), ...findEscapees(target).pids]) {
       try {
         process.kill(pid, "SIGKILL");
       } catch {

@@ -17,7 +17,11 @@ import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { _setSettingsFileForTests, loadSettings } from "../../src/config.js";
-import { classifierSpawnEnv } from "../../src/commands/discord.js";
+import {
+  classifierInput,
+  classifierSpawnEnv,
+  runClassifierCall,
+} from "../../src/commands/discord.js";
 import {
   __buildClaudeArgsForTests,
   spawnPty,
@@ -618,10 +622,21 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         }),
       );
     } catch (error) {
+      // A code and a timing only: the thrown message may carry a path or a screen.
+      const code = (error as NodeJS.ErrnoException)?.code ?? (error as Error)?.name ?? "error";
+      console.info(
+        `[isolation-spike] run-threw ${options.screen ?? "-"}: reason=threw:${String(code).replace(/[^A-Za-z0-9_-]/g, "")}; elapsedMs=${Date.now() - started}`,
+      );
       if (options.screen) await captureScreen(options.screen);
       throw error;
     }
     const elapsedMs = Date.now() - started;
+    if (result.exitCode !== 0) {
+      // Every non-zero exit says why, from a fixed set of codes (never a screen, transcript or env).
+      console.info(
+        `[isolation-spike] run-exit ${options.screen ?? "-"}: exit=${result.exitCode}; reason=${result.diagnostic?.reason ?? "none"}; phasesMs=${JSON.stringify(result.diagnostic?.phasesMs ?? {})}; elapsedMs=${elapsedMs}`,
+      );
+    }
     const hung = result.exitCode !== 0 || assistantEntries === 0;
     if (options.screen) {
       if (hung) await captureScreen(options.screen);
@@ -1616,4 +1631,73 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
       BUDGET + 20_000,
     );
   }
+  // ── r14 F3: the classifier's real traffic ────────────────────────────────────────────────
+  // About twenty ordinary, classifier-shaped messages through the real untrusted PTY path, with
+  // the classifier's 8 s bound and single retry. The counts are for Terry to read before the PR
+  // leaves draft; the row fails only when more than two of them fail closed after the retry.
+  test(
+    "F3 classifier traffic: replied first time / on retry / failed closed, and latency",
+    async () => {
+      expect(positiveProved).toBe(true);
+      const messages = [
+        "hire Ada",
+        "fire Grace",
+        "can you hire Linus and Margaret",
+        "what time is the stand-up",
+        "派出 劉備",
+        "撤回 張飛",
+        "please spin up a thread for Hopper",
+        "thanks, that fixed it",
+        "remove Turing from the project",
+        "hi team",
+        "bring in Knuth to review this",
+        "who is on call today",
+        "send Dijkstra to the migration",
+        "fire the build thread",
+        "good morning",
+        "hire Torvalds and Ritchie",
+        "the deploy finished",
+        "dismiss Lamport",
+        "叫 關羽 出來",
+        "lunch at 1?",
+      ];
+      expect(messages.length).toBe(20);
+      const outcome = { first: 0, retry: 0, closed: 0 };
+      const latencies: number[] = [];
+      const reasons: string[] = [];
+      for (const message of messages) {
+        opts = [];
+        const started = Date.now();
+        try {
+          const { call, attempts } = await runClassifierCall(classifierInput(message), {
+            runOneShot: (request) =>
+              withPrintRuntime({ env: callerPolicy() }, () => runOnceOnPty(request)),
+          });
+          if (call.exitCode === 0) {
+            if (attempts === 1) outcome.first++;
+            else outcome.retry++;
+            latencies.push(Date.now() - started);
+          } else {
+            outcome.closed++;
+            reasons.push(call.diagnostic?.reason ?? `exit-${call.exitCode}`);
+          }
+        } catch (error) {
+          outcome.closed++;
+          const code = (error as NodeJS.ErrnoException)?.code ?? (error as Error)?.name ?? "error";
+          reasons.push(`threw:${String(code).replace(/[^A-Za-z0-9_-]/g, "")}`);
+        }
+      }
+      latencies.sort((a, b) => a - b);
+      const at = (q: number): number | null =>
+        latencies.length === 0
+          ? null
+          : (latencies[Math.min(latencies.length - 1, Math.ceil(q * latencies.length) - 1)] ??
+            null);
+      console.info(
+        `[isolation-spike] F3 classifier: n=${messages.length}; repliedFirstTime=${outcome.first}; repliedOnRetry=${outcome.retry}; failedClosed=${outcome.closed}; p50Ms=${at(0.5)}; p95Ms=${at(0.95)}; failReasons=${JSON.stringify(reasons)}`,
+      );
+      expect(outcome.closed).toBeLessThanOrEqual(2);
+    },
+    20 * 20_000 + 60_000,
+  );
 });

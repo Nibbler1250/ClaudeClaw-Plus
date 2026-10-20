@@ -9,7 +9,13 @@ import { describe, expect, it } from "bun:test";
 import { EventEmitter } from "node:events";
 import type { spawn } from "node:child_process";
 import { homedir } from "node:os";
-import { classifierSpawnEnv, classifyThreadIntent } from "../commands/discord";
+import {
+  CLASSIFIER_ATTEMPT_TIMEOUT_MS,
+  CLASSIFIER_MODEL,
+  classifierSpawnEnv,
+  classifyThreadIntent,
+} from "../commands/discord";
+import type { OneShotRequest, OneShotResult } from "../oneshot/engine";
 import { buildPrintArgs } from "../oneshot/print";
 
 // The argv `classifyThreadIntent` executes: runOneShot builds it with
@@ -17,9 +23,9 @@ import { buildPrintArgs } from "../oneshot/print";
 const CLASSIFIER_ARGS = buildPrintArgs({
   route: "discord.classifier",
   prompt: "private message",
-  model: "claude-sonnet-4-20250514",
+  model: CLASSIFIER_MODEL,
   isolation: "untrusted",
-  timeoutMs: 15000,
+  timeoutMs: CLASSIFIER_ATTEMPT_TIMEOUT_MS,
 });
 
 describe("classifyThreadIntent isolation", () => {
@@ -121,5 +127,80 @@ describe("classifyThreadIntent itself (not a hand-built request)", () => {
     expect(seen.env.DISCORD_TOKEN).toBeUndefined();
     expect(seen.env.HOME).toBe(homedir());
     expect(seen.cwd).not.toBe(process.cwd());
+  });
+});
+
+// #570 r14 (F): the model alias, the 8 s bound and exactly one retry.
+describe("classifyThreadIntent: model, bound and retry", () => {
+  const REPLY = '{"action":"hire","names":["Ada"]}';
+  const answered = (text: string): OneShotResult => ({
+    text,
+    engine: "pty",
+    model: CLASSIFIER_MODEL,
+    exitCode: 0,
+  });
+  const hung = (): OneShotResult => ({
+    text: "",
+    engine: "pty",
+    model: CLASSIFIER_MODEL,
+    exitCode: 124,
+  });
+
+  /** A runOneShot that plays the given outcomes in order and records every request. */
+  function script(outcomes: Array<OneShotResult | Error>) {
+    const requests: OneShotRequest[] = [];
+    const run = (async (req: OneShotRequest) => {
+      requests.push(req);
+      const next = outcomes[requests.length - 1];
+      if (next === undefined) throw new Error("called more often than scripted");
+      if (next instanceof Error) throw next;
+      return next;
+    }) as never;
+    return { requests, run };
+  }
+
+  it("asks the haiku alias, never a dated model id", () => {
+    expect(CLASSIFIER_MODEL).toBe("haiku");
+  });
+
+  it("answers from the first attempt without a retry", async () => {
+    const s = script([answered(REPLY)]);
+    expect(await classifyThreadIntent("hire Ada", { runOneShot: s.run })).toEqual({
+      action: "hire",
+      names: ["Ada"],
+    });
+    expect(s.requests).toHaveLength(1);
+  });
+
+  it("retries once when the first attempt hangs, and succeeds when the second replies", async () => {
+    const s = script([hung(), answered(REPLY)]);
+    expect(await classifyThreadIntent("hire Ada", { runOneShot: s.run })).toEqual({
+      action: "hire",
+      names: ["Ada"],
+    });
+    expect(s.requests).toHaveLength(2);
+  });
+
+  it("fails closed after two hangs, with no third attempt", async () => {
+    const s = script([hung(), hung()]);
+    expect(await classifyThreadIntent("hire Ada", { runOneShot: s.run })).toBeNull();
+    expect(s.requests).toHaveLength(2);
+  });
+
+  it("retries a no-reply exit too, and keeps both attempts untrusted with the 8 s bound", async () => {
+    const noReply: OneShotResult = { text: "", engine: "pty", model: "haiku", exitCode: 1 };
+    const s = script([noReply, noReply]);
+    expect(await classifyThreadIntent("hire Ada", { runOneShot: s.run })).toBeNull();
+    expect(s.requests.map((r) => r.timeoutMs)).toEqual([8000, 8000]);
+    expect(s.requests.every((r) => r.isolation === "untrusted")).toBe(true);
+    expect(s.requests.every((r) => r.model === "haiku")).toBe(true);
+    // The whole call is bounded at two attempts: 16 s plus overhead, never more.
+    expect(s.requests.reduce((total, r) => total + r.timeoutMs, 0)).toBeLessThanOrEqual(16_000);
+  });
+
+  it("does not retry a call that threw (a prompt that could not be removed from disk)", async () => {
+    const s = script([new Error("cleanup failed")]);
+    expect(await classifyThreadIntent("hire Ada", { runOneShot: s.run })).toBeNull();
+    expect(s.requests).toHaveLength(1);
   });
 });

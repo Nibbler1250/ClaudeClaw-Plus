@@ -18,6 +18,13 @@ import { type StartMsReader, pidIdentity, processStartMs } from "./pty-proc-iden
 
 export type SignalFn = (pid: number, signal: NodeJS.Signals | 0) => void;
 
+/**
+ * Why a retired child is recorded as a survivor, so the call's failure says what happened:
+ * its process group was still alive, a process outside the group was, the escape scan could not
+ * say, or the disposal itself rejected.
+ */
+export type SurvivorCause = "group" | "escapee" | "scan-unknown" | "dispose-rejected";
+
 export interface GroupTerminationOptions {
   /** `process.kill`. Replaced in tests. */
   signal?: SignalFn;
@@ -119,11 +126,15 @@ export function processGroupGone(
  * leader's identity first (#570 r13, B): a pid that now belongs to a process with another start
  * time is a stranger, and neither it nor `-pid` is touched (a process group id cannot be
  * reused while the group has a member, so a recycled leader means the group is long gone).
+ * The identity is read again immediately before every signal (r14, B). That narrows pid reuse to
+ * the instant between the read and the `kill()`; it cannot close it without a native process
+ * handle, which is not built here (see pty-proc-identity).
  */
 class GroupTarget {
   private readonly leaderStartMs: number | null;
   private readonly read: StartMsReader;
   private readonly owned: () => boolean;
+  private loggedUnreadable = false;
 
   constructor(
     private readonly pid: number,
@@ -156,26 +167,62 @@ class GroupTarget {
   }
 
   /**
-   * Signal what is provably ours. The bare pid only while the PTY still owns it and its start
-   * time has not changed; `-pid` only while the group still has a member.
+   * Signal what is provably ours, the group first. Once the group has been signalled the bare pid
+   * is not: the leader is a member of its own group, so a second signal adds nothing and would be
+   * one more chance to hit a reused pid. The bare pid is signalled only when the group could not
+   * be (a leader that moved itself out of its group), while the PTY still owns it.
    */
   send(name: NodeJS.Signals): void {
-    const identity = this.identity();
-    if (identity === "recycled") return;
-    const owned = this.owned();
-    const bare = owned && (identity === "same" || identity === "unknown");
-    const group = identity === "same" || identity === "gone" || (identity === "unknown" && owned);
-    const targets: number[] = [];
-    if (group && exists(this.signal, -this.pid)) targets.push(-this.pid);
-    if (bare) targets.push(this.pid);
-    for (const target of targets) {
-      try {
-        this.signal(target, name);
-      } catch {
-        /* ESRCH: nothing there to signal */
-      }
+    if (this.sendGroup(name)) return;
+    this.sendBare(name);
+  }
+
+  /** `-pid`, while the group has a member and the leader is not a stranger. True when it was sent. */
+  private sendGroup(name: NodeJS.Signals): boolean {
+    const identity = this.identity(); // read now, not earlier: this is the last look before kill()
+    if (identity === "recycled") return false;
+    // A start time that was never recorded cannot tell a stranger from the leader, but a process
+    // group id cannot be reused while the group has a member, so `-pid` is still ours while
+    // `kill(-pid, 0)` shows one (#570 r14, B).
+    if (identity === "unknown" && this.leaderStartMs === null && !this.loggedUnreadable) {
+      this.loggedUnreadable = true;
+      console.warn(
+        `[pty-group-kill] start time of pid ${this.pid} was not recorded; signalling its group on group membership alone`,
+      );
+    }
+    const known =
+      identity === "same" ||
+      identity === "gone" ||
+      (identity === "unknown" && (this.owned() || this.leaderStartMs === null));
+    if (!known || !exists(this.signal, -this.pid)) return false;
+    try {
+      this.signal(-this.pid, name);
+      return true;
+    } catch {
+      return false; // ESRCH: nothing there to signal
     }
   }
+
+  private sendBare(name: NodeJS.Signals): void {
+    const identity = this.identity();
+    if (!this.owned() || (identity !== "same" && identity !== "unknown")) return;
+    try {
+      this.signal(this.pid, name);
+    } catch {
+      /* ESRCH: nothing there to signal */
+    }
+  }
+}
+
+/**
+ * Whether the group of `pid` (and its leader) is gone right now, by the same rules as the
+ * termination: a recycled leader means the group is long gone, a group made only of zombies is
+ * gone. For a caller that has to decide on a recorded survivor without signalling it (the sweep).
+ */
+export function groupGoneNow(pid: number, opts: GroupTerminationOptions = {}): boolean {
+  const { signal = process.kill, liveMembers = procLiveMembers } = opts;
+  if (!isSignalablePid(pid)) return false; // not a pid to reason about: not proof of absence
+  return new GroupTarget(pid, signal, liveMembers, opts).gone();
 }
 
 /**

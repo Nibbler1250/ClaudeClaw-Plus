@@ -2,18 +2,49 @@
  * Is this pid still the process we recorded? A pid is reused once its process has been reaped,
  * so a signal sent to a remembered pid can hit a stranger. Everything that signals an untrusted
  * claude (pty-group-kill, the escapee scan, the sweeper's survivor retry) checks the start time
- * recorded at spawn first (#570 r13, B).
+ * recorded at spawn first (#570 r13, B), and again immediately before each signal (r14, B).
+ *
+ * This narrows pid reuse to a very small window; it cannot close it. Between the check and the
+ * `kill()` the process can still exit and its pid be reused, and only a native process handle
+ * (a pidfd) would make "check and signal" one step. Node and Bun offer none, and none is built
+ * here.
  */
 
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 
 /** `ps -o lstart=` has 1 s resolution, so two readings of one process can differ by a second. */
 export const START_TIME_TOLERANCE_MS = 2000;
 
 export type StartMsReader = (pid: number) => number | null;
 
-/** Start time of `pid` from `ps -o lstart=` (1 s resolution), or null when it cannot be read. */
+/** Clock ticks per second of `/proc/<pid>/stat` times. 100 on every Linux build in use. */
+const LINUX_CLOCK_TICKS_PER_SECOND = 100;
+
+/**
+ * Linux: the start time from field 22 of `/proc/<pid>/stat` (ticks since boot), in ms since boot.
+ * A wall-clock step moves `ps -o lstart=` but not this. The value is only comparable with another
+ * read on the same boot, which is all a recorded start time is compared with. Null when the stat
+ * cannot be read or parsed. `comm` (field 2) may hold spaces and parens, so fields are split
+ * after the last `)`, where field 3 is the first.
+ */
+export function procStartMs(pid: number, procDir = "/proc"): number | null {
+  try {
+    const stat = readFileSync(`${procDir}/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    const ticks = Number(fields[19]); // field 22 is index 19 after field 3
+    return Number.isFinite(ticks) ? (ticks * 1000) / LINUX_CLOCK_TICKS_PER_SECOND : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Start time of `pid`, or null when it cannot be read. Linux: `/proc` (monotonic, 10 ms
+ * resolution). Elsewhere: `ps -o lstart=` (1 s resolution).
+ */
 export function processStartMs(pid: number): number | null {
+  if (process.platform === "linux") return procStartMs(pid);
   try {
     const out = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
       encoding: "utf8",

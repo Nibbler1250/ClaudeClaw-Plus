@@ -171,6 +171,24 @@ describe("the ready gate reads the current screen", () => {
     expect(Date.now() - started).toBeLessThan(3000);
   });
 
+  it("is ready when the REPL only moves its cursor or repaints identical text", async () => {
+    const child = await spawnScreen(["Starting"], 2500, 400);
+    paint(child, `\x1b[2J\x1b[H${FOOTER}`);
+    const started = Date.now();
+    // Every 100 ms, inside the 400 ms quiet window: a cursor move, then the same text again.
+    const timer = setInterval(() => {
+      paint(child, "\x1b[2;5H");
+      paint(child, `\x1b[1;1H${FOOTER}`);
+    }, 100);
+    try {
+      await child.runTurn("PROMPT_REACHED_THE_PTY", { timeoutMs: 600 }).catch(() => {});
+    } finally {
+      clearInterval(timer);
+    }
+    expect(received()).toContain("PROMPT_REACHED_THE_PTY");
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+
   it("refuses a footer that is still there but a screen that never went quiet", async () => {
     const child = await spawnScreen(["Starting"], 600, 400);
     paint(child, FOOTER);

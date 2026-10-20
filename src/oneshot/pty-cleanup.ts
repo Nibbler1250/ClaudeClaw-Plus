@@ -13,8 +13,19 @@ import {
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { encodeCwdForProjectsDir } from "../bus/jsonl-line-types.js";
-import { type EscapeScanTarget, terminateEscapees } from "../runner/pty-escape-scan.js";
-import { type GroupTerminationOptions, terminateProcessGroup } from "../runner/pty-group-kill.js";
+import {
+  type EscapeScan,
+  type EscapeScanTarget,
+  findEscapees,
+  terminateEscapees,
+} from "../runner/pty-escape-scan.js";
+import {
+  type GroupTerminationOptions,
+  type SurvivorCause,
+  groupGoneNow,
+  isSignalablePid,
+  terminateProcessGroup,
+} from "../runner/pty-group-kill.js";
 import {
   START_TIME_TOLERANCE_MS,
   type StartMsReader,
@@ -176,6 +187,18 @@ export interface GroupSurvivor {
   cwds: string[];
   /** Retries made by the sweeper so far. */
   retries: number;
+  /** Why it is recorded: what the failed call reports. */
+  cause: SurvivorCause;
+}
+
+/** Written into a survivor's config root, so a daemon restart still knows what to keep and stop. */
+export const ONESHOT_SURVIVOR_FILE = "survivor.json";
+
+interface SurvivorFileRecord {
+  pid: number;
+  startMs: number | null;
+  cwds: string[];
+  tempCwd?: string;
 }
 
 /**
@@ -184,21 +207,55 @@ export interface GroupSurvivor {
  * the group, and anything that left it, is gone; until then neither directory is swept.
  */
 const survivingGroups = new Map<string, GroupSurvivor>();
+
+/** Persist the record next to what it protects (mode 0600). A failure is logged, never thrown. */
+function writeSurvivorFile(root: string, survivor: GroupSurvivor): void {
+  const record: SurvivorFileRecord = {
+    pid: survivor.pid,
+    startMs: survivor.startMs,
+    cwds: survivor.cwds,
+    tempCwd: survivor.tempCwd,
+  };
+  try {
+    writeFileSync(join(root, ONESHOT_SURVIVOR_FILE), `${JSON.stringify(record)}\n`, {
+      mode: 0o600,
+    });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return; // no root: nothing for a restart to protect
+    console.error(
+      `[oneshot] survivor of pid ${survivor.pid} not persisted (${code ?? "error"}): a daemon restart will not know to keep its root`,
+    );
+  }
+}
+
 export function markGroupSurvivor(
   root: string,
   pid: number,
-  extra: { startMs?: number | null; tempCwd?: string; cwds?: string[] } = {},
+  extra: {
+    startMs?: number | null;
+    tempCwd?: string;
+    cwds?: string[];
+    cause?: SurvivorCause;
+  } = {},
 ): void {
-  survivingGroups.set(root, {
+  const survivor: GroupSurvivor = {
     pid,
     startMs: extra.startMs ?? null,
     tempCwd: extra.tempCwd,
     cwds: extra.cwds ?? [],
     retries: survivingGroups.get(root)?.retries ?? 0,
-  });
+    cause: extra.cause ?? "group",
+  };
+  survivingGroups.set(root, survivor);
+  writeSurvivorFile(root, survivor);
 }
 export function groupSurvivorOf(root: string): number | undefined {
   return survivingGroups.get(root)?.pid;
+}
+/** Why `root` is held as a survivor, for the failure message of the call that left it. */
+export function groupSurvivorCauseOf(root: string): SurvivorCause | undefined {
+  return survivingGroups.get(root)?.cause;
 }
 /** Test seam: how many roots have an unstopped survivor. */
 export function groupSurvivorCount(): number {
@@ -215,6 +272,29 @@ const protectedBySurvivor = (path: string): boolean => {
   return false;
 };
 
+/** What a root's `survivor.json` says: a record, `missing`, or `unreadable` (there but not understood). */
+function readSurvivorFile(root: string): SurvivorFileRecord | "missing" | "unreadable" {
+  let raw: string;
+  try {
+    raw = readFileSync(join(root, ONESHOT_SURVIVOR_FILE), "utf8");
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unreadable";
+  }
+  try {
+    const parsed = JSON.parse(raw) as SurvivorFileRecord;
+    const cwdsOk = Array.isArray(parsed.cwds) && parsed.cwds.every((c) => typeof c === "string");
+    if (!isSignalablePid(parsed.pid) || !cwdsOk) return "unreadable";
+    return {
+      pid: parsed.pid,
+      startMs: typeof parsed.startMs === "number" ? parsed.startMs : null,
+      cwds: parsed.cwds,
+      tempCwd: typeof parsed.tempCwd === "string" ? parsed.tempCwd : undefined,
+    };
+  } catch {
+    return "unreadable";
+  }
+}
+
 export interface SurvivorRetryDeps {
   terminate?: (pid: number, opts: GroupTerminationOptions) => Promise<boolean>;
   reap?: (target: EscapeScanTarget) => Promise<number[]>;
@@ -223,7 +303,8 @@ export interface SurvivorRetryDeps {
 
 /**
  * Signal every recorded survivor again. Each is checked against the start time recorded at
- * spawn before any signal, so a pid that was reused is never touched; the leader is no longer
+ * spawn immediately before every signal, so a pid that was reused is not touched (narrowed to
+ * the instant between the check and the kill, which only a native process handle could close); the leader is no longer
  * ours, so only its group is signalled. An entry is dropped once the group and everything that
  * left it are gone. A retry that fails is logged as metadata (pid, retry count, how many
  * processes), never paths or environment. Returns how many entries were cleared.
@@ -231,14 +312,15 @@ export interface SurvivorRetryDeps {
 export async function retrySurvivingGroups(deps: SurvivorRetryDeps = {}): Promise<number> {
   const terminate = deps.terminate ?? terminateProcessGroup;
   const reap = deps.reap ?? ((target: EscapeScanTarget) => terminateEscapees(target));
-  const startMs = deps.startMs ?? cachedStartMs();
   let cleared = 0;
   for (const [root, survivor] of [...survivingGroups]) {
     survivor.retries++;
     try {
+      // The start time is read fresh before every signal, not from the sweep pass's cache: this
+      // runs seconds after the pass began, and a cached reading is how a reused pid is signalled.
       const groupGone = await terminate(survivor.pid, {
         leaderStartMs: survivor.startMs,
-        startMs,
+        startMs: deps.startMs,
         leaderAlive: () => false,
       });
       const escapees = await reap({ root, cwds: survivor.cwds });
@@ -367,18 +449,92 @@ export interface SweepDeps {
   isOwnerDead?: (owner: OwnerRecord) => boolean;
   /** Replaces `ps` for the owners' start times; asked once per pid per pass. */
   startMs?: StartMsReader;
+  /** Replaces the check of a recorded survivor's group (with identity). True: it is gone. */
+  groupGone?: (survivor: { pid: number; startMs: number | null }) => boolean;
+  /** Replaces the escape scan (Linux). May throw. */
+  scan?: (target: EscapeScanTarget) => EscapeScan;
+}
+
+/** A quarantined directory is considered for removal only once it is this old. */
+export const ONESHOT_QUARANTINE_MAX_AGE_MS = 24 * 60 * 60_000;
+
+/**
+ * True when something of a recorded survivor is alive or cannot be told: its group (checked with
+ * identity, zombies excepted), anything that left the group (Linux scan), or a scan that failed.
+ */
+function survivorMayBeAlive(root: string, record: SurvivorFileRecord, deps: SweepDeps): boolean {
+  try {
+    const gone = deps.groupGone ?? ((s) => groupGoneNow(s.pid, { leaderStartMs: s.startMs }));
+    if (!gone(record)) return true;
+    return scanFindsSomething({ root, cwds: record.cwds }, deps);
+  } catch {
+    return true; // cannot tell: not gone
+  }
+}
+
+/** True when the scan finds a process, cannot say, or throws. */
+function scanFindsSomething(target: EscapeScanTarget, deps: SweepDeps): boolean {
+  try {
+    const scan = (deps.scan ?? ((t: EscapeScanTarget) => findEscapees(t)))(target);
+    return scan.pids.length > 0 || scan.unknown;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Before anything is removed: a config root with a `survivor.json` whose group, or whose escapees,
+ * may still be running goes back into the in-memory survivor map, so the timer keeps signalling it
+ * and neither it nor its temp cwd is swept (#570 r14, C). This ignores age: a restart a minute
+ * after a failed disposal must not lose the record.
+ */
+function adoptPersistedSurvivors(
+  dir: string,
+  names: readonly string[],
+  uid: number | undefined,
+  deps: SweepDeps,
+): void {
+  for (const name of names) {
+    if (!name.startsWith(ONESHOT_CONFIG_PREFIX)) continue;
+    const path = join(dir, name);
+    try {
+      const stat = lstatSync(path);
+      if (!stat.isDirectory() || (uid !== undefined && stat.uid !== uid)) continue;
+      if (survivingGroups.has(path) || activeDirs.has(path)) continue;
+      const record = readSurvivorFile(path);
+      if (record === "missing" || record === "unreadable") continue; // unreadable: quarantined below
+      if (!survivorMayBeAlive(path, record, deps)) continue;
+      survivingGroups.set(path, {
+        pid: record.pid,
+        startMs: record.startMs,
+        tempCwd: record.tempCwd,
+        cwds: record.cwds,
+        retries: 0,
+        cause: "group",
+      });
+      console.error(
+        `[oneshot] survivor of pid ${record.pid} found after a restart; ${name} kept and signalled again`,
+      );
+    } catch (error) {
+      console.warn(
+        `[oneshot] survivor record not checked (${(error as NodeJS.ErrnoException).code ?? "error"})`,
+      );
+    }
+  }
 }
 
 /**
  * Remove `claudeclaw-oneshot-cfg-*` and `claudeclaw-oneshot-pty-*` directories under `dir`
  * that a crashed or failed call left behind. A directory is swept only when ALL hold:
  * it is older than `maxAgeMs`; it belongs to this uid; no call of this daemon is still using
- * it; no claude of this daemon that outlived its retirement may still write into it; and its
- * owner (the daemon whose pid and start time its owner file names) is dead. A directory with
- * no owner file at all (made before the owner file existed) falls back to the age rule. One
- * whose owner file is there but cannot be read or understood is quarantined: logged once, never
- * removed here, because it may belong to a live call. Symlinks and plain files with the prefix
- * are left alone. Returns how many were removed; a failure on one entry does not stop the rest.
+ * it; no claude of this daemon that outlived its retirement may still write into it, nor one
+ * recorded in a `survivor.json` by an earlier daemon run; and its owner (the daemon whose pid
+ * and start time its owner file names) is dead. A directory with no owner file at all (made
+ * before the owner file existed) falls back to the age rule. One whose owner file (or
+ * `survivor.json`) is there but cannot be read or understood is quarantined: logged once by name,
+ * and removed only once it is 24 h old and the escape scan finds nothing in it, because it may
+ * belong to a live call. Symlinks and plain files with the prefix are left alone. Returns how
+ * many were removed; a failure on one entry does not stop the rest.
  */
 export function sweepStaleOneShotDirs(
   dir = tmpdir(),
@@ -397,6 +553,7 @@ export function sweepStaleOneShotDirs(
   } catch {
     return 0;
   }
+  adoptPersistedSurvivors(dir, names, uid, deps);
   for (const name of names) {
     if (!name.startsWith(ONESHOT_CONFIG_PREFIX) && !name.startsWith(ONESHOT_CWD_PREFIX)) continue;
     const path = join(dir, name);
@@ -408,10 +565,25 @@ export function sweepStaleOneShotDirs(
       // Another live daemon's call is kept. This daemon's own finished call (not `activeDirs`)
       // whose removal failed is a leftover too, so its owner file does not protect it.
       const owner = readOwnerFile(path);
-      if (owner === "unreadable") {
+      const survivorFile = name.startsWith(ONESHOT_CONFIG_PREFIX)
+        ? readSurvivorFile(path)
+        : "missing";
+      if (owner === "unreadable" || survivorFile === "unreadable") {
+        const what = owner === "unreadable" ? "owner file" : "survivor record";
         if (!quarantined.has(path)) {
           quarantined.add(path);
-          console.warn("[oneshot] temp dir quarantined: owner file unreadable, not removed");
+          console.warn(`[oneshot] temp dir ${name} quarantined: ${what} unreadable, not removed`);
+        }
+        const target: EscapeScanTarget = name.startsWith(ONESHOT_CONFIG_PREFIX)
+          ? { root: path, cwds: [] }
+          : { root: null, cwds: untrustedCwdForms(path) };
+        if (
+          now - stat.mtimeMs > ONESHOT_QUARANTINE_MAX_AGE_MS &&
+          !scanFindsSomething(target, deps)
+        ) {
+          rmSync(path, { recursive: true, force: true });
+          quarantined.delete(path);
+          removed++;
         }
         continue;
       }
