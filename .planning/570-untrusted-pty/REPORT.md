@@ -339,3 +339,38 @@ Fault injection, one site each, restored after, RED verbatim:
 ```
 
 Local: `src/oneshot` + `session-actions-argv` **196 pass, 5 skip, 0 fail**; PTY-related files plus `runner.test.ts` and `runner-recovery-guards.test.ts` **414 pass, 0 fail**; integration guard **0 pass, 31 skip, 0 fail**; lint 0 errors (1304 warnings); typecheck ratchet **149 against baseline 149**; plugin and marketplace **2.2.351**. No PR opened.
+
+### r8: bound the failed-turn wait
+
+Commit `fc9d830d`, live run [39359586393](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39359586393), Claude **2.1.304**: **36 pass, 0 fail**. This was the single r8 run. It also verifies the widened `[0, 1, 124]` harness allowance (the r7 edit that was not live-verified): the exit-1 production-model case no longer fails the suite. Positive control `MCP=true; hooks=true; memory=true`; the seven isolation rows and twins unchanged (all isolated, all RED).
+
+**Changes** (`src/oneshot/pty-transcript.ts`, `runOnceOnPty`):
+1. The transcript scan now also reports whether the CLI wrote a synthetic or API-error assistant entry. If it did and there is no real reply, `awaitLastAssistantReply` returns `{ failure: "api-error" }` immediately and `runOnceOnPty` returns exit 1 without waiting.
+2. The transcript wait is `transcriptWaitBudget(timeoutMs, elapsed, cap)`: what the turn left of the caller's `timeoutMs`, capped at 15 s, floor 1 s. A 15 s classifier can no longer take about 23 s. The warning now names the cause (`api-error` or `timeout`), still without content.
+3. `discord.ts`'s model id left alone, as instructed.
+
+**Live:**
+
+| Probe | Attempts | Result |
+| --- | --- | --- |
+| Production model id `claude-sonnet-4-20250514`, `timeoutMs` 15000 | 1 | exit **1**, text empty, **3644 ms**, `warnedApiError=true`, `warnedTimeout=false`: fails closed fast. r7 took about 23 s. |
+| Genuine message "please create a thread called release-notes", Haiku only | 2 | `outcome=intent; action=hire; namesCount=1; expectedIntent=true`, 2/2 |
+| Classifier-contract variant (correct answer `null`) | 5 | `productionParseOk=true; outcome=null; screenEcho=false`, 5/5 |
+| Hang rate, tools-baseline prompt | 5 | 0 hung; all exit 0 |
+
+The 3.6 s covers the whole call (spawn, the turn to the model's rejection, the transcript read), measured with the harness's own evidence poll switched off so it adds nothing to the number.
+
+**Unit tests** (`src/oneshot/pty-reply.test.ts`, no real claude): an API-error-only transcript fails with `failure: "api-error"` and a fake clock showing under a tenth of the bound elapsed; an empty transcript waits the bound and reports `timeout`; a real reply after an earlier error entry wins; `transcriptWaitBudget` cases (remaining, cap, floor, exhausted); `runOnceOnPty` with an API-error-only transcript returns exit 1 in under 1.5 s with an `api-error` warning; `runOnceOnPty` with an exhausted budget returns exit 1 in under 2.5 s.
+
+Fault injection, one site each, restored after, RED verbatim:
+
+```text
+(1) remove the API-error early exit -> 2 failures (13 pass / 2 fail)
+(fail) #570 failed-turn latency > an API-error-only transcript fails at once, far under the bound
+(fail) #570 failed-turn latency > runOnceOnPty: an API-error-only transcript returns exit 1 straight away [5003.35ms]
+(2) transcriptWaitBudget ignores the remaining budget (returns the cap) -> 2 failures (13 pass / 2 fail)
+(fail) #570 failed-turn latency > the transcript wait is what the turn left of timeoutMs, capped, with a floor
+(fail) #570 failed-turn latency > runOnceOnPty: an exhausted budget bounds the transcript wait to the floor [5003.70ms]
+```
+
+Local: `src/oneshot` + `session-actions-argv` **202 pass, 5 skip, 0 fail**; PTY-related files + `runner.test.ts` + `runner-recovery-guards.test.ts` **414 pass, 0 fail**; integration guard **0 pass, 30 skip, 0 fail**; lint 0 errors (1304 warnings); typecheck ratchet **149 against baseline 149**; plugin and marketplace **2.2.352**. No PR opened.
