@@ -102,3 +102,30 @@ During the wait, an additional unit check found that caller environment override
 ```
 
 After this correction the required scoped suite reports **175 pass, 4 skip, 0 fail**. One preceding run had the existing HTTP stalled-body timeout test return 1 instead of 124 in 3.64ms; it runs before the new PTY tests and passed on the unchanged rerun. No unrelated test code was changed. Lint and typecheck remain at the same passing counts. The live run above uses matching parent/caller config roots, so this additional override case is unit-only evidence.
+
+### r3 workflow outcome and stopping point
+
+[Run 39347652032](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39347652032), full tested SHA `d1c12fd49081c3768c11e7e1795b8a3c7dddc7c1`, Claude **2.1.304**: **17 pass, 4 fail**. Seven existing tests passed; new suite **10 pass, 4 fail**. Startup works with the explicitly derived interactive arguments. Follow-up `ffb4ec255e44bf0cff3e569455e8a7be9b19210a` aligns transcript cleanup with caller config roots and is covered by the local regression, not a separate live run.
+
+| Property | Control present | Control removed / RED evidence |
+| --- | --- | --- |
+| Tools | rc 0 and actual transcript, but missing completion token blocked the property assertion | Valid RED predicate: tool marker or tool_use detected |
+| MCP | No stub marker | No stub marker either; twin failed, no valid RED |
+| Hooks/settings | No hook marker | Valid RED predicate: hook marker fired |
+| User memory | No memory canary | No canary either; twin failed, no valid RED |
+| Commands/cwd | No command canary; empty cwd observed and removed | Twin failed; allowReplCommand only allows /compact, so arbitrary command never bypassed the input guard |
+| Transcript cleanup | Real JSONL seen before finally; removed afterwards | Valid RED predicate: disabling cleanup leaves JSONL |
+| Environment | Actual child fake canary absent | Valid RED predicate: admitted fake canary present |
+
+Caught real-control assertion failures logged verbatim:
+
+```text
+[isolation-spike] RED-with-control-removed tools: expected true, received false
+[isolation-spike] RED-with-control-removed hooks: expected true, received false
+[isolation-spike] RED-with-control-removed transcript cleanup: expected true, received false
+[isolation-spike] RED-with-control-removed environment: expected true, received false
+```
+
+No baseline leak was observed. Tools baseline is inconclusive because its wording guard failed despite a completed turn. MCP/memory fixture discovery and their ineffective twins remain undiagnosed; absent canaries in both directions are not isolation evidence. The command twin did not remove the existing /compact-only guard, as confirmed in the sanitizer source; no production guard was weakened to make it pass. These limitations are exposed as failing tests, not hidden skips or passing claims.
+
+**Stopped without Step 3:** all six properties and every twin were not proved. No new startup blocker occurred, so the brief's conditional startup retry was not used. No further workflow dispatch, capability flip, untrusted default change, rollout docs/README change or PR. Production keeps PTY isolation false and untrusted routes on print; HTTP stays explicit opt-in. Plugin and marketplace remain **2.2.346**. The remaining work is probe-fixture/negative-control diagnosis under a subsequent authorization, followed by security review before any PR.
