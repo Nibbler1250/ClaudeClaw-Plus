@@ -49,14 +49,14 @@ describe.skipIf(process.platform !== "linux")("processStartMs on Linux", () => {
   });
 });
 
-/** #570 r14d (H1): a `/proc` start time is exact, so a 2 s window only lets a recycled pid read as the same. */
+/** #570 r14e (H1): a `/proc` start time is exact, so any window only lets a recycled pid read as the same. */
 describe("sameStart", () => {
-  it("compares Linux /proc start times to within one clock tick", () => {
+  it("compares Linux /proc start times exactly: the next tick is another process", () => {
     expect(sameStart(10_000, 10_000, "linux")).toBe(true);
-    expect(sameStart(10_000, 10_010, "linux")).toBe(true);
-    // Went red (true) with the 2000 ms window put back on the Linux path.
+    // Went red (true) with `<= 10` put back on the Linux path.
+    expect(sameStart(10_000, 10_010, "linux")).toBe(false);
+    expect(sameStart(10_010, 10_000, "linux")).toBe(false);
     expect(sameStart(10_000, 11_000, "linux")).toBe(false);
-    expect(sameStart(11_000, 10_000, "linux")).toBe(false);
   });
 
   it("keeps 2 s for `ps -o lstart=`, which has one-second resolution", () => {

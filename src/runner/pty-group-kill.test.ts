@@ -9,6 +9,7 @@ import {
   terminateProcessGroup,
   type SignalFn,
 } from "./pty-group-kill.js";
+import { withPlatformAsync } from "./pty-test-platform.js";
 
 /** #570 r12 (A): a retired PTY child must be proven gone, with its group. */
 
@@ -170,6 +171,57 @@ describe("terminateProcessGroup", () => {
       } finally {
         warn.mockRestore();
       }
+    });
+
+    /** The leader pid is absent; the group `-PID` has a member. Every non-zero signal is recorded. */
+    const leaderGoneGroupLive = () => {
+      const calls: Array<[number, NodeJS.Signals | 0]> = [];
+      const signal: SignalFn = (target, name) => {
+        calls.push([target, name]);
+        if (name === 0 && target === PID) throw errno("ESRCH");
+      };
+      return { signal, calls };
+    };
+
+    it("signals nothing for a leader that is absent when its start time was never recorded, on a later retry, however live the group (r14e, H2)", async () => {
+      const k = leaderGoneGroupLive();
+      const retry = { ...instant, leaderStartMs: null, leaderAlive: () => false };
+      // A live `-PID` beside an absent leader may be someone else's group. Went red (signals sent
+      // to -PID) with `gone` accepted on its own again.
+      expect(await terminateProcessGroup(PID, { signal: k.signal, ...retry })).toBe(false);
+      expect(signalled(k.calls)).toEqual([]);
+    });
+
+    it("still signals the group of an absent leader during the first termination, and when the start time was recorded", async () => {
+      const first = leaderGoneGroupLive();
+      const unrecorded = {
+        ...instant,
+        leaderStartMs: null,
+        leaderAlive: () => false,
+        firstTermination: true,
+      };
+      await terminateProcessGroup(PID, { signal: first.signal, ...unrecorded });
+      // Went red (nothing sent) with the first-termination case dropped from the `gone` rule.
+      expect(signalled(first.calls).length).toBeGreaterThan(0);
+      expect(signalled(first.calls).every(([target]) => target === -PID)).toBe(true);
+
+      const recorded = leaderGoneGroupLive();
+      await terminateProcessGroup(PID, { signal: recorded.signal, ...instant });
+      // Went red (nothing sent) with the recorded-start case dropped from the `gone` rule.
+      expect(signalled(recorded.calls).length).toBeGreaterThan(0);
+      expect(signalled(recorded.calls).every(([target]) => target === -PID)).toBe(true);
+    });
+
+    it("on Linux a start time one tick off is another process: nothing is signalled (r14e, H1)", async () => {
+      const k = fakeKernel("SIGKILL");
+      // Recorded 10000, now 10010: the next tick, so a recycled pid. Went red (signals sent to
+      // -PID) with `<= 10` put back in sameStart.
+      const next = { ...instant, leaderStartMs: 10_000, startMs: () => 10_010 };
+      const result = await withPlatformAsync("linux", () =>
+        terminateProcessGroup(PID, { signal: k.signal, ...next }),
+      );
+      expect(signalled(k.calls)).toEqual([]);
+      expect(result).toBe(true); // a recycled leader means the group we started is gone
     });
 
     it("signals nothing for an unrecorded start time when the group has no member (the bare pid may be a stranger)", async () => {

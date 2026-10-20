@@ -203,9 +203,12 @@ class GroupTarget {
         `[pty-group-kill] start time of pid ${this.pid} was not recorded; signalling its group on group membership alone`,
       );
     }
+    // `gone` is read before the recorded start time is looked at, so it says only that the leader
+    // pid is absent. A live `-pid` group beside an absent leader is ours only if we recorded the
+    // leader, or this is the first termination (r14e, H2).
     const known =
       identity === "same" ||
-      identity === "gone" ||
+      (identity === "gone" && (this.leaderStartMs !== null || unrecordedOk)) ||
       (identity === "unknown" && (this.owned() || unrecordedOk));
     if (!known || !exists(this.signal, -this.pid)) return false;
     try {

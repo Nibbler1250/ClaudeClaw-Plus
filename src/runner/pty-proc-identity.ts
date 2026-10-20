@@ -21,19 +21,17 @@ export type StartMsReader = (pid: number) => number | null;
 /** Clock ticks per second of `/proc/<pid>/stat` times. 100 on every Linux build in use. */
 const LINUX_CLOCK_TICKS_PER_SECOND = 100;
 
-/** One clock tick. `/proc` start times are boot time plus ticks, so two reads of one process are equal. */
-export const LINUX_START_TOLERANCE_MS = 1000 / LINUX_CLOCK_TICKS_PER_SECOND;
-
 /**
  * Do two start times, read by `processStartMs`, belong to one process? On Linux they come from
- * `/proc` and are exact, so the window is one tick: a wider one only lets a recycled pid read as
- * the same process (#570 r14d, H1). Elsewhere they come from `ps -o lstart=`, which has 1 s
+ * `/proc` (ticks * 10 ms), so two reads of one process are identical and a different process in
+ * the next tick differs by 10: they compare exactly, and any window only lets a recycled pid read
+ * as the same process (#570 r14e, H1). Elsewhere they come from `ps -o lstart=`, which has 1 s
  * resolution, and the window is `START_TIME_TOLERANCE_MS`. Every comparison of a recorded start
  * time with a fresh reading goes through here.
  */
 export function sameStart(a: number, b: number, platform: string = process.platform): boolean {
-  const tolerance = platform === "linux" ? LINUX_START_TOLERANCE_MS : START_TIME_TOLERANCE_MS;
-  return Math.abs(a - b) <= tolerance;
+  if (platform === "linux") return a === b;
+  return Math.abs(a - b) <= START_TIME_TOLERANCE_MS;
 }
 
 /**
