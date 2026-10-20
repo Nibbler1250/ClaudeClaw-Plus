@@ -795,7 +795,7 @@ Both runs: the same commit, `7b97c9e1`, 55 tests in 3 files (r12 run 2: 55 pass,
 | **C** look-alikes, control present | **FAIL**: `exit=124; assistantEntries=0`, `promptSeen=true; assistant=0; apiErrors=0; synthetic=0; reached=false` (the harness' `reachedApi` requirement, `untrusted-pty-isolation.test.ts:658`) | pass (`canaryInReply=false; canaryInTranscript=false`) |
 | **C** look-alikes, twin (ASCII `@`, neutralising off) | pass | **FAIL**: `expect(result.exitCode).toBe(0)` received 1, at 11.2 s (harness line 643) |
 
-**What the two failures are, and are not.** They are two different sub-rows of the C family, each failing once in two runs of identical code, and each of them passed in the other run. In run 1 the prompt was written and recorded (`promptSeen=true`) and the model produced nothing for 60 s: the stall the baseline hang probes have measured since r6 (rate 1/5 in r9, 0/5 in r11, 3/5 in r12). In run 2 the twin returned exit 1 after about 11 s. Neither can be a ready-gate refusal: a refusal on a blocked screen comes one quiet window (500 ms by default) after the screen shows it, a footer that never shows or never settles is refused at the 20 s budget, and run 1 shows the prompt was written. The gate also let a real REPL through on every row that sends a prompt (positive control, B1, B2, B3, A-login, A-untouched, A-paste, A-proc), which is the evidence that the new screen decoder agrees with a real claude 2.1.304. **I cannot prove the two failures are unrelated to r13**: I have no child log for either, one sample each, and the same C family flaked in r10 (B3 print, control present) and r11 (B3 PTY twin) with no relevant change. A third run is not allowed by the brief; the useful next step is to read why the twin returns 1 (a `warn` from `runOnceOnPty` would say which of spawn failure, turn failure and no transcript reply it was, and the harness does not surface it).
+**What the two failures are, and are not.** They are two different sub-rows of the C family, each failing once in two runs of identical code, and each of them passed in the other run. In run 1 the prompt was written and recorded (`promptSeen=true`) and the model produced nothing for 60 s: the stall the baseline hang probes have measured since r6 (rate 1/5 in r9, 0/5 in r11, 3/5 in r12). In run 2 the twin returned exit 1 after about 11 s. **Correction in r14: this paragraph used to rule out a ready-gate refusal from timing, and that does not hold.** It argued that a refusal comes one quiet window after the screen shows it, or at the 20 s budget, and that the twin exited after about 11 s. But the quiet window restarted on every screen chunk, so a REPL that kept repainting without changing its text could be delayed or refused at a time that fits neither number, and the harness printed no reason. The cause of run 2's exit 1 is unknown. That the gate let a real REPL through on the rows that send a prompt (positive control, B1, B2, B3, A-login, A-untouched, A-paste, A-proc) is evidence that the screen decoder accepts a real claude 2.1.304, not evidence about this failure. **I cannot prove the two failures are unrelated to r13**: I have no child log for either, one sample each, and the same C family flaked in r10 (B3 print, control present) and r11 (B3 PTY twin) with no relevant change. A third run is not allowed by the brief; the useful next step is to read why the twin returns 1 (a `warn` from `runOnceOnPty` would say which of spawn failure, turn failure and no transcript reply it was, and the harness does not surface it).
 
 ### Local verification
 
@@ -847,3 +847,97 @@ G2   survivor !== undefined throw deleted (brief G2)           (fail) r12 A: a p
 ```
 
 Not injected: the 2 s grace lengths (values, not branches); the `ps -o lstart=` parse (under `bun test` the `lstart` string, which `ps` prints in local time, was read 1 hour out against `Date.now()` on this BST machine; I believe `bun test` defaults `TZ` to UTC, but I did not confirm it. Both the owner file and the signals read through the same parser, so they agree, and no assertion compares the value with the clock; a daemon under `bun run` parses local time); the Linux branch of `procLiveMembers` and the scan against a real `/proc` (fake directory only, plus the unrun Linux block).
+
+## r14: fail closed in the escape scan, survivors across restarts, haiku classifier with one retry
+
+Commits `f464b12d` (code and tests) and `e9af1e22` (observed-RED comments, `docs/oneshot-engines.md`), pushed to `povai`, plus a final docs commit with this section. No PR, no GitHub comment, no version bump (2.2.353). **One** integration workflow run was used of the two allowed: [39423879512](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39423879512) on `e9af1e22`, Claude 2.1.304. **I stopped after it, as the brief says to when a live row regresses.**
+
+### Stopped: the live suite regressed at the positive control
+
+The positive control failed, and every row after it failed because each one requires `positiveProved`. The 56-test job shows the control itself: `POSITIVE CONTROL: MCP=true; hooks=true; memory=true; assistant=true; completed=false`, then the thrown error `the escape scan after retirement of pid 3610 could not tell whether a process survived` (`run-threw -: reason=threw:Error; elapsedMs=15378`). So the call worked (claude answered, all three controls fired) and the **new fail-closed escape scan rejected it**: after retirement `findEscapees` returned `unknown`, which counts as a survivor, so `cleanupUntrustedOneShot` kept the root and failed the call.
+
+What I know and do not know:
+
+- Known: on the ubuntu runner at least one process of the runner's uid has an `environ` or `cwd` that cannot be read with an error other than ENOENT/ESRCH. The brief's rule (A) turns any such process into "unknown".
+- **Not known: which process, and which errno.** The scan logs only the typed result, not the code. My guess is EACCES on a non-dumpable process of the same uid (a runner helper), but this is unproven. I did not use the second run to find out, because the brief says to stop and report instead of improvising, and the second run is also the one that must carry the F3 counts.
+- This is a problem with the brief's rule as written, not a slip in the implementation: the rule cannot tell "a process that is ours and unreadable" from "a process of our uid that was never ours". Real claude descendants inherit our dumpable state, so an unreadable one is plausible, which is why I did not simply narrow the rule on a guess.
+
+Options for Terry (none applied):
+
+1. Make the scan log the errno and pid class (no names, no paths) for an unknown, and spend run 2 on that plus the F3 counts. If the unreadable process is unrelated to the call, narrow the rule on evidence.
+2. Narrow "unknown" now to processes whose `stat` shows our session or process group, or whose parent chain reaches the daemon, and treat other same-uid unreadable processes as foreign. This keeps the escape-scan guarantee for descendants but is a design change to the brief.
+3. Treat only EACCES/EPERM on `environ` as unknown when the same pid's `cwd` is also unreadable. Weaker; I would not pick it without evidence.
+
+I recommend 1 first.
+
+### Results that did not depend on the live rows
+
+- **G, Linux escape test: passed on CI.** Job step "Linux process tests (escape scan, group kill, start time)" in the same run, `Ran 59 tests across 4 files`, all `(pass)`, including the two real-process lines:
+  - `(pass) a descendant that calls setsid() (Linux) > is dead once the child is retired [4184.86ms]`
+  - `(pass) a descendant that calls setsid() (Linux) > twin: with the scan switched off it survives the group kill (so the test above can fail) [51.66ms]`
+  - and `(pass) processStartMs on Linux > is the /proc reading, and is steady across reads`.
+  It passed once. "Reliably" is not shown by one run.
+- **F3 (20 classifier messages): not measured.** The row was reached only as a failed test (`positiveProved` false), so there are no counts: replied first time, on retry, failed closed and p50/p95 are all unknown. The row fails only for more than 2 of 20, per the brief, and has not yet run.
+- The new `run-threw` / `run-exit` lines work: the failure above printed a reason and timing with no screen, transcript or env. The C twin's earlier "exit 1 at 11 s" can be read the same way in a later run.
+
+### What changed (all in `f464b12d` unless noted)
+
+| Item | Change |
+| --- | --- |
+| A | `findEscapees` returns `{ pids, unknown }` and throws if `/proc` cannot be listed; same-uid unreadable `environ`/`cwd` (not ENOENT/ESRCH) is unknown, foreign uids are skipped; `terminateEscapees` throws `EscapeScanUnknownError` when its scan is unknown. `dispose` scans whenever `_terminateGroup` is set, past the 30 s window (Opus M1). The two fail-open tests are inverted. |
+| B | `retrySurvivingGroups` no longer passes the pass's cached start time. `GroupTarget.send` signals the group and then not the bare pid; identity is read immediately before each signal. An unrecorded start time still allows `-pid` while the group has a member, logged once. `keepRootAfterFailedDispose` records the PTY's real `leaderStartMs` or logs that the root is unprotected. |
+| C | `survivor.json` (0600) is written into the root when a survivor is recorded. Before a sweep removes anything it reads it, checks the group with identity and runs the escape scan, and re-registers the root if anything is alive or unknown. A quarantined dir is named in the log and removed only after 24 h and a clean scan. `pty-supervisor.ts` comment fixed. |
+| D | Ready gate restarts its quiet timer only when the screen text changes. The cleanup failure names the cause (`group`, `escapee`, `scan-unknown`, `dispose-rejected`). `OneShotResult.diagnostic` carries a fixed-set reason code and phase timings; the harness prints it for every non-zero exit. |
+| E | Linux start time from `/proc/<pid>/stat` field 22; `ps` stays on macOS. One survivor-retry test uses the real `terminateProcessGroup` with a recording kernel. `landPty` calls `keepRootAfterFailedDispose` on a rejected late dispose. |
+| F | Classifier uses the `haiku` alias, 8 s per attempt, one retry on a timeout or no reply, a throw is not retried. Other `claude-sonnet-4-20250514` uses, left for the follow-up audit: `src/oneshot/pty-trusted.test.ts:61`, `src/oneshot/http.test.ts:53`, and (changed with the alias) `src/__tests__/discord-classifier-isolation.test.ts`. The only production site was `src/commands/discord.ts`. |
+| G | `integration.yml` runs the Linux process tests as a final step with `if: always()`. |
+
+**Pid reuse is narrowed, not closed.** Reading the start time immediately before each `kill()` shrinks the window in which a reused pid could be signalled to the instant between the read and the signal. It cannot be closed without a native process handle (a pidfd), which Node and Bun do not offer, and none is built here.
+
+### Local verification
+
+`src/oneshot src/runner src/__tests__/discord-classifier-isolation.test.ts src/commands`: **421 pass, 0 fail** (r13: 351 pass). Full-repo `bun run lint`: 0 errors. Typecheck ratchet: 149 against baseline 149. Run with `env -u ANTHROPIC_BASE_URL`, output to files.
+
+### Fault injection, one site each, on a `git archive` copy in the scratchpad, restored after (RED verbatim)
+
+Baseline on the copy: 171 pass, 0 fail. Each of the 33 injections went red. Assertion comments were written after seeing these lines.
+
+```text
+A1-readdir-fails-open                       (fail) findEscapees (fake /proc) > throws when /proc cannot be listed, and finds nothing for a root nobody carries  [+1 more]
+A2-environ-unreadable-ignored               (fail) findEscapees (fake /proc) > reports unknown for a process of ours whose environment cannot be read  [+3 more]
+A3-cwd-unreadable-ignored                   (fail) findEscapees (fake /proc) > reports unknown for a process of ours whose cwd cannot be read
+A4-foreign-uid-not-skipped                  (fail) findEscapees (fake /proc) > does not report unknown for a process that is gone, or one owned by another uid
+A5-first-scan-unknown-reads-as-empty        (fail) terminateEscapees (fake /proc) > throws, never reports success, when nothing was found but a process could not be read
+A6-final-unknown-not-thrown                 (fail) terminateEscapees (fake /proc) > throws, never reports success, when nothing was found but a process could not be read  [+1 more]
+A7-scan-skipped-after-window                (fail) retiring a PTY child > still looks for descendants that left the group when the child exited long ago
+B1-retry-uses-cached-start-time             (fail) retrySurvivingGroups with the real termination (#570 r14, B and E) > signals the group of the recorded leader with a recording kernel, and no cached start time
+B2-bare-pid-also-signalled                  (fail) terminateProcessGroup > pid identity (#570 r13, B) > checks again before the SIGKILL: a pid reused after the SIGTERM is not killed
+B2b-identity-cached-not-reread              (fail) terminateProcessGroup > pid identity (#570 r13, B) > checks again before the SIGKILL: a pid reused after the SIGTERM is not killed
+B3-unrecorded-start-time-refuses-group      (fail) terminateProcessGroup > pid identity (#570 r13, B) > signals the group of a pid whose start time was never recorded while it has a member, never the bare pid, and says so once
+B3b-unrecorded-start-time-logged-every-time (fail) terminateProcessGroup > pid identity (#570 r13, B) > signals the group of a pid whose start time was never recorded while it has a member, never the bare pid, and says so once
+B4-failed-dispose-records-null-start        (fail) r14 B/E: a rejected disposal records the PTY's real start time, or says the root is unprotected > keeps the leader's start time read at spawn, in memory and in survivor.json
+B4b-no-pty-not-logged                       (fail) r14 B/E: a rejected disposal records the PTY's real start time, or says the root is unprotected > logs that the root is unprotected when there is no PTY to name, and records nothing
+B5-escapee-signal-skips-identity            (fail) terminateEscapees (fake /proc) > does not signal a pid whose start time changed since it was found  [+1 more]
+E3-group-signal-removed                     (fail) retrySurvivingGroups with the real termination (#570 r14, B and E) > signals the group of the recorded leader with a recording kernel, and no cached start time  [+5 more]
+C1-survivor-file-not-written                (fail) survivor.json > is written into the root with the pid, start time and cwds, mode 0600  [+5 more]
+C2-adoption-pre-pass-removed                (fail) survivor.json > keeps a root whose recorded group is still alive across a restart, and re-registers it  [+2 more]
+C3-escape-scan-ignored-on-adoption          (fail) survivor.json > keeps a root when the group is gone but the escape scan finds a process, cannot say, or throws
+C4-quarantine-age-ignored                   (fail) sweepStaleOneShotDirs: who may be removed > quarantines a directory whose owner file is malformed or unreadable: logged once, never removed  [+1 more]
+C4b-quarantine-scan-ignored                 (fail) quarantine (#570 r14, M4) > is kept after 24 h when the scan finds a process, cannot say, or throws  [+1 more]
+C4c-quarantine-log-omits-name               (fail) survivor.json > quarantines a root whose survivor.json is unreadable: named in the log, not removed before 24 h
+C5-adoption-ignores-identity                (fail) survivor.json > reads the recorded identity: a leader pid that now has another start time is a group that is gone
+D1-quiet-timer-restarts-on-every-chunk      (fail) the ready gate reads the current screen > is ready when the REPL only moves its cursor or repaints identical text
+D2-cleanup-reason-always-group              (fail) r13 A6: a disposal that rejects keeps the root, as a survivor does > fails the call and leaves the config root when dispose() throws  [+2 more]
+D3-exec-reason-lost                         (fail) r12 E: a REPL that never became ready fails the call with nothing sent > returns exit 1 with no reply, tries once, retires the child and leaves no directory behind
+D4-escapee-cause-lost                       (fail) retirement and the recorded identity > names the cause to the survivor hook: group, escapee, or a scan that could not tell
+E1-wrong-stat-field                         (fail) procStartMs (fake /proc) > reads field 22 (ticks since boot) as milliseconds  [+1 more]
+E2-late-dispose-not-kept                    (fail) r14 B/E: a rejected disposal records the PTY's real start time, or says the root is unprotected > keeps the root when a late-landing PTY's disposal rejects, and still refuses the spawn
+F1-no-retry                                 (fail) classifyThreadIntent: model, bound and retry > retries once when the first attempt hangs, and succeeds when the second replies  [+2 more]
+F2-two-retries                              (fail) classifyThreadIntent: model, bound and retry > fails closed after two hangs, with no third attempt  [+1 more]
+F3-dated-model-back                         (fail) classifyThreadIntent: model, bound and retry > asks the haiku alias, never a dated model id  [+1 more]
+F4-15s-bound-back                           (fail) classifyThreadIntent: model, bound and retry > retries a no-reply exit too, and keeps both attempts untrusted with the 8 s bound
+```
+
+### Not done
+
+F3 counts, a second live sample of any row, and any change to the scan rule (see the options above). Version bump and PR are not started.
