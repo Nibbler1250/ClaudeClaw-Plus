@@ -649,16 +649,30 @@ export const CLASSIFIER_ATTEMPT_TIMEOUT_MS = 12000;
 
 export interface ClassifierCall {
   call: OneShotResult;
-  /** 1 when the first attempt answered or the failure was not a no-reply, 2 after the retry. */
+  /** 1 when the first attempt answered or its failure was one a retry cannot fix, 2 after the retry. */
   attempts: number;
 }
 
 /**
+ * Can a second attempt succeed where this failed? Only a timeout or a turn that produced no
+ * reply: those are flaky. Every other failure repeats itself (`not-ready:login-required` and the
+ * other `not-ready:*`, `config-dir`, `config-root`, `turn-error`, `busy`), so retrying it only
+ * spawns a second claude to fail the same way (#570 r15, A3). The print engine reports no
+ * diagnostic: its timeout is exit 124, which is a timeout too.
+ */
+function retryableClassifierFailure(call: OneShotResult): boolean {
+  if (call.exitCode === 0) return false;
+  const reason = call.diagnostic?.reason;
+  if (reason === undefined) return call.exitCode === 124;
+  return reason === "timeout" || reason.startsWith("no-reply");
+}
+
+/**
  * One classifier call: `CLASSIFIER_ATTEMPT_TIMEOUT_MS` per attempt, and exactly one retry when the
- * first attempt timed out or produced no reply (a non-zero exit). The retry changes nothing about
- * the call, so it is as isolated as the first. A throw (a cleanup that could not remove the
- * prompt from disk) is not retried: it is a security signal, not a flaky reply. After the retry a
- * failure stands: the caller fails closed.
+ * first attempt timed out or produced no reply (`retryableClassifierFailure`). The retry changes
+ * nothing about the call, so it is as isolated as the first. A throw (a cleanup that could not
+ * remove the prompt from disk) is not retried: it is a security signal, not a flaky reply. After
+ * the retry, or after any failure a retry cannot fix, the failure stands: the caller fails closed.
  */
 export async function runClassifierCall(
   input: string,
@@ -678,7 +692,7 @@ export async function runClassifierCall(
           timeoutMs: CLASSIFIER_ATTEMPT_TIMEOUT_MS,
         }),
     );
-    if (call.exitCode === 0 || attempts === 2) return { call, attempts };
+    if (!retryableClassifierFailure(call) || attempts === 2) return { call, attempts };
   }
   return { call, attempts: 2 };
 }

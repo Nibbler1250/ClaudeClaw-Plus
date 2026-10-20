@@ -25,15 +25,22 @@ export function claudeVersionAtLeast(version: string | null | undefined, min: st
  * when the version could not be read, the untrusted routes resolve to print (an explicit
  * `oneShot.routes` entry naming pty is rejected at the call). One warning, at startup.
  * Returns whether PTY isolation is advertised.
+ *
+ * Never on win32: the native env isolation (`withProcessEnvPolicy`) throws there, so an operator
+ * who turned the runner PTY on would get a classifier that fails on every call (#570 r15, A5).
  */
 export function applyPtyIsolationVersionGate(
   version: string | null | undefined,
   warn: (message: string) => void = console.warn,
+  platform: string = process.platform,
 ): boolean {
-  const ok = claudeVersionAtLeast(version, MIN_PTY_ISOLATION_CLAUDE_VERSION);
+  const supported = platform !== "win32";
+  const ok = supported && claudeVersionAtLeast(version, MIN_PTY_ISOLATION_CLAUDE_VERSION);
   const pty = engines.get("pty");
   if (pty) pty.caps.isolation = ok;
-  if (!ok) {
+  if (!supported) {
+    warn("[oneshot] PTY isolation is not available on win32: untrusted one-shot routes use print");
+  } else if (!ok) {
     warn(
       `[oneshot] claude ${version ?? "(version unreadable)"} is below ${MIN_PTY_ISOLATION_CLAUDE_VERSION}, the build the interactive isolation was measured on: untrusted one-shot routes use print`,
     );

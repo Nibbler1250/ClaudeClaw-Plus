@@ -5,10 +5,10 @@ declare `isolation: "untrusted"` or `isolation: "trusted-session"`, plus a posit
 `timeoutMs`. With no explicit one-shot setting, the trusted resume routes
 `compact`, `rotation.summary`, `memory.save.precompact` and `memory.save.stop`
 use `pty` when `pty.enabled` is true, and `print` when false. The untrusted
-routes (`discord.classifier`, `tuner.*`, `memory.recall`) follow `pty.enabled` too, but
+routes (`discord.classifier`, `tuner.*`) follow `pty.enabled` too, but
 only on a claude CLI at least 2.1.304, the build the interactive isolation was measured
-on; below that, or when the version cannot be read at startup, they stay on `print`
-(one startup warning). `print` and `pty` are built in and
+on, and never on Windows; below that, when the version cannot be read at startup, or on
+win32, they stay on `print` (one startup warning). `print` and `pty` are built in and
 need no declaration. The HTTP engines below are built in too, and need their
 settings.
 
@@ -45,10 +45,11 @@ budget. Exact routes override a namespace wildcard, then an explicit
 `oneShot.default`, then the implicit route default applies. The implicit default
 is `pty` when `pty.enabled` is true (`print` otherwise, including the Windows
 default) for the trusted resume routes **and** for the untrusted routes
-(`discord.classifier`, `tuner.*`, `memory.recall`) while the claude version gate
+(`discord.classifier`, `tuner.*`) while the claude version gate
 below holds. `claude -p` still runs in the default configuration whenever the
-gate or `pty.enabled` says print, and for the tuner's `claude_cli` backend, which
-always selects print. Unknown engines and incompatible capabilities fail settings
+gate or `pty.enabled` says print, for the tuner's `claude_cli` backend, which
+always selects print, and for memory recall, which does not go through `runOneShot`
+at all: it runs in Python (#545) and spawns `claude -p` itself. Unknown engines and incompatible capabilities fail settings
 load.
 
 The PTY engine advertises `caps.isolation: true` (#570). The interactive isolation
@@ -62,16 +63,28 @@ rejected, and an HTTP engine stays an explicit opt-in. Reverting the flag in
 `src/oneshot/registry.ts` does not close the gate, because `applyPtyIsolationVersionGate`
 (`src/oneshot/claude-version.ts`) overwrites `pty.caps.isolation` at startup. To roll the
 untrusted routes back to print, pin them in settings and restart the daemon:
-`"oneShot": { "routes": { "discord.classifier": "print", "tuner.*": "print", "memory.recall": "print" } }`
+`"oneShot": { "routes": { "discord.classifier": "print", "tuner.*": "print" } }`
 (an explicit route beats the implicit default, and `print` advertises isolation, so settings
 load accepts it). Alternatively, raise `MIN_PTY_ISOLATION_CLAUDE_VERSION` in
 `src/oneshot/claude-version.ts` above the installed claude and restart, which is a code
 change. One caveat is recorded in the
 spike: a prompt that tells a tool-less session to run a tool sometimes gets no reply.
 It is bounded by the caller's timeout and fails closed: the classifier (the `haiku` alias)
-allows 12 s per attempt and retries exactly once when an attempt times out or gets no reply,
-so a call is bounded at about 24 s plus teardown, and after the retry it treats a non-zero exit as "not a
-thread command". A call that throws (a cleanup that could not remove the prompt) is not retried. An untrusted
+allows 12 s per attempt and retries exactly once, and only when an attempt timed out or got no
+reply (a diagnostic reason of `timeout` or `no-reply*`; on `print`, exit 124). Every other
+failure (`not-ready:*`, `config-dir`, `config-root`, `turn-error`, `busy`) repeats itself, so it
+stands after one attempt. A call is bounded at about 24 s plus teardown, and a failure that
+stands is treated as "not a thread command". Retiring the child (an abort, a deadline) or the
+child exiting ends the REPL-ready wait at once. A call that throws (a cleanup that could not
+remove the prompt) is not retried. At most 2 untrusted PTY one-shots run at once
+(`UNTRUSTED_ONESHOT_MAX_CONCURRENT`, in process, not a setting): a third returns `busy` without
+spawning anything, and the classifier gets null for it.
+
+An API-key-only host is not covered: untrusted routes carry no API-key defaults, and the
+throwaway config root has no login, so on claude 2.1.304 or later with `pty.enabled` the
+spawn stops at `not-ready:login-required` and the classifier returns null for every message.
+That is by design. The fix for such a host is the rollback pin above (`print` for
+`discord.classifier` and `tuner.*`). An untrusted
 PTY call returns the model's reply read from the session transcript, never the rendered
 screen (which echoes the prompt); if no reply appears it exits 1, or 124 when the caller
 aborted or its own deadline ran out during the wait. Trusted routes keep the screen text.

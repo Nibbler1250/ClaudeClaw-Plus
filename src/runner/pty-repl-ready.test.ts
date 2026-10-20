@@ -204,3 +204,92 @@ describe("the ready gate reads the current screen", () => {
     expect(received()).toBe("");
   });
 });
+
+// #570 r15 (A2): a pending ready gate ends when the child is retired or exits, instead of
+// running to its own deadline. The gate's 12 s deadline is held on a fake clock and never
+// fires, so a turn that settles here was ended by dispose or exit, not by the deadline.
+describe("a pending ready gate ends with the child (r15, A2)", () => {
+  const GATE_MS = 12_000;
+
+  function gateClock() {
+    const pending = new Map<ReturnType<typeof setTimeout>, () => void>();
+    return {
+      pending,
+      options: {
+        _setTimeout: (cb: () => void, ms: number): ReturnType<typeof setTimeout> => {
+          if (ms !== GATE_MS) return setTimeout(cb, ms);
+          const handle = {} as ReturnType<typeof setTimeout>;
+          pending.set(handle, cb);
+          return handle;
+        },
+        _clearTimeout: (handle: ReturnType<typeof setTimeout>): void => {
+          if (!pending.delete(handle)) clearTimeout(handle);
+        },
+      },
+    };
+  }
+
+  /** A shell that paints a screen with no footer, then runs `after` (default: waits for input). */
+  async function spawnWithClock(
+    clock: ReturnType<typeof gateClock>,
+    after = `exec cat > '${sink}'`,
+  ): Promise<PtyProcess> {
+    const child = await spawnPty({
+      sessionId: "",
+      cwd: dir,
+      isolation: "untrusted",
+      env: { PATH: "/usr/bin:/bin" },
+      security: { level: "moderate", allowedTools: [], disallowedTools: [] },
+      _commandOverride: "/bin/sh",
+      _argsOverride: ["-c", `printf 'Loading...\\n'; ${after}`],
+      quietWindowMs: 50,
+      _replReadyBudgetMs: GATE_MS,
+      ...clock.options,
+    });
+    spawned.push(child);
+    return child;
+  }
+
+  /** What the turn did within `ms` of real time: its error, or "waiting" if it was still pending. */
+  async function outcome(turned: Promise<unknown>, ms = 3000): Promise<unknown> {
+    const settledTurn = turned.then(
+      () => "resolved",
+      (error: unknown) => error,
+    );
+    const giveUp = new Promise((resolve) => setTimeout(() => resolve("waiting"), ms));
+    return Promise.race([settledTurn, giveUp]);
+  }
+
+  it("dispose during the gate rejects the turn at once, not at the gate deadline", async () => {
+    const clock = gateClock();
+    const child = await spawnWithClock(clock);
+    const turned = turn(child, GATE_MS);
+    await settled(100);
+    expect(clock.pending.size).toBe(1); // the gate is waiting on its deadline
+    await child.dispose();
+    const result = await outcome(turned);
+    expect(result).toBeInstanceOf(PtyNotReadyError);
+    expect((result as Error).message).toMatch(/\(closed\)/);
+    expect(clock.pending.size).toBe(0); // the deadline timer was cleared, not left to fire
+    expect(received()).toBe("");
+  });
+
+  it("a child that exits during the gate rejects the turn at once", async () => {
+    const clock = gateClock();
+    const child = await spawnWithClock(clock, "sleep 0.3; exit 3");
+    const result = await outcome(turn(child, GATE_MS));
+    expect(result).toBeInstanceOf(PtyNotReadyError);
+    expect((result as Error).message).toMatch(/\(exited\)/);
+    expect(clock.pending.size).toBe(0);
+  });
+
+  it("a turn started on a child that is already retired does not start a gate", async () => {
+    const clock = gateClock();
+    const child = await spawnWithClock(clock);
+    await child.dispose();
+    const result = await outcome(turn(child, GATE_MS));
+    expect(result).toBeInstanceOf(PtyNotReadyError);
+    expect((result as Error).message).toMatch(/\(closed\)/);
+    expect(clock.pending.size).toBe(0);
+  });
+});

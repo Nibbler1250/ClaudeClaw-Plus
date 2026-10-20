@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EscapeScan } from "../runner/pty-escape-scan.js";
 import { terminateProcessGroup } from "../runner/pty-group-kill.js";
+import { currentBootId, recordedOnAnotherBoot } from "../runner/pty-proc-identity.js";
 import { withPlatform } from "../runner/pty-test-platform.js";
 import {
   DAEMON_INSTANCE,
@@ -38,6 +39,7 @@ import {
   markOneShotDirActive,
   operatorSecureStorageDir,
   processStartMs,
+  readOwnerFile,
   releaseOneShotDir,
   resetGroupSurvivorsForTests,
   resetOneShotSweeperForTests,
@@ -917,5 +919,125 @@ describe("start-time comparison by platform (r14d, H1)", () => {
     // Went red (false) with the 2000 ms window on the Linux path of isOwnerDead.
     expect(withPlatform("linux", () => isOwnerDead(owner, deps))).toBe(true);
     expect(withPlatform("darwin", () => isOwnerDead(owner, deps))).toBe(false);
+  });
+});
+
+// #570 r15 (A1): a Linux start time counts from boot, so a record written before a reboot can
+// show a live pid whose start time matches by coincidence. Records carry the boot id, and one
+// from another boot names nothing that can be running: nothing is probed or signalled.
+describe("a persisted record from another boot is gone", () => {
+  const onBoot = (current: string) => (recorded: string | null | undefined) =>
+    recordedOnAnotherBoot(recorded, { platform: "linux", bootId: () => current });
+  const restart = (): void => resetGroupSurvivorsForTests();
+  const quiet = () => [
+    spyOn(console, "warn").mockImplementation(() => {}),
+    spyOn(console, "error").mockImplementation(() => {}),
+  ];
+
+  it("isOwnerDead: a live pid with a matching start time is dead when the boot id differs", () => {
+    const owner = live({ bootId: "boot-A" }); // this very process, same start time
+    expect(isOwnerDead(owner, { anotherBoot: onBoot("boot-B") })).toBe(true);
+    // The twin: the same record on the boot that wrote it is still the live owner.
+    expect(isOwnerDead(owner, { anotherBoot: onBoot("boot-A") })).toBe(false);
+    // A Linux record with no boot id is from before the field existed.
+    expect(isOwnerDead(live({ bootId: null }), { anotherBoot: onBoot("boot-B") })).toBe(true);
+  });
+
+  it("the sweep removes a directory whose owner file is from another boot", () => {
+    const path = leftover(`${ONESHOT_CONFIG_PREFIX}old-boot`, OLD, live({ bootId: "boot-A" }));
+    expect(sweep({ anotherBoot: onBoot("boot-A") })).toBe(0); // same boot: the owner lives
+    expect(existsSync(path)).toBe(true);
+    expect(sweep({ anotherBoot: onBoot("boot-B") })).toBe(1);
+    expect(existsSync(path)).toBe(false);
+  });
+
+  /** A root left by a daemon that died; its survivor.json names a leader and one held process (probes are stubbed). */
+  function persisted(bootId: string | null): string {
+    const root = leftover(
+      `${ONESHOT_CONFIG_PREFIX}survivor-${bootId}`,
+      OLD,
+      live({ pid: deadPid(), instance: "the-daemon-before-the-restart", bootId }),
+    );
+    writeFileSync(
+      join(root, ONESHOT_SURVIVOR_FILE),
+      JSON.stringify({
+        pid: 4242,
+        startMs: selfStart,
+        bootId,
+        cwds: [],
+        unknown: [{ pid: 4343, startMs: selfStart }],
+      }),
+    );
+    utimesSync(root, OLD, OLD);
+    return root;
+  }
+
+  it("survivor.json from another boot: no group probe, no scan, no hold, and the root is swept", () => {
+    const root = persisted("boot-A");
+    const groupGone = spyOn({ f: (_r: unknown) => true }, "f");
+    const scan = spyOn({ f: (_t: unknown) => ({ pids: [], unknown: [] }) as EscapeScan }, "f");
+    const heldAlive = spyOn({ f: (_p: unknown) => true }, "f");
+    const logs = quiet();
+    try {
+      restart();
+      expect(
+        sweep({
+          anotherBoot: onBoot("boot-B"),
+          groupGone: groupGone as never,
+          scan: scan as never,
+          heldAlive: heldAlive as never,
+        }),
+      ).toBe(1);
+      expect(groupGone).not.toHaveBeenCalled();
+      expect(scan).not.toHaveBeenCalled();
+      expect(heldAlive).not.toHaveBeenCalled();
+      expect(groupSurvivorOf(root)).toBeUndefined();
+      expect(unknownHoldCount()).toBe(0);
+      expect(existsSync(root)).toBe(false);
+    } finally {
+      for (const log of logs) log.mockRestore();
+    }
+  });
+
+  it("twin: the same record on the boot that wrote it is still a survivor and is kept", () => {
+    const root = persisted("boot-A");
+    const logs = quiet();
+    try {
+      restart();
+      const asked: Array<{ pid: number; startMs: number | null }> = [];
+      expect(
+        sweep({
+          anotherBoot: onBoot("boot-A"),
+          groupGone: (r) => {
+            asked.push({ pid: r.pid, startMs: r.startMs });
+            return false;
+          },
+          scan: () => ({ pids: [], unknown: [] }) as EscapeScan,
+          heldAlive: () => true,
+        }),
+      ).toBe(0);
+      expect(asked).toEqual([{ pid: 4242, startMs: selfStart }]); // asked with the recorded identity
+      expect(groupSurvivorOf(root)).toBe(4242);
+      expect(existsSync(root)).toBe(true);
+    } finally {
+      for (const log of logs) log.mockRestore();
+    }
+  });
+
+  it("writes the boot id into the owner file and into survivor.json", () => {
+    const cwd = createUntrustedTempCwd();
+    const root = createUntrustedConfigRoot([cwd]);
+    try {
+      // null off Linux (nothing to compare), the kernel's id on Linux. Either way the field is there.
+      const owner = readOwnerFile(root);
+      expect(typeof owner).toBe("object");
+      expect((owner as OwnerRecord).bootId).toBe(currentBootId());
+      markGroupSurvivor(root, 4242, { startMs: 7, cwds: [cwd] });
+      const record = JSON.parse(readFileSync(join(root, ONESHOT_SURVIVOR_FILE), "utf8"));
+      expect(record.bootId).toBe(currentBootId());
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 });

@@ -30,7 +30,9 @@ import {
 import {
   type StartMsReader,
   cachedStartMs,
+  currentBootId,
   processStartMs,
+  recordedOnAnotherBoot,
   sameStart,
 } from "../runner/pty-proc-identity.js";
 
@@ -55,7 +57,7 @@ export const ONESHOT_CONFIG_PREFIX = "claudeclaw-oneshot-cfg-";
 /** Prefix of the per-call temp cwd. */
 export const ONESHOT_CWD_PREFIX = "claudeclaw-oneshot-pty-";
 
-/** Leftovers older than this are removed at daemon start. */
+/** Leftovers older than this are removed at daemon start, and by the sweep every `ONESHOT_SWEEP_INTERVAL_MS` after it. */
 export const ONESHOT_SWEEP_MAX_AGE_MS = 10 * 60_000;
 
 const nonEmpty = (value: string | undefined): string | undefined =>
@@ -113,9 +115,14 @@ export const DAEMON_INSTANCE = randomUUID();
 
 export interface OwnerRecord {
   pid: number;
-  /** Epoch ms the owner process started, when `ps` could say. */
+  /**
+   * When the owner process started, from `processStartMs`: epoch ms off Linux, ms since boot on
+   * Linux (so only comparable under the same `bootId`). Null when it could not be read.
+   */
   startMs: number | null;
   instance: string;
+  /** Linux boot id the start time was read on; null off Linux, or when unreadable. */
+  bootId?: string | null;
 }
 
 let selfOwner: OwnerRecord | undefined;
@@ -124,6 +131,7 @@ function selfOwnerRecord(): OwnerRecord {
     pid: process.pid,
     startMs: processStartMs(process.pid),
     instance: DAEMON_INSTANCE,
+    bootId: currentBootId(),
   };
   return selfOwner;
 }
@@ -157,6 +165,7 @@ export function readOwnerFile(dir: string): OwnerFile {
       pid: parsed.pid,
       startMs: typeof parsed.startMs === "number" ? parsed.startMs : null,
       instance: parsed.instance,
+      bootId: typeof parsed.bootId === "string" ? parsed.bootId : null,
     };
   } catch {
     return "unreadable";
@@ -205,6 +214,11 @@ interface SurvivorFileRecord {
   /** The PTY leader. Its group is checked (with `startMs`) when a restart reads this. */
   pid: number;
   startMs: number | null;
+  /**
+   * The Linux boot id every start time in this record was read on. A restart that finds another
+   * one (or none) treats every process named here as gone and signals none (#570 r15, A1).
+   */
+  bootId?: string | null;
   cwds: string[];
   tempCwd?: string;
   /** Processes the scan could not read (#570 r14b); the root stays while any of them lives. */
@@ -249,7 +263,11 @@ function writeSurvivorFile(root: string): void {
       ? { pid: hold.leaderPid, startMs: hold.leaderStartMs, cwds: hold.cwds, tempCwd: hold.tempCwd }
       : undefined;
   if (!base) return;
-  const record: SurvivorFileRecord = { ...base, ...(hold ? { unknown: hold.procs } : {}) };
+  const record: SurvivorFileRecord = {
+    ...base,
+    bootId: currentBootId(),
+    ...(hold ? { unknown: hold.procs } : {}),
+  };
   try {
     writeFileSync(join(root, ONESHOT_SURVIVOR_FILE), `${JSON.stringify(record)}\n`, {
       mode: 0o600,
@@ -321,7 +339,14 @@ export function markUnknownProcs(
   writeSurvivorFile(root);
 }
 
-/** The process is alive with the start time recorded for it. A dead or recycled pid is gone. */
+/** Was a persisted start time read on another boot than this one (`recordedOnAnotherBoot`)? */
+type AnotherBoot = (recordedBootId: string | null | undefined) => boolean;
+
+/**
+ * The process is alive with the start time recorded for it. A dead or recycled pid is gone.
+ * The caller has already established that the record was made on this boot: a Linux start time
+ * from another one is not comparable (see `adoptPersistedSurvivors`).
+ */
 export function heldProcAlive(
   proc: HeldProc,
   deps: { kill?: (pid: number, signal: 0) => void; startMs?: StartMsReader } = {},
@@ -414,6 +439,7 @@ function readSurvivorFile(root: string): SurvivorFileRecord | "missing" | "unrea
     return {
       pid: parsed.pid,
       startMs: typeof parsed.startMs === "number" ? parsed.startMs : null,
+      bootId: typeof parsed.bootId === "string" ? parsed.bootId : null,
       cwds: parsed.cwds,
       tempCwd: typeof parsed.tempCwd === "string" ? parsed.tempCwd : undefined,
       ...(parsed.unknown
@@ -494,12 +520,21 @@ export async function retrySurvivingGroups(deps: SurvivorRetryDeps = {}): Promis
   return cleared;
 }
 
-/** The owner is gone: no such pid, or the pid now belongs to a process that started later. */
+/**
+ * The owner is gone: no such pid, the pid now belongs to a process that started later, or the
+ * record is from another boot (nothing it names can be running; its pid and start time are no
+ * longer evidence of anything, #570 r15, A1).
+ */
 export function isOwnerDead(
   owner: OwnerRecord,
-  deps: { kill?: (pid: number, signal: 0) => void; startMs?: (pid: number) => number | null } = {},
+  deps: {
+    kill?: (pid: number, signal: 0) => void;
+    startMs?: (pid: number) => number | null;
+    anotherBoot?: AnotherBoot;
+  } = {},
 ): boolean {
   if (owner.instance === DAEMON_INSTANCE) return false; // this daemon; `activeDirs` decides
+  if ((deps.anotherBoot ?? recordedOnAnotherBoot)(owner.bootId)) return true;
   const kill = deps.kill ?? process.kill;
   try {
     kill(owner.pid, 0);
@@ -608,6 +643,8 @@ export interface SweepDeps {
   scan?: (target: EscapeScanTarget) => EscapeScan;
   /** Replaces the check that a held unreadable process is still alive with the same start time. */
   heldAlive?: (proc: HeldProc) => boolean;
+  /** Replaces the check that a persisted record was made on another boot (Linux). */
+  anotherBoot?: AnotherBoot;
 }
 
 /** A quarantined directory is considered for removal only once it is this old. */
@@ -652,6 +689,15 @@ function adoptPersistedSurvivors(
       if (survivingGroups.has(path) || unknownHolds.has(path) || activeDirs.has(path)) continue;
       const record = readSurvivorFile(path);
       if (record === "missing" || record === "unreadable") continue; // unreadable: quarantined below
+      // Written on another boot: every process it names is gone, so nothing is probed or signalled
+      // (a new-boot process with the same pid and uptime would read as the recorded one). The root
+      // is then swept like one whose owner is dead.
+      if ((deps.anotherBoot ?? recordedOnAnotherBoot)(record.bootId)) {
+        console.warn(
+          `[oneshot] survivor record of ${name} is from an earlier boot; nothing signalled`,
+        );
+        continue;
+      }
 
       // The group of the recorded leader (with identity), and what the scan sees now.
       let groupAlive = true; // cannot tell: not gone
@@ -733,7 +779,9 @@ export function sweepStaleOneShotDirs(
   const uid = deps.uid ?? process.getuid?.();
   // One `ps` per pid for the whole pass: the same owner pid names many directories.
   const startMs = cachedStartMs(deps.startMs);
-  const ownerDead = deps.isOwnerDead ?? ((owner: OwnerRecord) => isOwnerDead(owner, { startMs }));
+  const ownerDead =
+    deps.isOwnerDead ??
+    ((owner: OwnerRecord) => isOwnerDead(owner, { startMs, anotherBoot: deps.anotherBoot }));
   let removed = 0;
   let names: string[];
   try {
@@ -796,7 +844,7 @@ export const ONESHOT_SWEEP_INTERVAL_MS = 10 * 60_000;
 export interface SweeperDeps {
   setInterval?: (callback: () => void, ms: number) => { unref?: () => unknown };
   sweep?: () => number;
-  /** Signals recorded survivors again; runs before each timed sweep. */
+  /** Signals recorded survivors again; started at each timed pass beside the sweep, not before it. */
   retrySurvivors?: () => Promise<number>;
 }
 

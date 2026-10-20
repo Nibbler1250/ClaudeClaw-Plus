@@ -30,9 +30,11 @@ import {
   __untrustedGroupOptionsForTests,
   __landPtyForTests,
   __resetSupervisorForTests,
+  UNTRUSTED_ONESHOT_MAX_CONCURRENT,
   injectOneShotTrustForTests,
   injectSpawnPty,
   runOnceOnPty,
+  untrustedOneShotsInFlightForTests,
 } from "../runner/pty-supervisor.js";
 import { applyPtyIsolationVersionGate, claudeVersionAtLeast } from "./claude-version.js";
 import { resolveOneShotEngine } from "./config.js";
@@ -1057,6 +1059,19 @@ describe("C2: PTY isolation is advertised only on a measured claude version", ()
     }
   });
 
+  it("win32: isolation withheld on a measured version, untrusted routes resolve to print (r15, A5)", () => {
+    const warnings: string[] = [];
+    expect(applyPtyIsolationVersionGate("2.1.304", (m) => warnings.push(m), "win32")).toBe(false);
+    expect(engines.get("pty")!.caps.isolation).toBe(false);
+    expect(resolveOneShotEngine({ engines: {}, routes: {} }, "discord.classifier", true)).toBe(
+      "print",
+    );
+    expect(warnings).toHaveLength(1);
+    // The same version on another platform is still advertised.
+    expect(applyPtyIsolationVersionGate("2.1.304", () => {}, "linux")).toBe(true);
+    expect(applyPtyIsolationVersionGate("2.1.304", () => {}, "darwin")).toBe(true);
+  });
+
   it("an explicit pty route is refused at the call while isolation is withheld", async () => {
     applyPtyIsolationVersionGate("2.1.1", () => {});
     await expect(run()).rejects.toThrow("does not advertise isolation");
@@ -1231,5 +1246,115 @@ describe("C: the reply gets its `@` back, on both engines, in one place", () => 
 
   it("a trusted call's reply is left exactly as the model wrote it", async () => {
     expect(await printEcho("trusted-session", "a\uff20b")).toBe("a\uff20b");
+  });
+});
+
+// #570 r15 (A4): ephemeral entries skip `maxConcurrent`, so untrusted one-shots have a cap of
+// their own. Over it a call returns `busy` before anything is created or spawned.
+describe("r15 A4: concurrent untrusted PTY one-shots are capped", () => {
+  /** A spawn that parks until released, so calls stay in flight. */
+  function parkedSpawn() {
+    const parked: Array<() => void> = [];
+    injectSpawnPty(async (opts) => {
+      spawned.push(opts);
+      await new Promise<void>((resolve) => parked.push(resolve));
+      return {
+        label: "state",
+        pid: 1,
+        sessionId: SID,
+        cwd: opts.cwd,
+        isAlive: () => true,
+        lastTurnEndedAt: () => 0,
+        runTurn: async () => {
+          reply(opts);
+          return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
+        },
+        dispose: async () => {},
+      } as never;
+    });
+    return parked;
+  }
+  const until = async (ready: () => boolean): Promise<void> => {
+    for (let i = 0; i < 200 && !ready(); i++) await new Promise((r) => setTimeout(r, 10));
+    expect(ready()).toBe(true);
+  };
+  const LONG = { timeoutMs: 30_000 };
+
+  it("is two", () => {
+    expect(UNTRUSTED_ONESHOT_MAX_CONCURRENT).toBe(2);
+  });
+
+  it("a third call while two are in flight returns busy without spawning or creating a directory", async () => {
+    const parked = parkedSpawn();
+    const first = run(callerEnv(), LONG);
+    const second = run(callerEnv(), LONG);
+    await until(() => spawned.length === UNTRUSTED_ONESHOT_MAX_CONCURRENT);
+    const dirsBefore = oneShotTempDirs("claudeclaw-oneshot-").length;
+
+    const third = await run(callerEnv(), LONG);
+
+    expect(third.exitCode).toBe(1);
+    expect(third.diagnostic?.reason).toBe("busy");
+    expect(spawned).toHaveLength(UNTRUSTED_ONESHOT_MAX_CONCURRENT);
+    expect(oneShotTempDirs("claudeclaw-oneshot-")).toHaveLength(dirsBefore);
+    expect(untrustedOneShotsInFlightForTests()).toBe(UNTRUSTED_ONESHOT_MAX_CONCURRENT);
+
+    for (const release of parked) release();
+    expect((await first).exitCode).toBe(0);
+    expect((await second).exitCode).toBe(0);
+    expect(untrustedOneShotsInFlightForTests()).toBe(0);
+  });
+
+  it("a slot frees when a call finishes: the next call runs", async () => {
+    const parked = parkedSpawn();
+    const calls = [run(callerEnv(), LONG), run(callerEnv(), LONG)];
+    await until(() => parked.length === 2);
+    parked[0]!(); // whichever call owns this spawn finishes; the other stays in flight
+    await until(() => untrustedOneShotsInFlightForTests() === 1);
+    const next = run(callerEnv(), LONG);
+    await until(() => parked.length === 3); // it spawned: the freed slot was usable
+    for (const release of parked) release();
+    for (const outcome of await Promise.all([...calls, next])) expect(outcome.exitCode).toBe(0);
+    expect(untrustedOneShotsInFlightForTests()).toBe(0);
+  });
+
+  it("a slot frees when the call throws (a root that could not be removed)", async () => {
+    fakeSpawn();
+    const failing = spyOn(cleanup, "removeUntrustedConfigRoot").mockImplementation(() => {
+      throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+    });
+    try {
+      // More throwing calls than slots: a leaked slot per throw would make the third one busy.
+      for (let i = 0; i < UNTRUSTED_ONESHOT_MAX_CONCURRENT + 1; i++) {
+        await expect(run()).rejects.toThrow();
+      }
+    } finally {
+      failing.mockRestore();
+      for (const opts of spawned)
+        rmSync(opts.env.CLAUDE_CONFIG_DIR!, { recursive: true, force: true });
+    }
+    expect(spawned).toHaveLength(UNTRUSTED_ONESHOT_MAX_CONCURRENT + 1);
+    expect(untrustedOneShotsInFlightForTests()).toBe(0);
+  });
+
+  it("a slot frees when the call fails before any state exists (config dir not absolute)", async () => {
+    fakeSpawn();
+    for (let i = 0; i < UNTRUSTED_ONESHOT_MAX_CONCURRENT + 1; i++) {
+      const failed = await run(callerEnv({ CLAUDE_CONFIG_DIR: "relative/dir" }));
+      expect(failed.diagnostic?.reason).toBe("config-dir");
+    }
+    expect(untrustedOneShotsInFlightForTests()).toBe(0);
+  });
+
+  it("a trusted call neither takes a slot nor is refused when the slots are full", async () => {
+    const parked = parkedSpawn();
+    const full = [run(callerEnv(), LONG), run(callerEnv(), LONG)];
+    await until(() => parked.length === 2);
+    const trusted = run(callerEnv(), { ...LONG, route: "compact", isolation: "trusted-session" });
+    await until(() => parked.length === 3);
+    expect(untrustedOneShotsInFlightForTests()).toBe(UNTRUSTED_ONESHOT_MAX_CONCURRENT);
+    for (const release of parked) release();
+    await Promise.allSettled([...full, trusted]);
+    expect(untrustedOneShotsInFlightForTests()).toBe(0);
   });
 });

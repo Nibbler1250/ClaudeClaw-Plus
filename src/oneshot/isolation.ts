@@ -13,7 +13,8 @@ export const UNTRUSTED_CLAUDE_ARGS = [
 
 /** Explicit interactive exceptions; each needs a compensating control. */
 export const PRINT_ONLY_UNTRUSTED_ARGS = [
-  // Interactive sessions persist: runOnceOnPty's finally removes their project transcripts.
+  // Interactive sessions persist: runOnceOnPty's finally removes the whole throwaway config root
+  // (transcripts included), or keeps it while a claude that outlived its retirement may write.
   "--no-session-persistence",
 ] as const;
 

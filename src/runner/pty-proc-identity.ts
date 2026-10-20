@@ -36,10 +36,12 @@ export function sameStart(a: number, b: number, platform: string = process.platf
 
 /**
  * Linux: the start time from field 22 of `/proc/<pid>/stat` (ticks since boot), in ms since boot.
- * A wall-clock step moves `ps -o lstart=` but not this. The value is only comparable with another
- * read on the same boot, which is all a recorded start time is compared with. Null when the stat
- * cannot be read or parsed. `comm` (field 2) may hold spaces and parens, so fields are split
- * after the last `)`, where field 3 is the first.
+ * A wall-clock step moves `ps -o lstart=` but not this. The value restarts from zero at every
+ * boot, so it is only comparable with another read on the same boot. A recorded start time that
+ * outlives the daemon (an owner file, `survivor.json`) can be read again after a reboot, so it
+ * is stored with the boot id and compared only when that matches (`recordedOnAnotherBoot`,
+ * #570 r15, A1). Null when the stat cannot be read or parsed. `comm` (field 2) may hold spaces
+ * and parens, so fields are split after the last `)`, where field 3 is the first.
  */
 export function procStartMs(pid: number, procDir = "/proc"): number | null {
   try {
@@ -69,6 +71,48 @@ export function processStartMs(pid: number): number | null {
   } catch {
     return null;
   }
+}
+
+export type BootIdReader = () => string | null;
+
+const BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id";
+
+/**
+ * Linux: the kernel's id for this boot, fixed until the next one. (Not `btime` from `/proc/stat`,
+ * which can drift between reads.) Null when it cannot be read.
+ */
+export function readBootId(path = BOOT_ID_PATH): string | null {
+  try {
+    const id = readFileSync(path, "utf8").trim();
+    return id === "" ? null : id;
+  } catch {
+    return null;
+  }
+}
+
+/** The id to store beside a start time that outlives this process: Linux only, null elsewhere. */
+export function currentBootId(platform: string = process.platform): string | null {
+  return platform === "linux" ? readBootId() : null;
+}
+
+/**
+ * Was a persisted start time recorded on a boot other than this one? Then no process it names
+ * can be alive: every one of them is gone, and nothing may be signalled on its account. Only
+ * Linux needs this (its start times count from boot; macOS `ps lstart` is epoch time). A
+ * Linux record with no boot id predates the field and is treated as another boot's. When this
+ * boot's id cannot be read the answer is no: nothing can be shown to differ.
+ */
+export function recordedOnAnotherBoot(
+  recorded: string | null | undefined,
+  {
+    platform = process.platform,
+    bootId = readBootId,
+  }: { platform?: string; bootId?: BootIdReader } = {},
+): boolean {
+  if (platform !== "linux") return false;
+  const now = bootId();
+  if (now === null) return false;
+  return recorded == null || recorded !== now;
 }
 
 /** A reader that asks `ps` once per pid: for one sweep pass, which looks at the same pid several times. */

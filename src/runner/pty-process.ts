@@ -103,8 +103,10 @@ export interface PtyProcessOptions {
   /** Test seam: how long an untrusted spawn waits for the REPL footer. Default 20 s. */
   _replReadyBudgetMs?: number;
   /**
-   * Called with the pid, and the leader's start time recorded at spawn (null when `ps` could not
-   * say), when retirement could not get the group to disappear. It must not throw: if it does,
+   * Called with the pid, and the leader's start time recorded at spawn (null when it could not be
+   * read), and why: the group is still alive, an escapee outside it is, or the escapee scan could
+   * not tell (`scan-unknown`). Called when retirement could not get all of that to disappear.
+   * It must not throw: if it does,
    * the error is logged and `dispose()` rejects, so the caller keeps whatever the child may
    * still be writing into.
    */
@@ -626,6 +628,8 @@ class PtyProcessImpl implements PtyProcess {
   /** Why the REPL was refused, once it has been: later turns are refused without waiting. */
   private _notReady: string | null = null;
   private _onScreen: (() => void) | null = null;
+  /** Ends a pending ready gate with a failure reason; set only while one is waiting. */
+  private _endReplGate: ((reason: string) => void) | null = null;
   private readonly _replReadyBudgetMs: number;
   /** When `_handleExit` ran; a group of a child that exited long ago is not signalled. */
   private _exitedAt = 0;
@@ -841,6 +845,10 @@ class PtyProcessImpl implements PtyProcess {
     // its listener array by index inside `fire()`, and disposing a listener
     // from within its own callback mutates the array under the iterator,
     // which causes subsequent listeners to be skipped.
+
+    // A child that exited while the ready gate waited will never show a footer. A boot screen it
+    // died on (a login menu) is still the better reason.
+    this._endReplGate?.(this._blockedBootReason() ?? "exited");
 
     if (this._turnInProgress) {
       const err = new PtyClosedError(
@@ -1131,6 +1139,8 @@ class PtyProcessImpl implements PtyProcess {
     if (this._turnInProgress) {
       this._rejectTurn(new PtyClosedError(this.label, null, "SIGTERM"));
     }
+    // The ready gate is not a turn: ending it here lets the caller waiting on it go at once.
+    this._endReplGate?.("closed");
 
     // bun-pty's kill() fires onExit synchronously, so the exit event below proves nothing
     // about the child. The group is signalled first, while the leader is still ours, and its
@@ -1228,6 +1238,12 @@ class PtyProcessImpl implements PtyProcess {
     }
   }
 
+  /** The code of the blocked boot screen (login, onboarding, trust) on the screen now, if any. */
+  private _blockedBootReason(): string | undefined {
+    const screen = stripAnsi(this._screen.text());
+    return BLOCKED_BOOT_SCREENS.find(([, pattern]) => pattern.test(screen))?.[0];
+  }
+
   /**
    * Untrusted one-shot: resolve `ok` once claude's REPL footer is on screen with no login,
    * onboarding or trust screen, and `!ok` with a reason code otherwise (a blocked screen, or no
@@ -1236,20 +1252,25 @@ class PtyProcessImpl implements PtyProcess {
    * the screen is no longer collected.
    */
   _awaitReplReady(budgetMs: number): Promise<ReplReadyVerdict> {
+    // A child that is already retired or gone will never show a footer: no wait, no timers.
+    if (this._disposed) return Promise.resolve({ ok: false, reason: "closed" });
+    if (!this._alive)
+      return Promise.resolve({ ok: false, reason: this._blockedBootReason() ?? "exited" });
     return new Promise((resolve) => {
       let quiet: ReturnType<typeof setTimeout> | null = null;
       const finish = (verdict: ReplReadyVerdict): void => {
         this._clearTimeout(deadline);
         if (quiet !== null) this._clearTimeout(quiet);
         this._onScreen = null;
+        this._endReplGate = null;
         this._readyGate = false;
         this._screen = new Screen(1, 1); // nothing more is collected
         resolve(verdict);
       };
-      const blockedReason = (): string | undefined => {
-        const screen = stripAnsi(this._screen.text());
-        return BLOCKED_BOOT_SCREENS.find(([, pattern]) => pattern.test(screen))?.[0];
-      };
+      // Retirement and exit end the wait at once (#570 r15, A2): without this the gate ran to its
+      // own deadline after the child was gone, and a retired attempt kept its caller waiting.
+      this._endReplGate = (reason) => finish({ ok: false, reason });
+      const blockedReason = (): string | undefined => this._blockedBootReason();
       // Judged on the screen as it is now, not on what was ever written: a login menu that was
       // cleared and replaced by the REPL is gone, and a status painted after the footer is there.
       // Once the footer (or a blocked screen) shows, one quiet window must pass without the

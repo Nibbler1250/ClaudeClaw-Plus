@@ -1888,10 +1888,23 @@ async function cleanupUntrustedOneShot(state: UntrustedOneShotState): Promise<vo
 }
 
 /**
+ * Untrusted PTY one-shots that may run at once. In-process, not a setting: each is an interactive
+ * claude, and the ephemeral scope sits outside `maxConcurrent`. Over it a call returns `busy`
+ * without spawning (the classifier treats that like any other failure: null, no retry).
+ */
+export const UNTRUSTED_ONESHOT_MAX_CONCURRENT = 2;
+let untrustedOneShotsInFlight = 0;
+/** Test seam: how many untrusted one-shots hold a slot. */
+export function untrustedOneShotsInFlightForTests(): number {
+  return untrustedOneShotsInFlight;
+}
+
+/**
  * A utility turn on its own PTY, through the same spawn path as keyed sessions
  * (`buildSpawnOptions`, multiplexer config) with the #546 ephemeral scope: registered in
  * `state.ptys` so shutdown and `/kill` reach it, never reused, outside the LRU and the
- * `maxConcurrent` cap, retired on return. A trusted call gets the supervisor's trust
+ * `maxConcurrent` cap (an untrusted call has its own, `UNTRUSTED_ONESHOT_MAX_CONCURRENT`),
+ * retired on return. A trusted call gets the supervisor's trust
  * self-heal; an untrusted one runs in a throwaway cwd and a throwaway config root (trusted
  * there, credentials from the operator's own store), both removed when the call ends.
  *
@@ -1930,6 +1943,25 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
       ? { diagnostic: { reason, phasesMs: { ...phasesMs, total: Date.now() - startedAt } } }
       : {}),
   });
+  // Ephemeral entries are outside `maxConcurrent`, and every short guild message starts an
+  // untrusted one-shot, so a burst would start that many interactive claudes at once. Over the
+  // limit the call fails closed here, before anything is created or spawned (#570 r15, A4).
+  let slotHeld = false;
+  if (untrusted) {
+    if (untrustedOneShotsInFlight >= UNTRUSTED_ONESHOT_MAX_CONCURRENT) {
+      console.warn(
+        `[pty-supervisor] one-shot ${req.route}: ${untrustedOneShotsInFlight} untrusted one-shots already running; not started`,
+      );
+      return result(1, "", undefined, "busy");
+    }
+    untrustedOneShotsInFlight++;
+    slotHeld = true;
+  }
+  const freeSlot = (): void => {
+    if (!slotHeld) return;
+    slotHeld = false;
+    untrustedOneShotsInFlight--;
+  };
   // Created inside the try and removed in the finally, so it never depends on
   // the turn settling (a hung turn or a spawn that never lands).
   let untrustedState: UntrustedOneShotState | undefined;
@@ -2052,10 +2084,12 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
       // Interactive claude ignores --no-session-persistence, so its on-disk state is
       // removed here, on success, failure and abort alike. The PTY is normally retired
       // before this point; when admission outlived the deadline it is retired later, so
-      // the same cleanup runs again once that late retirement settles.
+      // the same cleanup runs again once that late retirement settles. The concurrency slot
+      // is held until then too: a late claude is still a running one.
       const release = (): void => {
         untrustedCleanup.releaseOneShotDir(state.configRoot);
         untrustedCleanup.releaseOneShotDir(state.tempCwd);
+        freeSlot();
       };
       try {
         await cleanupUntrustedOneShot(state);
@@ -2072,6 +2106,8 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
           release();
         }
       }
+    } else {
+      freeSlot(); // failed before any state existed (config-dir, helpers): nothing else to release
     }
   }
 }

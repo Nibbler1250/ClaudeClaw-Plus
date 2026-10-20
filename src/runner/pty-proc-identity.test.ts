@@ -2,7 +2,15 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pidIdentity, procStartMs, processStartMs, sameStart } from "./pty-proc-identity.js";
+import {
+  currentBootId,
+  pidIdentity,
+  procStartMs,
+  processStartMs,
+  readBootId,
+  recordedOnAnotherBoot,
+  sameStart,
+} from "./pty-proc-identity.js";
 import { withPlatform } from "./pty-test-platform.js";
 
 /** #570 r14 (E): on Linux the start time comes from `/proc/<pid>/stat` field 22, not from `ps`. */
@@ -78,5 +86,61 @@ describe("pidIdentity on Linux", () => {
       "recycled",
     );
     expect(withPlatform("darwin", () => pidIdentity(4242, 10_000, { exists, read }))).toBe("same");
+  });
+});
+
+// #570 r15 (A1): Linux start times count from boot, so a persisted one is comparable only on the
+// boot that wrote it. The boot id is stored beside it and checked first.
+describe("recordedOnAnotherBoot", () => {
+  const boot = (id: string | null) => ({ platform: "linux", bootId: () => id });
+
+  it("same boot id: not another boot", () => {
+    expect(recordedOnAnotherBoot("boot-A", boot("boot-A"))).toBe(false);
+  });
+
+  it("different boot id: another boot", () => {
+    expect(recordedOnAnotherBoot("boot-A", boot("boot-B"))).toBe(true);
+  });
+
+  it("a Linux record with no boot id predates the field: another boot", () => {
+    expect(recordedOnAnotherBoot(null, boot("boot-B"))).toBe(true);
+    expect(recordedOnAnotherBoot(undefined, boot("boot-B"))).toBe(true);
+  });
+
+  it("this boot's id unreadable: nothing can be shown to differ", () => {
+    expect(recordedOnAnotherBoot("boot-A", boot(null))).toBe(false);
+    expect(recordedOnAnotherBoot(null, boot(null))).toBe(false);
+  });
+
+  it("off Linux there is no boot id to compare (ps lstart is epoch time)", () => {
+    for (const platform of ["darwin", "freebsd"]) {
+      expect(recordedOnAnotherBoot(null, { platform, bootId: () => "boot-B" })).toBe(false);
+      expect(recordedOnAnotherBoot("boot-A", { platform, bootId: () => "boot-B" })).toBe(false);
+    }
+  });
+});
+
+describe("readBootId / currentBootId", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "boot-id-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("reads the id with its trailing newline removed", () => {
+    const file = join(dir, "boot_id");
+    writeFileSync(file, "6f1c2f64-0d0a-4a52-9d3b-2a0f6b7c1e11\n");
+    expect(readBootId(file)).toBe("6f1c2f64-0d0a-4a52-9d3b-2a0f6b7c1e11");
+  });
+
+  it("is null for a missing or empty file", () => {
+    expect(readBootId(join(dir, "none"))).toBeNull();
+    const empty = join(dir, "empty");
+    writeFileSync(empty, "\n");
+    expect(readBootId(empty)).toBeNull();
+  });
+
+  it("is null off Linux", () => {
+    expect(currentBootId("darwin")).toBeNull();
   });
 });
