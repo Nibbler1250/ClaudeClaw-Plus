@@ -297,3 +297,45 @@ Fault injection, one site at a time, restored after each:
 ```
 
 Local: `src/oneshot` + `session-actions-argv` **187 pass, 5 skip, 0 fail**; all PTY-related test files plus `runner.test.ts` **535 pass, 0 fail**; integration guard **0 pass, 27 skip, 0 fail**; lint 0 errors; typecheck ratchet **149 against baseline 149**. Plugin and marketplace **2.2.350**. No PR opened.
+
+### r7: one-shot PTY calls return the model's reply
+
+Fix commit `d7e92d79`, live run [39357543237](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39357543237), Claude **2.1.304**: **35 pass, 2 fail**. Positive control `MCP=true; hooks=true; memory=true`; the seven isolation rows and their twins are unchanged from r6 (all isolated, all RED; filtered out of the table below because they did not move). This was the single r7 run.
+
+**Bug (as diagnosed):** `runOnceOnPty` returned `exec.rawStdout`, the rendered screen with the echoed prompt. The classifier prompt holds example JSON, so the greedy `{...}` match could select the example intent: a hire/fire not chosen by the model.
+
+**Fix:** `src/oneshot/pty-transcript.ts` plus a branch in `runOnceOnPty` (untrusted routes only). It returns the text of the last non-synthetic, non-API-error assistant message (text blocks of entries sharing the final message id, joined) from the transcript, read before the `finally` cleanup, with a 15 s lag bound and 300 ms settle. No reply in time gives a warning without content, exit **1**, empty text. Screen text is never used for an untrusted route.
+
+**Trusted routes: screen text kept.** Chosen because they carry no untrusted input, no caller parses the text, and a resumed session's transcript location is not fixed, so reading it would be unverified code on paths that currently work.
+
+**Live results:**
+
+| Probe | Attempts | Result |
+| --- | --- | --- |
+| Hang rate, tools-baseline prompt | 5 | 0 hung; all exit 0; 5.4 to 7.9 s |
+| Classifier-contract variant (correct answer `null`), `productionParseOk` from the real `runOnceOnPty` result | 5 | `productionParseOk=true`, `outcome=null`, `screenEcho=false`, **5/5**; 159 to 574 chars |
+| Genuine message "please create a thread called release-notes", **Haiku** | 2 | `outcome=intent; action=hire; namesCount=1; expectedIntent=true`, **2/2** |
+| Same message, **production model** `claude-sonnet-4-20250514` | 2 | **failed closed, 0/2**: exit 1 after about 23 s |
+
+(r6 comparison: the same contract probe parsed 0/5 before the fix; its reply text was 5 to 11k characters of screen.)
+
+**Why the production-model attempts failed: the model id is retired.** The transcript's only assistant record was a synthetic API-error entry (`synthetic=1; apiError=1`), and the live screen read `Claude Sonnet 4 was retired on June 15, 2026`. So `discord.ts`'s hard-coded `claude-sonnet-4-20250514` gets no reply on this CLI/account. That is **pre-existing and engine-independent**: on `print` the same call would exit non-zero and `classifyThreadIntent` would return `null`. I did not change it. Net effect today: Discord hire/fire classification returns `null` for every message, before and after this PR. Haiku was used for the parse check and it extracted and parsed correctly.
+
+**The 2 failing tests** are exactly those two production-model attempts. They failed the harness's own exit-code allowance (it accepted 0 or 124; the fail-closed exit is 1), not an isolation property. After the run I widened the allowance to `[0, 1, 124]` in the test. **That edit is not live-verified** (no runs left).
+
+Also observed: a failed turn waits the full 15 s transcript bound after the turn, outside the caller's `timeoutMs` (about 23 s in total for a 15 s classifier). Early exit when an API-error entry is already present would remove most of it. Not done.
+
+**Unit tests (no real claude)**, `src/oneshot/pty-reply.test.ts`: (a) exact transcript reply, not the screen; multi-entry reply joined; (b) real reply followed by synthetic/API-error entries returns only the real one; (c) no reply in time gives non-zero exit, empty text, warning with no content; (c') missing transcript likewise; (d) classifier driven through `classifyThreadIntent` -> `runOneShot` -> faked PTY: screen holds the example JSON, transcript reply `null` -> `null`; a genuine message -> the transcript's intent; a failed turn -> `null`; transcript removed after extraction. Existing untrusted-PTY tests now write a transcript reply in their doubles.
+
+Fault injection, one site each, restored after, RED verbatim:
+
+```text
+(i) return exec.rawStdout again -> 7 failures (60 pass / 7 fail), including
+(fail) #570 one-shot PTY reply extraction > (a) returns the exact transcript reply, not the screen text
+(fail) #570 one-shot PTY reply extraction > (d) the classifier returns null when the screen holds example JSON but the reply is null
+(fail) one-shot isolation contract > untrusted PTY temporary cwd > is removed after a normal turn
+(ii) skip the synthetic/API-error filter -> 1 failure (8 pass / 1 fail)
+(fail) #570 one-shot PTY reply extraction > (b) ignores synthetic and API-error entries that follow the real reply
+```
+
+Local: `src/oneshot` + `session-actions-argv` **196 pass, 5 skip, 0 fail**; PTY-related files plus `runner.test.ts` and `runner-recovery-guards.test.ts` **414 pass, 0 fail**; integration guard **0 pass, 31 skip, 0 fail**; lint 0 errors (1304 warnings); typecheck ratchet **149 against baseline 149**; plugin and marketplace **2.2.351**. No PR opened.

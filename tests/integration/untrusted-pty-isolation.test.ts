@@ -487,7 +487,8 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     if (options.allowNoTurn) {
       // A locally refused slash command never reaches the API, so the turn may
       // idle out (124). Startup is proved by the positive control and the twin.
-      expect([0, 124]).toContain(result.exitCode);
+      // 1 is runOnceOnPty's fail-closed code when no real assistant reply exists (#570).
+      expect([0, 1, 124]).toContain(result.exitCode);
       console.info(
         `[isolation-spike] no-turn probe: exit=${result.exitCode}; assistantEntries=${assistantEntries}`,
       );

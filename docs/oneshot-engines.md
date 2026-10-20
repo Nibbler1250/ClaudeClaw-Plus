@@ -57,10 +57,8 @@ rejected, and an HTTP engine stays an explicit opt-in. Reverting the flag in
 `src/oneshot/registry.ts` closes the gate again. One caveat is recorded in the
 spike: a prompt that tells a tool-less session to run a tool sometimes gets no reply.
 It is bounded by the caller's timeout (the classifier uses 15 s) and fails closed,
-since the classifier treats a non-zero exit as "not a thread command". A second open
-item is recorded there too: the PTY engine returns raw terminal text, and the classifier's
-JSON parse was not satisfied by any reply in the probe, so classification on PTY needs
-confirming with real hire/fire inputs. Routes that
+since the classifier treats a non-zero exit as "not a thread command". An untrusted PTY call returns the model's reply read from the session transcript, never the rendered
+screen (which echoes the prompt); if no reply appears it exits 1. Trusted routes keep the screen text. Routes that
 carry untrusted text also reject any isolation other than `untrusted`.
 
 Trusted calls may supply `cwd` for session lookup, including named-agent working
