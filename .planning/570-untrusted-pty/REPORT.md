@@ -578,3 +578,160 @@ Not injected: the 200 ms quiet-wait *length* (a value, not a branch); `CLAUDE_CO
 - A tuner env allowlist.
 - Carried from earlier rounds: `discord.ts` hard-codes the retired classifier model id; a process that never runs `start.ts` (the tuner CLI) stays on print.
 - Unproven: what exactly wrote into the root during removal in run 1.
+
+
+## r12: really stop the child before deleting its config root, plus the r11 review fixes
+
+Commits `5a2db852` (code), `413acff8` (the readiness gate moved, the harness fix) and a final docs commit with this section. Two workflow runs, the maximum: [39379302117](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39379302117) on `5a2db852` (**failed every row**, cause below) and [39380635437](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39380635437) on `413acff8` (Claude **2.1.304**, **55 pass, 0 fail**). No PR, no GitHub comment, no version bump (2.2.353). Two reviewers (Codex, Opus security) found nothing critical; Codex found one HIGH, which the coordinator confirmed.
+
+### A. HIGH: retirement did not prove the child dead
+
+**Mechanism (`node_modules/bun-pty/src/terminal.ts:216-222`).** `kill()` returns at once if `_closing` is set; otherwise it sets it, calls `bun_pty_kill` and `bun_pty_close`, and fires `onExit` synchronously with `exitCode: 0`. So the awaited exit event in `dispose()` meant "we asked", the SIGKILL 2 s later was a no-op, and nothing signalled a descendant.
+
+**Reproduced on macOS before changing anything.** A shell as session leader, one background child that ignores SIGHUP (`(trap '' HUP; exec sleep 60) &`):
+
+```text
+shell 80286 80286 Ss+ | bg 80287 80286 S+        (pid, pgid, stat: the leader's pgid equals its pid; the child is in its group)
+after a bare pty.kill():   leader: gone | bg: 16789 16788 S  sleep 60     (six samples over 600 ms: the child survives, its group id is the dead leader's pid)
+after process.kill(-pid, SIGTERM) + pty.kill():  both gone within 50 ms
+```
+
+**pgid equals pid.** Measured on macOS (above) and asserted by `pty-group-retire.test.ts` with `ps -o pgid= -p`. **Not measured by me on Linux:** it is the POSIX property of a session leader, and the same test will measure it when `test.yml` runs it there. What Linux did show (run 2): none of 55 calls failed with a surviving group, and the new A-proc row found no process naming the throwaway root.
+
+**Change.**
+- `src/runner/pty-group-kill.ts` (new). `terminateProcessGroup(pid)`: SIGTERM to `-pid` and `pid`, poll `kill(pid, 0)` and `kill(-pid, 0)` until both answer ESRCH (EPERM counts as alive), SIGKILL to both after 2 s, poll again for up to 2 s, resolve true only on ESRCH. It refuses a pid that could reach init, itself or every process (`<= 1`, non-integer, `process.pid`). On Linux a zombie that nobody has reaped yet answers `kill(.., 0)`, so `/proc/<n>/stat` is read and a group with only `Z`/`X` members counts as gone; elsewhere that check is skipped.
+- `PtyProcessImpl.dispose()` (untrusted by default) sends the group SIGTERM **before** `pty.kill()`, awaits the group after it, and on failure logs the pid, calls `onGroupSurvived(pid)` and still returns. A child that exited on its own is swept only within 30 s of the exit, because the pid of a child that died long ago may belong to someone else.
+- The supervisor passes `onGroupSurvived` for untrusted spawns; it records the root (`markGroupSurvivor`). `cleanupUntrustedOneShot` then **keeps the root** (the periodic sweep removes it later), logs the pid, and throws, so the call fails and never reports success.
+- `removeUntrustedConfigRoot` stays as the second line of defence; its comment no longer calls itself the fix.
+- **Trusted sessions are not changed.** Supervisor tests drive them with fake pids, so a group signal would hit a real process. `terminateGroup` is an option (default: on for untrusted) and the twin test turns it off.
+
+### B. The startup sweep could delete a live call
+
+Owner file `.oneshot-owner.json` (mode 0600; daemon pid, process start time from `ps -o lstart=`, a random instance id) is written into every config root and temp cwd when it is created. A directory is swept only when **all** hold: older than 10 minutes; `stat.uid === process.getuid()`; not registered as a running call of this daemon (`markOneShotDirActive`, released when the call and its late retirement have finished); and its owner is dead (ESRCH, or the pid now has a different start time; a start time that cannot be compared counts as alive). A daemon's own finished call whose removal failed is a leftover too. No readable owner file falls back to the age rule, so pre-r12 leftovers are still swept. `startOneShotSweeper()` (called from `start.ts`) sweeps now and every 10 minutes on an unref'd timer, registered once. The integration harness asserts the temp cwd is empty at spawn; it now expects exactly the owner file (this is what broke run 1).
+
+### C. Credential refresh writes outside the throwaway root
+
+`CLAUDE_SECURESTORAGE_CONFIG_DIR` also selects where a refreshed OAuth token is written. Read out of the 2.1.304 binary (offsets 218117501 and 218121010; identifiers are minified, the shape is verbatim):
+
+```js
+let V=yD();await ie().mkdir(V);let te;try{i("tengu_oauth_token_refresh_lock_acquiring",{}),te=await Hqs(V)}catch(ne){if(ne.code==="ELOCKED"){ ...retry up to 5 times, 1-2 s apart... }}
+function Y8n(e,n){return{lockfilePath:Df(e,".oauth_refresh.lock"),realpath:!1,stale:60000,update:5000,onCompromised:...}}
+async function ww(e){return`${await Y0(e).catch(()=>e)}.lock`}            // a legacy lock, also keyed by e
+R=await Gn().mutate((H)=>{let V=H.claudeAiOauth?.refreshToken;if(!(H.claudeAiOauth!==void 0&&H.claudeAiOauth!==null&&(V===""||V===n)))return w=!0,H;return{...H,claudeAiOauth:aw(H.claudeAiOauth,b)}},s)   // compare-and-swap on the stored refresh token, 3 tries
+```
+
+`yD()` is the credential directory (the variable, else the config dir). The lock is `<credential dir>/.oauth_refresh.lock` (plus the legacy `<realpath(dir)>.lock`), **not** under `CLAUDE_CONFIG_DIR`, so a one-shot (credential dir = the operator's) and the daemon's own claude (variable unset, so its config dir, the same directory) contend on one lock. The stop condition (a lock under `CLAUDE_CONFIG_DIR`) does not apply. I did not design a fix because none is needed. `docs/oneshot-engines.md`, the spike doc and the code comments now say exactly this: **the only write outside the throwaway root is claude's own credential refresh into the operator's credential store.** The spike doc's earlier "no longer touches the operator's config root at all" was narrowed to match. **Not measured:** an actual refresh (see D2).
+
+### D. Test gaps
+
+1. **A-login no longer falls back.** The env-token fallback is gone: if the store does not authenticate the child, the row is red and `secureStorageMeasured` stays false. The twin now fails if the control did not pass, instead of skipping.
+2. **A-refresh: not added, and refresh is unmeasured.** A row needs a credential that is already expired **with a valid refresh token**. The CI secret is an `sk-ant-oat01-` long-lived token with no refresh token, and a made-up refresh token would only exercise the failure path against the real OAuth server. So I did not write it. What is known is the shape above (lock and compare-and-swap), read from the binary, not run.
+3. **`requireModel` is `requireApiContact`.** Its comment and the log line (`reached-api`) now say an API-error or synthetic record proves the request reached the API, not that the model read the prompt. No row was weakened.
+
+### E. Fail closed when the REPL never appears
+
+The first untrusted `runTurn` waits for a ready REPL and writes nothing until then: the rolling screen must show a footer (`tab to cycle`, or the default mode's `for shortcuts`) and none of: a login or onboarding menu, a trust dialog, or the REPL's own `Not logged in` / `Run /login` status. Otherwise it rejects with `PtyNotReadyError` (reason code only, never screen text), remembered for later turns, bounded by `min(20 s, the turn's timeout)`; the supervisor returns exit 1 and retires the child (one spawn attempt). **Measured before choosing the rule** (claude 2.1.304 on this Mac, no login): the footer `⏵⏵ auto mode on (shift+tab to cycle)` is painted **together with** `Not logged in · Run /login`, so the footer alone proves nothing; the r11 CI log shows the same line in the A-login twin. The gate first sat in `spawnPty` and made run 1's design wrong in a second way: the harness reads the live child's environ right after the spawn (the B2 API-key twin needs `childHasApiKey`), which a refused spawn would have skipped. It is in `runTurn`, so the child is returned and the prompt is still never written.
+
+### F. Small fixes
+
+1. **State before the project dir (Opus LOW 5).** `untrustedState` exists before `untrustedPtyProjectDir` (a `realpathSync`) can throw, so the `finally` removes both directories (test with the resolver forced to throw).
+2. **Print's env policy and `CLAUDE_CONFIG_DIR` (Opus LOW 7).** It does lose it: print's override env replaces the whole env, and the credential directory was resolved from that, so an operator with a custom `CLAUDE_CONFIG_DIR` was sent to the default store. `operatorSecureStorageDir(policyEnv, daemonEnv)` now falls back to the daemon's own env for what the policy does not name; the policy still wins when it names a directory. `pty-isolation.test.ts` cleared the host's `CLAUDE_CONFIG_DIR` for its exact-env check.
+3. **Genuine U+FF20 (Codex LOW).** A U+FF20 the model writes comes back as `@`. Accepted as a known limitation; recorded in `pty-prompt-sanitizer.ts`. Reversible escaping not built.
+
+### Live results
+
+**Run 1 (`5a2db852`): every row failed.** The positive control exited 1 in 221 ms and every later row failed on `positiveProved`. The harness asserts `expect(readdirSync(options.cwd)).toEqual([])` at spawn; the owner file made the cwd non-empty, so the injected spawn threw. That harness cannot run locally (it needs the CI token), so nothing local could have shown it. The harness now expects exactly the owner file.
+
+**Run 2 (`413acff8`): 55 pass, 0 fail** (3 files; r11 was 53 pass, 1 fail of 54).
+
+| Row | Control present | Twin |
+| --- | --- | --- |
+| Positive control | `MCP=true; hooks=true; memory=true; assistant=true; completed=true` | |
+| tools, MCP, hooks, memory, command flag, transcript cleanup, environment | all isolated | all RED |
+| **B1** trust seeded | `trustAtSpawn=true; exit=0; completed=true; stalled=false` | RED (`trustAtSpawn=false; exit=1; assistantEntries=0; stalled=true`) |
+| **B2** `ANTHROPIC_API_KEY` | `exit=0; assistantEntries=1` | RED (`exit=124; assistantEntries=0`) |
+| **B3** `@`, PTY | `canaryInReply=false; canaryInTranscript=false`, `reached-api: promptSeen=true; assistant=1; apiErrors=0` | RED (`canaryInTranscript=true`). **The twin that failed in r11 now passes.** |
+| **B3** `@`, print | `exit=0; reachedModel=true; canaryInWire=false` | RED |
+| **A-login** | `exit=0; assistantEntries=1; apiErrors=0` (store `0600`, token length 108) | RED (`exit=1; assistantEntries=0`: the gate refuses `Not logged in`, where r11's twin timed out in the REPL) |
+| **A-untouched** | `filesBefore=2; filesAfter=2; changed=[]` | RED (`filesAfter=15`) |
+| **A-paste** | 2834 chars; mid-turn `paste-cache/<hash>.txt` and `projects/<cwd>/<uuid>.jsonl` hold the canary; `rootGone=true; operatorRootHolds=0; tmpdirHolds=[]` | RED (`rootGone=false`) |
+| **A-proc (new, Linux)** | `processesNamingThrowawayRoot=0`, after a planted process proved the scanner counts (>= 1) | none: a healthy claude may leave no descendant, so there is no live twin. The mechanism's twin is the local real-process test (`pty-group-retire.test.ts`) |
+| Hang rate | baseline **3/5 hung**, contract 0/5; genuine message `outcome=intent; action=hire` 2/2; production model id `exit=1` in 3890 ms, `warnedApiError=true` | |
+
+**Baseline hang rate 3/5 against 0/5 in r11 and 1/5 in r9.** All three hung attempts have the same shape: `exit=1; assistantEntries=2; synthetic=1; apiError=1; stop=["tool_use", ...]`, i.e. the tools-baseline prompt makes Haiku try the disabled tool and the CLI writes an API-error record. `assistantEntries=2` means the prompt was written (the gate was open). These probes measure an intermittent no-reply and are not isolation proof. I did not establish whether r12 changed the rate; the shape is the one earlier rounds recorded, and I have one sample per round.
+
+All three STOP conditions were checked and none fired: the refresh lock is not under `CLAUDE_CONFIG_DIR`; the process group is killable (no call in run 2 failed with a survivor, and the unit tests kill HUP-proof and TERM-proof children); A-login, A-untouched and A-paste held as in r11 (login through the store, operator root byte-identical, canary only in the throwaway root).
+
+### Local verification
+
+- `src/oneshot src/runner`: **301 pass, 4 skip, 0 fail**. Wider run (`src/oneshot src/runner src/__tests__ src/skills-tuner src/commands`): 2549 pass, 4 skip, **3 fail, the same three as r11** (`agents.test.ts` "accepts simple kebab-case names", two `gateway/session-id-seam.test.ts` cases).
+- Lint: **0 errors**, 1370 warnings, 324 infos. Typecheck ratchet **149 against baseline 149**. Plugin and marketplace versions unchanged (2.2.353).
+- New tests: `pty-group-kill.test.ts` (unit, 10), `pty-group-retire.test.ts` (real shell through the real PTY path, 8), `pty-repl-ready.test.ts` (11), `pty-sweep.test.ts` (18), plus the r12 blocks in `pty-untrusted-state.test.ts`.
+
+### Fault injection, one site each, on a copy of the worktree in the scratchpad, restored after (RED verbatim)
+
+Each injection changes one site and runs the named tests; the `(fail)` line is the first one reported. I wrote each assertion comment after seeing its line. **E5 first came back still green** ("Not logged in" was covered by "Run /login" in the one test string); the test was split so each wording is checked alone, after which E5a and E5b go red. The first E4 run hung and was killed by the harness after 90 s, which is how a never-firing deadline shows. E1-E11 are the readiness gate after it moved to `runTurn`; its first version (in `spawnPty`) was injected the same way before the move and went red at every site.
+
+```text
+A1 no SIGTERM to the group                             (fail) retiring a PTY child > leaves neither the shell nor its background child alive, on SIGTERM and without waiting out the grace
+A2 no SIGKILL escalation                               (fail) terminateProcessGroup > escalates to SIGKILL when the group outlives SIGTERM   [+1 more]
+A3 group termination off by default for untrusted      (fail) retiring a PTY child > leaves neither the shell nor its background child alive, on SIGTERM and without waiting out the grace   [+2 more]
+A4 dispose does not wait for the group                 (fail) retiring a PTY child > leaves neither the shell nor its background child alive, on SIGTERM and without waiting out the grace   [+2 more]
+A5 survivor never reported                             (fail) retiring a PTY child > reports the pid when the group cannot be made to disappear, and does not claim success
+A6 EPERM read as gone                                  (fail) terminateProcessGroup > reads EPERM as alive, not gone
+A7 pid guard removed                                   (fail) terminateProcessGroup > never signals a pid that could reach init, itself, or every process
+A8 only the leader checked                             (fail) terminateProcessGroup > does not take the leader's disappearance for the group's
+A9 recency guard removed                               (fail) retiring a PTY child > does not signal the group of a child that exited long ago (its pid may be someone else's now)
+A10 zombie leader never counts as gone                 (fail) terminateProcessGroup > counts an unreaped zombie as gone where /proc can tell, and not otherwise
+A11 group not signalled, only the leader               (fail) retiring a PTY child > leaves neither the shell nor its background child alive, on SIGTERM and without waiting out the grace   [+2 more]
+E1 blocked screens not checked                         (fail) an untrusted first turn waits for a ready REPL > refuses a login menu, with the reason, and writes nothing   [+2 more]
+E2 ready without any footer                            (fail) an untrusted first turn waits for a ready REPL > refuses when no footer arrives within the budget   [+1 more]
+E3 gate off for untrusted spawns                       (fail) an untrusted first turn waits for a ready REPL > refuses a login menu, with the reason, and writes nothing   [+2 more]
+E4 footer deadline never fires                         (fail) by hang: bun test killed after 90 s
+E5a 'Not logged in' alternative removed                (fail) an untrusted first turn waits for a ready REPL > refuses the logged-out status 'Not logged in', though the footer is painted
+E5b 'Run /login' alternative removed                   (fail) an untrusted first turn waits for a ready REPL > refuses the logged-out status 'Please Run /login', though the footer is painted
+E6 onboarding pattern removed                          (fail) an untrusted first turn waits for a ready REPL > refuses an onboarding screen
+E7 trust-dialog pattern removed                        (fail) an untrusted first turn waits for a ready REPL > refuses a trust dialog
+E8 refusal not remembered for later turns              (fail) an untrusted first turn waits for a ready REPL > keeps refusing: a second turn is not written either, and does not wait again
+E9 footer wait not bound by the turn timeout           (fail) an untrusted first turn waits for a ready REPL > is bound by the turn's own timeout when that is shorter than the footer budget
+E10 default-mode footer not accepted                   (fail) an untrusted first turn waits for a ready REPL > accepts the default mode's footer too
+E11 supervisor: refusal not turned into exit 1           (fail) r12 E: a REPL that never became ready fails the call with nothing sent > returns exit 1 with no reply, tries once, retires the child and leaves no directory behind
+B1a owner of another daemon never protects a dir       (fail) sweepStaleOneShotDirs: who may be removed > keeps an old directory whose owner is still running   [+1 more]
+B1b owner never counted dead                           (fail) sweepStaleOneShotDirs: who may be removed > removes an old directory whose owner is dead   [+1 more]
+B2 uid check removed                                   (fail) sweepStaleOneShotDirs: who may be removed > skips a directory owned by another uid, whatever its owner file says
+B3 age check removed                                   (fail) sweepStaleOneShotDirs: who may be removed > keeps a young directory even when its owner is dead   [+1 more]
+B4 active dirs not honoured                            (fail) sweepStaleOneShotDirs: who may be removed > keeps a call of this daemon that is still running, and removes one it has finished with
+B5 own-instance owner file protects a finished call    (fail) sweepStaleOneShotDirs: who may be removed > keeps a call of this daemon that is still running, and removes one it has finished with
+B6 ESRCH not read as dead                              (fail) sweepStaleOneShotDirs: who may be removed > removes an old directory whose owner is dead
+B7 reused pid not detected                             (fail) sweepStaleOneShotDirs: who may be removed > removes one whose pid now belongs to a process that started later
+B8 unknown start time read as different                (fail) sweepStaleOneShotDirs: who may be removed > keeps one when the owner's start time cannot be compared
+B9 missing owner file read as live                     (fail) sweepStaleOneShotDirs: who may be removed > falls back to the age rule without a readable owner file
+B10 timer registered on every call                     (fail) startOneShotSweeper > sweeps now and registers one unref'd 10-minute timer, however often it is called
+B11 timer not unref'd                                  (fail) startOneShotSweeper > sweeps now and registers one unref'd 10-minute timer, however often it is called
+B12 interval is 1 minute                               (fail) startOneShotSweeper > sweeps now and registers one unref'd 10-minute timer, however often it is called
+B13 a throwing pass escapes the tick                   (fail) startOneShotSweeper > survives a pass that throws, so the next tick still runs
+B14a config root has no owner file                     (fail) owner files > are written into the config root and the temp cwd when they are created
+B14b temp cwd has no owner file                        (fail) owner files > are written into the config root and the temp cwd when they are created
+F2a daemon CLAUDE_CONFIG_DIR ignored                   (fail) operatorSecureStorageDir with the daemon's own env > takes the operator's CLAUDE_CONFIG_DIR from the daemon when print's policy env lacks it   [+1 more]
+F2b daemon explicit store ignored                      (fail) operatorSecureStorageDir with the daemon's own env > takes an explicit CLAUDE_SECURESTORAGE_CONFIG_DIR from the daemon too
+S1a config root not registered as active               (fail) r12 B: a running call's directories are owned, registered and not swept > registers them for the call and releases them when it ends, however it ends   [+2 more]
+S1b temp cwd not registered as active                  (fail) r12 B: a running call's directories are owned, registered and not swept > registers them for the call and releases them when it ends, however it ends   [+2 more]
+S1c registrations never released                       (fail) r12 B: a running call's directories are owned, registered and not swept > registers them for the call and releases them when it ends, however it ends   [+1 more]
+S1d late-retire path never releases                    (fail) C3: cleanup runs again once a late-landing spawn has settled > removes the root a claude wrote into after the call had already returned
+S2 survivor check removed from cleanup                 (fail) r12 A: a process group that outlives retirement fails the call and keeps the root > throws, logs the pid, and leaves the root for the sweep (nothing may still be writing into a removed dir)
+S3 survivor hook not passed to the spawn               (fail) r12 A: a process group that outlives retirement fails the call and keeps the root > throws, logs the pid, and leaves the root for the sweep (nothing may still be writing into a removed dir)
+S4 survivor hook records nothing                       (fail) r12 A: a process group that outlives retirement fails the call and keeps the root > throws, logs the pid, and leaves the root for the sweep (nothing may still be writing into a removed dir)
+S5 state built after the project dir (F1 leak)         (fail) r12 F1: a failure while building the call's state leaks nothing > removes the temp cwd and the config root when the project dir cannot be resolved
+S6 daemon env not consulted for the credential dir (F2) (fail) r12 F2: the operator's config dir comes from the daemon when print's policy env lacks it > an operator with a custom CLAUDE_CONFIG_DIR keeps that credential store
+S7 start.ts no longer starts the sweeper               (fail) A: startup sweep of leftovers > the daemon runs it at start, before the version probe
+```
+
+Not injected: the 2 s and 2 s grace lengths and the 20 s footer budget (values, not branches); the `ps -o lstart=` parse and the Linux `/proc` reader against a real `/proc` (the reader is tested on a fake directory, and run 2 exercised it live without a failure). Not covered by a live row: macOS, an actual token refresh, and the keychain.
+
+### Follow-ups (not done here)
+
+- A refresh row, once there is a throwaway account with a refresh token.
+- Group termination for trusted sessions, behind a guard that keeps fake pids from being signalled.
+- A survivor's root is kept for the 10-minute sweep, which removes it even if the survivor is still writing; nothing here kills a survivor that SIGKILL could not.
+- The baseline hang probe's rate across rounds (above).
+- Carried from earlier rounds: Whole-paste image-path handling, the version gate probed once at startup, bun-pty `env_clear`, a classifier rate limit, a tuner env allowlist, the retired classifier model id in `discord.ts`.
