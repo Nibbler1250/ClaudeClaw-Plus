@@ -83,9 +83,11 @@ it is held while a claude of that call may still be alive and freed only on posi
 that it is gone. A call whose claude is still being admitted when its deadline passes keeps the
 slot until that claude has landed and been retired (past `UNTRUSTED_LATE_SLOT_CEILING_MS` it only
 logs `one-shot slot held past ceiling: retirement pending`; it does not free). A call whose claude
-survived retirement hands its slot to the survivor record, and the sweeper's identity-checked
-retry releases it once, when the survivor is confirmed gone. Survivors a restarted daemon adopts
-from `survivor.json` count against the cap the same way. A held slot makes a new call `busy`
+survived retirement, or left a process the escape scan could not read (an unknown hold), hands its
+slot to that record. The slot is released once, when neither a survivor nor an unknown hold is left
+for the root: the sweeper's identity-checked retry confirms the survivor gone, and prunes a hold
+whose processes have exited. Survivors and holds a restarted daemon adopts from `survivor.json`
+(holds are persisted in its `unknown` list) count against the cap the same way. A held slot makes a new call `busy`
 (fail closed); one whose retirement never settles stays held until the daemon restarts.
 
 An API-key-only host is not covered: untrusted routes carry no API-key defaults, and the

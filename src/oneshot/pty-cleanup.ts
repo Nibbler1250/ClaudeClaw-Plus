@@ -189,7 +189,7 @@ export function activeOneShotDirCount(): number {
  * Untrusted PTY one-shots that may run at once. In-process, not a setting: each is an interactive
  * claude, and the ephemeral scope sits outside the supervisor's `maxConcurrent`. Over it a call
  * returns `busy` without spawning (the classifier treats that like any other failure: null, no
- * retry). #570 r15, A4.
+ * retry). A slot stays counted while a survivor or an unknown hold stands for its call. #570 r15, A4.
  */
 export const UNTRUSTED_ONESHOT_MAX_CONCURRENT = 2;
 
@@ -219,10 +219,11 @@ export function untrustedOneShotsInFlight(): number {
 }
 
 /**
- * Slots whose call has returned while its claude is a recorded survivor, keyed by config root.
- * The reservation follows the child: it is released once, by `releaseSurvivorSlot`, when the
- * sweeper's identity-checked retry confirms the survivor gone. Not a second counter: each entry
- * is the `free` of a reservation already counted in `untrustedInFlight`.
+ * Slots whose call has returned while a process of it may still be alive, keyed by config root:
+ * a recorded survivor or an unknown hold (a process the escape scan could not read). The
+ * reservation follows the child: it is released once, by `releaseIfClear`, when neither map has
+ * the root any more. Not a second counter: each entry is the `free` of a reservation already
+ * counted in `untrustedInFlight`.
  */
 const survivorSlots = new Map<string, () => void>();
 
@@ -244,7 +245,7 @@ export interface OneShotSlot {
   /**
    * The call has returned and the slot follows its child. Waits for `retired` when a late claude
    * may still land (never freeing at the ceiling), then keeps the slot while `root` is a recorded
-   * survivor, and frees it otherwise.
+   * survivor or an unknown hold, and frees it otherwise.
    */
   settle(root: string, retired?: Promise<unknown>): void;
 }
@@ -253,9 +254,11 @@ export interface OneShotSlot {
 export function acquireUntrustedOneShotSlot(): OneShotSlot | undefined {
   if (untrustedInFlight >= UNTRUSTED_ONESHOT_MAX_CONCURRENT) return undefined;
   const free = reserveCount();
-  // Transfer the reservation to the survivor record, or free it when nothing of the call is left.
+  // Transfer the reservation to the root's survivor or unknown hold, or free it when nothing of
+  // the call is left. `unknownHoldActive` first: it prunes a hold whose processes are gone.
   const handOver = (root: string): void => {
-    if (survivingGroups.has(root) && !survivorSlots.has(root)) survivorSlots.set(root, free);
+    const held = unknownHoldActive(root) || survivingGroups.has(root);
+    if (held && !survivorSlots.has(root)) survivorSlots.set(root, free);
     else free();
   };
   return {
@@ -279,10 +282,7 @@ export function acquireUntrustedOneShotSlot(): OneShotSlot | undefined {
   };
 }
 
-/**
- * The survivor recorded under `root` is confirmed gone: release the reservation that followed it.
- * Once only; a root with no reservation is a no-op.
- */
+/** Release the reservation that followed `root`. Once only; a root with no reservation is a no-op. */
 function releaseSurvivorSlot(root: string): void {
   const free = survivorSlots.get(root);
   if (!free) return;
@@ -291,8 +291,18 @@ function releaseSurvivorSlot(root: string): void {
 }
 
 /**
- * A survivor adopted from `survivor.json` after a restart counts against the cap like one this
- * run recorded, until it is confirmed gone. It may take the count past the cap: the cap only
+ * The one release rule: a root's reservation is owned by it while a recorded survivor OR an
+ * unknown hold stands, and is released when neither does. Called wherever either map loses its
+ * entry for a root. Reads the maps, not `unknownHoldActive`: callers have just pruned.
+ */
+function releaseIfClear(root: string): void {
+  if (survivingGroups.has(root) || unknownHolds.has(root)) return;
+  releaseSurvivorSlot(root);
+}
+
+/**
+ * A survivor or hold adopted from `survivor.json` after a restart counts against the cap like one
+ * this run recorded, until it is confirmed gone. It may take the count past the cap: the cap only
  * refuses new calls.
  */
 function reserveSurvivorSlot(root: string): void {
@@ -483,14 +493,21 @@ export function heldProcAlive(
   return sameStart(now, proc.startMs);
 }
 
+let heldAliveDefault: (proc: HeldProc) => boolean = (proc) => heldProcAlive(proc);
+/** Test seam: replace the liveness check every hold uses unless a sweep names its own. `null` restores it. */
+export function setHeldAliveForTests(check: ((proc: HeldProc) => boolean) | null): void {
+  heldAliveDefault = check ?? ((proc) => heldProcAlive(proc));
+}
+
 /** Drop the dead processes of a hold, and the hold itself when none is left. True while it stands. */
 function holdStands(root: string, deps: SweepDeps = {}): boolean {
   const hold = unknownHolds.get(root);
   if (!hold) return false;
-  const alive = deps.heldAlive ?? ((p: HeldProc) => heldProcAlive(p));
+  const alive = deps.heldAlive ?? heldAliveDefault;
   const procs = hold.procs.filter((p) => alive(p));
   if (procs.length === 0) {
     unknownHolds.delete(root);
+    releaseIfClear(root);
     return false;
   }
   if (procs.length !== hold.procs.length) {
@@ -627,7 +644,7 @@ export async function retrySurvivingGroups(deps: SurvivorRetryDeps = {}): Promis
       )(target);
       if (groupGone && escapees.length === 0) {
         survivingGroups.delete(root);
-        releaseSurvivorSlot(root);
+        releaseIfClear(root); // an unknown hold the reap just recorded keeps the slot
         cleared++;
       } else {
         console.error(
@@ -640,6 +657,9 @@ export async function retrySurvivingGroups(deps: SurvivorRetryDeps = {}): Promis
       );
     }
   }
+  // A hold is pruned here too, so the slot that follows it comes back on the timer, not only when
+  // the sweep happens to look at an old directory. Nothing is signalled for a hold.
+  for (const root of [...unknownHolds.keys()]) holdStands(root);
   return cleared;
 }
 
@@ -802,7 +822,7 @@ function adoptPersistedSurvivors(
   uid: number | undefined,
   deps: SweepDeps,
 ): void {
-  const alive = deps.heldAlive ?? ((p: HeldProc) => heldProcAlive(p));
+  const alive = deps.heldAlive ?? heldAliveDefault;
   for (const name of names) {
     if (!name.startsWith(ONESHOT_CONFIG_PREFIX)) continue;
     const path = join(dir, name);
@@ -869,6 +889,7 @@ function adoptPersistedSurvivors(
           cwds: record.cwds,
           procs,
         });
+        reserveSurvivorSlot(path); // a hold reserves a slot as a survivor does
         console.warn(
           `[oneshot] ${procs.length} unreadable process(es) of ${name} still alive after a restart; root kept while they live`,
         );
