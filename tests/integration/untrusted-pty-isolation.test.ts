@@ -11,6 +11,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { spawn } from "node:child_process";
 import { join, relative } from "node:path";
 import { _setSettingsFileForTests, loadSettings } from "../../src/config.js";
 import { classifierSpawnEnv } from "../../src/commands/discord.js";
@@ -830,19 +831,79 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         const path = plantMentionFile();
         // Twin: the shared U+FF20 replacement is switched off through its test seam.
         if (twin) setUntrustedFileMentionNeutralizingForTests(false);
-        const result = await withPrintRuntime({ env: callerPolicy() }, () =>
-          engines.get("print")!.run({
-            route: "discord.classifier",
-            isolation: "untrusted",
-            prompt: mentionPrompt(path),
-            timeoutMs: 90_000,
-          }),
+        // The same wire instrumentation as src/oneshot/e2e.test.ts: stream-json events let the
+        // row see whether a real model message exists, which the exit code and text cannot show.
+        let wire = "";
+        const instrumentedSpawn = ((
+          command: string,
+          args: string[],
+          options: Parameters<typeof spawn>[2],
+        ) => {
+          const child = spawn(
+            command,
+            [...args, "--output-format", "stream-json", "--verbose"],
+            options,
+          );
+          child.stdout?.on("data", (data: Buffer) => {
+            wire += data.toString();
+          });
+          return child;
+        }) as typeof spawn;
+        let stderrLength = 0;
+        const result = await withPrintRuntime(
+          {
+            env: callerPolicy(),
+            spawn: instrumentedSpawn,
+            onStderr: (excerpt) => {
+              stderrLength = excerpt.length;
+            },
+          },
+          () =>
+            engines.get("print")!.run({
+              route: "discord.classifier",
+              isolation: "untrusted",
+              prompt: mentionPrompt(path),
+              timeoutMs: 90_000,
+            }),
         );
-        const expanded = result.text.includes(FILE_CANARY);
+        const events = wire
+          .split("\n")
+          .filter((line) => line.trim() !== "")
+          .flatMap((line) => {
+            try {
+              return [JSON.parse(line) as Record<string, unknown>];
+            } catch {
+              return [];
+            }
+          });
+        const kinds: Record<string, number> = {};
+        for (const event of events)
+          kinds[String(event.type)] = (kinds[String(event.type)] ?? 0) + 1;
+        const done = events.find((event) => event.type === "result");
+        // A real model message: an assistant event that is neither the CLI's synthetic record
+        // nor flagged as an API error.
+        const reachedModel = events.some((event) => {
+          const message = event.message as { model?: unknown } | undefined;
+          return (
+            event.type === "assistant" &&
+            event.isApiErrorMessage !== true &&
+            message?.model !== "<synthetic>"
+          );
+        });
+        const expanded = wire.includes(FILE_CANARY);
+        // Shapes and booleans only, never content.
         console.info(
-          `[isolation-spike] B3 PRINT ${direction}: exit=${result.exitCode}; replyLength=${result.text.length}; canaryInReply=${expanded}`,
+          `[isolation-spike] B3 PRINT ${direction}: exit=${result.exitCode}; replyLength=${result.text.length}; stderrLength=${stderrLength}; events=${JSON.stringify(kinds)}; resultSubtype=${String(done?.subtype)}; resultIsError=${String(done?.is_error)}; reachedModel=${reachedModel}; canaryInWire=${expanded}`,
         );
-        expect(result.exitCode).toBe(0);
+        if (twin) {
+          // Control removed: the call is healthy and the file's contents come back.
+          expect(result.exitCode).toBe(0);
+        } else {
+          // Control present: judged on the canary, as in the PTY rows. The call may end on an
+          // API error (exit 1), but a crash or timeout may not pass as isolation.
+          expect([0, 1]).toContain(result.exitCode);
+          expect(reachedModel).toBe(true);
+        }
         checkIsolation("B3 @ file mention (print)", !expanded, twin);
       },
       BUDGET,
