@@ -19,6 +19,7 @@ import { join, relative } from "node:path";
 import { _setSettingsFileForTests, loadSettings } from "../config.js";
 import {
   __buildClaudeArgsForTests,
+  PtyNotReadyError,
   spawnPty,
   type PtyProcessOptions,
 } from "../runner/pty-process.js";
@@ -518,15 +519,39 @@ describe("r12 A: a process group that outlives retirement fails the call and kee
   });
 });
 
-describe("r12 E: a spawn refused for want of a ready REPL fails the call with nothing sent", () => {
-  it("returns exit 1 with no reply and leaves no directory behind", async () => {
+describe("r12 E: a REPL that never became ready fails the call with nothing sent", () => {
+  it("returns exit 1 with no reply, tries once, retires the child and leaves no directory behind", async () => {
     const before = oneShotTempDirs("claudeclaw-oneshot-");
-    injectSpawnPty(async () => {
-      throw new Error("untrusted PTY not ready (login-required); nothing was sent");
+    let spawns = 0;
+    let turns = 0;
+    let disposed = 0;
+    injectSpawnPty(async (opts) => {
+      spawns++;
+      return {
+        label: "state",
+        pid: 1,
+        sessionId: SID,
+        cwd: opts.cwd,
+        isAlive: () => true,
+        lastTurnEndedAt: () => 0,
+        runTurn: async () => {
+          turns++;
+          throw new PtyNotReadyError("state", "login-required");
+        },
+        dispose: async () => {
+          disposed++;
+        },
+      } as never;
     });
     const result = await run();
+    // Went red (124, after a pointless wait for a transcript that cannot exist) with the failed
+    // exec no longer returned as the call's result.
     expect(result.exitCode).toBe(1);
     expect(result.text).toBe("");
+    // One attempt: a refused screen is not retried, and the child is not left running.
+    expect(spawns).toBe(1);
+    expect(turns).toBe(1);
+    expect(disposed).toBeGreaterThanOrEqual(1);
     expect(oneShotTempDirs("claudeclaw-oneshot-")).toEqual(before);
   });
 });

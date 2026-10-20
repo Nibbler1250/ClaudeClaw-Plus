@@ -276,6 +276,20 @@ export class PtyTurnTimeoutError extends Error {
   }
 }
 
+/**
+ * An untrusted one-shot's REPL never became usable (a login, onboarding or trust screen, or no
+ * footer in time), so the prompt was not written. Only the reason code is carried.
+ */
+export class PtyNotReadyError extends Error {
+  constructor(
+    public readonly label: string,
+    public readonly reason: string,
+  ) {
+    super(`untrusted PTY not ready (${reason}); nothing was sent`);
+    this.name = "PtyNotReadyError";
+  }
+}
+
 export class PtyClosedError extends Error {
   constructor(
     public readonly label: string,
@@ -332,6 +346,12 @@ const BLOCKED_BOOT_SCREENS: ReadonlyArray<readonly [string, RegExp]> = [
   ["onboarding", /Choose\s*the\s*text\s*style|Let'?s\s*get\s*started/i],
   ["trust-dialog", /trust\s*this\s*folder|Do\s*you\s*trust\s*the\s*files/i],
 ];
+
+/**
+ * claude's idle REPL footer: the mode-cycler hint ("tab to cycle", every mode of 2.1.304 that
+ * has one) or the default mode's "? for shortcuts".
+ */
+const REPL_FOOTER = /tab\s*to\s*cycle|for\s*shortcuts/;
 
 /** A child that exited on its own is still swept for descendants for this long. */
 const GROUP_SWEEP_MAX_AGE_MS = 30_000;
@@ -572,6 +592,8 @@ class PtyProcessImpl implements PtyProcess {
    */
   private _readyGate: boolean;
   private _screenTail = "";
+  /** Why the REPL was refused, once it has been: later turns are refused without waiting. */
+  private _notReady: string | null = null;
   private _onScreen: (() => void) | null = null;
   private readonly _replReadyBudgetMs: number;
   /** When `_handleExit` ran; a group of a child that exited long ago is not signalled. */
@@ -801,6 +823,33 @@ class PtyProcessImpl implements PtyProcess {
       onChunk?: (text: string) => void;
       onToolEvent?: (line: string) => void;
       /** Deliberate REPL command (`/compact`); honoured only for an exact allowed command. */
+      allowReplCommand?: boolean;
+    },
+  ): Promise<PtyTurnResult> {
+    // An untrusted one-shot's first turn waits for a ready REPL; nothing is written until then.
+    if (this._notReady !== null) {
+      return Promise.reject(new PtyNotReadyError(this.label, this._notReady));
+    }
+    if (this._readyGate) {
+      return this._awaitReplReady(Math.min(this._replReadyBudgetMs, opts.timeoutMs)).then(
+        (verdict) => {
+          if (!verdict.ok) {
+            this._notReady = verdict.reason ?? "unknown";
+            throw new PtyNotReadyError(this.label, this._notReady);
+          }
+          return this._startTurn(prompt, opts);
+        },
+      );
+    }
+    return this._startTurn(prompt, opts);
+  }
+
+  private _startTurn(
+    prompt: string,
+    opts: {
+      timeoutMs: number;
+      onChunk?: (text: string) => void;
+      onToolEvent?: (line: string) => void;
       allowReplCommand?: boolean;
     },
   ): Promise<PtyTurnResult> {
@@ -1106,10 +1155,6 @@ class PtyProcessImpl implements PtyProcess {
     this._onExitDisposable = null;
   }
 
-  _requiresReplReady(): boolean {
-    return this._readyGate;
-  }
-
   /**
    * Untrusted one-shot: resolve `ok` once claude's REPL footer is on screen with no login,
    * onboarding or trust screen, and `!ok` with a reason code otherwise (a blocked screen, or no
@@ -1117,7 +1162,7 @@ class PtyProcessImpl implements PtyProcess {
    * `ok`. Only the reason code is reported, never screen text. Spawn-time only; once decided,
    * the screen is no longer collected.
    */
-  _awaitReplReady(): Promise<ReplReadyVerdict> {
+  _awaitReplReady(budgetMs: number): Promise<ReplReadyVerdict> {
     return new Promise((resolve) => {
       const finish = (verdict: ReplReadyVerdict): void => {
         this._clearTimeout(deadline);
@@ -1134,11 +1179,11 @@ class PtyProcessImpl implements PtyProcess {
             return;
           }
         }
-        if (/tab\s*to\s*cycle/.test(screen)) finish({ ok: true });
+        if (REPL_FOOTER.test(screen)) finish({ ok: true });
       };
       const deadline = this._setTimeout(
         () => finish({ ok: false, reason: "no-repl-footer" }),
-        this._replReadyBudgetMs,
+        budgetMs,
       );
       this._onScreen = check;
       check();
@@ -1395,23 +1440,7 @@ export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
         reject(new Error(`PTY for ${cmd} exited before TUI settled (pid=${pty.pid})${detail}`));
         return;
       }
-      if (!proc._requiresReplReady()) {
-        resolve(proc);
-        return;
-      }
-      // An untrusted prompt is written only into a REPL that is ready: the footer is up and
-      // no login, onboarding or trust screen is showing. Otherwise the spawn fails with the
-      // reason, nothing has been written, and the child is retired with its process group.
-      void proc._awaitReplReady().then(async (verdict) => {
-        if (verdict.ok) {
-          resolve(proc);
-          return;
-        }
-        await proc.dispose().catch(() => {});
-        reject(
-          new Error(`untrusted PTY not ready (${verdict.reason ?? "unknown"}); nothing was sent`),
-        );
-      });
+      resolve(proc);
     });
   });
 }

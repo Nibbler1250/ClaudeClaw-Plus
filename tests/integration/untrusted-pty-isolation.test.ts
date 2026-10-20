@@ -235,7 +235,8 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     errors = spyOn(console, "error").mockImplementation(() => {});
     injectSpawnPty(async (options) => {
       opts.push(options);
-      expect(readdirSync(options.cwd)).toEqual([]);
+      // Empty but for the owner file the sweep reads (r12): nothing else is planted in the cwd.
+      expect(readdirSync(options.cwd)).toEqual([cleanup.ONESHOT_OWNER_FILE]);
       // r11: the child's config root is a per-call throwaway, never the operator's `config`.
       // A twin may re-point it at the spawn boundary (extraChildEnv); production is judged
       // on what it passed in `options.env`.
@@ -1285,6 +1286,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         planted.kill("SIGKILL");
       }
       await run(`Reply with ${DONE}.`, { model: "haiku", allowNoTurn: true, timeoutMs: 60_000 });
+      expect(childRoot.includes("claudeclaw-oneshot-cfg-")).toBe(true); // an empty needle would match everything
       const holders = processesNaming(childRoot);
       console.info(`[isolation-spike] A-proc: processesNamingThrowawayRoot=${holders}`);
       expect(holders).toBe(0);
