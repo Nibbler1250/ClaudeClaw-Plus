@@ -1442,3 +1442,46 @@ What I can and cannot say. None of the r15 changes acts after the prompt has bee
 - A4 means a burst of more than 2 simultaneous guild messages gets `busy` for the extra ones (the classifier returns null, no retry). The cap is a named constant, not a setting.
 - The late-slot ceiling (60 s) is a number I chose, not a measured one.
 - The integration job is red (B3 above). I stopped there, as the brief says, and did not retry.
+
+## r15b: Codex P1 (Linux-only fixture failures) and hang-signature retry
+
+Branch `feat/570-untrusted-pty-isolation`, from `686e735a`. Codex thread 4329278388 on PR #581 (`src/oneshot/pty-sweep.test.ts:99`).
+
+### Why nobody saw it
+
+The `Test` workflow runs only on PRs into `main`, and #581 targets `feat/572`, so no Linux unit run had happened on this branch. macOS skips the boot-id branch (`platform !== "linux"`). On Linux `recordedOnAnotherBoot()` treats a record with no `bootId` as another boot's, so the sweeper removed any fixture built without one before it looked at the pid.
+
+### What changed
+
+| Item | Change | Where |
+| --- | --- | --- |
+| Fixtures | `live()` now stamps `bootId: currentBootId()`, as the writer does. That is the live-owner, unknown-start-time and cached-start-time cases Codex named, and the r14d `isOwnerDead` case (it had the same gap and also went red). The cache test's `own` literal is now `live()`. | `src/oneshot/pty-sweep.test.ts` |
+| Audit | Every test that builds an `OwnerRecord`, writes an owner file or `survivor.json`, or calls `isOwnerDead` / `heldProcAlive` / `adoptPersistedSurvivors` / `sweepStaleOneShotDirs`, in `src/oneshot`, `src/runner` and `src/__tests__`. Only `pty-sweep.test.ts` builds records by hand. `pty-untrusted-state.test.ts` uses the writers (which stamp the id) or dirs with no owner file; `pty-group-retire.test.ts` and `pty-proc-identity.test.ts` build none; `src/__tests__` has none. The explicit `bootId: "boot-A"` / `null` fixtures in the r15 A1 describe are deliberate. | (no change) |
+| Linux switch | `CLAUDECLAW_TEST_PLATFORM=linux`, honoured only when `NODE_ENV=test`, makes the boot-id seam defaults (`readBootId()` with no path, `currentBootId()`, `recordedOnAnotherBoot()`) act as Linux with the fixed id `TEST_BOOT_ID`. An explicit path or platform argument still wins. It does not touch `/proc` reads or `sameStart`. | `src/runner/pty-proc-identity.ts`; tests in `pty-proc-identity.test.ts` |
+| Hang retry | `isHangSignature` (exit 124, reason `timeout`, `promptSeen`, 0 assistant entries, 0 API errors) and `rowRetryLine`, both pure. `run()` in the integration spike takes `retryHang: <row label>`, set only on CONTROL PRESENT rows, and calls once more when the first call matches. Twins and every other failure are not retried. It logs `[isolation-spike] row-retry <row label>: reason=hang-signature`. | `src/runner/pty-hang-signature.ts`, `tests/integration/untrusted-pty-isolation.test.ts` |
+
+Rows given `retryHang`: tools, MCP, settings and hooks, user memory, transcript cleanup, B1, B2, B3 PTY, C `@` look-alikes, A-untouched, C1. Not given it: rows whose control already accepts exit 124 and has no API-contact check (command flag, A-login, A-paste, A-proc, the hang-rate probes).
+
+### Proof
+
+| Check | Result |
+| --- | --- |
+| `bun test src/oneshot src/runner`, normal | 461 pass / 0 fail (468 tests, 19 files; 7 skip) |
+| Same, `CLAUDECLAW_TEST_PLATFORM=linux` | 461 pass / 0 fail |
+| Switch on, fixtures as they were (no boot id), `pty-sweep.test.ts` | 49 pass / **4 fail** (RED lines below) |
+| Hang predicate always false | `pty-hang-signature.test.ts` 8 pass / **1 fail**: `isHangSignature (#570 r15b) > the known no-reply hang is the signature`; restored, 9 pass / 0 fail |
+| `bun run lint` | exit 0 (existing warnings only) |
+| `bun run typecheck` | 149 errors, baseline 149 |
+
+RED lines, switch on, fixtures reverted:
+
+```
+(fail) sweepStaleOneShotDirs: may be removed > keeps an old directory owner still running
+(fail) sweepStaleOneShotDirs: may be removed > keeps one when owner's start time cannot be compared
+(fail) retrySurvivingGroups > asks owner pid's start time once per sweep pass
+(fail) start-time comparison by platform (r14d, H1) > owner whose /proc start moved by one second dead; under ps it still owner
+```
+
+(The first three are the cases Codex named; the log compressor dropped some words from the names. The fourth has the same missing boot id.)
+
+One unrelated failure seen once: `HTTP engines > openai-compatible: the timeout aborts the request` (`http.test.ts:213`, expected 124, got 1) in one of seven Linux-switch runs. It uses a 50 ms timeout and no boot-id code; it passed in four isolated runs with the switch on and in the full rerun. I take it for a timing flake under load, and have not shown that.

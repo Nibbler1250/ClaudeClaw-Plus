@@ -77,13 +77,31 @@ export type BootIdReader = () => string | null;
 
 const BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id";
 
+/** The boot id the test-only Linux switch reports (`linuxUnderTest`). */
+export const TEST_BOOT_ID = "00000000-test-boot-id";
+
+/**
+ * Test-only switch: `CLAUDECLAW_TEST_PLATFORM=linux` under `bun test` (NODE_ENV=test) makes the
+ * boot-id seam defaults below behave as on Linux with a fixed boot id, so the Linux path of the
+ * sweep and survivor suites runs on a Mac (#570 r15b). It touches nothing else: `/proc` reads and
+ * `sameStart` keep the real platform. Outside a test run it is never read as set.
+ */
+function linuxUnderTest(): boolean {
+  return process.env.NODE_ENV === "test" && process.env.CLAUDECLAW_TEST_PLATFORM === "linux";
+}
+
+function bootIdPlatform(): string {
+  return linuxUnderTest() ? "linux" : process.platform;
+}
+
 /**
  * Linux: the kernel's id for this boot, fixed until the next one. (Not `btime` from `/proc/stat`,
  * which can drift between reads.) Null when it cannot be read.
  */
-export function readBootId(path = BOOT_ID_PATH): string | null {
+export function readBootId(path?: string): string | null {
+  if (path === undefined && linuxUnderTest()) return TEST_BOOT_ID;
   try {
-    const id = readFileSync(path, "utf8").trim();
+    const id = readFileSync(path ?? BOOT_ID_PATH, "utf8").trim();
     return id === "" ? null : id;
   } catch {
     return null;
@@ -91,7 +109,7 @@ export function readBootId(path = BOOT_ID_PATH): string | null {
 }
 
 /** The id to store beside a start time that outlives this process: Linux only, null elsewhere. */
-export function currentBootId(platform: string = process.platform): string | null {
+export function currentBootId(platform: string = bootIdPlatform()): string | null {
   return platform === "linux" ? readBootId() : null;
 }
 
@@ -105,7 +123,7 @@ export function currentBootId(platform: string = process.platform): string | nul
 export function recordedOnAnotherBoot(
   recorded: string | null | undefined,
   {
-    platform = process.platform,
+    platform = bootIdPlatform(),
     bootId = readBootId,
   }: { platform?: string; bootId?: BootIdReader } = {},
 ): boolean {

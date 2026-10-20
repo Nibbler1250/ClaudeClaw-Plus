@@ -92,9 +92,12 @@ function deadPid(): number {
 }
 
 const selfStart = processStartMs(process.pid);
+// Stamped with this boot's id, as the writer does: on Linux a record with none is another boot's
+// and is swept before its pid is looked at (#570 r15b).
 const live = (over: Partial<OwnerRecord> = {}): OwnerRecord => ({
   pid: process.pid,
   startMs: selfStart,
+  bootId: currentBootId(),
   instance: "another-daemon",
   ...over,
 });
@@ -432,7 +435,7 @@ describe("retrySurvivingGroups", () => {
 
   // #570 r13 (F): the same owner pid names many directories; ask `ps` about it once per pass.
   it("asks for each owner pid's start time once per sweep pass", () => {
-    const own = { pid: process.pid, startMs: selfStart, instance: "another-daemon" };
+    const own = live();
     for (const n of [1, 2, 3]) leftover(`${ONESHOT_CWD_PREFIX}same-owner-${n}`, OLD, own);
     const asked: number[] = [];
     const startMs = (pid: number): number | null => {

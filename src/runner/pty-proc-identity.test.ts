@@ -10,6 +10,7 @@ import {
   readBootId,
   recordedOnAnotherBoot,
   sameStart,
+  TEST_BOOT_ID,
 } from "./pty-proc-identity.js";
 import { withPlatform } from "./pty-test-platform.js";
 
@@ -142,5 +143,49 @@ describe("readBootId / currentBootId", () => {
 
   it("is null off Linux", () => {
     expect(currentBootId("darwin")).toBeNull();
+  });
+});
+
+// #570 r15b: CLAUDECLAW_TEST_PLATFORM=linux runs the boot-id branch on a Mac. It must change only
+// the seam defaults, and only under NODE_ENV=test.
+describe("the test-only Linux switch", () => {
+  const saved = {
+    platform: process.env.CLAUDECLAW_TEST_PLATFORM,
+    nodeEnv: process.env.NODE_ENV,
+  };
+  const restore = (key: string, value: string | undefined): void => {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  };
+  afterEach(() => {
+    restore("CLAUDECLAW_TEST_PLATFORM", saved.platform);
+    restore("NODE_ENV", saved.nodeEnv);
+  });
+
+  it("on: the defaults act as Linux with the fixed boot id", () => {
+    process.env.NODE_ENV = "test";
+    process.env.CLAUDECLAW_TEST_PLATFORM = "linux";
+    expect(readBootId()).toBe(TEST_BOOT_ID);
+    expect(currentBootId()).toBe(TEST_BOOT_ID);
+    expect(recordedOnAnotherBoot(null)).toBe(true); // no boot id: from before the field
+    expect(recordedOnAnotherBoot("some-other-boot")).toBe(true);
+    expect(recordedOnAnotherBoot(TEST_BOOT_ID)).toBe(false);
+  });
+
+  it("on: an explicit path or platform still wins", () => {
+    process.env.NODE_ENV = "test";
+    process.env.CLAUDECLAW_TEST_PLATFORM = "linux";
+    expect(readBootId("/nonexistent/boot_id")).toBeNull();
+    expect(currentBootId("darwin")).toBeNull();
+    expect(recordedOnAnotherBoot(null, { platform: "darwin" })).toBe(false);
+  });
+
+  it("off, or outside NODE_ENV=test: the real platform decides", () => {
+    delete process.env.CLAUDECLAW_TEST_PLATFORM;
+    expect(currentBootId()).toBe(currentBootId(process.platform));
+    process.env.CLAUDECLAW_TEST_PLATFORM = "linux";
+    process.env.NODE_ENV = "production";
+    expect(readBootId()).not.toBe(TEST_BOOT_ID);
+    expect(currentBootId()).not.toBe(TEST_BOOT_ID);
   });
 });
