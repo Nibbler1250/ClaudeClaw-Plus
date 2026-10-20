@@ -1501,3 +1501,41 @@ Every `row-retry` line in the run (one):
 Not fixed, as the addendum says to stop when a row fails after its retry. The likely fix is to give every `retryHang` row a test timeout of twice its call budget plus margin (the retry can use the whole budget again). Say if you want that and another integration run.
 
 Every other row, including A-login, A-untouched, A-paste, F3 and the hang-rate samples, passed. Other non-zero exits seen and not retried (expected, they are twins or `allowNoTurn` rows): `trust-twin` exit 1 `not-ready:trust-dialog`, `api-key-twin` exit 124, `a-login-twin` exit 1 `not-ready:login-required`, `hang-baseline-3` exit 124 (a hang-rate sample, `allowNoTurn`, not a CONTROL PRESENT row).
+
+## r15c: room for the hang retry, and a probe for row C
+
+Commit `4fef80e1`, from `fd8c608d`. No version bump, no PR comment, no `@codex review`.
+
+| Item | Change |
+| --- | --- |
+| Timeouts | `retryRowTimeoutMs(callBudgetMs)` = `RETRY_ATTEMPTS (2) x (call budget + 15 s) + 30 s`, pure, in `pty-hang-signature.ts`. Every `retryHang` row's test timeout is now `rowTimeoutMs(twin, budget)` in the spike: twins keep `BUDGET + 20 s`; CONTROL PRESENT rows take the larger of that and the derived value (180 s for a 60 s call, 300 s for 120 s). Rows with `retryHang`: tools, MCP, settings and hooks, user memory, transcript cleanup, B1, B2, B3 PTY, C, A-untouched, C1. |
+| Retry result line | `[isolation-spike] row-retry <label>: attempt=2 exit=<n> reason=<code> elapsedMs=<n>`, logged after the second attempt. |
+| Probe | `HANG RATE C look-alike prompt`, 5 attempts with row C's prompt and control present, same 60 s call, no retry, never fails the run (`hang-rate probe=c-lookalike ...`, plus a summary line). |
+
+Gates: `pty-hang-signature.test.ts` 16 pass. With `RETRY_ATTEMPTS` set back to 1, 5 tests go RED (`is two full attempts plus the margin`, and the `at least 2 x 30000/60000/120000 ms + 30 s` cases, and `covers a hung first attempt...`); restored. `src/oneshot` + `src/runner`: 468 pass / 0 fail normally and with `CLAUDECLAW_TEST_PLATFORM=linux`. Lint exit 0, typecheck 149/149.
+
+### Integration run: results
+
+Run [39488188682](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39488188682) on `4fef80e1`: **conclusion success; 61 pass / 0 fail** (56 rows plus the 5 new probes); Linux step 86/86.
+
+Every row-retry line (one row retried; C passed on attempt 2):
+
+```
+[isolation-spike] row-retry C @ look-alikes CONTROL PRESENT: reason=hang-signature
+[isolation-spike] row-retry C @ look-alikes CONTROL PRESENT: attempt=2 exit=0 reason=none elapsedMs=7948
+```
+
+The five c-lookalike probe lines:
+
+```
+hang-rate probe=c-lookalike attempt=1 exit=124 assistantEntries=0 elapsedMs=75250 hung=true
+hang-rate probe=c-lookalike attempt=2 exit=0 assistantEntries=2 elapsedMs=8087 hung=false
+hang-rate probe=c-lookalike attempt=3 exit=0 assistantEntries=2 elapsedMs=8219 hung=false
+hang-rate probe=c-lookalike attempt=4 exit=0 assistantEntries=2 elapsedMs=7088 hung=false
+hang-rate probe=c-lookalike attempt=5 exit=0 assistantEntries=2 elapsedMs=6539 hung=false
+hang-rate-summary probe=c-lookalike: hung=1/5; exit124=1
+```
+
+Other probes: baseline hung 1/5 (exit 124), contract 0/5.
+
+What this shows. Row C hung on its first attempt in this run too (and the probe's first attempt hung), and the retry answered in 7.9 s, so the retry is what makes the row pass. Row C has now hung in runs 5b, 6, 7 (row) and in 1 of 5 probes; counting only the unretried calls I have (runs 3 to 5 clean: 3, probe: 1 of 5), the prompt hangs on roughly 1 call in 4 to 5. Both hangs in this run were the **first** call of a fresh sequence; the 4 later probe attempts, in the same job, answered in 6.5 to 8.2 s. Five samples cannot separate a first-call effect from chance. I do not know the cause.
