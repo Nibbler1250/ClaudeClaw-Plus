@@ -1321,14 +1321,9 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
   // They measure an intermittent no-reply, they are not isolation proof and have
   // no twin; the baseline row above carries the control-removed twin. Every
   // attempt still asserts no marker and no tool_use.
-  const classifierContract = (() => {
-    const source = readFileSync(join(import.meta.dir, "../../src/commands/discord.ts"), "utf8");
-    const start = source.indexOf("const systemPrompt = `");
-    const end = source.indexOf("`;", start);
-    return start >= 0 && end > start
-      ? source.slice(start + "const systemPrompt = `".length, end)
-      : "";
-  })();
+  // The classifier's instructions, taken from production's own builder (r14 moved the prompt out of
+  // `classifyThreadIntent`, so scraping the source text no longer finds it).
+  const classifierContract = classifierInput("").split("\n\n---\nUser message:")[0] ?? "";
   const ATTEMPTS = 5;
   const hangRecords: Array<{ probe: string; attempt: number; hung: boolean; exit: number }> = [];
 
@@ -1363,11 +1358,9 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     const trimmed = text.trim();
     return `productionParseOk=${parsed.ok}; outcome=${parsed.outcome}; action=${parsed.action ?? "none"}; namesCount=${parsed.names?.length ?? 0}; screenEcho=${/Return ONLY valid JSON/.test(trimmed)}; length=${trimmed.length}`;
   }
-  const PRODUCTION_MODEL = (() => {
-    const source = readFileSync(join(import.meta.dir, "../../src/commands/discord.ts"), "utf8");
-    const at = source.indexOf('route: "discord.classifier"');
-    return source.slice(at, at + 200).match(/model:\s*"(claude-[^"]+)"/)?.[1] ?? "";
-  })();
+  // The dated id production named until r14. It was retired on 15 Jun 2026; production now asks
+  // for the `haiku` alias. Kept as a probe that a retired id still fails closed fast.
+  const RETIRED_MODEL = "claude-sonnet-4-20250514";
 
   for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
     test(
@@ -1452,13 +1445,12 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
     );
   }
 
-  // ONE attempt on the production model id (retired). It must fail closed FAST: the
+  // ONE attempt on the retired model id. It must fail closed FAST: the
   // transcript holds only an API-error entry, so runOnceOnPty returns exit 1 at once
   // instead of waiting out the transcript bound, inside the classifier's 15 s deadline.
   test(
-    "PRODUCTION model id fails closed fast (retired model, 15 s classifier deadline)",
+    "RETIRED model id fails closed fast (15 s deadline)",
     async () => {
-      expect(PRODUCTION_MODEL).not.toBe("");
       const prompt = `${classifierContract}\n\n---\nUser message: please create a thread called release-notes`;
       // The harness's own evidence poll would add its wait to the measured latency.
       expectAssistant = false;
@@ -1472,7 +1464,7 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
           route: "discord.classifier",
           isolation: "untrusted",
           prompt,
-          model: PRODUCTION_MODEL,
+          model: RETIRED_MODEL,
           timeoutMs: 15_000,
         }),
       );

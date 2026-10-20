@@ -941,3 +941,108 @@ F4-15s-bound-back                           (fail) classifyThreadIntent: model, 
 ### Not done
 
 F3 counts, a second live sample of any row, and any change to the scan rule (see the options above). Version bump and PR are not started.
+
+## r14b: the escape scan's "unknown" rule, and the last integration run
+
+Commits `34496bd8` (rule, tests), a seam commit, `1cf2d133` (observed-RED comments, docs) and a final commit with the harness fix and this section. No PR, no GitHub comment, no version bump (2.2.353). Integration run 2 of 2, the last: [39428283596](https://github.com/TerrysPOV/ClaudeClaw-Plus/actions/runs/39428283596) on `1cf2d133`, Claude 2.1.304. **No third run.**
+
+### The rule (coordinator ruling on r14)
+
+1. **Only a process born after the child can be ours.** `findEscapees` reads each candidate's start time from `/proc/<pid>/stat` field 22 and skips any same-uid process that started before the leader's recorded start time (same ticks, from the r14 E change), readable or not.
+2. **A post-spawn same-uid process whose `environ` AND `cwd` both fail is "unknown"** (ENOENT/ESRCH still means gone). If only one fails, the readable one decides. I treat every non-gone error as a failed read, not only EACCES/EPERM, so a stranger error still fails closed.
+3. **Unknown keeps the root but does not fail the call.** It is not recorded as a group survivor. `markUnknownProcs` keeps the root and temp cwd, writes the pids and start times into `survivor.json`, and the sweep drops the hold once none of them is alive with the same start time (dead or recycled counts as gone). A restart reads the list back. A positively matched escapee that will not die, or a surviving group, still fails the call. `readdir(/proc)` failure still throws.
+4. **Logged, metadata only, once per process:** pid, errno of `environ` and of `cwd`, whether the daemon is an ancestor, and age relative to the leader in ms.
+
+Two choices the ruling did not spell out: quarantine removal (24 h) now counts only positive matches and a `/proc` listing failure, because a quarantined dir has no leader time to tell a stranger from a candidate and would otherwise be kept for ever on any host with a non-dumpable process of our uid; and the leader's start time is passed through `reapEscapees({ pid, startMs })`, so the supervisor never has to guess it.
+
+### Live results, run 2
+
+Result: **49 pass, 7 fail** of 56. The 7 failures are all one cause and none is an A row (below). Run 1 had failed everything after the positive control.
+
+| Row | Result |
+| --- | --- |
+| Positive control | pass (MCP, hooks and memory all fired) |
+| tools, MCP, hooks, memory, command flag, transcript cleanup, child env | control present: pass; twins RED as expected |
+| B1 trust, B2 API key, B3 `@` PTY and print, C look-alikes | control present: pass; twins RED as expected |
+| **A-login** | `authenticated=true; exit=0; assistantEntries=1; apiErrors=0; storageDirIsOperatorRoot=true; childHasOauthToken=false`; twin RED (`authenticated=false; exit=1`) |
+| **A-untouched** | `filesBefore=2; filesAfter=2; changed=[]`; twin RED (`filesAfter=16`) |
+| **A-paste** | `promptLength=2182`; mid-turn `paste-cache/<hash>.txt` and `projects/<cwd>/<uuid>.jsonl` hold the canary; `rootGone=true; operatorRootHolds=0; tmpdirHolds=[]`; twin RED (`rootGone=false`) |
+| **A-proc** | `processesNamingThrowawayRoot=0` |
+| HANG RATE tools baseline | 5/5 pass, 7.1 to 9.2 s each |
+| GENUINE message (haiku) | attempt 1 `exit=124` at 35.2 s (outcome null); attempt 2 `exit=0` at 7.5 s. Both pass: the row asserts no tool use and records the shape |
+| C1 persistence | control present: pass; twin RED |
+| **F3, 20 classifier messages** | see below |
+| HANG RATE classifier contract variant 1 to 5, "PRODUCTION model id fails closed fast", HANG RATE summary | **fail, 7 tests, harness only** (below) |
+
+**No unknown was logged on CI.** The scan's `escape scan could not read pid ...` line appears nowhere in the integration rows of this run (the harness prints those lines with a `scan-unknown:` prefix; the only text matches in the log are test names in the Linux step). So this run does not show what the unreadable process in run 1 was, or that the age filter is what fixed it: with no log, either the age filter skipped it or it did not occur this time. I cannot tell which, and one run cannot separate them.
+
+### F3: 20 ordinary classifier-shaped messages through the real untrusted PTY path
+
+```text
+[isolation-spike] F3 classifier: n=20; repliedFirstTime=20; repliedOnRetry=0; failedClosed=0; p50Ms=6586; p95Ms=6989; failReasons=[]
+```
+
+| Replied first time | Replied on retry | Failed closed | p50 | p95 |
+| --- | --- | --- | --- | --- |
+| 20 | 0 | 0 | 6 586 ms | 6 989 ms |
+
+**For Terry before the PR leaves draft: the latency is close to the bound.** Every call took about 6.6 to 7.0 s against the 8 s per-attempt timeout, so there is about 1 s of headroom at p95 and the retry was never exercised on real traffic. The GENUINE row's first attempt in this same run took 35 s to time out and the second 7.5 s, so a slow call is a live possibility; a first attempt that crosses 8 s becomes a retry (16 s total), and one that crosses it twice fails closed. 20 of 20 is a sample from one run, not a rate.
+
+### The 7 failures: my harness, not production
+
+Three rows of the harness read `src/commands/discord.ts` as text: the classifier contract (`const systemPrompt = `) and the model id (`model: "claude-..."`). My r14 change moved the prompt into `CLASSIFIER_SYSTEM_PROMPT` and the model to `"haiku"`, so the contract came back as `""` (`Expected to contain: "Return ONLY valid JSON or the word null."`, `Received: ""`, five times) and the model-id row had nothing to find. That also failed "HANG RATE summary", which counts the contract rows. I fixed all three after the run: the contract now comes from `classifierInput("")`, checked locally to contain the instruction line, and the retired-model row uses the literal `claude-sonnet-4-20250514`, renamed "RETIRED model id fails closed fast (15 s deadline)". **This fix is untested on CI: there is no run left.** The contract-variant hang-rate sample (5 attempts) was therefore not taken; the baseline variant was (5/5 fine).
+
+### Linux escape test (G): passed again
+
+Same run, step "Linux process tests", `Ran 65 tests across 4 files`, including:
+
+```text
+(pass) a descendant that calls setsid() (Linux) > is dead once the child is retired [59.45ms]
+(pass) a descendant that calls setsid() (Linux) > twin: with the scan switched off it survives the group kill (so the test above can fail) [57.63ms]
+(pass) processStartMs on Linux > is the /proc reading, and is steady across reads [0.15ms]
+```
+
+Passed in both runs (run 1: 4184 ms and 51 ms for the first two), so twice, which is not a statistical "reliably". This run's version passes the leader's start time from the PTY into the scan, so it also shows that the age filter does not skip a real escapee.
+
+### Local verification
+
+`src/oneshot src/runner src/__tests__/discord-classifier-isolation.test.ts src/commands`: **436 pass, 0 fail**. Full-repo lint 0 errors; typecheck ratchet 149 against baseline 149.
+
+### Fault injection, one site each, on a fresh `git archive` copy (baseline 121 pass, 0 fail), restored after (RED verbatim)
+
+All 19 went red. Assertion comments were written after these lines.
+
+```text
+R1-age-filter-removed                     (fail) findEscapees (fake /proc) > ignores an unreadable process that started before the leader: foreign, not unknown  [+1 more]
+R2-age-filter-inverted                    (fail) findEscapees (fake /proc) > ignores an unreadable process that started before the leader: foreign, not unknown  [+6 more]
+R3-single-failed-read-is-unknown          (fail) findEscapees (fake /proc) > is not unknown when only the environment cannot be read and the cwd says it is foreign  [+1 more]
+R4-unknown-ignored                        (fail) terminateEscapees (fake /proc) > hands unreadable processes to onUnknown and returns [], signalling nothing  [+1 more]
+R5-unreadable-ignored-entirely            (fail) findEscapees (fake /proc) > reports an unreadable process born after the leader as unknown, with metadata only  [+5 more]
+R6-readdir-failure-swallowed              (fail) findEscapees (fake /proc) > throws when /proc cannot be listed, and finds nothing for a root nobody carries  [+1 more]
+R7-ancestry-always-false                  (fail) findEscapees (fake /proc) > says whether the daemon is an ancestor of an unreadable process
+R8-positive-match-not-stopped             (fail) terminateEscapees (fake /proc) > SIGTERMs an escapee, and is done once the scan comes back empty  [+2 more]
+R9-hold-ignored-by-sweep                  (fail) unknown holds (r14b) > keeps the root and the temp cwd while the unreadable process lives with the same start time, then removes them  [+2 more]
+R10-hold-never-dropped                    (fail) unknown holds (r14b) > keeps the root and the temp cwd while the unreadable process lives with the same start time, then removes them  [+3 more]
+R11-start-time-ignored-in-liveness        (fail) unknown holds (r14b) > counts a recycled pid as gone: the same pid with another start time does not keep the root
+R12-unknown-not-persisted                 (fail) unknown holds (r14b) > writes the unknown pids and their start times into survivor.json, with the leader  [+1 more]
+R13-restart-ignores-recorded-unknown      (fail) unknown holds (r14b) > is re-registered after a restart while a recorded process lives, and removed once it is gone
+R14-unknown-recorded-as-group-survivor    (fail) unknown holds (r14b) > keeps the root and the temp cwd while the unreadable process lives with the same start time, then removes them  [+3 more]
+R15-log-every-time                        (fail) unknown holds (r14b) > logs metadata only: pid, errnos, ancestry and age, and nothing else
+R16-hold-fails-the-call                   (fail) r14b: an unreadable process is a hold on the root, not a failure > returns the reply, keeps the root and temp cwd, records no group survivor, and the sweeper removes them once the process is gone
+R17-hold-ignored-by-cleanup               (fail) r14b: an unreadable process is a hold on the root, not a failure > returns the reply, keeps the root and temp cwd, records no group survivor, and the sweeper removes them once the process is gone
+R18-leader-time-not-passed-to-scan        (fail) r14b: an unreadable process is a hold on the root, not a failure > hands the scan the leader's start time, and turns what it could not read into a hold on the root
+R19-leader-time-not-passed-by-retry       (fail) retrySurvivingGroups > terminates each recorded survivor again, with the identity recorded at spawn and no claim on the leader
+```
+
+### Security review notes (automated, on `34496bd8`)
+
+- **HIGH, unknown does not fail the call.** The coordinator's rule 3, not an oversight. Not changed. Mitigations in place: the log carries `descendant` and `ageMs`, the root is held while the process lives, and a positive match still fails. The reviewer's stronger fix (a cgroup or PID namespace for untrusted PTYs, so escapees can be killed without reading `/proc`) is the real answer and is a follow-up.
+- **MEDIUM, quarantine ignores unknowns.** Deliberate, for the reason given above.
+- **MEDIUM, `survivor.json` sits in the root the untrusted process can write.** Valid defence in depth, low in practice here: the untrusted argv is `--tools ""`, so claude cannot write files, and the daemon writes the record after the spawn. Follow-ups: keep the records in a daemon-owned directory or sign them; on adoption reject a null or future `startMs`. I did not reject a null `startMs` now because a hold with an unreadable start time is legitimate and dropping it would remove a root under a live writer.
+
+### Follow-ups
+
+- The other `claude-sonnet-4-20250514` uses: `src/oneshot/pty-trusted.test.ts:61`, `src/oneshot/http.test.ts:53` (test fixtures); the production site is fixed.
+- Re-run the integration workflow once (it was not allowed here) to confirm the harness fix and take the contract-variant hang sample.
+- Decide whether 8 s is enough: p95 6.99 s leaves little room.
+- The security-review items above.
