@@ -29,7 +29,7 @@ import {
 import * as cleanup from "../../src/oneshot/pty-cleanup.js";
 import { withPrintRuntime } from "../../src/oneshot/print.js";
 import { engines } from "../../src/oneshot/registry.js";
-import { UNTRUSTED_CLAUDE_ARGS } from "../../src/oneshot/isolation.js";
+import { PRINT_ONLY_UNTRUSTED_ARGS, UNTRUSTED_CLAUDE_ARGS } from "../../src/oneshot/isolation.js";
 
 const disposableCI =
   process.env.CI === "true" && process.env.GITHUB_ACTIONS === "true" && !!process.env.RUNNER_TEMP;
@@ -143,7 +143,11 @@ describe.skipIf(!disposableCI)("untrusted interactive PTY isolation — disposab
         }),
       );
       const canonical = __buildClaudeArgsForTests(options);
-      expect(canonical.slice(canonical.indexOf("--tools"))).toEqual([...UNTRUSTED_CLAUDE_ARGS]);
+      expect(canonical.slice(canonical.indexOf("--tools"))).toEqual(
+        UNTRUSTED_CLAUDE_ARGS.filter(
+          (arg) => !(PRINT_ONLY_UNTRUSTED_ARGS as readonly string[]).includes(arg),
+        ),
+      );
       const args = mutateArgs([...canonical]);
       console.info(`[isolation-spike] argv=${JSON.stringify(args)}`);
       let pty: PtyProcess;

@@ -303,8 +303,73 @@ function loadLibc(): void {
   }
 }
 
-export function withCleanProcessEnv<T>(fn: () => T): T {
+let _readNativeEnvironment: (() => Map<string, string>) | undefined;
+
+/** Enumerate libc, not process.env: Bun may have deleted a key only on the JS side. */
+function readNativeEnvironment(): Map<string, string> {
+  if (!_readNativeEnvironment) {
+    // biome-ignore lint/suspicious/noExplicitAny: platform-specific Bun FFI symbols
+    const { dlopen, FFIType, read, CString } = require("bun:ffi") as any;
+    const darwin = process.platform === "darwin";
+    const lib = dlopen(
+      darwin ? "/usr/lib/libSystem.B.dylib" : "libc.so.6",
+      darwin
+        ? { _NSGetEnviron: { args: [], returns: FFIType.ptr } }
+        : { dlsym: { args: [FFIType.ptr, FFIType.cstring], returns: FFIType.ptr } },
+    );
+    _readNativeEnvironment = () => {
+      const address = darwin
+        ? lib.symbols._NSGetEnviron()
+        : lib.symbols.dlsym(null, Buffer.from("environ\0"));
+      if (!address) throw new Error("Native environment isolation unavailable");
+      const entries = read.ptr(address);
+      if (!entries) throw new Error("Native environment isolation unavailable");
+      const values = new Map<string, string>();
+      // Bun supports 64-bit targets. environ is a NULL-terminated char**.
+      for (let index = 0; index < 65536; index++) {
+        const pointer = read.ptr(entries, index * 8);
+        if (!pointer) return values;
+        const entry = new CString(pointer).toString();
+        const split = entry.indexOf("=");
+        if (split > 0) values.set(entry.slice(0, split), entry.slice(split + 1));
+      }
+      throw new Error("Native environment isolation exceeded its entry bound");
+    };
+  }
+  return _readNativeEnvironment();
+}
+
+/** Exact policy for untrusted native spawns; never expose native values in diagnostics. */
+function withProcessEnvPolicy<T>(fn: () => T, policy: Record<string, string>): T {
+  // Fail closed before touching global state if native isolation is unavailable.
+  if (!_libcUnsetEnv || !_libcSetEnv) throw new Error("Native environment isolation unavailable");
+  const native = readNativeEnvironment();
+  const keys = [...new Set([...native.keys(), ...Object.keys(process.env)])].filter(
+    (key) => !Object.hasOwn(policy, key),
+  );
+  const js = new Map(keys.map((key) => [key, process.env[key]]));
+  try {
+    for (const key of keys) {
+      delete process.env[key];
+      if (_libcUnsetEnv(Buffer.from(`${key}\0`)) !== 0)
+        throw new Error("Native environment isolation failed");
+    }
+    return fn();
+  } finally {
+    for (const key of keys) {
+      const jsValue = js.get(key);
+      if (jsValue === undefined) delete process.env[key];
+      else process.env[key] = jsValue;
+      const value = native.get(key);
+      if (value === undefined) _libcUnsetEnv(Buffer.from(`${key}\0`));
+      else _libcSetEnv(Buffer.from(`${key}\0`), Buffer.from(`${value}\0`), 1);
+    }
+  }
+}
+
+export function withCleanProcessEnv<T>(fn: () => T, policy?: Record<string, string>): T {
   loadLibc();
+  if (policy) return withProcessEnvPolicy(fn, policy);
   const restore: Record<string, string | undefined> = {};
   for (const k of SPAWN_ENV_STRIP_KEYS) {
     const currentValue = process.env[k];

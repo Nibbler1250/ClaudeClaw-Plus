@@ -8,7 +8,7 @@ import { _setSettingsFileForTests, loadSettings, reloadSettings } from "../confi
 import { runOneShot, type OneShotRequest } from "./engine.js";
 import { engines } from "./registry.js";
 import { KNOWN_ROUTES, UNTRUSTED_ROUTES, parseOneShotSettings } from "./config.js";
-import { UNTRUSTED_CLAUDE_ARGS } from "./isolation.js";
+import { PRINT_ONLY_UNTRUSTED_ARGS, UNTRUSTED_CLAUDE_ARGS } from "./isolation.js";
 import { buildPrintArgs, withPrintRuntime } from "./print.js";
 import { PtyClosedError, __buildClaudeArgsForTests } from "../runner/pty-process.js";
 import {
@@ -277,9 +277,13 @@ describe("one-shot isolation contract", () => {
       expect(build).toBeDefined();
       const args = build!();
       const start = args.indexOf("--tools");
-      expect(args.slice(start, start + UNTRUSTED_CLAUDE_ARGS.length)).toEqual([
-        ...UNTRUSTED_CLAUDE_ARGS,
-      ]);
+      const expected =
+        engine.id === "pty"
+          ? UNTRUSTED_CLAUDE_ARGS.filter(
+              (arg) => !(PRINT_ONLY_UNTRUSTED_ARGS as readonly string[]).includes(arg),
+            )
+          : [...UNTRUSTED_CLAUDE_ARGS];
+      expect(args.slice(start, start + expected.length)).toEqual(expected);
       for (const flag of [
         "--mcp-config",
         "--resume",

@@ -30,11 +30,11 @@
  *   startup. When neither `sessionId` nor `newSessionId` is provided, we spawn
  *   without any session flag and Claude allocates internally. An untrusted
  *   one-shot (`isolation: "untrusted"`) takes neither flag even when an id is
- *   set: `buildClaudeArgs` returns early with `--no-session-persistence`.
+ *   set: `buildClaudeArgs` returns early with interactive isolation flags.
  */
 import { spawn as ptySpawn, type IPty } from "bun-pty";
 import type { SecurityConfig } from "../config";
-import { UNTRUSTED_CLAUDE_ARGS } from "../oneshot/isolation.js";
+import { untrustedInteractiveArgs } from "../oneshot/isolation.js";
 import { cliModelFlag } from "../oneshot/model.js";
 import { withCleanProcessEnv } from "../runner";
 import {
@@ -394,7 +394,7 @@ function buildClaudeArgs(opts: PtyProcessOptions): string[] {
   if (opts.isolation === "untrusted") {
     const model = cliModelFlag(opts.modelOverride);
     if (model) args.push("--model", model);
-    args.push(...UNTRUSTED_CLAUDE_ARGS);
+    args.push(...untrustedInteractiveArgs());
     return args;
   }
 
@@ -1181,14 +1181,16 @@ export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
       // key" interactive gate, and leaks the prompt + a truncated key into
       // the PTY (visible on Discord/Telegram). withCleanProcessEnv strips
       // those keys from process.env around the synchronous FFI call.
-      pty = withCleanProcessEnv(() =>
-        ptySpawn(cmd, args, {
-          name: "xterm-256color",
-          cols,
-          rows,
-          cwd: opts.cwd,
-          env: opts.env,
-        }),
+      pty = withCleanProcessEnv(
+        () =>
+          ptySpawn(cmd, args, {
+            name: "xterm-256color",
+            cols,
+            rows,
+            cwd: opts.cwd,
+            env: opts.env,
+          }),
+        opts.isolation === "untrusted" ? opts.env : undefined,
       );
     } catch (err) {
       reject(

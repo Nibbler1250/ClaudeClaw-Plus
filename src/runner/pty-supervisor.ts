@@ -68,6 +68,7 @@ import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";
 import { trustedToolFlags, validateIsolation } from "../oneshot/isolation.js";
 import { validateRouteEngine } from "../oneshot/config.js";
 import * as untrustedCleanup from "../oneshot/pty-cleanup.js";
+import { printRuntime } from "../oneshot/print.js";
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1491,7 +1492,12 @@ async function buildSpawnOptions(
   // the daemon's raw env regardless of the resolved model/provider.
   const runnerHelpers = await getRunnerHelpers();
   const cleanEnv = runnerHelpers.cleanSpawnEnv();
-  const childEnv = runnerHelpers.buildChildEnv(cleanEnv, modelOverride ?? "", api ?? "");
+  // Untrusted calls use print's exact caller policy, without trusted provider
+  // augmentation (which can reintroduce secrets excluded by that policy).
+  const childEnv =
+    entry.scope.isolation === "untrusted"
+      ? { ...(printRuntime()?.env ?? cleanEnv) }
+      : runnerHelpers.buildChildEnv(cleanEnv, modelOverride ?? "", api ?? "");
 
   let resolvedSecurityArgs = securityArgs;
   if (!resolvedSecurityArgs) {

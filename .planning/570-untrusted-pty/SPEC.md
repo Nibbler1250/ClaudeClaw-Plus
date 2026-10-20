@@ -43,3 +43,11 @@ Operator credentials/configuration, #559, unrelated integration failures, PR cre
 3. Run scoped unit contracts/lint, bump both versions, commit and push spike only.
 4. Dispatch/watch one integration workflow. Record each measured result.
 5. If all properties green and twins red, implement Step 3 and dispatch once more; otherwise stop and report blockers.
+
+## r3 ruling (2026-10-20)
+
+The previous failure was a startup blocker, not a red isolation property. Continue with the same branch. Declare the explicit print-only subset beside the canonical constant and derive interactive args by removing exactly it; transcript removal compensates for the persistence flag. Tests pin the subset to only that known exception and reject excluding tools/MCP/settings/commands.
+
+Use the same async-local caller environment as print for untrusted PTYs, without trusted provider augmentation. Because bun-pty merges native parent environment, constrain both its supplied environment and libc inheritance during the synchronous spawn; restore the parent's JS/native state afterwards. No credentials in argv, files or logs. Capture-only and native-inheritance unit tests precede implementation.
+
+Confirm remaining flags with local help without authentication, run unit checks and fault probes, bump both versions and publish. Allow one live workflow plus one startup-blocker retry. Any measured baseline canary leak stops rollout. Only all-green properties with demonstrated red twins authorize capability/default changes and the final workflow.

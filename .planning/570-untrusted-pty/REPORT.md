@@ -73,3 +73,22 @@ Authentication uses only the existing workflow's step-scoped secret environment.
 Stopped at the red spike as instructed. No measured leak can be claimed, and interactive isolation remains unproved. Exact shared argv parity currently conflicts with successful interactive startup because the CLI rejects a shared print-only flag. The new cleanup compensates for transcript persistence only once the PTY can boot; simulated unit files prove its local behavior, not the live security property. Source inspection also identifies a possible caller-environment policy gap, which remains unmeasured.
 
 Step 3 is deliberately deferred: no capability flip, untrusted default change, default-to-print mutation probe, README edit or public engine-guide claim. The Claude security review remains for the coordinator before any PR. No prior-art code copied; existing shared argv and supervisor seams reused. `.planning/559-pty-submit/`, `.serena/`, scratchpads and other pre-existing untracked state remain untouched. The cancelled option B draft is still stashed.
+
+## r3 continuation
+
+The coordinator explicitly authorized continuing past the startup blocker. Added the single print-only subset and derived interactive argv; no critical isolation flag is omitted. Local help/version check (no auth) on 2.1.304 confirmed the other four flags have no print-only restriction. The transcript cleanup remains the explicit persistence compensation.
+
+Fixed the confirmed caller-environment policy gap: untrusted PTY uses print's async-local override or the same clean default, without trusted provider augmentation. Its native FFI spawn applies that exact key policy to both JS and libc environments, including native-only keys, and restores each snapshot separately. Trusted strip-list semantics remain intact. Unit tests capture the caller policy and use a real harmless shell PTY with a native-only canary to prove no inheritance and restoration after success/throw; no local Claude model/auth calls.
+
+Single-site fault probes, all restored:
+
+```text
+(fail) the actual untrusted PTY spawn preserves every interactive isolation argument [29.76ms]
+(fail) the print-only exception is exactly the explicit compensated persistence flag [2.56ms]
+(fail) untrusted PTY spawn uses the exact same caller environment policy as print [23.25ms]
+(fail) untrusted native PTY inheritance excludes even native-only variables and restores the parent [33.12ms]
+```
+
+The faults respectively removed strict MCP isolation, added tools to the print-only subset, bypassed the caller override, and bypassed the native policy at the FFI boundary. Environment comparisons emit only booleans on failure. No injected fault remains.
+
+Local required one-shot/session checks: **174 pass, 4 skip, 0 fail**. Runner/PTY checks (including `runner.test.ts`): **193 pass, 0 fail**. Whole-repo lint: **0 errors, 1302 warnings, 324 infos**. Typecheck ratchet **149 against baseline 149**. Both version scripts produced **2.2.346**. Live workflow results pending below.

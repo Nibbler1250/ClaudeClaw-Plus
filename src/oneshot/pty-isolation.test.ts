@@ -3,7 +3,11 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { _setSettingsFileForTests, loadSettings } from "../config.js";
-import { __buildClaudeArgsForTests, type PtyProcessOptions } from "../runner/pty-process.js";
+import {
+  __buildClaudeArgsForTests,
+  spawnPty,
+  type PtyProcessOptions,
+} from "../runner/pty-process.js";
 import {
   __resetSupervisorForTests,
   injectOneShotTrustForTests,
@@ -11,7 +15,8 @@ import {
   runOnceOnPty,
 } from "../runner/pty-supervisor.js";
 import { untrustedPtyProjectDir } from "./pty-cleanup.js";
-import { UNTRUSTED_CLAUDE_ARGS } from "./isolation.js";
+import { PRINT_ONLY_UNTRUSTED_ARGS, UNTRUSTED_CLAUDE_ARGS } from "./isolation.js";
+import { withPrintRuntime } from "./print.js";
 import { engines } from "./registry.js";
 
 let dir: string;
@@ -69,12 +74,100 @@ const request = {
   timeoutMs: 1000,
 };
 
-it("the actual untrusted PTY spawn preserves the complete shared isolation argv", async () => {
+it("the actual untrusted PTY spawn preserves every interactive isolation argument", async () => {
   fakeSpawn();
   expect((await runOnceOnPty(request)).exitCode).toBe(0);
   expect(spawned).toHaveLength(1);
   const args = __buildClaudeArgsForTests(spawned[0]!);
-  expect(args.slice(args.indexOf("--tools"))).toEqual([...UNTRUSTED_CLAUDE_ARGS]);
+  expect(args.slice(args.indexOf("--tools"))).toEqual(
+    UNTRUSTED_CLAUDE_ARGS.filter(
+      (arg) => !(PRINT_ONLY_UNTRUSTED_ARGS as readonly string[]).includes(arg),
+    ),
+  );
+});
+
+it("the print-only exception is exactly the explicit compensated persistence flag", () => {
+  expect([...PRINT_ONLY_UNTRUSTED_ARGS]).toEqual(["--no-session-persistence"]);
+  for (const required of [
+    "--tools",
+    "--strict-mcp-config",
+    "--setting-sources",
+    "--disable-slash-commands",
+  ]) {
+    expect(PRINT_ONLY_UNTRUSTED_ARGS as readonly string[]).not.toContain(required);
+  }
+});
+
+it("untrusted PTY spawn uses the exact same caller environment policy as print", async () => {
+  fakeSpawn();
+  const env = { PATH: "/usr/bin:/bin", HOME: dir, ONESHOT_ALLOWED_CANARY: "EXAMPLE_PLACEHOLDER" };
+  await withPrintRuntime({ env }, () => runOnceOnPty({ ...request, model: "glm" }));
+  expect(spawned).toHaveLength(1);
+  // Compare in memory: a failed assertion must never dump a real environment.
+  expect(
+    JSON.stringify(Object.entries(spawned[0]!.env).sort()) ===
+      JSON.stringify(Object.entries(env).sort()),
+  ).toBe(true);
+});
+
+it("untrusted native PTY inheritance excludes even native-only variables and restores the parent", async () => {
+  const { dlopen, FFIType } = await import("bun:ffi");
+  const library = dlopen(
+    process.platform === "darwin" ? "/usr/lib/libSystem.B.dylib" : "libc.so.6",
+    {
+      setenv: { args: [FFIType.cstring, FFIType.cstring, FFIType.i32], returns: FFIType.i32 },
+      unsetenv: { args: [FFIType.cstring], returns: FFIType.i32 },
+      getenv: { args: [FFIType.cstring], returns: FFIType.cstring },
+    },
+  );
+  const name = `ONESHOT_NATIVE_TEST_${process.pid}`;
+  const key = Buffer.from(`${name}\0`);
+  const previous = library.symbols.getenv(key)?.toString();
+  const savedJs = process.env[name];
+  const marker = join(dir, "inherited");
+  const done = join(dir, "child-ready");
+  // Seed libc only. process.env can be missing an inherited native variable.
+  library.symbols.setenv(key, Buffer.from("EXAMPLE_PLACEHOLDER\0"), 1);
+  delete process.env[name];
+  let child: Awaited<ReturnType<typeof spawnPty>> | undefined;
+  try {
+    child = await spawnPty({
+      sessionId: "",
+      cwd: dir,
+      isolation: "untrusted",
+      env: { PATH: "/usr/bin:/bin" },
+      security: { level: "moderate", allowedTools: [], disallowedTools: [] },
+      _commandOverride: "/bin/sh",
+      _skipReadySettle: true,
+      _argsOverride: [
+        "-c",
+        `if [ -n "$${name}" ]; then touch '${marker}'; fi; touch '${done}'; cat`,
+      ],
+    });
+    const deadline = Date.now() + 2000;
+    while (!existsSync(done) && Date.now() < deadline)
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(existsSync(done)).toBe(true);
+    expect(existsSync(marker)).toBe(false);
+    // A failed assertion prints only a boolean, never a native value.
+    expect(library.symbols.getenv(key)?.toString() === "EXAMPLE_PLACEHOLDER").toBe(true);
+    expect(process.env[name] === undefined).toBe(true);
+    const { withCleanProcessEnv } = await import("../runner.js");
+    expect(() =>
+      withCleanProcessEnv(() => {
+        throw new Error("expected probe failure");
+      }, {}),
+    ).toThrow("expected probe failure");
+    expect(library.symbols.getenv(key)?.toString() === "EXAMPLE_PLACEHOLDER").toBe(true);
+    expect(process.env[name] === undefined).toBe(true);
+  } finally {
+    await child?.dispose();
+    if (previous === undefined) library.symbols.unsetenv(key);
+    else library.symbols.setenv(key, Buffer.from(`${previous}\0`), 1);
+    if (savedJs === undefined) delete process.env[name];
+    else process.env[name] = savedJs;
+    library.close();
+  }
 });
 
 for (const failure of [false, true]) {

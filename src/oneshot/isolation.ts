@@ -11,6 +11,18 @@ export const UNTRUSTED_CLAUDE_ARGS = [
   "--disable-slash-commands",
 ] as const;
 
+/** Explicit interactive exceptions; each needs a compensating control. */
+export const PRINT_ONLY_UNTRUSTED_ARGS = [
+  // Interactive sessions persist: runOnceOnPty's finally removes their project transcripts.
+  "--no-session-persistence",
+] as const;
+
+export function untrustedInteractiveArgs(): string[] {
+  return UNTRUSTED_CLAUDE_ARGS.filter(
+    (arg) => !(PRINT_ONLY_UNTRUSTED_ARGS as readonly string[]).includes(arg),
+  );
+}
+
 /** Also applied by engine entry points, so direct calls cannot bypass it. */
 export function validateIsolation(req: import("./engine.js").OneShotRequest): void {
   if (req.isolation !== "untrusted" && req.isolation !== "trusted-session")
