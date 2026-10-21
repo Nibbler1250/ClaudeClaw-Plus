@@ -43,6 +43,7 @@ import {
 } from "../sessionManager";
 import {
   PtyClosedError,
+  PtyPromptNotAcceptedError,
   PtyTurnTimeoutError,
   type PtyProcess,
   type PtyProcessOptions,
@@ -505,6 +506,35 @@ describe("pty-supervisor retry and backoff", () => {
     const next = await runOnPty("global", "again", { timeoutMs: 1000 });
     expect(next.exitCode).toBe(0);
     expect(next.rawStdout).toBe("second");
+    expect(spawned).toHaveLength(2);
+  });
+
+  it("#562: a prompt claude never accepted is an error (exit 1, never 0), runs once, and retires the entry", async () => {
+    // Retries are allowed on purpose: a re-sent prompt could land twice, so this must not retry.
+    injectMaxRetriesForTests(3);
+    injectSleep(async () => {});
+    let turns = 0;
+    const { spawn, spawned } = makeSpawnTracker(() =>
+      makeFakePty("not-accepted", {
+        onTurn: async () => {
+          turns += 1;
+          if (turns === 1) throw new PtyPromptNotAcceptedError("not-accepted", 6000);
+          return { text: "second", bytesCaptured: 1, cleanBoundary: true, sessionId: "sid" };
+        },
+      }),
+    );
+    injectSpawnPty(spawn);
+    const result = await runOnPty("global", "p", { timeoutMs: 1000 });
+    // Fault: let the error fall through to the retry path and this is a respawn + exit 0.
+    expect(result.exitCode).toBe(1);
+    expect(result.rawStdout).toBe("");
+    expect(result.stderr).toContain("not accepted");
+    expect(turns).toBe(1);
+    // The TUI's state is unknown after a prompt it never took up: retire it, as on a timeout.
+    expect(spawned[0]?.disposed).toBe(true);
+    expect(snapshotSupervisor().ptys).toHaveLength(0);
+    const next = await runOnPty("global", "again", { timeoutMs: 1000 });
+    expect(next.exitCode).toBe(0);
     expect(spawned).toHaveLength(2);
   });
 

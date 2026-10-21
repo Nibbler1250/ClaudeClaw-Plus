@@ -542,7 +542,10 @@ describe("PtyProcess — Bypass Permissions boot dialog (issue #460)", () => {
       }),
     );
     expect(proc.isAlive()).toBe(true);
-    const result = await proc.runTurn("✻ after-dialog shift+tab to cycle", { timeoutMs: 5000 });
+    const result = await proc.runTurn(
+      "✻ after-dialog esc to interrupt · Baked for 1s · done 16:36",
+      { timeoutMs: 5000 },
+    );
     expect(proc.isAlive()).toBe(true);
     expect(result.text).toContain("after-dialog");
     await proc.dispose();
@@ -636,9 +639,12 @@ describe("PtyProcess — project MCP server approval dialog (issue #469)", () =>
         }),
       );
       expect(proc.isAlive()).toBe(true);
-      const result = await proc.runTurn("✻ after-mcp-dialog shift+tab to cycle", {
-        timeoutMs: 5000,
-      });
+      const result = await proc.runTurn(
+        "✻ after-mcp-dialog esc to interrupt · Baked for 1s · done 16:36",
+        {
+          timeoutMs: 5000,
+        },
+      );
       expect(proc.isAlive()).toBe(true);
       expect(result.text).toContain("after-mcp-dialog");
       await proc.dispose();
@@ -657,9 +663,12 @@ describe("PtyProcess — project MCP server approval dialog (issue #469)", () =>
         sentinelMaxWaitMs: 5000,
       }),
     );
-    const result = await proc.runTurn("✻ slow-next-screen shift+tab to cycle", {
-      timeoutMs: 5000,
-    });
+    const result = await proc.runTurn(
+      "✻ slow-next-screen esc to interrupt · Baked for 1s · done 16:36",
+      {
+        timeoutMs: 5000,
+      },
+    );
     expect(proc.isAlive()).toBe(true);
     expect(result.text).toContain("slow-next-screen");
     await proc.dispose();
@@ -682,7 +691,10 @@ describe("PtyProcess — project MCP server approval dialog (issue #469)", () =>
         sentinelMaxWaitMs: 5000,
       }),
     );
-    const result = await proc.runTurn("✻ late-dialog shift+tab to cycle", { timeoutMs: 5000 });
+    const result = await proc.runTurn(
+      "✻ late-dialog esc to interrupt · Baked for 1s · done 16:36",
+      { timeoutMs: 5000 },
+    );
     expect(proc.isAlive()).toBe(true);
     expect(result.text).toContain("late-dialog");
     await proc.dispose();
@@ -749,10 +761,10 @@ describe("PtyProcess — runTurn sentinel-echo (clean boundary)", () => {
   // status-box row and in resumed scrollback. Real claude emits
   // spinners while generating; `/bin/cat` doesn't, so we slip one
   // into the prompt and let cat echo it back to satisfy the gate.
-  // The prompts ALSO carry the idle REPL footer "to cycle" (issue #316):
-  // the parser only treats quiet as turn-completion once claude has returned
-  // to the idle prompt. `/bin/cat` echoes it back, standing in for the footer
-  // real claude paints when a turn finishes.
+  // The prompts ALSO carry `esc to interrupt` (the turn-start edge, #562) and a
+  // done-summary (the turn-done signal, #369): the parser only completes a turn
+  // that was seen running and has since returned to idle. `/bin/cat` echoes them
+  // back, standing in for the chrome real claude paints.
 
   test("cat echoes the sentinel back → cleanBoundary=true", async () => {
     const proc = await spawnPty(
@@ -763,7 +775,10 @@ describe("PtyProcess — runTurn sentinel-echo (clean boundary)", () => {
         sentinelMaxWaitMs: 5000,
       }),
     );
-    const result = await proc.runTurn("✻ hello world shift+tab to cycle", { timeoutMs: 5000 });
+    const result = await proc.runTurn(
+      "✻ hello world esc to interrupt · Baked for 1s · done 16:36",
+      { timeoutMs: 5000 },
+    );
     expect(result.cleanBoundary).toBe(true);
     // cat echoes the prompt; the response should contain it.
     expect(result.text.toLowerCase()).toContain("hello world");
@@ -781,7 +796,7 @@ describe("PtyProcess — runTurn sentinel-echo (clean boundary)", () => {
         sentinelMaxWaitMs: 5000,
       }),
     );
-    const longPrompt = `✻ ${"x".repeat(500)} shift+tab to cycle`;
+    const longPrompt = `✻ ${"x".repeat(500)} esc to interrupt · Baked for 1s · done 16:36`;
     const result = await proc.runTurn(longPrompt, { timeoutMs: 5000 });
     expect(result.cleanBoundary).toBe(true);
     expect(result.text).toContain("x".repeat(20));
@@ -798,12 +813,15 @@ describe("PtyProcess — runTurn sentinel-echo (clean boundary)", () => {
       }),
     );
     let chunkBytes = 0;
-    const result = await proc.runTurn("✻ streaming-test-payload shift+tab to cycle", {
-      timeoutMs: 5000,
-      onChunk: (s) => {
-        chunkBytes += s.length;
+    const result = await proc.runTurn(
+      "✻ streaming-test-payload esc to interrupt · Baked for 1s · done 16:36",
+      {
+        timeoutMs: 5000,
+        onChunk: (s) => {
+          chunkBytes += s.length;
+        },
       },
-    });
+    );
     expect(result.cleanBoundary).toBe(true);
     expect(chunkBytes).toBeGreaterThan(0);
     await proc.dispose();
@@ -837,7 +855,7 @@ describe("PtyProcess — runTurn sentinel max-wait fallback", () => {
         // activity gate looks for never appeared; octal is portable.
         _argsOverride: [
           "-c",
-          "stty -echo; read _; printf '\\342\\234\\273 shift+tab to cycle'; sleep 5",
+          "stty -echo; read _; printf '\\033]0;\\342\\227\\220 w\\007\\342\\234\\273 shift+tab to cycle'; sleep 5",
         ],
         quietWindowMs: 50,
         sentinelMaxWaitMs: 250,
@@ -871,7 +889,7 @@ describe("PtyProcess — runTurn sentinel max-wait fallback", () => {
         _commandOverride: "/bin/sh",
         _argsOverride: [
           "-c",
-          "echo BANNER_BANNER_BANNER_PRETURN; stty -echo; read _; printf '\\342\\234\\273 response-bytes-during-turn shift+tab to cycle'; sleep 5",
+          "echo BANNER_BANNER_BANNER_PRETURN; stty -echo; read _; printf '\\033]0;\\342\\227\\220 w\\007\\342\\234\\273 response-bytes-during-turn shift+tab to cycle'; sleep 5",
         ],
         quietWindowMs: 100,
         sentinelMaxWaitMs: 400,
@@ -928,7 +946,9 @@ describe("PtyProcess — sentinel UUID override hook", () => {
         _sentinelUuidOverride: () => "pinned-uuid-1234",
       }),
     );
-    const result = await proc.runTurn("✻ hi shift+tab to cycle", { timeoutMs: 5000 });
+    const result = await proc.runTurn("✻ hi esc to interrupt · Baked for 1s · done 16:36", {
+      timeoutMs: 5000,
+    });
     expect(result.cleanBoundary).toBe(true);
     await proc.dispose();
   });
@@ -949,7 +969,9 @@ describe("PtyProcess — concurrency", () => {
     // per Codex P1 on PR #124); without it the first turn never
     // completes and the test times out instead of exercising the
     // concurrency rejection.
-    const t1 = proc.runTurn("✻ first shift+tab to cycle", { timeoutMs: 5000 });
+    const t1 = proc.runTurn("✻ first esc to interrupt · Baked for 1s · done 16:36", {
+      timeoutMs: 5000,
+    });
     let err: unknown;
     try {
       await proc.runTurn("✻ second", { timeoutMs: 5000 });

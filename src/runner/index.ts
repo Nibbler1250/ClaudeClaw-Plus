@@ -14,6 +14,7 @@ export {
   sanitizePtyPromptText,
   PtyTurnTimeoutError,
   PtyClosedError,
+  PtyPromptNotAcceptedError,
   type PtyProcess,
   type PtyProcessOptions,
   type PtyTurnResult,

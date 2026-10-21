@@ -62,7 +62,7 @@
 // mixing forms makes greps lie and risks breakage if we ever flip to
 // `moduleResolution: nodenext` (which requires the extension).
 import type { PtyProcess, PtyProcessOptions, PtyTurnResult, SpawnPty } from "./pty-process.js";
-import { PtyClosedError, PtyTurnTimeoutError } from "./pty-process.js";
+import { PtyClosedError, PtyPromptNotAcceptedError, PtyTurnTimeoutError } from "./pty-process.js";
 import { ensureTrustAccepted } from "./pty-trust-prompt.js";
 import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";
 import { trustedToolFlags, validateIsolation } from "../oneshot/isolation.js";
@@ -1163,7 +1163,9 @@ export async function sendToLiveSession(
         return { status: "failed", error: "aborted", timedOut: false, aborted: true };
       }
       const timedOut = err instanceof PtyTurnTimeoutError;
-      if (timedOut) await retireEntry(entry);
+      // #562: a prompt claude never took up leaves the TUI in a state we cannot read;
+      // retire it as on a timeout so the next call respawns and resumes cleanly.
+      if (timedOut || err instanceof PtyPromptNotAcceptedError) await retireEntry(entry);
       return { status: "failed", error: (err as Error).message, timedOut, aborted: false };
     }
   }
@@ -2296,6 +2298,9 @@ async function runTurnWithRetries(
       lastErr = err;
       const retryable = err instanceof PtyClosedError || err instanceof PtyTurnTimeoutError;
       if (!retryable) {
+        // #562: the PTY is alive but never started the turn. Not retried here (a re-sent
+        // prompt could land twice), and not reported as success: the caller gets exit 1.
+        if (err instanceof PtyPromptNotAcceptedError) await retireEntry(entry);
         return errorResult(
           `[pty-supervisor] non-retryable error on ${entry.sessionKey}: ${(err as Error).message}`,
         );

@@ -133,6 +133,10 @@ export interface PtyProcessOptions {
   /** Quiet window (ms) of inactivity before runTurn writes the sentinel.
    *  Default: 500. */
   quietWindowMs?: number;
+  /** How long (ms) to wait for evidence the prompt was ACCEPTED (the turn-start
+   *  edge, #562) before re-sending the submit key once, and again before failing
+   *  the turn with `PtyPromptNotAcceptedError`. Default: 3000. */
+  submitConfirmMs?: number;
   /** Hard cap (ms) waiting for the sentinel echo after we write it. After
    *  this elapses with no echo, the turn completes with cleanBoundary=false.
    *  Default: 30_000. */
@@ -254,6 +258,24 @@ export class PtyTurnTimeoutError extends Error {
   }
 }
 
+/**
+ * The prompt was written but claude never showed a turn running (#562): the
+ * paste sat unsubmitted in the input box, or the TUI is wedged. Raised instead
+ * of completing the turn on whatever the screen happened to show. NOT retried by
+ * the supervisor: the process is alive, and a re-sent prompt could land twice.
+ */
+export class PtyPromptNotAcceptedError extends Error {
+  constructor(
+    public readonly label: string,
+    public readonly elapsedMs: number,
+  ) {
+    super(
+      `PTY prompt not accepted for ${label}: no turn started within ${elapsedMs}ms of the send and one submit retry`,
+    );
+    this.name = "PtyPromptNotAcceptedError";
+  }
+}
+
 export class PtyClosedError extends Error {
   constructor(
     public readonly label: string,
@@ -269,6 +291,7 @@ export class PtyClosedError extends Error {
 
 const DEFAULT_QUIET_WINDOW_MS = 500;
 const DEFAULT_SENTINEL_MAX_WAIT_MS = 30_000;
+const DEFAULT_SUBMIT_CONFIRM_MS = 3000;
 const DEFAULT_QUIET_TICK_MS = 50;
 const DEFAULT_COLS = 100;
 const DEFAULT_ROWS = 30;
@@ -458,6 +481,7 @@ class PtyProcessImpl implements PtyProcess {
   private _pty: IPty;
   private readonly _quietWindowMs: number;
   private readonly _sentinelMaxWaitMs: number;
+  private readonly _submitConfirmMs: number;
   private readonly _now: () => number;
   private readonly _setTimeout: (cb: () => void, ms: number) => ReturnType<typeof setTimeout>;
   private readonly _clearTimeout: (handle: ReturnType<typeof setTimeout>) => void;
@@ -479,6 +503,9 @@ class PtyProcessImpl implements PtyProcess {
   private _turnHardTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
   private _quietTickHandle: ReturnType<typeof setInterval> | null = null;
   private _sentinelDeadlineHandle: ReturnType<typeof setTimeout> | null = null;
+  /** #562: fires while no turn-start edge has been seen; retries the submit once. */
+  private _submitConfirmHandle: ReturnType<typeof setTimeout> | null = null;
+  private _submitRetried = false;
   private _turnStartedAt = 0;
   /** Sentinel state for the current turn. */
   private _activeSentinelBytes: Uint8Array | null = null;
@@ -519,6 +546,7 @@ class PtyProcessImpl implements PtyProcess {
     this.label = `${opts.agentName ?? "pty"}:${pty.pid}`;
     this._quietWindowMs = opts.quietWindowMs ?? DEFAULT_QUIET_WINDOW_MS;
     this._sentinelMaxWaitMs = opts.sentinelMaxWaitMs ?? DEFAULT_SENTINEL_MAX_WAIT_MS;
+    this._submitConfirmMs = opts.submitConfirmMs ?? DEFAULT_SUBMIT_CONFIRM_MS;
     this._now = opts._now ?? (() => Date.now());
     this._setTimeout = opts._setTimeout ?? ((cb, ms) => setTimeout(cb, ms));
     this._clearTimeout = opts._clearTimeout ?? ((h) => clearTimeout(h));
@@ -628,8 +656,10 @@ class PtyProcessImpl implements PtyProcess {
 
     const events = feed(this._parser, bytes, now);
 
-    // onChunk streaming — opportunistic delta delivery.
-    if (this._turnInProgress && this._onChunk) {
+    // onChunk streaming — opportunistic delta delivery. Only once the turn has
+    // started (#562): before that the screen is a repaint of the previous
+    // conversation, which a streaming caller would show as this turn's output.
+    if (this._turnInProgress && this._parser.sawTurnStartEdge && this._onChunk) {
       const decoded = this._streamDecoder.decode(bytes, { stream: true });
       const stripped = stripAnsiInline(decoded);
       if (stripped.length > 0) {
@@ -643,7 +673,7 @@ class PtyProcessImpl implements PtyProcess {
 
     // onToolEvent — best-effort detection of `⏺ <ToolName>(<args>)` and
     // `  ⎿ <result>` lines.
-    if (this._turnInProgress && this._onToolEvent) {
+    if (this._turnInProgress && this._parser.sawTurnStartEdge && this._onToolEvent) {
       const text = new TextDecoder().decode(bytes);
       const stripped = stripAnsiInline(text).replace(/\r\n/g, "\n").replace(/\r/g, "");
       for (const line of stripped.split("\n")) {
@@ -771,6 +801,8 @@ class PtyProcessImpl implements PtyProcess {
         }, opts.timeoutMs);
       }
 
+      this._armSubmitConfirm();
+
       // Tick the quiet timer until the parser fires `quiet`, then write the
       // sentinel; once written, the timer continues to enforce the sentinel
       // max-wait deadline.
@@ -785,6 +817,48 @@ class PtyProcessImpl implements PtyProcess {
         }
       }, DEFAULT_QUIET_TICK_MS);
     });
+  }
+
+  /**
+   * #562: positive evidence the prompt was accepted is the parser's turn-start
+   * edge. Until it shows, the screen may be the old conversation repainted around
+   * a paste that was never submitted (or whose CR landed inside the paste). Wait
+   * `submitConfirmMs`, press Enter once more (harmless on an empty input box if
+   * the first one WAS accepted), wait again, then fail the turn: never complete
+   * it on stale output.
+   */
+  private _clearSubmitConfirm(): void {
+    if (this._submitConfirmHandle != null) {
+      this._clearTimeout(this._submitConfirmHandle);
+      this._submitConfirmHandle = null;
+    }
+  }
+
+  private _armSubmitConfirm(): void {
+    this._submitRetried = false;
+    const check = (): void => {
+      this._submitConfirmHandle = null;
+      if (!this._turnInProgress || this._parser.sawTurnStartEdge) return;
+      if (!this._submitRetried) {
+        this._submitRetried = true;
+        try {
+          dumpPtyTrace(`>> pid=${this._pid} retry submit (no turn-start edge)`, "");
+          this._pty.write("\r");
+        } catch (err) {
+          this._rejectTurn(err instanceof Error ? err : new Error(String(err)));
+          return;
+        }
+        this._submitConfirmHandle = this._setTimeout(check, this._submitConfirmMs);
+        return;
+      }
+      // Still nothing: clear whatever sits in the input box so it cannot be
+      // submitted by the NEXT turn's CR, then fail.
+      this._writeSentinelCleanup(true);
+      this._rejectTurn(
+        new PtyPromptNotAcceptedError(this.label, this._now() - this._turnStartedAt),
+      );
+    };
+    this._submitConfirmHandle = this._setTimeout(check, this._submitConfirmMs);
   }
 
   /**
@@ -837,8 +911,8 @@ class PtyProcessImpl implements PtyProcess {
    * No trailing `\r` — the supervisor's next `runTurn` submits via its own
    * prompt write.
    */
-  private _writeSentinelCleanup(): void {
-    if (!this._activeSentinelBytes) return;
+  private _writeSentinelCleanup(force = false): void {
+    if (!this._activeSentinelBytes && !force) return;
     try {
       this._pty.write("\x15");
     } catch {
@@ -853,7 +927,12 @@ class PtyProcessImpl implements PtyProcess {
     // prompt write — which we never see because prompts go OUT, not back IN)
     // up to the sentinel echo. We don't see our own prompt-write echo from
     // claude either; claude submits on Enter and doesn't re-echo the line.
-    const turnStart = this._parser.turnStartOffset;
+    // #562: from the turn-start edge, not the send. What arrived between the two is
+    // the repaint of the previous conversation, and its last `●` block would
+    // otherwise be extracted as this turn's answer.
+    const turnStart = this._parser.sawTurnStartEdge
+      ? this._parser.turnEdgeOffset
+      : this._parser.turnStartOffset;
     const allBytes = concatBytes(this._turnBuf, this._turnBufLen);
     // turnStart is an offset into the stream; the buffer starts at the same
     // origin (we cleared it at runTurn entry), so we slice directly.
@@ -890,6 +969,7 @@ class PtyProcessImpl implements PtyProcess {
       this._clearTimeout(this._sentinelDeadlineHandle);
       this._sentinelDeadlineHandle = null;
     }
+    this._clearSubmitConfirm();
 
     // Send cleanup bytes to clear claude's prompt buffer.
     this._writeSentinelCleanup();
@@ -928,6 +1008,7 @@ class PtyProcessImpl implements PtyProcess {
       this._clearTimeout(this._sentinelDeadlineHandle);
       this._sentinelDeadlineHandle = null;
     }
+    this._clearSubmitConfirm();
     resetTurn(this._parser);
     this._activeSentinelBytes = null;
     this._activeSentinelString = "";

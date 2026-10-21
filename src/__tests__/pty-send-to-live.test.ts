@@ -24,6 +24,7 @@ import {
 import {
   type PtyProcess,
   type PtyProcessOptions,
+  PtyPromptNotAcceptedError,
   PtyTurnTimeoutError,
   type PtyTurnResult,
 } from "../runner/pty-process";
@@ -452,6 +453,23 @@ describe("sendToLiveSession", () => {
     expect(r.status).toBe("failed");
     if (r.status !== "failed") throw new Error("unreachable");
     expect(r.timedOut).toBe(true);
+    expect(spawned[0].disposed).toBe(true);
+    expect(supervisorEntryCount()).toBe(0);
+  });
+
+  it("#562: a prompt claude never accepted reports failed (not sent) and retires the entry", async () => {
+    await seed("global");
+    spawned[0].runTurn = (async () => {
+      throw new PtyPromptNotAcceptedError("fake", 6000);
+    }) as PtyProcess["runTurn"];
+
+    const r = await sendToLiveSession("global", "/compact", { timeoutMs: 5000 });
+
+    // Fault: drop the retire and the entry stays live on a TUI we cannot read.
+    expect(r.status).toBe("failed");
+    if (r.status !== "failed") throw new Error("unreachable");
+    expect(r.error).toContain("not accepted");
+    expect(r.timedOut).toBe(false);
     expect(spawned[0].disposed).toBe(true);
     expect(supervisorEntryCount()).toBe(0);
   });
