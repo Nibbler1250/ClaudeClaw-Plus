@@ -582,7 +582,7 @@ describe("pty-output-parser — sentinel flow (synthetic)", () => {
     const uuid = "uuid-316-cuf";
     const sentinelBytes = encodeSentinel(buildSentinel(uuid));
 
-    const now = 1000;
+    let now = 1000;
     startTurn(parser, uuid, sentinelBytes, now);
 
     // claude 2.1.89+ renders inter-word spaces as CUF (cursor-forward)
@@ -729,7 +729,7 @@ describe("pty-output-parser — sentinel flow (synthetic)", () => {
     const uuid = "uuid-split";
     const sentinelBytes = encodeSentinel(buildSentinel(uuid));
 
-    const now = 1000;
+    let now = 1000;
     startTurn(parser, uuid, sentinelBytes, now);
 
     feed(parser, new Uint8Array([0xe2]), now);

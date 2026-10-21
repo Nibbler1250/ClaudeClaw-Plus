@@ -103,8 +103,8 @@ describe("TranscriptTurn — acceptance", () => {
   });
 
   test("a prompt the CLI recorded as a paste is wrapped in pasted_content tags and still matches", () => {
-    // Every long prompt on CLI 2.1.296. Fault: compare without removing the tags AND with
-    // collapsed whitespace and the wrapped entry no longer contains the written text.
+    // Every long prompt on CLI 2.1.296. Fault: compare by equality instead of containment
+    // and the wrapped entry never matches the written text.
     const t = tx();
     const turn_ = turn(t, "R17x please do the thing");
     appendFileSync(
