@@ -14,6 +14,7 @@ import {
   updateLlmRouterSettings,
   type LlmRouterTiers,
 } from "./services/llm-router-settings";
+import { handleEnginesRoute, startupEngines } from "./services/engines-routes";
 import { ModelCatalogue } from "../plugins/llm-router/catalogue";
 import type { LlmModelsParams } from "../plugins/llm-router/types";
 import { createQuickJob, deleteJob } from "./services/jobs";
@@ -213,6 +214,9 @@ function requireCsrf(req: Request): Response | null {
 }
 
 export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
+  // The agent-turn engine the daemon started with, for the Engines modal's
+  // "restart required" (bus agents keep their supervision until a restart).
+  const engineStartup = startupEngines(opts.getSnapshot().settings);
   // Every response — rejections before routing included — leaves through
   // withSecurityHeaders (CSP, anti-framing, nosniff, no-store on /api/*).
   async function route(req: Request): Promise<Response> {
@@ -493,6 +497,13 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
         return json({ ok: false, error: "Failed to update llm-router settings" });
       }
     }
+
+    // Engines settings (#552): one-shot routing, agent-turn engine, engine probe.
+    const enginesResponse = await handleEnginesRoute(req, url, {
+      requireCsrf,
+      startup: engineStartup,
+    });
+    if (enginesResponse) return enginesResponse;
 
     // OpenRouter catalogue proxy backing the dashboard model picker (#70 D3).
     // Lazy singleton catalogue; reads OPENROUTER_API_KEY at request time so a
