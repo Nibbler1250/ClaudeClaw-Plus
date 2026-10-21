@@ -135,11 +135,18 @@ export function graphViolations(
     found.push({ file: sf.fileName, line: line + 1, what });
   };
 
-  const isDeclarationName = (node: ts.Identifier): boolean => {
+  /**
+   * Names inside an import/export specifier (both sides of `a as b`) are not uses. An import
+   * specifier is judged on its own, below; an export specifier or `export * as P` is
+   * pass-through, and flagged only where something on the graph imports it.
+   */
+  const isSpecifierName = (node: ts.Identifier): boolean => {
     const p = node.parent;
     return (
-      (ts.isImportSpecifier(p) || ts.isExportSpecifier(p) || ts.isNamespaceImport(p)) &&
-      p.name === node
+      ts.isImportSpecifier(p) ||
+      ts.isExportSpecifier(p) ||
+      ts.isNamespaceExport(p) ||
+      (ts.isNamespaceImport(p) && p.name === node)
     );
   };
 
@@ -180,7 +187,7 @@ export function graphViolations(
             report(sf, node, `dynamic import of the parser (${arg.text})`);
           }
         }
-      } else if (ts.isIdentifier(node) && !isDeclarationName(node)) {
+      } else if (ts.isIdentifier(node) && !isSpecifierName(node)) {
         // Any use: `feed(...)`, `P.feed`, `ns.harmless`. A use of the parser's namespace
         // object (passed around) is flagged too: nothing can be said of what it reaches.
         const name = parserTarget(checker.getSymbolAtLocation(node));
