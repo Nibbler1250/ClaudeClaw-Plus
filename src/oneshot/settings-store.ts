@@ -50,6 +50,8 @@ export interface OneShotView {
 }
 
 const ENGINE_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+const SUPERVISION_MODES = new Set(["pty-stdin", "tmux", "process", "process-stream-json"]);
+const ENV_NAME_STRICT = /^[A-Z_][A-Z0-9_]{0,63}$/;
 const VIEW_KEYS = ["baseUrl", "model", "tier", "apiKeyEnv"] as const;
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -69,13 +71,18 @@ function serialized<T>(fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
-/** `https://user:secret@host` → `https://user:***@host`. */
+/** Credentials a URL can carry (user, password, query values) → `***`. */
 export function maskUrl(url: string): string {
   try {
     const parsed = new URL(url);
-    if (!parsed.password) return url;
-    parsed.password = "***";
-    return parsed.toString().replace(/\/$/, url.endsWith("/") ? "/" : "");
+    if (!parsed.username && !parsed.password && !parsed.search) return url;
+    if (parsed.username) parsed.username = "***";
+    if (parsed.password) parsed.password = "***";
+    for (const key of [...new Set(parsed.searchParams.keys())]) parsed.searchParams.set(key, "***");
+    const masked = parsed.toString();
+    return !url.endsWith("/") && masked.endsWith("/") && !parsed.search
+      ? masked.slice(0, -1)
+      : masked;
   } catch {
     return url;
   }
@@ -127,6 +134,12 @@ export function applyOneShotPatch(
         next.baseUrl === maskUrl(previous.baseUrl)
       )
         next.baseUrl = previous.baseUrl;
+      // The loader accepts any identifier; a value written here is checked
+      // harder so a key pasted into the field is refused, and not echoed.
+      if (next.apiKeyEnv !== undefined && !ENV_NAME_STRICT.test(String(next.apiKeyEnv)))
+        throw new Error(
+          `oneShot.engines.${name}.apiKeyEnv must be the NAME of an environment variable (upper case, e.g. OPENAI_API_KEY), not the key`,
+        );
       declared[name] = next;
     }
     raw.engines = declared;
@@ -217,7 +230,11 @@ export function agentEngineView(doc: Record<string, unknown>): AgentEngineView {
       .filter((a): a is Record<string, unknown> => isObject(a) && typeof a.id === "string")
       .map((a) => ({
         id: a.id as string,
-        supervision: typeof a.supervision === "string" ? a.supervision : "pty-stdin",
+        // Same reading as the loader: an unknown value is dropped, the resolver defaults it.
+        supervision:
+          typeof a.supervision === "string" && SUPERVISION_MODES.has(a.supervision.trim())
+            ? a.supervision.trim()
+            : "pty-stdin",
       })),
   };
 }

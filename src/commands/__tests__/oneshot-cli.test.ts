@@ -209,7 +209,7 @@ describe("oneshot engine", () => {
       SECRET,
     );
     expect(code).toBe(1);
-    expect(err[0]).toContain("must be the name of an environment variable");
+    expect(err[0]).toContain("must be the NAME of an environment variable");
     expect(await readFile(settingsFile, "utf-8")).not.toContain(SECRET);
   });
 
@@ -242,4 +242,15 @@ describe("oneshot test", () => {
     expect(out[0]).toMatch(/^engine m: isolation ok, \d+ ms, exit 0$/);
     expect(out[1]).toBe("PONG");
   });
+});
+
+describe("oneshot engine add, key flag forms", () => {
+  for (const flag of [`--key=${SECRET}`, `--api-key=${SECRET}`]) {
+    it(`refuses ${flag.split("=")[0]}= and writes nothing`, async () => {
+      const before = await readFile(settingsFile, "utf-8");
+      const { code } = await cli("engine", "add", "r", "--kind", "ollama", "--model", "m", flag);
+      expect(code).toBe(1);
+      expect(await readFile(settingsFile, "utf-8")).toBe(before);
+    });
+  }
 });

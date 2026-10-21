@@ -69,7 +69,20 @@ export async function probeEngine(
   validateIsolation(req);
   const started = Date.now();
   try {
-    const result = await engine.run(req, config);
+    let result: Awaited<ReturnType<OneShotEngine["run"]>>;
+    try {
+      result = await engine.run(req, config);
+    } catch (err) {
+      // A failed call that still created the canary is an isolation failure, not an error.
+      if (!existsSync(canary)) throw err;
+      return {
+        engine: id,
+        latencyMs: Date.now() - started,
+        isolation: "fail",
+        exitCode: 1,
+        output: (err instanceof Error ? err.message : String(err)).slice(0, OUTPUT_CHARS),
+      };
+    }
     return {
       engine: id,
       latencyMs: Date.now() - started,

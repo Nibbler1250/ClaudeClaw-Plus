@@ -2265,9 +2265,11 @@ setInterval(loadKanban, 10000);
           meta.appendChild(sub);
           const btns = document.createElement("div");
           btns.className = "lr-row-btns";
+          // The form edits the chat engines only; other kinds (llm-router tier) stay JSON-only.
+          const editable = engine.type === "openai-compatible" || engine.type === "ollama";
           [["Test", function() { testEngine(engine.name); }],
-           ["Edit", function() { fillForm(engine); }],
-           ["Remove", function() { removeEngine(engine.name); }]].forEach(function(spec) {
+           editable ? ["Edit", function() { fillForm(engine); }] : null,
+           ["Remove", function() { removeEngine(engine.name); }]].filter(Boolean).forEach(function(spec) {
             const b = document.createElement("button");
             b.type = "button";
             b.className = "hb-toggle";

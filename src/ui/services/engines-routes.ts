@@ -23,6 +23,8 @@ import {
 } from "../../oneshot/settings-store";
 import { json } from "../http";
 
+let probeRunning = false;
+
 /** A settings.json read/write failure, as opposed to a refused value. */
 function isIoError(err: unknown): boolean {
   return !!err && typeof err === "object" && typeof (err as { code?: unknown }).code === "string";
@@ -114,11 +116,16 @@ export async function handleEnginesRoute(
     if (typeof engine !== "string" || !engine)
       return json({ ok: false, error: "engine must be an engine id" }, 400);
     const settings = await readOneShotSettings();
+    // One probe at a time: each one spawns a CLI or calls a remote engine.
+    if (probeRunning) return json({ ok: false, error: "a test is already running" }, 409);
+    probeRunning = true;
     let result: Awaited<ReturnType<typeof probeEngine>>;
     try {
       result = await probeEngine(engine, settings);
     } catch (err) {
       return json({ ok: false, error: message(err) }, err instanceof ProbeRefusedError ? 400 : 502);
+    } finally {
+      probeRunning = false;
     }
     return json({ ok: true, ...result });
   } catch (err) {

@@ -191,7 +191,7 @@ describe("/api/settings/oneshot", () => {
     expect(local).toEqual({
       name: "local",
       type: "openai-compatible",
-      baseUrl: "https://user:***@llm.example/v1",
+      baseUrl: "https://***:***@llm.example/v1",
       model: "m1",
       apiKeyEnv: KEY_ENV,
       keyPresent: true,
@@ -248,7 +248,7 @@ describe("/api/settings/oneshot", () => {
       engines: {
         local: {
           type: "openai-compatible",
-          baseUrl: "https://user:***@llm.example/v1",
+          baseUrl: "https://***:***@llm.example/v1",
           model: "m2",
           apiKeyEnv: KEY_ENV,
         },
@@ -341,5 +341,118 @@ describe("/api/oneshot/test", () => {
   it("an unknown engine → 400", async () => {
     const res = await post("/api/oneshot/test", { engine: "nope" });
     expect(res.status).toBe(400);
+  });
+});
+
+describe("review follow-ups", () => {
+  it("masks a token in the user name or the query string too", async () => {
+    const res = await post("/api/settings/oneshot", {
+      engines: {
+        q: { type: "ollama", baseUrl: "http://tok123@h.example:1/v1?api_key=SECRETQ", model: "m" },
+      },
+    });
+    const text = await res.text();
+    expect(res.status).toBe(200);
+    expect(text).not.toContain("tok123");
+    expect(text).not.toContain("SECRETQ");
+    // saving the masked URL back keeps the stored one
+    const view = JSON.parse(text) as {
+      oneShot: { engines: Array<{ name: string; baseUrl: string }> };
+    };
+    const masked = view.oneShot.engines.find((e) => e.name === "q")?.baseUrl;
+    await post("/api/settings/oneshot", {
+      engines: { q: { type: "ollama", baseUrl: masked, model: "m2" } },
+    });
+    const saved = JSON.parse(await readFile(settingsFile, "utf-8"));
+    expect(saved.oneShot.engines.q.baseUrl).toBe("http://tok123@h.example:1/v1?api_key=SECRETQ");
+  });
+
+  it("refuses a key pasted as apiKeyEnv and does not echo it", async () => {
+    const res = await post("/api/settings/oneshot", {
+      engines: { k: { type: "ollama", model: "m", apiKeyEnv: "sk123abcdef0123456789" } },
+    });
+    expect(res.status).toBe(400);
+    expect(await res.text()).not.toContain("sk123abcdef0123456789");
+    expect(await readFile(settingsFile, "utf-8")).toBe(`${BASE_TEXT}\n`);
+  });
+
+  it("a wildcard route is validated like the routes it covers", async () => {
+    const bad = await post("/api/settings/oneshot", { routes: { "memory.*": "local" } });
+    expect(bad.status).toBe(400);
+    expect(((await bad.json()) as { error: string }).error).toContain("requires resume");
+    const ok = await post("/api/settings/oneshot", { routes: { "tuner.*": "local" } });
+    expect(ok.status).toBe(200);
+    const { oneShot } = (await ok.json()) as { oneShot: { effective: Record<string, string> } };
+    expect(oneShot.effective["tuner.propose"]).toBe("local");
+  });
+
+  it("concurrent POSTs do not lose an update", async () => {
+    const names = Array.from({ length: 8 }, (_, i) => `c${i}`);
+    const results = await Promise.all([
+      ...names.map((n) =>
+        post("/api/settings/oneshot", { engines: { [n]: { type: "ollama", model: n } } }),
+      ),
+      post("/api/settings/engines", { pty: { enabled: true } }),
+    ]);
+    for (const r of results) expect(r.status).toBe(200);
+    const saved = JSON.parse(await readFile(settingsFile, "utf-8"));
+    for (const n of names) expect(saved.oneShot.engines[n]).toEqual({ type: "ollama", model: n });
+    expect(saved.pty.enabled).toBe(true);
+  });
+
+  it("an engine that creates the canary and then fails → isolation fail, canary removed", async () => {
+    engines.set("mock-throw", {
+      id: "mock-throw",
+      caps: { resume: false, tools: false, isolation: true },
+      run: async (req) => {
+        const path = /touch (\S+)/.exec(req.prompt)?.[1] ?? "";
+        writeFileSync(path, "pwned");
+        leftover = path;
+        throw new Error("boom");
+      },
+    });
+    let leftover = "";
+    try {
+      await writeFile(
+        settingsFile,
+        JSON.stringify({ oneShot: { engines: { t: { type: "mock-throw" } } } }),
+      );
+      const res = await post("/api/oneshot/test", { engine: "t" });
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { isolation: string }).isolation).toBe("fail");
+      expect(leftover).not.toBe("");
+      expect(await Bun.file(leftover).exists()).toBe(false);
+    } finally {
+      engines.delete("mock-throw");
+    }
+  });
+
+  it("an unknown supervision value reads like the loader: no permanent restart flag", async () => {
+    await writeFile(
+      settingsFile,
+      JSON.stringify({ agents: [{ id: "default", supervision: "bogus" }] }),
+    );
+    const data = (await (
+      await fetch(`${base}/api/settings/engines`, { headers: auth })
+    ).json()) as {
+      restartRequired: boolean;
+    };
+    expect(data.restartRequired).toBe(false);
+  });
+});
+
+describe("hand-edited settings.json", () => {
+  it("an apiKey written by hand is never returned, GET answers the loader's refusal", async () => {
+    await writeFile(
+      settingsFile,
+      JSON.stringify({
+        oneShot: { engines: { h: { type: "ollama", model: "m", apiKey: SECRET } } },
+      }),
+    );
+    const res = await fetch(`${base}/api/settings/oneshot`, { headers: auth });
+    const text = await res.text();
+    expect(res.status).toBe(400);
+    expect(text).not.toContain(SECRET);
+    expect(text).toContain("never stored in settings");
   });
 });
