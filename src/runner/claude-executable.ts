@@ -6,33 +6,53 @@
  */
 import { execSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { win32 } from "node:path";
+
+/**
+ * Picks the binary from `where claude` output, in PATH order. The first
+ * `claude.exe` (a native install) is used as is; the first `claude.cmd` (the
+ * npm shim) is swapped for the `claude.exe` the package ships next to it.
+ * Whichever comes first on PATH wins. A shim without its `claude.exe`,
+ * extensionless and `.ps1` entries are skipped. `"claude"` when nothing fits.
+ */
+export function pickClaudeExecutable(
+  whereOutput: string,
+  exists: (path: string) => boolean = existsSync,
+): string {
+  const lines = whereOutput
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const line of lines) {
+    const lower = line.toLowerCase();
+    if (lower.endsWith(".exe")) return line;
+    if (lower.endsWith(".cmd")) {
+      const exePath = win32.join(
+        win32.dirname(line),
+        "node_modules",
+        "@anthropic-ai",
+        "claude-code",
+        "bin",
+        "claude.exe",
+      );
+      if (exists(exePath)) return exePath;
+    }
+  }
+  return "claude";
+}
 
 /**
  * On Windows, `claude` resolves to `claude.cmd`, a batch wrapper that must
  * be run through cmd.exe (8191-char command-line limit). Resolving the
  * underlying `claude.exe` lets us call it directly via CreateProcessW
  * (32767-char limit). Required because --append-system-prompt + prompt
- * files + CLAUDE.md can easily exceed 8K.
+ * files + CLAUDE.md can easily exceed 8K. Takes the first `claude.exe` or
+ * resolvable `claude.cmd` on PATH (see `pickClaudeExecutable`).
  */
 function resolveClaudeExecutable(): string {
   if (process.platform !== "win32") return "claude";
   try {
-    const out = execSync("where claude", { encoding: "utf8" });
-    const cmdPath = out
-      .split(/\r?\n/)
-      .map((s) => s.trim())
-      .find((s) => s.toLowerCase().endsWith(".cmd"));
-    if (!cmdPath) return "claude";
-    const exePath = join(
-      dirname(cmdPath),
-      "node_modules",
-      "@anthropic-ai",
-      "claude-code",
-      "bin",
-      "claude.exe",
-    );
-    return existsSync(exePath) ? exePath : "claude";
+    return pickClaudeExecutable(execSync("where claude", { encoding: "utf8" }));
   } catch {
     return "claude";
   }

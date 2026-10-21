@@ -9,7 +9,11 @@ import type { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { type PluginAction, buildArgs } from "../commands/plugin-cli";
 import { runPrint, withPrintRuntime } from "../oneshot/print";
-import { _setClaudeExecutableForTests, claudeExecutable } from "../runner/claude-executable";
+import {
+  _setClaudeExecutableForTests,
+  claudeExecutable,
+  pickClaudeExecutable,
+} from "../runner/claude-executable";
 
 const RESOLVED = "C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe";
 
@@ -19,6 +23,55 @@ describe("claudeExecutable()", () => {
   it('is "claude" outside Windows', () => {
     if (process.platform === "win32") return;
     expect(claudeExecutable()).toBe("claude");
+  });
+});
+
+describe("pickClaudeExecutable (where claude output)", () => {
+  const shimExe = String.raw`C:\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe`;
+  const exists = (p: string) => p === shimExe;
+
+  it("a native claude.exe first on PATH wins over a later npm shim", () => {
+    const out =
+      String.raw`C:\native\claude.exe` +
+      "\r\n" +
+      String.raw`C:\npm\claude` +
+      "\r\n" +
+      String.raw`C:\npm\claude.cmd` +
+      "\r\n";
+    expect(pickClaudeExecutable(out, exists)).toBe(String.raw`C:\native\claude.exe`);
+  });
+
+  it("an npm shim first on PATH resolves to the claude.exe beside it", () => {
+    const out =
+      String.raw`C:\npm\claude` +
+      "\r\n" +
+      String.raw`C:\npm\claude.cmd` +
+      "\r\n" +
+      String.raw`C:\native\claude.exe`;
+    expect(pickClaudeExecutable(out, exists)).toBe(shimExe);
+  });
+
+  it("a shim without its claude.exe falls through to the next entry", () => {
+    const out = String.raw`C:\old\claude.cmd` + "\n" + String.raw`C:\native\claude.exe`;
+    expect(pickClaudeExecutable(out, () => false)).toBe(String.raw`C:\native\claude.exe`);
+  });
+
+  it("matches extensions in any case and ignores surrounding spaces", () => {
+    const out = `  ${String.raw`C:\npm\CLAUDE.CMD`}  \r\n`;
+    expect(pickClaudeExecutable(out, exists)).toBe(shimExe);
+    expect(pickClaudeExecutable(` ${String.raw`C:\native\Claude.EXE`} `, exists)).toBe(
+      String.raw`C:\native\Claude.EXE`,
+    );
+  });
+
+  it('"claude" when nothing usable is listed', () => {
+    expect(
+      pickClaudeExecutable(
+        String.raw`C:\npm\claude` + "\r\n" + String.raw`C:\npm\claude.ps1`,
+        exists,
+      ),
+    ).toBe("claude");
+    expect(pickClaudeExecutable("", exists)).toBe("claude");
   });
 });
 
