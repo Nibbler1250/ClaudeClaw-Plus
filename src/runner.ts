@@ -146,6 +146,20 @@ function resolveClaudeExecutable(): string {
   }
 }
 const CLAUDE_EXECUTABLE = resolveClaudeExecutable();
+let claudeExecutableForTests: string | null = null;
+
+/** The claude binary to spawn — `claude.exe` on Windows when it can be found,
+ *  plain `"claude"` everywhere else. For spawn sites outside this module (the
+ *  interactive PTY, the bus session manager): bun-pty cannot start the
+ *  `claude.cmd` shim, and node's spawn does not run it without a shell. */
+export function claudeExecutable(): string {
+  return claudeExecutableForTests ?? CLAUDE_EXECUTABLE;
+}
+
+/** Test seam: make `claudeExecutable()` return `path` (null restores it). */
+export function _setClaudeExecutableForTests(path: string | null): void {
+  claudeExecutableForTests = path;
+}
 
 /** Versions of the Claude Code CLI whose interactive TTY output the PTY parser
  *  has been validated against (see .planning/pty-migration/SPEC.md §2 and the

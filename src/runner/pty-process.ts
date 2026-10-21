@@ -36,7 +36,7 @@ import { spawn as ptySpawn, type IPty } from "bun-pty";
 import type { SecurityConfig } from "../config";
 import { UNTRUSTED_CLAUDE_ARGS } from "../oneshot/isolation.js";
 import { cliModelFlag } from "../oneshot/model.js";
-import { withCleanProcessEnv } from "../runner";
+import { claudeExecutable, withCleanProcessEnv } from "../runner";
 import {
   createParser,
   decodeTurn,
@@ -1095,7 +1095,7 @@ function concatBytes(parts: Uint8Array[], totalLen: number): Uint8Array {
  */
 export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
   return new Promise<PtyProcess>((resolve, reject) => {
-    const cmd = opts._commandOverride ?? "claude";
+    const cmd = opts._commandOverride ?? claudeExecutable();
     const args = buildClaudeArgs(opts);
     const cols = opts.cols ?? DEFAULT_COLS;
     const rows = opts.rows ?? DEFAULT_ROWS;
