@@ -601,12 +601,15 @@ so a corrupt-session reset still happens (the exit-0 path used to feed it the sa
 `command-error` outcome carries NO output (`rawStdout` is empty): its text is a description,
 not a reply.
 
-**Answer = every assistant message of the window, joined by a blank line (`\n\n`); the blocks
-of one message join as-is.** Behaviour change to confirm: a turn that narrates between tool
-calls ("Let me look.") now returns that narration too. The print path's `result` is the final
-message only. Chosen because the brief asks for "all text of this turn's assistant messages"
-and last-wins was the H4 defect; one line to change (`answerText`) if the operator prefers the
-final message.
+**Answer = the FINAL assistant message of the matched turn (operator ruling after round 3,
+`7d56b209`).** Same as the print path's `result`: PTY is a drop-in, so Telegram/Discord/cron
+output must not start carrying between-tool narration ("Let me look."). The blocks of that one
+message join as-is. If the final message has no text but an earlier one does (a turn that ends
+on a tool-only message), the answer is the LAST message that has text; if none has any, it is
+empty. Round 3 first returned every message joined by a blank line; that was reverted. H4's
+defect was crossing into the NEXT turn, which the frozen window fixes; choosing the final
+message inside the window is independent of it. (Streaming `onChunk` is unchanged: it still
+emits assistant text as it appears, as the print path's stream does.)
 
 **When the outcome is committed.** At the first terminal-`stop_reason` line that has text. A
 final message whose first line has no text (the CLI writes a thinking block as its own line
@@ -922,7 +925,7 @@ REAL `pty-supervisor.ts` / `pty-process.ts`: the real-graph test goes RED on bot
    text inside its window.
 2. A user typing into the live TUI mid-turn, or `[Request interrupted by user]`, now fails the
    turn as `ambiguous` instead of being folded into the answer.
-3. The answer is now all assistant text of the turn (see the decision above).
+3. The answer is the final message, or the last one with text when the turn ends on a tool-only message (see the decision above).
 4. A duplicate of the prompt that is recorded after `runTurn` has returned is not detected.
 5. M4's "executes twice" TUI is a model of a CLI that does not exist; it shows what the reader
    does if it did, not that claude does.

@@ -185,7 +185,7 @@ describe("TranscriptTurn — answer and end of reply", () => {
     expect(s.ended).toBe(false);
   });
 
-  test("a tool_use stop does not end the turn; the final end_turn message does; the answer is all the turn's text", () => {
+  test("a tool_use stop does not end the turn; the final end_turn message does and is the answer", () => {
     const t = tx();
     const turn_ = turn(t);
     appendFileSync(
@@ -208,8 +208,8 @@ describe("TranscriptTurn — answer and end of reply", () => {
     appendFileSync(t.path, nl(assistantLine("FINAL", { id: "m2", stop: "end_turn" })));
     s = turn_.poll();
     expect(s.ended).toBe(true);
-    // Messages join with a blank line, in order: not "the last message wins".
-    expect(s.answer).toBe("Let me look.\n\nFINAL");
+    // Only the final message: the narration before the tool call is not the answer.
+    expect(s.answer).toBe("FINAL");
   });
 
   test("blocks of ONE message arriving over separate polls are joined, in full", () => {
@@ -642,19 +642,69 @@ describe("TranscriptTurn — the matched turn is a window, frozen when it ends (
     expect(s.ended).toBe(true);
   });
 
-  test("another message of the same turn is read until the final one: all text, in order", () => {
+  test("narration, then a tool call, then the final answer: the answer is ONLY the final message", () => {
+    // What a user would otherwise get in Telegram/Discord/cron output. Fault: join every
+    // message of the window ("Let me look.\n\nThe tool ran.\n\nFINAL-ANSWER").
     const t = tx();
     const turn_ = turn(t);
     appendFileSync(
       t.path,
       nl(
         userLine("R17x please"),
-        assistantLine("First, the plan.", { id: "m1", stop: "tool_use" }),
-        assistantLine("Then the result.", { id: "m2", stop: "tool_use" }),
-        assistantLine("And the summary.", { id: "m3" }),
+        assistantLine("", {
+          id: "m1",
+          stop: "tool_use",
+          blocks: [
+            { type: "text", text: "Let me look." },
+            { type: "tool_use", name: "Read", input: { file_path: "/a" } },
+          ],
+        }),
+        assistantLine("The tool ran.", { id: "m2", stop: "tool_use" }),
+        assistantLine("FINAL-ANSWER", { id: "m3" }),
       ),
     );
-    expect(turn_.poll().answer).toBe("First, the plan.\n\nThen the result.\n\nAnd the summary.");
+    const s = turn_.poll();
+    expect(s.answer).toBe("FINAL-ANSWER");
+    expect(s.ended).toBe(true);
+    expect(s.toolLines).toEqual(['● Read({"file_path":"/a"})']);
+  });
+
+  test("the blocks of the final message join as-is", () => {
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(
+        userLine("R17x please"),
+        assistantLine("narration", { id: "m1", stop: "tool_use" }),
+        assistantLine("PART-A ", { id: "m2", stop: null }),
+        assistantLine("PART-B", { id: "m2" }),
+      ),
+    );
+    expect(turn_.poll().answer).toBe("PART-A PART-B");
+  });
+
+  test("a turn that ends on a tool-only message returns the last message that has text", () => {
+    // The final message has no text block. Fault: take the final message's text without the
+    // fallback and the answer is "".
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(
+        userLine("R17x please"),
+        assistantLine("Earlier narration.", { id: "m1", stop: "tool_use" }),
+        assistantLine("The last words.", { id: "m2", stop: "tool_use" }),
+        assistantLine("", {
+          id: "m3",
+          blocks: [{ type: "tool_use", name: "Bash", input: { command: "true" } }],
+        }),
+        systemLine("turn_duration"),
+      ),
+    );
+    const s = turn_.poll();
+    expect(s.ended).toBe(true);
+    expect(s.answer).toBe("The last words.");
   });
 
   test("a final message written as a thinking line first still gets its text line", () => {

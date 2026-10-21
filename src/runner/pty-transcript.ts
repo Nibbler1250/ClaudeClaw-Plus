@@ -13,8 +13,10 @@
  *     turn's prompt (`promptMatches`: the whole payload, not a substring). Only bytes
  *     appended AFTER the send are read, so an earlier entry (or an earlier identical
  *     prompt) can never satisfy it.
- *   - ANSWER: ALL the text of the assistant messages appended after that `user` entry,
- *     in order, one message per paragraph (`\n\n`); the blocks of one message join as-is.
+ *   - ANSWER: the text of the FINAL assistant message of that turn, as the print path's
+ *     `result` is: the blocks of that one message join as-is. Narration between tool calls
+ *     ("Let me look.") is not the answer. A final message with no text (a turn that ends on
+ *     a tool-only message) leaves the last message that has text.
  *   - ENDED OK: a message of that turn carries a terminal `stop_reason`
  *     (`isTerminalStopReason`, the bus's own rule), or the CLI wrote `turn_duration`.
  *   - ENDED FAILED: the CLI wrote an API-error line (`isApiErrorMessage` / `error`), a
@@ -161,7 +163,7 @@ export interface TranscriptTurnState {
   ended: boolean;
   /** Set when the turn ended in failure. A failed turn has no answer to return. */
   failure: TurnFailure | null;
-  /** All the text of the turn's assistant messages; `/compact`'s result for a command. */
+  /** The final assistant message's text (the last one that has any); `/compact`'s result for a command. */
   answer: string;
   /** Top-level user entries appended after the send that were NOT this prompt. */
   foreignUserEntries: number;
@@ -271,11 +273,12 @@ export class TranscriptTurn {
     };
   }
 
+  /**
+   * The last message of the window that has text. `messages` only ever holds messages with
+   * text, so a final message that has none (tool-only) leaves the one before it.
+   */
   private answerText(): string {
-    return this.messages
-      .map((m) => m.text)
-      .filter((t) => t !== "")
-      .join("\n\n");
+    return this.messages[this.messages.length - 1]?.text ?? "";
   }
 
   private stat(): { dev: bigint; ino: bigint; size: bigint } | null {

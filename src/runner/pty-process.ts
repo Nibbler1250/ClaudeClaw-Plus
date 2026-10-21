@@ -19,7 +19,8 @@
  *   2. Accepted = a `user` (or `enqueue`) entry whose payload IS this prompt, appended after
  *      the mark. Not seen within `submitConfirmMs`: one bare CR; again: Ctrl-U and
  *      `PtyPromptNotAcceptedError`.
- *   3. Answer = all the assistant text of the turn's window in the transcript.
+ *   3. Answer = the text of the turn's FINAL assistant message in the transcript (the print
+ *      path's `result`), never between-tool narration and never a later turn.
  *   4. Done = the turn's final assistant message carries a terminal stop reason (or the CLI
  *      wrote `turn_duration`; `/compact`: `compact_boundary`). Failed = the CLI's own API
  *      error, a command's stderr, or an uncertain attribution (`PtyTurnFailedError`); a
