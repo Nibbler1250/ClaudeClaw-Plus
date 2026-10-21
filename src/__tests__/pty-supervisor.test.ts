@@ -44,6 +44,8 @@ import {
 import {
   PtyClosedError,
   PtyPromptNotAcceptedError,
+  PtyTurnFailedError,
+  TranscriptReplacedError,
   PtyTurnTimeoutError,
   type PtyProcess,
   type PtyProcessOptions,
@@ -534,24 +536,93 @@ describe("pty-supervisor retry and backoff", () => {
     expect(snapshotSupervisor().ptys).toHaveLength(0);
   });
 
-  it("#562 round 2: an unconfirmed boundary whose transcript shows a COMPLETE reply is returned, and the entry is retired", async () => {
-    // The choice: a complete assistant reply in the transcript is the answer, so it is not
-    // thrown away; the TUI never confirmed idle, so the entry is not reused.
+  it("#562 round 3: a result with an unconfirmed boundary fails even when it carries a complete reply", async () => {
+    // The old `replyComplete` exception returned this as a success. Fault: restore the
+    // exception in boundaryVerdict and this is exit 0 with "the whole answer".
     const { spawn, spawned } = makeSpawnTracker(() =>
       makeFakePty("complete", {
-        onTurn: async () => ({
-          text: "the whole answer",
-          bytesCaptured: 16,
-          cleanBoundary: false,
-          replyComplete: true,
-          sessionId: "sid",
-        }),
+        onTurn: async () =>
+          ({
+            text: "the whole answer",
+            bytesCaptured: 16,
+            cleanBoundary: false,
+            replyComplete: true,
+            sessionId: "sid",
+          }) as unknown as PtyTurnResult,
       }),
     );
     injectSpawnPty(spawn);
     const result = await runOnPty("global", "p", { timeoutMs: 1000 });
-    expect(result.exitCode).toBe(0);
-    expect(result.rawStdout).toBe("the whole answer");
+    expect(result.exitCode).toBe(1);
+    expect(result.rawStdout).toBe("");
+    expect(result.stderr).toContain("boundary unconfirmed");
+    expect(spawned[0]?.disposed).toBe(true);
+  });
+
+  it("#562 round 3: an API error in the transcript is exit 1 with the CLI's text as output, runs once, retires the entry", async () => {
+    // The text must reach the runner as output: `signatureErrorWarrantsReset` reads it to
+    // reset a corrupt session, as the print path does from its output on a non-zero exit.
+    // Fault: leave the PtyTurnFailedError out of the supervisor's catch and it falls into
+    // the retry path (a second run of the prompt) or loses the text.
+    injectMaxRetriesForTests(3);
+    injectSleep(async () => {});
+    let turns = 0;
+    const { spawn, spawned } = makeSpawnTracker(() =>
+      makeFakePty("api-error", {
+        onTurn: async () => {
+          turns += 1;
+          throw new PtyTurnFailedError("api-error", "api-error", "API Error: 529 overloaded");
+        },
+      }),
+    );
+    injectSpawnPty(spawn);
+    const result = await runOnPty("global", "p", { timeoutMs: 1000 });
+    expect(result.exitCode).toBe(1);
+    expect(result.rawStdout).toBe("API Error: 529 overloaded");
+    expect(result.stderr).toContain("api-error");
+    expect(turns).toBe(1);
+    expect(spawned[0]?.disposed).toBe(true);
+  });
+
+  it("#562 round 3: an uncertain outcome is exit 1 with NO output, runs once, retires the entry", async () => {
+    // Fault: put an `ambiguous` text in rawStdout and the runner reads a made-up reply.
+    injectMaxRetriesForTests(3);
+    injectSleep(async () => {});
+    let turns = 0;
+    const { spawn, spawned } = makeSpawnTracker(() =>
+      makeFakePty("ambiguous", {
+        onTurn: async () => {
+          turns += 1;
+          throw new PtyTurnFailedError("ambiguous", "ambiguous", "another prompt was recorded");
+        },
+      }),
+    );
+    injectSpawnPty(spawn);
+    const result = await runOnPty("global", "p", { timeoutMs: 1000 });
+    expect(result.exitCode).toBe(1);
+    expect(result.rawStdout).toBe("");
+    expect(result.stderr).toContain("uncertain");
+    expect(turns).toBe(1);
+    expect(spawned[0]?.disposed).toBe(true);
+  });
+
+  it("#562 round 3: a replaced transcript is exit 1, runs once, retires the entry", async () => {
+    injectMaxRetriesForTests(3);
+    injectSleep(async () => {});
+    let turns = 0;
+    const { spawn, spawned } = makeSpawnTracker(() =>
+      makeFakePty("replaced", {
+        onTurn: async () => {
+          turns += 1;
+          throw new TranscriptReplacedError("/x/s.jsonl", "was replaced by a different file");
+        },
+      }),
+    );
+    injectSpawnPty(spawn);
+    const result = await runOnPty("global", "p", { timeoutMs: 1000 });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("replaced");
+    expect(turns).toBe(1);
     expect(spawned[0]?.disposed).toBe(true);
   });
 

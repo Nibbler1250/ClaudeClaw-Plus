@@ -67,7 +67,9 @@ import {
   PtyBoundaryUnconfirmedError,
   PtyClosedError,
   PtyPromptNotAcceptedError,
+  PtyTurnFailedError,
   PtyTurnTimeoutError,
+  TranscriptReplacedError,
 } from "./pty-process.js";
 import { ensureTrustAccepted } from "./pty-trust-prompt.js";
 import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";
@@ -1158,12 +1160,11 @@ export async function sendToLiveSession(
     try {
       const result = await raceAbort(turn, opts.signal);
       await persisted;
-      // #562 round 2: the end-of-turn marker never echoed. The turn may have run, so the
-      // entry goes (its TUI is in a state we cannot read) and, unless the transcript shows
-      // a complete reply, the send is reported failed rather than sent.
-      const verdict = boundaryVerdict(result);
-      if (verdict !== "ok") await retireEntry(entry);
-      if (verdict === "failed") {
+      // #562 round 3: a result whose boundary is not clean is a failure, whatever text it
+      // carries. The turn may have run, so the entry goes (its TUI is in a state we cannot
+      // read) and the send is reported failed rather than sent.
+      if (boundaryVerdict(result) === "failed") {
+        await retireEntry(entry);
         return {
           status: "failed",
           error: new PtyBoundaryUnconfirmedError(pty.label).message,
@@ -1184,7 +1185,17 @@ export async function sendToLiveSession(
       const timedOut = err instanceof PtyTurnTimeoutError;
       // #562: a prompt claude never took up leaves the TUI in a state we cannot read;
       // retire it as on a timeout so the next call respawns and resumes cleanly.
-      if (timedOut || err instanceof PtyPromptNotAcceptedError) await retireEntry(entry);
+      // The same for a turn the transcript says failed (API error, command stderr, an
+      // uncertain attribution) or whose transcript was replaced: the TUI is in a state we
+      // cannot read, and the prompt may have run.
+      if (
+        timedOut ||
+        err instanceof PtyPromptNotAcceptedError ||
+        err instanceof PtyTurnFailedError ||
+        err instanceof TranscriptReplacedError
+      ) {
+        await retireEntry(entry);
+      }
       return { status: "failed", error: (err as Error).message, timedOut, aborted: false };
     }
   }
@@ -2307,13 +2318,11 @@ async function runTurnWithRetries(
       });
       // Persist session ID if newly captured.
       await persistSessionId(entry, result.sessionId);
-      // #562 round 2: the end-of-turn marker never echoed. The turn may have run, so it is
-      // not retried and the entry goes (its TUI is in a state we cannot read). Without a
-      // complete reply in the transcript the call fails (exit 1) instead of returning
-      // whatever bytes were captured as a success.
-      const verdict = boundaryVerdict(result);
-      if (verdict !== "ok") await retireEntry(entry);
-      if (verdict === "failed") {
+      // #562 round 3: a result whose boundary is not clean is a failure (exit 1), not a
+      // success with whatever text it carries. The turn may have run, so it is not retried
+      // and the entry goes (its TUI is in a state we cannot read).
+      if (boundaryVerdict(result) === "failed") {
+        await retireEntry(entry);
         return errorResult(
           `[pty-supervisor] non-retryable error on ${entry.sessionKey}: ${new PtyBoundaryUnconfirmedError(entry.pty?.label ?? entry.sessionKey).message}`,
         );
@@ -2331,6 +2340,21 @@ async function runTurnWithRetries(
         // #562: the PTY is alive but never started the turn. Not retried here (a re-sent
         // prompt could land twice), and not reported as success: the caller gets exit 1.
         if (err instanceof PtyPromptNotAcceptedError) await retireEntry(entry);
+        // #562 round 3: the transcript says the turn FAILED. Matched to the print path: a
+        // non-zero exit, not retried, the session reset left to the runner. For an API
+        // error the CLI's own text goes out as the output, because that is what the
+        // runner reads to tell a corrupt session from any other failure
+        // (`signatureErrorWarrantsReset`, the same input the print path gives it).
+        if (err instanceof PtyTurnFailedError) {
+          await retireEntry(entry);
+          return {
+            ...errorResult(
+              `[pty-supervisor] non-retryable error on ${entry.sessionKey}: ${err.message}`,
+            ),
+            rawStdout: err.kind === "api-error" ? err.text : "",
+          };
+        }
+        if (err instanceof TranscriptReplacedError) await retireEntry(entry);
         return errorResult(
           `[pty-supervisor] non-retryable error on ${entry.sessionKey}: ${(err as Error).message}`,
         );

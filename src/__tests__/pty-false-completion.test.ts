@@ -19,9 +19,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SecurityConfig } from "../config";
 import {
+  PtyClosedError,
   PtyPromptNotAcceptedError,
   PtyTranscriptUnavailableError,
+  PtyTurnFailedError,
   PtyTurnTimeoutError,
+  TranscriptReplacedError,
   type PtyProcessOptions,
   spawnPty,
 } from "../runner/index";
@@ -447,6 +450,185 @@ describe("#562 — the screen's only say is timing, and it can only delay", () =
     const out = await runOutcome(script, t, { quietWindowMs: 50, settleCapMs: 4000 });
     expect(out.text).toBe("QUIET");
     expect(Date.now() - t0).toBeLessThan(2500);
+  });
+});
+
+describe("#562 round 3 — once the transcript commits the outcome, nothing the screen does changes it", () => {
+  const noisy = "while true; do printf .; sleep 0.05; done";
+
+  test("a hard timeout shorter than completion + settle does not turn the committed reply into a timeout", async () => {
+    // Reply written at ~0.15 s; the screen never goes quiet, so the return waits out the
+    // 1500 ms cap; the deadline (500 ms) falls inside that wait. Fault: leave the deadline
+    // armed after the commit (drop the clear in `_commitTurn` AND the committed-guard in the
+    // timeout callback) and the supervisor would retry the prompt.
+    const t = tx();
+    const script = `${fakeTurn({ tx: t.path, prompt: PROMPT, answer: "COMMITTED" })}; ${noisy}`;
+    const out = await runOutcome(
+      script,
+      t,
+      { quietWindowMs: 200, settleCapMs: 1500 },
+      { timeoutMs: 500 },
+    );
+    expect(out.err).toBeUndefined();
+    expect(out.text).toBe("COMMITTED");
+  });
+
+  test("the deadline passing with the reply already in the file, unread, is not a timeout", async () => {
+    // The poll interval is stretched to 400 ms, so at the 300 ms deadline nothing has read
+    // the reply yet. Fault: drop the poll in the timeout callback and this rejects with
+    // PtyTurnTimeoutError.
+    const t = tx();
+    const script = `${fakeTurn({ tx: t.path, prompt: PROMPT, answer: "UNREAD-AT-DEADLINE" })}; sleep 8`;
+    const out = await runOutcome(
+      script,
+      t,
+      {
+        quietWindowMs: 50,
+        settleCapMs: 400,
+        submitConfirmMs: 2000,
+        _setInterval: (cb) => setInterval(cb, 400),
+      },
+      { timeoutMs: 300 },
+    );
+    expect(out.err).toBeUndefined();
+    expect(out.text).toBe("UNREAD-AT-DEADLINE");
+  });
+
+  test("the process exiting while the screen settles keeps the committed reply (no PtyClosedError, so no replay)", async () => {
+    // Fault: reject with PtyClosedError on exit even when the turn is committed, and the
+    // supervisor respawns and runs the prompt a second time.
+    const t = tx();
+    const script = `${fakeTurn({ tx: t.path, prompt: PROMPT, answer: "BEFORE-EXIT" })}; ${"for i in 1 2 3 4 5 6; do printf .; sleep 0.05; done"}; exit 0`;
+    const out = await runOutcome(script, t, { quietWindowMs: 500, settleCapMs: 3000 });
+    expect(out.err).toBeUndefined();
+    expect(out.text).toBe("BEFORE-EXIT");
+  });
+
+  test("the process exiting before the last poll read the reply still keeps it", async () => {
+    // Reply appended and the process gone within one poll interval. Fault: drop the final
+    // read in `_handleExit` and the reply is never seen: PtyClosedError.
+    const t = tx();
+    const script = `${fakeTurn({ tx: t.path, prompt: PROMPT, answer: "UNREAD-AT-EXIT", think: 0.05 })}; exit 0`;
+    const out = await runOutcome(
+      script,
+      t,
+      { quietWindowMs: 500, settleCapMs: 3000, _setInterval: (cb) => setInterval(cb, 2000) },
+      { timeoutMs: 5000 },
+    );
+    expect(out.err).toBeUndefined();
+    expect(out.text).toBe("UNREAD-AT-EXIT");
+  });
+
+  test("a later prompt and its answer arriving DURING the settle cannot change the result", async () => {
+    // The screen is still painting, so the return waits; B's records land in that wait.
+    // Fault: no `closed` phase (keep ingesting) and the result is ANSWER-B.
+    const t = tx();
+    const script = [
+      fakeTurn({ tx: t.path, prompt: PROMPT, answer: "ANSWER-A" }),
+      "sleep 0.1",
+      append(t.path, userLine("the scheduled prompt B")),
+      append(t.path, assistantLine("ANSWER-B", { id: "msg_b" })),
+      noisy,
+    ].join("; ");
+    const out = await runOutcome(script, t, { quietWindowMs: 200, settleCapMs: 1200 });
+    expect(out.err).toBeUndefined();
+    expect(out.text).toBe("ANSWER-A");
+  });
+});
+
+describe("#562 round 3 — a failed turn is a failure", () => {
+  test("an API error in the transcript rejects with the CLI's text, as a PtyTurnFailedError", async () => {
+    const t = tx();
+    const script = [
+      "IFS= read -r l",
+      append(t.path, userLine(PROMPT)),
+      append(
+        t.path,
+        JSON.stringify({
+          type: "assistant",
+          isApiErrorMessage: true,
+          message: {
+            id: "e",
+            role: "assistant",
+            model: "<synthetic>",
+            content: [{ type: "text", text: "API Error: 529 overloaded" }],
+            stop_reason: "stop_sequence",
+          },
+        }),
+      ),
+      "sleep 8",
+    ].join("; ");
+    const out = await runOutcome(script, t);
+    // Fault: resolve the failure with the text (the round-2 shape) and `err` is undefined.
+    expect(out.text).toBeUndefined();
+    expect(out.err).toBeInstanceOf(PtyTurnFailedError);
+    expect((out.err as PtyTurnFailedError).kind).toBe("api-error");
+    expect((out.err as PtyTurnFailedError).text).toBe("API Error: 529 overloaded");
+  });
+
+  test("a transcript replaced during the turn rejects with TranscriptReplacedError", async () => {
+    const t = tx(`${userLine(PROMPT)}\n${assistantLine("OLD-HISTORY")}\n`);
+    const script = [
+      "IFS= read -r l",
+      `cp ${t.path} ${t.path}.copy`,
+      `mv ${t.path}.copy ${t.path}`,
+      "sleep 8",
+    ].join("; ");
+    const out = await runOutcome(script, t);
+    // Fault: drop the identity check and the replacement's retained history is read as
+    // this turn's reply: the turn resolves with OLD-HISTORY.
+    expect(out.text).toBeUndefined();
+    expect(out.err).toBeInstanceOf(TranscriptReplacedError);
+  });
+});
+
+describe("#562 round 3 — executions, not bytes: a late transcript record is one turn", () => {
+  const userEntries = (path: string): number =>
+    readFileSync(path, "utf8")
+      .split("\n")
+      .filter((l) => l.includes('"type":"user"')).length;
+
+  test("accepted at once, the record flushes late: ONE executed turn, one reply", async () => {
+    const t = tx();
+    // The CLI takes the prompt at the first CR, and writes its record 0.35 s later: past
+    // the first submit deadline (200 ms), so the retry CR goes in. Here that CR lands on an
+    // empty input box and does nothing, as in the real TUI.
+    const script = [
+      "IFS= read -r l1",
+      "sleep 0.35",
+      append(t.path, userLine(PROMPT)),
+      "sleep 0.1",
+      append(t.path, assistantLine("RAN-ONCE")),
+      "sleep 8",
+    ].join("; ");
+    const out = await runOutcome(script, t, { submitConfirmMs: 200 });
+    expect(out.err).toBeUndefined();
+    expect(out.text).toBe("RAN-ONCE");
+    // Count what the CLI executed, not what we wrote. Fault: a retry that resubmits the
+    // prompt makes the fake read a second line, but this fake never would: it is the
+    // `executes twice` test below that proves a second execution is not a success.
+    expect(userEntries(t.path)).toBe(1);
+  });
+
+  test("a TUI that would execute twice on the retry Enter: two executions, and the turn is NOT a success", async () => {
+    const t = tx();
+    // Each Enter the TUI reads runs the buffered prompt. The retry CR (200 ms) triggers a
+    // second execution whose record lands (0.5 s) before the first reply (0.7 s).
+    const script = [
+      "IFS= read -r l1",
+      `( sleep 0.3; ${append(t.path, userLine(PROMPT))}; sleep 0.4; ${append(t.path, assistantLine("FIRST-REPLY", { id: "m1" }))} ) &`,
+      "IFS= read -r l2",
+      `( sleep 0.3; ${append(t.path, userLine(PROMPT))} ) &`,
+      "wait",
+      "sleep 8",
+    ].join("\n");
+    const out = await runOutcome(script, t, { submitConfirmMs: 200 }, { timeoutMs: 4000 });
+    // Fault: let a second matching user entry through (drop the duplicate check) and this
+    // resolves with FIRST-REPLY while the prompt ran twice.
+    expect(userEntries(t.path)).toBe(2);
+    expect(out.text).toBeUndefined();
+    expect(out.err).toBeInstanceOf(PtyTurnFailedError);
+    expect((out.err as PtyTurnFailedError).kind).toBe("ambiguous");
   });
 });
 

@@ -788,7 +788,6 @@ describe("PtyProcess — runTurn resolves on the transcript", () => {
   test("a turn the transcript shows complete resolves with the transcript's answer", async () => {
     const { result, ended } = await turnOn("hello world");
     expect(result.cleanBoundary).toBe(true);
-    expect(result.replyComplete).toBe(true);
     expect(result.text).toBe("hello world");
     expect(result.bytesCaptured).toBe(Buffer.byteLength("hello world"));
     expect(ended).toBeGreaterThan(0);

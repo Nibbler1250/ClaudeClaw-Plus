@@ -16,6 +16,8 @@ export {
   PtyClosedError,
   PtyPromptNotAcceptedError,
   PtyBoundaryUnconfirmedError,
+  PtyTurnFailedError,
+  TranscriptReplacedError,
   PtyTranscriptUnavailableError,
   boundaryVerdict,
   type PtyProcess,

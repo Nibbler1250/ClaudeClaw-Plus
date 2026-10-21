@@ -45,7 +45,14 @@ import { stripAnsi } from "./pty-output-parser";
 // pull it from `pty-process` (and through `runner/index`) keep working without
 // loading bun-pty just to get the helper.
 import { preparePtyPromptForWrite, sanitizePtyPromptText } from "./pty-prompt-sanitizer";
-import { resolveTranscriptPath, TranscriptTurn } from "./pty-transcript";
+import {
+  resolveTranscriptPath,
+  TranscriptReplacedError,
+  TranscriptTurn,
+  type TurnFailureKind,
+} from "./pty-transcript";
+
+export { TranscriptReplacedError };
 import { appendFileSync } from "node:fs";
 
 /**
@@ -232,41 +239,58 @@ export interface PtyProcess {
 export interface PtyTurnResult {
   text: string;
   bytesCaptured: number;
-  /** Always true from a real process now: a turn resolves only on a complete transcript
-   *  reply. A process that reports false is treated as a failure by both callers. */
+  /** Always true from a real process: a turn resolves only on a complete transcript
+   *  reply. A result that says false is a failure for both callers, whatever else it
+   *  carries (#562 round 3: there is no "complete anyway" exception). */
   cleanBoundary: boolean;
   sessionId: string;
-  /**
-   * The transcript shows the turn's final reply, so `text` is the whole answer even if
-   * the sentinel never echoed. Absent on a path with no transcript.
-   */
-  replyComplete?: boolean;
 }
 
 /**
- * The sentinel never echoed (the TUI stalled, or the turn outran the quiet detector),
- * and nothing else says the reply is complete. The turn may have run: never resubmit.
- * `cleanBoundary=false` used to come back as a success with whatever bytes were
- * captured (#562 round 2, finding 4).
+ * A result whose boundary is not confirmed. A real process never returns one (it rejects
+ * instead); the type and the callers keep the contract, so a stand-in that does is a
+ * failure, not a success with whatever text it carried. The turn may have run: never
+ * resubmit.
  */
 export class PtyBoundaryUnconfirmedError extends Error {
   constructor(public readonly label: string) {
     super(
-      `PTY turn boundary unconfirmed for ${label}: the end-of-turn marker never echoed and no complete reply was recorded; the turn may have run`,
+      `PTY turn boundary unconfirmed for ${label}: no complete reply was confirmed in the session transcript; the turn may have run`,
     );
     this.name = "PtyBoundaryUnconfirmedError";
   }
 }
 
 /**
- * What to do with a finished turn: `ok` (clean boundary), `ok-retire` (the reply is
- * complete but the TUI never confirmed idle, so return the answer and retire the entry),
- * or `failed` (an unconfirmed boundary with no complete reply). Both callers of
- * `runTurn` in the supervisor apply it.
+ * What to do with a finished turn: `ok`, or `failed` when the boundary is not clean. There
+ * is no third verdict: a reply that arrived without a clean boundary used to be returned
+ * as a success and the entry retired (#562 round 3, M2). Both callers of `runTurn` in the
+ * supervisor apply it.
  */
-export function boundaryVerdict(result: PtyTurnResult): "ok" | "ok-retire" | "failed" {
-  if (result.cleanBoundary) return "ok";
-  return result.replyComplete === true ? "ok-retire" : "failed";
+export function boundaryVerdict(result: PtyTurnResult): "ok" | "failed" {
+  return result.cleanBoundary ? "ok" : "failed";
+}
+
+/**
+ * The transcript says the turn ended in failure: the CLI's own API error, a command's
+ * stderr, or something that leaves it uncertain whose reply this is (`ambiguous`). The
+ * prompt did run (or may have), so the turn is never retried or resubmitted. For an
+ * `api-error`, `text` is the CLI's error text, which the runner reads to decide whether the
+ * stored session is corrupt (the print path does the same from its output).
+ */
+export class PtyTurnFailedError extends Error {
+  constructor(
+    public readonly label: string,
+    public readonly kind: TurnFailureKind,
+    public readonly text: string,
+  ) {
+    super(
+      kind === "ambiguous"
+        ? `PTY turn outcome uncertain for ${label}: ${text}; the turn may have run`
+        : `PTY turn failed for ${label} (${kind}): ${text}`,
+    );
+    this.name = "PtyTurnFailedError";
+  }
 }
 
 /**
@@ -733,8 +757,11 @@ class PtyProcessImpl implements PtyProcess {
     let state: ReturnType<TranscriptTurn["poll"]>;
     try {
       state = tx.poll();
-    } catch {
-      return; // A read that failed is a poll that saw nothing; the next one retries.
+    } catch (err) {
+      // The file is no longer the one the turn started on: nothing in it can be trusted
+      // as new evidence, and the prompt may have run. Fail, never resubmit.
+      if (err instanceof TranscriptReplacedError) this._rejectTurn(err);
+      return; // Any other failed read is a poll that saw nothing; the next one retries.
     }
     if (state.accepted) {
       this._accepted = true;
@@ -756,7 +783,23 @@ class PtyProcessImpl implements PtyProcess {
         }
       }
     }
-    if (state.ended && this._endedAt === 0) this._endedAt = this._now();
+    if (state.ended && this._endedAt === 0) this._commitTurn();
+  }
+
+  /**
+   * The transcript has established the outcome: the turn is COMMITTED. From here the hard
+   * timeout, the submit retry and a PTY exit can no longer change it; the screen settling
+   * that follows only delays the return (#562 round 3, H5). A timeout that fired during
+   * the settle would turn a finished reply into `PtyTurnTimeoutError`, which the supervisor
+   * retries: the same prompt would run a second time.
+   */
+  private _commitTurn(): void {
+    this._endedAt = this._now();
+    this._clearSubmitConfirm();
+    if (this._turnHardTimeoutHandle != null) {
+      this._clearTimeout(this._turnHardTimeoutHandle);
+      this._turnHardTimeoutHandle = null;
+    }
   }
 
   /**
@@ -770,6 +813,11 @@ class PtyProcessImpl implements PtyProcess {
     if (!this._turnInProgress) return;
     this._pollTurn();
     if (this._endedAt === 0) return;
+    // A failed turn is retired by the caller, so there is no next paste to wait for.
+    if (this._tx?.state().failure) {
+      this._completeTurn();
+      return;
+    }
     const now = this._now();
     if (now - this._lastDataAt >= this._quietWindowMs || now - this._endedAt >= this._settleCapMs) {
       this._completeTurn();
@@ -795,6 +843,15 @@ class PtyProcessImpl implements PtyProcess {
     // which causes subsequent listeners to be skipped.
 
     if (this._turnInProgress) {
+      // A reply the transcript committed (even one not read yet) stays the outcome: the
+      // process exiting while the screen settles must not make the supervisor respawn and
+      // run it again.
+      this._pollTurn();
+      if (!this._turnInProgress) return;
+      if (this._endedAt !== 0) {
+        this._completeTurn();
+        return;
+      }
       const err = new PtyClosedError(
         this.label,
         info.exitCode ?? null,
@@ -881,6 +938,10 @@ class PtyProcessImpl implements PtyProcess {
 
       if (opts.timeoutMs > 0) {
         this._turnHardTimeoutHandle = this._setTimeout(() => {
+          // The outcome may already be in the file, unread (the poll runs every 50 ms): a
+          // reply that finished before the deadline is not a timeout.
+          this._pollTurn();
+          if (!this._turnInProgress || this._endedAt !== 0) return;
           const elapsed = this._now() - this._turnStartedAt;
           this._rejectTurn(new PtyTurnTimeoutError(this.label, elapsed));
         }, opts.timeoutMs);
@@ -967,7 +1028,15 @@ class PtyProcessImpl implements PtyProcess {
     // One more read so nothing written since the last poll is missed. The answer is the
     // assistant's own text from the transcript; the screen contributes nothing to it.
     this._pollTurn();
-    const text = this._tx?.state().answer ?? "";
+    if (!this._turnInProgress) return; // that read found the file replaced: already failed
+    const state = this._tx?.state();
+    const text = state?.answer ?? "";
+    const failure = state?.failure ?? null;
+    if (failure) {
+      this._lastTurnEndedAt = this._now();
+      this._rejectTurn(new PtyTurnFailedError(this.label, failure.kind, failure.text));
+      return;
+    }
     this._turnInProgress = false;
     this._tx = null;
     this._lastTurnEndedAt = this._now();
@@ -978,11 +1047,9 @@ class PtyProcessImpl implements PtyProcess {
     const result: PtyTurnResult = {
       text,
       bytesCaptured: Buffer.byteLength(text),
-      // Kept for callers' contract: a turn now resolves only on a complete transcript
-      // reply, so there is no unconfirmed-boundary success left to report.
+      // A turn resolves only on a complete transcript reply; anything else rejects.
       cleanBoundary: true,
       sessionId: this._sessionId,
-      replyComplete: true,
     };
     const resolve = this._turnResolve;
     this._turnResolve = null;

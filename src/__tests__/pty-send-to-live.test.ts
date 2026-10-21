@@ -25,8 +25,10 @@ import {
   type PtyProcess,
   type PtyProcessOptions,
   PtyPromptNotAcceptedError,
+  PtyTurnFailedError,
   PtyTurnTimeoutError,
   type PtyTurnResult,
+  TranscriptReplacedError,
 } from "../runner/pty-process";
 
 interface Deferred<T> {
@@ -476,7 +478,7 @@ describe("sendToLiveSession", () => {
     expect(supervisorEntryCount()).toBe(0);
   });
 
-  it("#562 round 2: an unconfirmed boundary with a COMPLETE transcript reply is sent, and the entry is retired", async () => {
+  it("#562 round 3: an unconfirmed boundary fails even with a complete reply and `replyComplete`", async () => {
     await seed("global");
     spawned[0].runTurn = (async () => ({
       text: "the whole answer",
@@ -484,13 +486,51 @@ describe("sendToLiveSession", () => {
       cleanBoundary: false,
       replyComplete: true,
       sessionId: "sess-1",
-    })) as PtyProcess["runTurn"];
+    })) as unknown as PtyProcess["runTurn"];
 
     const r = await sendToLiveSession("global", "hello", { timeoutMs: 5000 });
 
-    expect(r.status).toBe("sent");
-    if (r.status !== "sent") throw new Error("unreachable");
-    expect(r.text).toBe("the whole answer");
+    // Fault: restore the `replyComplete` exception and this is "sent" with the text.
+    expect(r.status).toBe("failed");
+    if (r.status !== "failed") throw new Error("unreachable");
+    expect(r.error).toContain("boundary unconfirmed");
+    expect(spawned[0].disposed).toBe(true);
+    expect(supervisorEntryCount()).toBe(0);
+  });
+
+  it("#562 round 3: an API error or a command's stderr in the transcript reports failed (not sent) and retires the entry", async () => {
+    for (const [kind, text] of [
+      ["api-error", "API Error: 529"],
+      ["command-error", "Error: Not enough messages to compact."],
+    ] as const) {
+      await seed("global");
+      spawned[spawned.length - 1].runTurn = (async () => {
+        throw new PtyTurnFailedError("fake", kind, text);
+      }) as PtyProcess["runTurn"];
+
+      const r = await sendToLiveSession("global", "hello", { timeoutMs: 5000 });
+
+      // Fault: leave PtyTurnFailedError out of the retire list and the entry stays live.
+      expect(r.status).toBe("failed");
+      if (r.status !== "failed") throw new Error("unreachable");
+      expect(r.error).toContain(text);
+      expect(r.timedOut).toBe(false);
+      expect(spawned[spawned.length - 1].disposed).toBe(true);
+      expect(supervisorEntryCount()).toBe(0);
+    }
+  });
+
+  it("#562 round 3: a replaced transcript reports failed and retires the entry", async () => {
+    await seed("global");
+    spawned[0].runTurn = (async () => {
+      throw new TranscriptReplacedError("/x/s.jsonl", "was replaced by a different file");
+    }) as PtyProcess["runTurn"];
+
+    const r = await sendToLiveSession("global", "hello", { timeoutMs: 5000 });
+
+    expect(r.status).toBe("failed");
+    if (r.status !== "failed") throw new Error("unreachable");
+    expect(r.error).toContain("replaced");
     expect(spawned[0].disposed).toBe(true);
     expect(supervisorEntryCount()).toBe(0);
   });
