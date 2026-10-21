@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,6 +10,7 @@ import {
   type PtyProcessOptions,
 } from "../runner/index";
 import { __buildClaudeArgsForTests } from "../runner/pty-process";
+import { _setClaudeExecutableForTests } from "../runner";
 import type { SecurityConfig } from "../config";
 
 // ─── Shared test helpers ────────────────────────────────────────────────────
@@ -1169,4 +1170,44 @@ describe("sanitizePtyPromptText (issue #65 item 3)", () => {
   test("preserves printable Unicode and multi-byte UTF-8", () => {
     expect(sanitizePtyPromptText("héllo 🪶 wörld")).toBe("héllo 🪶 wörld");
   });
+});
+
+// ─── Spawned executable (#573) ───────────────────────────────────────────────
+
+describe("PtyProcess — spawns the resolved claude executable (#573)", () => {
+  // On Windows the resolved executable is claude.exe: bun-pty cannot start
+  // the bare `claude` (a .cmd shim). Here the seam stands in for the resolver,
+  // and a fake `claude` first on PATH catches a spawn of the bare name — so
+  // the real CLI is never launched, even on a host that has one.
+  test.skipIf(process.platform === "win32")(
+    "spawns claudeExecutable() when no _commandOverride is given",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "pty-573-"));
+      const script = (name: string, body: string) => {
+        const file = join(dir, name);
+        writeFileSync(file, `#!/bin/sh\n${body}\n`);
+        chmodSync(file, 0o755);
+        return file;
+      };
+      script("claude", "echo BARE_CLAUDE_573; exit 4");
+      const resolved = script("resolved-claude", "echo RESOLVED_CLAUDE_573; exit 3");
+      const savedPath = process.env.PATH;
+      process.env.PATH = `${dir}:${savedPath ?? ""}`;
+      _setClaudeExecutableForTests(resolved);
+      try {
+        const proc = await spawnPty(
+          baseOpts({ env: { ...process.env } as Record<string, string>, _argsOverride: [] }),
+        );
+        await new Promise<void>((r) => setTimeout(r, 300));
+        const info = proc.exitInfo();
+        await proc.dispose();
+        expect(info?.tail).toContain("RESOLVED_CLAUDE_573");
+        expect(info?.exitCode).toBe(3);
+      } finally {
+        _setClaudeExecutableForTests(null);
+        process.env.PATH = savedPath;
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
 });

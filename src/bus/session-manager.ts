@@ -34,7 +34,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { NATIVE_SCHEDULING_TOOLS_BLOCKLIST } from "../config";
-import { cleanSpawnEnv, withCleanProcessEnv } from "../runner";
+import { claudeExecutable, cleanSpawnEnv, withCleanProcessEnv } from "../runner";
 import {
   deleteConfigForPty,
   type PtyIdentity,
@@ -77,7 +77,8 @@ export interface AgentHealth {
 
 export interface SessionManagerOptions {
   /**
-   * Test seam: override the spawned executable (default `"claude"`). The same
+   * Test seam: override the spawned executable (default: `claudeExecutable()`
+   * from `src/runner.ts`, which is `"claude"` outside Windows). The same
    * trick is used by `src/runner/pty-process.ts` so unit tests can swap in
    * `/bin/cat`, `/bin/sh`, etc.
    */
@@ -1093,7 +1094,7 @@ export class SessionManager {
     env: Record<string, string>,
     realCwd: string,
   ): Promise<PtyAgentProcess> {
-    const cmd = this.options.commandOverride ?? "claude";
+    const cmd = this.options.commandOverride ?? claudeExecutable();
     // Dynamic import keeps `bun-pty` (native) out of the cold path for tests
     // that exercise non-PTY modes.
     const { spawn: ptySpawn } = (await import("bun-pty")) as {
@@ -1148,7 +1149,7 @@ export class SessionManager {
     env: Record<string, string>,
     realCwd: string,
   ): ChildAgentProcess {
-    const cmd = this.options.commandOverride ?? "claude";
+    const cmd = this.options.commandOverride ?? claudeExecutable();
     // Use node:child_process for broad compatibility and a stable
     // `ChildProcess` interface across Bun + Node runtimes. (`Bun.spawn`
     // returns a different shape; using node:child_process avoids the
