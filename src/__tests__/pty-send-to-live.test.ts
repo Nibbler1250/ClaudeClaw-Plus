@@ -457,6 +457,44 @@ describe("sendToLiveSession", () => {
     expect(supervisorEntryCount()).toBe(0);
   });
 
+  it("#562 round 2: an unconfirmed turn boundary reports failed (not sent) and retires the entry", async () => {
+    await seed("global");
+    spawned[0].runTurn = (async () => ({
+      text: "partial",
+      bytesCaptured: 7,
+      cleanBoundary: false,
+      sessionId: "sess-1",
+    })) as PtyProcess["runTurn"];
+
+    const r = await sendToLiveSession("global", "/compact", { timeoutMs: 5000 });
+
+    // Fault: report the send as "sent" again and this is a success on a partial answer.
+    expect(r.status).toBe("failed");
+    if (r.status !== "failed") throw new Error("unreachable");
+    expect(r.error).toContain("boundary unconfirmed");
+    expect(spawned[0].disposed).toBe(true);
+    expect(supervisorEntryCount()).toBe(0);
+  });
+
+  it("#562 round 2: an unconfirmed boundary with a COMPLETE transcript reply is sent, and the entry is retired", async () => {
+    await seed("global");
+    spawned[0].runTurn = (async () => ({
+      text: "the whole answer",
+      bytesCaptured: 16,
+      cleanBoundary: false,
+      replyComplete: true,
+      sessionId: "sess-1",
+    })) as PtyProcess["runTurn"];
+
+    const r = await sendToLiveSession("global", "hello", { timeoutMs: 5000 });
+
+    expect(r.status).toBe("sent");
+    if (r.status !== "sent") throw new Error("unreachable");
+    expect(r.text).toBe("the whole answer");
+    expect(spawned[0].disposed).toBe(true);
+    expect(supervisorEntryCount()).toBe(0);
+  });
+
   it("#562: a prompt claude never accepted reports failed (not sent) and retires the entry", async () => {
     await seed("global");
     spawned[0].runTurn = (async () => {

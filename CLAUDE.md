@@ -87,6 +87,14 @@ Both `plugin-version-guard` and `marketplace-version-guard` are required CI chec
 
 ---
 
+## PTY turn evidence
+
+The screen is never evidence that a prompt was accepted, that a turn finished, or of what the answer was. Only the session transcript is. The screen may be used for readiness, dialogs and liveness, and only to stop or fail a turn, never to mark it successful.
+
+Why: #559 and the #562 soak. Repaints of the old conversation, chunk splits, a prompt echoed into the input box and changes to the CLI's chrome each produced a false success; the transcript-reading bus path went 99/99. Where it lives: `src/runner/pty-transcript.ts` reads the transcript; `src/__tests__/pty-turn-evidence-guard.test.ts` fails the build if `pty-process.ts`, `pty-supervisor.ts`, `pty-transcript.ts` or `live-session-actions.ts` import the screen parser's completion/answer API (`pty-output-parser.ts`: the sentinel, `feed`/`tick`, `extractResponseText`/`decodeTurn`). A PTY turn with no transcript (an untrusted one-shot runs `--no-session-persistence`) fails with `PtyTranscriptUnavailableError`; it does not fall back to the screen.
+
+---
+
 ## Software Development Cycle (SDC)
 
 This project follows the 9-stage Claude-Code-managed SDC. **Canonical spec: `~/.claude/rules/sdc.md`** (+ `~/.claude/rules/pr-review.md`). The stage table, marker mechanics, override, and rationale live there — not duplicated here.

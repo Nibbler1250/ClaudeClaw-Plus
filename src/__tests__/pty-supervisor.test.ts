@@ -509,6 +509,52 @@ describe("pty-supervisor retry and backoff", () => {
     expect(spawned).toHaveLength(2);
   });
 
+  it("#562 round 2: an unconfirmed turn boundary is an error (exit 1), runs once, and retires the entry", async () => {
+    // cleanBoundary=false used to come back as exit 0 with whatever bytes were captured.
+    // The turn may have run, so it is not retried either.
+    injectMaxRetriesForTests(3);
+    injectSleep(async () => {});
+    let turns = 0;
+    const { spawn, spawned } = makeSpawnTracker(() =>
+      makeFakePty("unconfirmed", {
+        onTurn: async () => {
+          turns += 1;
+          return { text: "partial", bytesCaptured: 7, cleanBoundary: false, sessionId: "sid" };
+        },
+      }),
+    );
+    injectSpawnPty(spawn);
+    const result = await runOnPty("global", "p", { timeoutMs: 1000 });
+    // Fault: ignore cleanBoundary in runTurnWithRetries and this is exit 0 with "partial".
+    expect(result.exitCode).toBe(1);
+    expect(result.rawStdout).toBe("");
+    expect(result.stderr).toContain("boundary unconfirmed");
+    expect(turns).toBe(1);
+    expect(spawned[0]?.disposed).toBe(true);
+    expect(snapshotSupervisor().ptys).toHaveLength(0);
+  });
+
+  it("#562 round 2: an unconfirmed boundary whose transcript shows a COMPLETE reply is returned, and the entry is retired", async () => {
+    // The choice: a complete assistant reply in the transcript is the answer, so it is not
+    // thrown away; the TUI never confirmed idle, so the entry is not reused.
+    const { spawn, spawned } = makeSpawnTracker(() =>
+      makeFakePty("complete", {
+        onTurn: async () => ({
+          text: "the whole answer",
+          bytesCaptured: 16,
+          cleanBoundary: false,
+          replyComplete: true,
+          sessionId: "sid",
+        }),
+      }),
+    );
+    injectSpawnPty(spawn);
+    const result = await runOnPty("global", "p", { timeoutMs: 1000 });
+    expect(result.exitCode).toBe(0);
+    expect(result.rawStdout).toBe("the whole answer");
+    expect(spawned[0]?.disposed).toBe(true);
+  });
+
   it("#562: a prompt claude never accepted is an error (exit 1, never 0), runs once, and retires the entry", async () => {
     // Retries are allowed on purpose: a re-sent prompt could land twice, so this must not retry.
     injectMaxRetriesForTests(3);

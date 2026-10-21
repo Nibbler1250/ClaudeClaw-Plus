@@ -62,7 +62,13 @@
 // mixing forms makes greps lie and risks breakage if we ever flip to
 // `moduleResolution: nodenext` (which requires the extension).
 import type { PtyProcess, PtyProcessOptions, PtyTurnResult, SpawnPty } from "./pty-process.js";
-import { PtyClosedError, PtyPromptNotAcceptedError, PtyTurnTimeoutError } from "./pty-process.js";
+import {
+  boundaryVerdict,
+  PtyBoundaryUnconfirmedError,
+  PtyClosedError,
+  PtyPromptNotAcceptedError,
+  PtyTurnTimeoutError,
+} from "./pty-process.js";
 import { ensureTrustAccepted } from "./pty-trust-prompt.js";
 import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";
 import { trustedToolFlags, validateIsolation } from "../oneshot/isolation.js";
@@ -1152,6 +1158,19 @@ export async function sendToLiveSession(
     try {
       const result = await raceAbort(turn, opts.signal);
       await persisted;
+      // #562 round 2: the end-of-turn marker never echoed. The turn may have run, so the
+      // entry goes (its TUI is in a state we cannot read) and, unless the transcript shows
+      // a complete reply, the send is reported failed rather than sent.
+      const verdict = boundaryVerdict(result);
+      if (verdict !== "ok") await retireEntry(entry);
+      if (verdict === "failed") {
+        return {
+          status: "failed",
+          error: new PtyBoundaryUnconfirmedError(pty.label).message,
+          timedOut: false,
+          aborted: false,
+        };
+      }
       return {
         status: "sent",
         text: result.text,
@@ -2288,6 +2307,17 @@ async function runTurnWithRetries(
       });
       // Persist session ID if newly captured.
       await persistSessionId(entry, result.sessionId);
+      // #562 round 2: the end-of-turn marker never echoed. The turn may have run, so it is
+      // not retried and the entry goes (its TUI is in a state we cannot read). Without a
+      // complete reply in the transcript the call fails (exit 1) instead of returning
+      // whatever bytes were captured as a success.
+      const verdict = boundaryVerdict(result);
+      if (verdict !== "ok") await retireEntry(entry);
+      if (verdict === "failed") {
+        return errorResult(
+          `[pty-supervisor] non-retryable error on ${entry.sessionKey}: ${new PtyBoundaryUnconfirmedError(entry.pty?.label ?? entry.sessionKey).message}`,
+        );
+      }
       return {
         rawStdout: result.text,
         stderr: "",
