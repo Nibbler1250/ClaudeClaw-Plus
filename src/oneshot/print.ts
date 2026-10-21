@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { claudeExecutable } from "../runner/claude-executable.js";
 import { cleanSpawnEnv } from "../runner/spawn-env.js";
 import type { OneShotRequest, OneShotResult } from "./engine.js";
 import { UNTRUSTED_CLAUDE_ARGS, trustedToolFlags, validateIsolation } from "./isolation.js";
@@ -73,7 +74,7 @@ export async function runPrint(req: OneShotRequest): Promise<OneShotResult> {
       : (req.cwd ?? process.cwd());
   try {
     return await new Promise<OneShotResult>((resolve, reject) => {
-      const child = (overrides?.spawn ?? spawn)("claude", args, {
+      const child = (overrides?.spawn ?? spawn)(claudeExecutable(), args, {
         stdio: [stdinPrompt ? "pipe" : "ignore", "pipe", "pipe"],
         env,
         cwd,
