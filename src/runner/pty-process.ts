@@ -14,14 +14,20 @@
  * (exit, tail diagnostics) and timing (wait for a repaint to quiet before the next
  * prompt), and only ever to delay, fail or abort a turn, never to complete one.
  *
- *   1. Mark the transcript size, write the prompt as a bracketed paste + `\r`.
- *   2. Accepted = a `user` (or `enqueue`) entry for this prompt appended after the mark.
- *      Not seen within `submitConfirmMs`: one bare CR; again: Ctrl-U and
+ *   1. Mark the transcript (size and file identity), write the prompt as a bracketed paste
+ *      + `\r`.
+ *   2. Accepted = a `user` (or `enqueue`) entry whose payload IS this prompt, appended after
+ *      the mark. Not seen within `submitConfirmMs`: one bare CR; again: Ctrl-U and
  *      `PtyPromptNotAcceptedError`.
- *   3. Answer = the assistant text appended after that entry.
- *   4. Done = that turn's final assistant entry carries a terminal stop reason (or the
- *      CLI wrote `turn_duration`; `/compact`: `compact_boundary`).
- *   5. No transcript to read (untrusted one-shot, no session id, switched off) = the
+ *   3. Answer = all the assistant text of the turn's window in the transcript.
+ *   4. Done = the turn's final assistant message carries a terminal stop reason (or the CLI
+ *      wrote `turn_duration`; `/compact`: `compact_boundary`). Failed = the CLI's own API
+ *      error, a command's stderr, or an uncertain attribution (`PtyTurnFailedError`); a
+ *      transcript that was replaced fails with `TranscriptReplacedError`.
+ *   5. The moment the transcript establishes the outcome it is COMMITTED (`_commitTurn`): the
+ *      hard timeout is cancelled and a PTY exit no longer rejects. The screen settle that
+ *      follows only delays the return.
+ *   6. No transcript to read (untrusted one-shot, no session id, switched off) = the
  *      turn fails before anything is written: `PtyTranscriptUnavailableError`.
  *
  * ─── OR-6 decision (session-ID) ──────────────────────────────────────────────

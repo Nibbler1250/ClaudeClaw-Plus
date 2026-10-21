@@ -565,3 +565,364 @@ containment itself).
 5. `sentinelMaxWaitMs`, `turnIdleTimeoutMs` and `quietWindowMs` remain in settings so
    existing files parse; `sentinelMaxWaitMs` is now unused and `quietWindowMs` is the
    readiness wait.
+
+# Round 3: Codex review of `4ef9379f` (5 HIGH, 4 MEDIUM)
+
+Branch `feat/550-pty-default`. The operator rule stands (the screen is never success,
+acceptance or answer evidence; only the session transcript). Codex closed round-1 findings
+1, 2, 3, 5, 6; this round fixes the transcript reader itself. No real `claude` was run.
+
+## Round 3: summary
+
+| Finding | What changed | Where |
+|---|---|---|
+| H1 placeholder is not an answer | a non-error `<synthetic>` line is neither text nor an end (the bus tailer's rule) | `pty-transcript.ts` `ingestAssistant` |
+| H2 + M2 success vs failure | the reader returns running / OK / FAILED (`api-error`, `command-error`, `ambiguous`); a failure rejects `runTurn` with `PtyTurnFailedError`; both callers fail on it; `boundaryVerdict` has no `ok-retire` | `pty-transcript.ts`, `pty-process.ts`, `pty-supervisor.ts` |
+| H3 exact match | `promptMatches` compares the whole payload for equality after the CLI's paste wrapper and the padding it adds are taken off; internal whitespace is kept; a TAB may be recorded as nothing or spaces at its own position only; a second identical prompt fails the turn as `ambiguous` | `pty-transcript.ts` |
+| H4 frozen window | the matched turn is a window: it closes at the first entry that is not part of it; the answer is all the window's assistant text | `pty-transcript.ts` |
+| H5 commit, then settle | `_commitTurn` cancels the hard timeout when the transcript establishes the outcome; a PTY exit after the commit completes the turn instead of rejecting | `pty-process.ts` |
+| M1 file identity | `mark()` records dev+inode and the size; a removed, replaced or cut-short file throws `TranscriptReplacedError`, which fails the turn | `pty-transcript.ts`, `pty-process.ts`, `pty-supervisor.ts` |
+| M3 guard follows the graph | the guard builds the TypeScript module graph from the four modules and resolves every identifier through its alias chain | `pty-turn-evidence-guard.test.ts` |
+| M4 executions, not bytes | fake TUIs count the user entries they execute | `pty-false-completion.test.ts` |
+
+## Round 3: decisions
+
+**API errors: matched to the print path, not the bus path.** Read first:
+`src/runner.ts` (`signatureErrorWarrantsReset`, ~2246) and `src/bus/jsonl-tailer.ts` (~785).
+On the print path an API error is a non-zero exit, the CLI's text is the output the runner
+scans, a corrupt session is reset by the RUNNER (not by the process layer), and nothing
+retries. The bus path publishes `system.api_error`, releases the turn with EMPTY text and
+does not retry either. So an API error is now: `runTurn` rejects with `PtyTurnFailedError`
+(`kind: "api-error"`); `runOnPty` returns exit 1, no retry, the entry retired, and
+`rawStdout` = the CLI's error text. That text is deliberate: `signatureErrorWarrantsReset`
+reads the output and the transcript's own `isApiErrorMessage` entry, whatever the exit code,
+so a corrupt-session reset still happens (the exit-0 path used to feed it the same text).
+`sendToLiveSession` returns `failed`, not `sent`, and retires the entry. An `ambiguous` or
+`command-error` outcome carries NO output (`rawStdout` is empty): its text is a description,
+not a reply.
+
+**Answer = every assistant message of the window, joined by a blank line (`\n\n`); the blocks
+of one message join as-is.** Behaviour change to confirm: a turn that narrates between tool
+calls ("Let me look.") now returns that narration too. The print path's `result` is the final
+message only. Chosen because the brief asks for "all text of this turn's assistant messages"
+and last-wins was the H4 defect; one line to change (`answerText`) if the operator prefers the
+final message.
+
+**When the outcome is committed.** At the first terminal-`stop_reason` line that has text. A
+final message whose first line has no text (the CLI writes a thinking block as its own line
+and repeats the stop reason) waits for the rest of that SAME message, and the window closes
+on the next entry that is not part of it. After the commit only lines of the final message's
+own id can still extend the answer; a later prompt, another message id or `turn_duration`
+closes the window. A final message with no text at all and nothing after it never ends
+(the hard timeout does; before this round the bare stop reason ended it).
+
+**Uncertainty fails closed.** Inside the window a non-meta user text that is not this prompt
+(`isMeta`, tool results, compaction summaries and `<local-command-stdout>` are the turn's own)
+fails the turn as `ambiguous`; so does a second copy of this prompt, inside the window or as
+the first entry after the final message. A copy that arrives after `runTurn` returned cannot be
+seen. Correlation ids: the matched entry's `uuid`/`promptId` identify "the same record" so a
+line the CLI repeats is not a duplicate. The `parentUuid` chain is NOT used to attribute
+assistant lines: another prompt inside the window already fails the turn, and rejecting an
+unrecognised parent would turn a chain shape I have not seen into a hang.
+
+**A failed turn skips the screen settle.** The entry is retired anyway, so there is no next
+paste to wait for.
+
+## Round 3: tests
+
+- `pty-transcript.test.ts`: 57 tests (the `4ef9379f` file ran about 28): exact match incl. the two required negatives and
+  the TAB rule, duplicate and foreign prompts, failure kinds, placeholder, window/freeze
+  (A,B in one poll; B after the commit; B during the settle), file identity (bigger and smaller
+  replacement holding an earlier identical prompt+answer, cut short, removed, created later),
+  message join.
+- `pty-false-completion.test.ts`: H5 (a deadline inside the settle; a deadline with the reply
+  unread; a PTY exit during the settle; a PTY exit before the last read; B arriving during the
+  settle), failure and replaced transcript at the process level, and M4 (below).
+- M4: `a TUI that would execute twice on the retry Enter` counts the `user` entries the fake
+  writes (2) and asserts the turn is `ambiguous`, not a success; the late-flush TUI asserts
+  exactly ONE `user` entry and one reply.
+- `pty-supervisor.test.ts` / `pty-send-to-live.test.ts`: the two exception tests (`~537`,
+  `~479`) now require a FAILURE; new tests for api-error (exit 1, output = the CLI's text, run
+  once, entry retired), ambiguous (exit 1, no output), replaced transcript.
+- `pty-turn-evidence-guard.test.ts`: 23 tests; the real module graph is clean, and 19 negative
+  fixtures: a named/aliased/type-only/namespace/multi-line import, a dynamic import (result
+  used and unused), a require, a renamed re-export (one and two barrels deep), a namespace
+  barrel (`export * as P`), a star barrel used through a namespace and destructured, a dynamic
+  import of a barrel, and two wrapper modules.
+
+### Round 3: fault injection (one site at a time, on a `git archive` copy)
+
+Each fault was named and its failing test predicted before the run; the first failing assertion of each run is quoted below with the source line, the expected and the received value. Raw output of every run: `fi-<id>.txt` in the session scratchpad. `git archive` of the final code commit, `node_modules` symlinked, pristine file restored after each run.
+
+```
+H1-placeholder-terminal: H1: treat a non-error `<synthetic>` placeholder as the end and as text   [2 failing]
+   assertion: 586 
+        expect(s.ended).toBe(false);
+   (fail) error: expect(received).toBe(expected) ; Expected: false ; Received: true
+
+H2-apierror-no-failure: H2: an API error sets only `ended` (the round-2 shape), no `failure`   [4 failing]
+   assertion: 249 
+        expect(s.failure).toEqual({ kind: "api-error", text: "API Error: 529" });
+   (fail) error: expect(received).toEqual(expected) ; - { ; -   "kind": "api-error", ; -   "text": "API Error: 529", ; - }
+
+H2-stderr-ignored: H2/M2: ignore `<local-command-stderr>` on system entries   [2 failing]
+   assertion: 320 
+        expect(s.failure).toEqual({
+   (fail) error: expect(received).toEqual(expected) ; - { ; -   "kind": "command-error", ; -   "text": "Error: Not enough messages to compact.", ; - }
+
+H2-process-failure-resolves: H2: `_completeTurn` resolves instead of rejecting a failed turn   [2 failing]
+   assertion: 563 
+        expect(out.text).toBeUndefined();
+   (fail) error: expect(received).toBeUndefined() ; Received: ""
+
+H2-supervisor-failed-branch: H2: drop the `PtyTurnFailedError` branch in `runOnPty`   [2 failing]
+   assertion: 581 
+        expect(result.rawStdout).toBe("API Error: 529 overloaded");
+   (fail) error: expect(received).toBe(expected) ; Expected: "API Error: 529 overloaded" ; Received: ""
+
+H2-supervisor-apitext-dropped: H2: an api-error exits 1 but without the CLI's text as output   [1 failing]
+   assertion: 581 
+        expect(result.rawStdout).toBe("API Error: 529 overloaded");
+   (fail) error: expect(received).toBe(expected) ; Expected: "API Error: 529 overloaded" ; Received: ""
+
+H2-supervisor-ambiguous-text-leaks: H2: an uncertain outcome's text is put in `rawStdout`   [1 failing]
+   assertion: 603 
+        expect(result.rawStdout).toBe("");
+   (fail) error: expect(received).toBe(expected) ; Expected: "" ; Received: "another prompt was recorded"
+
+H2-live-no-retire-failed: H2: `sendToLiveSession` does not retire the entry after a failed turn   [2 failing]
+   assertion: 518 
+          expect(spawned[spawned.length - 1].disposed).toBe(true);
+   (fail) error: expect(received).toBe(expected) ; Expected: true ; Received: false
+
+M2-exception-restored: M2: restore the `replyComplete` exception in `boundaryVerdict`   [2 failing]
+   assertion: 556 
+        expect(result.exitCode).toBe(1);
+   (fail) error: expect(received).toBe(expected) ; Expected: 1 ; Received: 0
+
+H3-containment: H3: `includes` instead of equality   [2 failing]
+   assertion: 373 
+        expect(promptMatches("hourly check status and restart failures", "check status", false)).toBe(
+   (fail) error: expect(received).toBe(expected) ; Expected: false ; Received: true
+
+H3-whitespace-insensitive: H3: strip all whitespace before comparing   [1 failing]
+   assertion: 381 
+        expect(promptMatches("ab", "a b", false)).toBe(false);
+   (fail) error: expect(received).toBe(expected) ; Expected: false ; Received: true
+
+H3-tab-rule-dropped: H3: compare a TAB as written (drop the tab rule)   [2 failing]
+   assertion: 157 
+        expect(turn_.poll().accepted).toBe(true);
+   (fail) error: expect(received).toBe(expected) ; Expected: true ; Received: false
+
+H3-dup-in-window: H3: a second matching/foreign prompt inside the window is ignored   [3 failing]
+   assertion: 428 
+        expect(s.failure?.kind).toBe("ambiguous");
+   (fail) error: expect(received).toBe(expected) ; Expected: "ambiguous" ; Received: undefined
+
+H3-dup-after-reply: H3: a duplicate right after the reply does not downgrade it   [1 failing]
+   assertion: 439 
+        expect(s.failure?.kind).toBe("ambiguous");
+   (fail) error: expect(received).toBe(expected) ; Expected: "ambiguous" ; Received: undefined
+
+H3-uuid-dedupe-dropped: H3: a repeated line (same uuid) is treated as a second prompt   [1 failing]
+   assertion: 453 
+        expect(s.failure).toBeNull();
+   (fail) error: expect(received).toBeNull() ; Received: { ; kind: "ambiguous", ; text: "the same prompt was recorded a second time inside the turn", ; }
+
+H4-terminal-accepts-any-message: H4: the final-message phase accepts any later assistant message   [1 failing]
+   assertion: 713 
+        expect(s.answer).toBe("ANSWER-A");
+   (fail) error: expect(received).toBe(expected) ; - "ANSWER-A" ; + "ANSWER-A ; + ; + UNRELATED-NOTIFICATION-REPLY"
+
+H4-window-never-closes: H4: `finish()` no longer closes the window   [2 failing]
+   assertion: 727 
+        expect(s.answer).toBe("A");
+   (fail) error: expect(received).toBe(expected) ; Expected: "A" ; Received: "ALATE"
+
+H4-keep-ingesting-after-end: H4: both of the above (the headline A/B tests need both removed)   [6 failing]
+   assertion: 627 
+        expect(s.answer).toBe("ANSWER-A");
+   (fail) error: expect(received).toBe(expected) ; - "ANSWER-A" ; + "ANSWER-A ; + ; + ANSWER-B"
+
+H4-join-last-wins: H4: the answer is the last message only   [2 failing]
+   assertion: 212 
+        expect(s.answer).toBe("Let me look.\n\nFINAL");
+   (fail) error: expect(received).toBe(expected) ; - "Let me look. ; - ; - FINAL" ; + "FINAL"
+
+H4-terminal-without-text-ends: H4: a final line with no text ends the turn at once   [2 failing]
+   assertion: 674 
+        expect(s.ended).toBe(false);
+   (fail) error: expect(received).toBe(expected) ; Expected: false ; Received: true
+
+M1-no-identity-check: M1: no dev+inode comparison   [2 failing]
+   assertion: 745 
+        expect(() => turn_.poll()).toThrow(TranscriptReplacedError);
+   (fail) error: expect(received).toThrow(expected) ; Expected constructor: TranscriptReplacedError ; Received function did not throw ; Received value: { ; accepted: false,
+
+M1-no-shrink-check: M1: no size-below-offset check   [1 failing]
+   assertion: 766 
+        expect(() => turn_.poll()).toThrow(/cut short/);
+   (fail) error: expect(received).toThrow(expected) ; Expected pattern: /cut short/ ; Received function did not throw ; Received value: { ; accepted: false,
+
+M1-removed-ignored: M1: a removed file is treated as nothing new   [1 failing]
+   assertion: 774 
+        expect(() => turn_.poll()).toThrow(/removed/);
+   (fail) error: expect(received).toThrow(expected) ; Expected pattern: /removed/ ; Received function did not throw ; Received value: { ; accepted: false,
+
+M1-process-replaced-swallowed: M1: `_pollTurn` swallows `TranscriptReplacedError`   [1 failing]
+   assertion: 581 
+        expect(out.err).toBeInstanceOf(TranscriptReplacedError);
+   (fail) error: expect(received).toBeInstanceOf(expected) ; Expected constructor: [class TranscriptReplacedError extends Error] ; Received value: 987 
+
+M1-supervisor-replaced-no-retire: M1: the supervisor does not retire after `TranscriptReplacedError`   [1 failing]
+   assertion: 626 
+        expect(spawned[0]?.disposed).toBe(true);
+   (fail) error: expect(received).toBe(expected) ; Expected: true ; Received: false
+
+H5-clear-and-guard: H5: no clear in `_commitTurn` AND no committed-guard in the deadline callback   [2 failing]
+   assertion: 472 
+        expect(out.err).toBeUndefined();
+   (fail) error: expect(received).toBeUndefined() ; Received: 937 
+
+H5-clear-only: H5: no clear in `_commitTurn` (the callback guard stays)
+   GREEN (no failure)  <- see 'Redundant sites' below
+
+H5-guard-only: H5: no committed-guard in the deadline callback (the clear stays)   [1 failing]
+   assertion: 493 
+        expect(out.err).toBeUndefined();
+   (fail) error: expect(received).toBeUndefined() ; Received: 941 
+
+H5-deadline-poll: H5: no read in the deadline callback   [1 failing]
+   assertion: 493 
+        expect(out.err).toBeUndefined();
+   (fail) error: expect(received).toBeUndefined() ; Received: 940 
+
+H5-exit-committed: H5: a PTY exit rejects `PtyClosedError` even when committed   [2 failing]
+   assertion: 503 
+        expect(out.err).toBeUndefined();
+   (fail) error: expect(received).toBeUndefined() ; Received: 846 
+
+H5-exit-final-read: H5: no final read on exit   [1 failing]
+   assertion: 518 
+        expect(out.err).toBeUndefined();
+   (fail) error: expect(received).toBeUndefined() ; Received: 848 
+
+G1-no-alias-following: M3: the guard does not follow alias chains   [11 failing]
+   assertion: 385 
+          expect(violationsOf(files, opts).length).toBeGreaterThan(0);
+   (fail) error: expect(received).toBeGreaterThan(expected) ; Expected: > 0 ; Received: 0
+
+G2-no-dynamic-import-check: M3: the guard ignores `import()` / `require()`   [2 failing]
+   assertion: 385 
+          expect(violationsOf(files, opts).length).toBeGreaterThan(0);
+   (fail) error: expect(received).toBeGreaterThan(expected) ; Expected: > 0 ; Received: 0
+
+G3-roots-only: M3: the guard looks at the four modules only, not the graph they reach   [17 failing]
+   assertion: 386 
+          expect(violationsOf(files, opts).length).toBeGreaterThan(0);
+   (fail) error: expect(received).toBeGreaterThan(expected) ; Expected: > 0 ; Received: 0
+
+G4-no-destructure-check: M3: the guard ignores destructuring of a namespace   [1 failing]
+   assertion: 385 
+          expect(violationsOf(files, opts).length).toBeGreaterThan(0);
+   (fail) error: expect(received).toBeGreaterThan(expected) ; Expected: > 0 ; Received: 0
+
+G5-no-use-check: M3: the guard ignores identifier uses   [2 failing]
+   assertion: 385 
+          expect(violationsOf(files, opts).length).toBeGreaterThan(0);
+   (fail) error: expect(received).toBeGreaterThan(expected) ; Expected: > 0 ; Received: 0
+
+G6-no-import-specifier-check: M3: the guard ignores import specifiers   [1 failing]
+   assertion: 385 
+          expect(violationsOf(files, opts).length).toBeGreaterThan(0);
+   (fail) error: expect(received).toBeGreaterThan(expected) ; Expected: > 0 ; Received: 0
+
+G9-match-by-local-name: M3: the guard matches the local name, not the name it resolves to   [4 failing]
+   assertion: 385 
+          expect(violationsOf(files, opts).length).toBeGreaterThan(0);
+   (fail) error: expect(received).toBeGreaterThan(expected) ; Expected: > 0 ; Received: 0
+
+G10-no-use-and-no-specifier: M3: the guard ignores both uses and import specifiers   [13 failing]
+   assertion: 385 
+          expect(violationsOf(files, opts).length).toBeGreaterThan(0);
+   (fail) error: expect(received).toBeGreaterThan(expected) ; Expected: > 0 ; Received: 0
+
+G7-real-code-renamed-import: M3 (real code): `import { feed as quietly }` added to pty-supervisor.ts   [1 failing]
+   assertion: 226 
+        expect(violations).toEqual([]);
+   (fail) error: expect(received).toEqual(expected) ; - [] ; + [ ; +   { ; +     "file": "/private/tmp/claude-501/-Users-terrenceyodaiken-orca-workspaces-claudeclaw-plus-Sonnet/e154f5e4-2fcf-41b0-b6e5-48376d0cf59b/scratchpad/inj/src/runner/pty-supervisor.ts",
+
+G8-real-code-via-barrel: M3 (real code): `import { tick as calm } from "./index"` added to pty-process.ts   [1 failing]
+   assertion: 226 
+        expect(violations).toEqual([]);
+   (fail) error: expect(received).toEqual(expected) ; - [] ; + [ ; +   { ; +     "file": "/private/tmp/claude-501/-Users-terrenceyodaiken-orca-workspaces-claudeclaw-plus-Sonnet/e154f5e4-2fcf-41b0-b6e5-48376d0cf59b/scratchpad/inj/src/runner/pty-process.ts",
+
+```
+
+### Redundant sites (said plainly)
+
+- **H5 clear vs guard.** Dropping the clear in `_commitTurn` alone stays GREEN
+  (`H5-clear-only`): the deadline callback also refuses to reject a committed turn, so the
+  two back each other. Dropping the guard alone is RED (`H5-guard-only`, unread-at-deadline
+  test, which also needs the read in the callback, `H5-deadline-poll`). The settle test is
+  RED only when both are removed (`H5-clear-and-guard`). Kept both on purpose; the clear is
+  the stated mechanism and the guard is what the callback's own read needs.
+- **H4 id match vs window closure.** `H4-terminal-accepts-any-message` and
+  `H4-window-never-closes` each leave the headline "A, B in one poll" and "B during the
+  settle" tests GREEN, because either site alone still keeps B out. Both removed together
+  (`H4-keep-ingesting-after-end`) turns them RED. Each site has its own RED test too (a later
+  assistant message with no prompt between; a closed window reads nothing more).
+- **Guard shapes.** Several fixtures are caught by more than one path (an import specifier AND
+  an identifier use). The matrix below shows every fixture goes RED under at least one
+  sabotage of the guard; the namespace barrel needs both the use check and the specifier check
+  removed (`G10`).
+
+| Fixture | RED under |
+|---|---|
+| named import (guarded module / reached module) | G1 alias following, G10, G3 (reached) |
+| aliased import | G1, G9 local-name matching, G10, G3 |
+| renamed re-export through a barrel / two barrels deep | G1, G9, G10, G3 |
+| namespace barrel `export * as P` | G10, G3 |
+| star barrel via namespace import / dynamic import of a barrel | G5 use check, G10, G3 |
+| star barrel destructured | G4 destructuring check, G3 |
+| dynamic import, result unused | G2 `import()` check, G3 |
+| require | G2, G3 |
+| wrapper module / wrapper through a renamed barrel | G1, G3 roots-only, G9, G10 |
+| helper off the allow-list in a guarded module | G1, G6 specifier check, G10 |
+
+`G3` = "look at the four modules only, not the graph they reach": 17 of 19 fixtures go RED, which
+is the whole point of the change. `G7` / `G8` put a renamed import and a barrel import into the
+REAL `pty-supervisor.ts` / `pty-process.ts`: the real-graph test goes RED on both.
+
+## Round 3: verification
+
+- Every test file that imports the PTY runner, supervisor, transcript reader, `runOnPty` or
+  `sendToLiveSession` (20 files, incl. the oneshot engine and the gateway seam): **623 pass / 0
+  fail**, normally and with `CLAUDECLAW_TEST_PLATFORM=linux`. An earlier normal run of the
+  13-file subset hit one failure: the #469 "a dialog that paints late gets a fresh hard-timeout
+  window" test (a 5 s turn timeout under load; `_waitForReadySettle` is untouched this round;
+  it passes alone, 70/70 in `pty-process.test.ts`, and in the two later full runs). It is the
+  same timing-sensitive test round 2 recorded.
+- `bun run lint` (full repo): 0 errors (1292 warnings, 325 infos, pre-existing).
+  `bun run typecheck`: 149 errors, baseline 149.
+- `env -u ANTHROPIC_BASE_URL` throughout; test output went to files; no
+  `.claude/claudeclaw/paused.json` left behind.
+- Nothing touched `~/.claude` or `~/.claude.json`; no real `claude`, no throwaway config dir.
+
+## Round 3: not done / risks
+
+1. **No real claude, again.** What only a real run can confirm: (a) the CLI records a pasted
+   prompt as exactly the written text inside its `<pasted_content>` wrapper, with no change to
+   internal whitespace beyond a TAB. If it normalises anything else (collapsed runs of spaces,
+   re-expanded newlines), equality fails and the turn ends in `PtyPromptNotAcceptedError`
+   after ~6 s. That fails LOUD and never falsely succeeds, but Nibbler's rerun is where it
+   would show; (b) a final assistant message is followed by `turn_duration` or another entry,
+   so a text-less final message still closes; (c) a healthy turn never has a non-meta user
+   text inside its window.
+2. A user typing into the live TUI mid-turn, or `[Request interrupted by user]`, now fails the
+   turn as `ambiguous` instead of being folded into the answer.
+3. The answer is now all assistant text of the turn (see the decision above).
+4. A duplicate of the prompt that is recorded after `runTurn` has returned is not detected.
+5. M4's "executes twice" TUI is a model of a CLI that does not exist; it shows what the reader
+   does if it did, not that claude does.
