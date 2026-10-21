@@ -134,9 +134,15 @@ export function applyOneShotPatch(
         next.baseUrl === maskUrl(previous.baseUrl)
       )
         next.baseUrl = previous.baseUrl;
-      // The loader accepts any identifier; a value written here is checked
-      // harder so a key pasted into the field is refused, and not echoed.
-      if (next.apiKeyEnv !== undefined && !ENV_NAME_STRICT.test(String(next.apiKeyEnv)))
+      // The loader accepts any identifier; a NEW value written here is checked
+      // harder so a key pasted into the field is refused, and not echoed. The
+      // stored value saved back unchanged stays editable.
+      const keptKeyEnv = isObject(previous) && next.apiKeyEnv === previous.apiKeyEnv;
+      if (
+        next.apiKeyEnv !== undefined &&
+        !keptKeyEnv &&
+        !ENV_NAME_STRICT.test(String(next.apiKeyEnv))
+      )
         throw new Error(
           `oneShot.engines.${name}.apiKeyEnv must be the NAME of an environment variable (upper case, e.g. OPENAI_API_KEY), not the key`,
         );

@@ -456,3 +456,22 @@ describe("hand-edited settings.json", () => {
     expect(text).toContain("never stored in settings");
   });
 });
+
+describe("hand-written lower-case apiKeyEnv", () => {
+  it("stays editable when saved back unchanged, a new lower-case value is refused", async () => {
+    await writeFile(
+      settingsFile,
+      JSON.stringify({
+        oneShot: { engines: { l: { type: "ollama", model: "m", apiKeyEnv: "openai_key" } } },
+      }),
+    );
+    const kept = await post("/api/settings/oneshot", {
+      engines: { l: { type: "ollama", model: "m2", apiKeyEnv: "openai_key" } },
+    });
+    expect(kept.status).toBe(200);
+    const changed = await post("/api/settings/oneshot", {
+      engines: { l: { type: "ollama", model: "m2", apiKeyEnv: "other_key" } },
+    });
+    expect(changed.status).toBe(400);
+  });
+});
