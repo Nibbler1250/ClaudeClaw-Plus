@@ -9,9 +9,10 @@
  *   - a short burst is typed: a CR submits, Ctrl-U clears the line.
  *
  * Typed and pasted text is echoed, as the input box paints it, so the
- * supervisor's sentinel echo works. A submit prints `SUBMITTED<text>` between
- * a spinner glyph and the idle footer, the two marks the output parser waits
- * for before it ends a turn.
+ * supervisor's sentinel echo works. A submit paints what claude paints while a
+ * turn runs (a running window title and the `esc to interrupt` footer, the
+ * turn-start edge #562 requires), then `SUBMITTED<text>`, then the done-summary
+ * and idle footer the output parser waits for before it ends the turn.
  */
 const PASTE_BURST_BYTES = 64;
 const START = "\x1b[200~";
@@ -49,7 +50,9 @@ process.stdin.on("data", (buf: Buffer) => {
     const ch = s[0];
     s = s.slice(1);
     if (ch === "\r") {
-      process.stdout.write(`\n✻ working\nSUBMITTED<${line}>\n> shift+tab to cycle\n`);
+      process.stdout.write(
+        `\n\x1b]0;◐ Work\x07✻ working… esc to interrupt\nSUBMITTED<${line}>\n✻ Baked for 1s · done 16:36\n> shift+tab to cycle\n`,
+      );
       line = "";
     } else if (ch === "\x15") {
       line = "";

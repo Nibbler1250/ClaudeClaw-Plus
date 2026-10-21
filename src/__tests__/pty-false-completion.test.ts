@@ -13,6 +13,9 @@
  */
 import { describe, expect, test } from "bun:test";
 import { PtyPromptNotAcceptedError, spawnPty, type PtyProcessOptions } from "../runner/index";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { SecurityConfig } from "../config";
 
 const NO_SECURITY: SecurityConfig = {
@@ -136,24 +139,57 @@ describe("#562 — a turn completes only on evidence the prompt was accepted", (
     expect(result.text).not.toMatch(/OLD-R\d+x/);
   });
 
-  test("a prompt accepted on the first CR needs no retry", async () => {
-    // The healthy path must not regress. `read -t` waits for a second line: a retry
-    // CR sent after a healthy submit would make it return and print EXTRA-CR-SEEN.
-    const proc = await spawnPty(
-      opts(
-        `read _l; printf '${BUSY}${ANSWER}${DONE}'; read -t 2 _l2 && echo EXTRA-CR-SEEN; sleep 8`,
-        {
+  test("a prompt accepted on the first CR is not re-submitted, even when the turn outlasts submitConfirmMs", async () => {
+    // The healthy path must not regress. The turn runs 0.5 s past its busy marker, longer
+    // than submitConfirmMs, so a confirm timer that ignored the edge would fire mid-turn.
+    // The retry leaves a line in the PTY trace; `read -t` is not in dash, so look there.
+    const dir = mkdtempSync(join(tmpdir(), "pty-562-"));
+    const trace = join(dir, "trace.log");
+    process.env.CLAUDECLAW_PTY_DUMP = trace;
+    try {
+      const proc = await spawnPty(
+        opts(`read _l; printf '${BUSY}'; sleep 0.5; printf '${ANSWER}${DONE}'; sleep 8`, {
           submitConfirmMs: 150,
-        },
-      ),
-    );
-    const result = await proc.runTurn("R17x please", { timeoutMs: 5000 });
-    // Let a (wrong) retry timer fire before looking: it would land in the next turn's input.
-    await new Promise((r) => setTimeout(r, 400));
-    await proc.dispose();
-    expect(result.cleanBoundary).toBe(true);
-    expect(result.text).toContain("NEW-ANSWER-R17x");
-    expect(result.text).not.toContain("EXTRA-CR-SEEN");
+        }),
+      );
+      const result = await proc.runTurn("R17x please", { timeoutMs: 5000 });
+      await proc.dispose();
+      expect(result.cleanBoundary).toBe(true);
+      expect(result.text).toContain("NEW-ANSWER-R17x");
+      // The trace must exist for this to prove anything: it holds the prompt write.
+      const wire = readFileSync(trace, "utf8");
+      expect(wire).toContain("write prompt");
+      // Fault: let the timer retry after the edge and this line appears.
+      expect(wire).not.toContain("retry submit");
+    } finally {
+      delete process.env.CLAUDECLAW_PTY_DUMP;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a prompt that is never accepted clears the input box before failing, so the next CR cannot submit it", async () => {
+    // After the retry CR, the fake goes raw and records the next byte it receives.
+    // Ctrl-U (0x15) is what empties claude's input box.
+    const dir = mkdtempSync(join(tmpdir(), "pty-562-"));
+    const seen = join(dir, "seen.hex");
+    try {
+      const proc = await spawnPty(
+        opts(
+          `read _l1; printf '${STALE}'; read _l2; stty raw -echo; dd bs=1 count=1 2>/dev/null | od -An -tx1 > ${seen}; sleep 8`,
+        ),
+      );
+      const err = await proc.runTurn("R17x please", { timeoutMs: 5000 }).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(PtyPromptNotAcceptedError);
+      await new Promise((r) => setTimeout(r, 300));
+      await proc.dispose();
+      // Fault: skip the clear and the fake never receives a byte, so this is empty.
+      expect(readFileSync(seen, "utf8").trim()).toBe("15");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("onChunk is not fed the stale repaint of a turn that never started", async () => {
