@@ -275,6 +275,10 @@ describe("the guard itself can fail", () => {
       "a dynamic import",
       { "main.ts": `export const p = await import("./pty-output-parser");\np.feed();` },
     ],
+    [
+      "a dynamic import of the parser whose result is not used",
+      { "main.ts": `export const loaded = import("./pty-output-parser");` },
+    ],
     ["a require", { "main.ts": `const p = require("./pty-output-parser");\nvoid p;` }],
     [
       "a multi-line import",
