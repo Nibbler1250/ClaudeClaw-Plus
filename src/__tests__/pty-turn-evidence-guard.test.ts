@@ -227,8 +227,16 @@ describe("PTY turn evidence: nothing the success-deciding modules reach uses the
 });
 
 describe("the guard itself can fail", () => {
-  /** A fake `src/` on disk: the parser, whatever the fixture adds, and a `main.ts` root. */
-  function violationsOf(files: Record<string, string>): Violation[] {
+  /**
+   * A fake `src/` on disk: the parser, whatever the fixture adds, and a `main.ts` root. By
+   * default the fixture's `main.ts` is moved to `mid.ts`, a module the root merely reaches, so
+   * the shape is judged by the graph rule; `direct` keeps it in the root, which is also held
+   * to "nothing but the readiness helpers".
+   */
+  function violationsOf(
+    files: Record<string, string>,
+    opts: { direct?: boolean } = {},
+  ): Violation[] {
     const dir = mkdtempSync(join(tmpdir(), "pty-guard-"));
     try {
       const all: Record<string, string> = {
@@ -243,6 +251,10 @@ describe("the guard itself can fail", () => {
         ].join("\n"),
         ...files,
       };
+      if (!opts.direct && all["main.ts"] !== undefined) {
+        all["mid.ts"] = `${all["main.ts"]}\nexport const touch = (): void => {};`;
+        all["main.ts"] = `import { touch } from "./mid";\ntouch();`;
+      }
       for (const [name, text] of Object.entries(all)) {
         const path = join(dir, name);
         mkdirSync(dirname(path), { recursive: true });
@@ -254,8 +266,16 @@ describe("the guard itself can fail", () => {
     }
   }
 
-  const bad: Array<[string, Record<string, string>]> = [
-    ["a named import", { "main.ts": `import { feed } from "./pty-output-parser";\nfeed();` }],
+  const bad: Array<[string, Record<string, string>, { direct?: boolean }?]> = [
+    [
+      "a named import in a guarded module",
+      { "main.ts": `import { feed } from "./pty-output-parser";\nfeed();` },
+      { direct: true },
+    ],
+    [
+      "a named import in a module the guarded ones reach",
+      { "main.ts": `import { feed } from "./pty-output-parser";\nfeed();` },
+    ],
     [
       "an aliased import",
       { "main.ts": `import { decodeTurn as d } from "./pty-output-parser";\nd();` },
@@ -291,6 +311,7 @@ describe("the guard itself can fail", () => {
       {
         "main.ts": `import { expandCursorForwardToSpaces } from "./pty-output-parser";\nexpandCursorForwardToSpaces("");`,
       },
+      { direct: true },
     ],
     // The shapes a text scan cannot see (round 3, M3):
     [
@@ -352,9 +373,9 @@ describe("the guard itself can fail", () => {
       },
     ],
   ];
-  for (const [label, files] of bad) {
+  for (const [label, files, opts] of bad) {
     test(`flags ${label}`, () => {
-      expect(violationsOf(files).length).toBeGreaterThan(0);
+      expect(violationsOf(files, opts).length).toBeGreaterThan(0);
     });
   }
 
