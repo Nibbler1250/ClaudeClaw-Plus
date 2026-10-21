@@ -459,7 +459,7 @@ containment itself).
 
 ```
 ## I10 Ctrl-U not sent on not-accepted: exit=1 failing=1
-   (fail) #562 — the screen is never evidence the prompt was accepted > a prompt that is never accepted clears the input box before failing, so the next CR cannot submit it [677.76ms]
+   (fail) #562 — the screen is never evidence the prompt was accepted > a prompt that is never accepted clears the input box before failing, so the next CR cannot submit it [3427.27ms]
 ```
 
 ```
@@ -529,12 +529,13 @@ containment itself).
 ## Round 2: verification
 
 - Affected suites: every test importing the PTY runner/supervisor/parser plus the new files
-  (27 files): normally **662 pass / 1 fail**, with `CLAUDECLAW_TEST_PLATFORM=linux`
-  **663 pass / 0 fail**. The one failure is `a dialog that paints late gets a fresh
-  hard-timeout window` (#469), a `PtyClosedError` where the fake's dialog script exited 1
-  because its Esc did not arrive in time under the load of the parallel run; it passed 3/3
-  alone straight afterwards and in every other run. That code (`_waitForReadySettle`) is
-  untouched by round 2. Treat it as load-sensitive, not as a regression.
+  and the gateway seam test (27 files), on the final commit: **663 pass / 0 fail**, both
+  normally and with `CLAUDECLAW_TEST_PLATFORM=linux`. Earlier runs on this branch hit two
+  timing-sensitive tests under parallel load, neither a regression: the #469 "dialog that
+  paints late" test (a fake dialog script exited 1 when its Esc was late; `_waitForReadySettle`
+  is untouched by round 2; it passed 3/3 alone) and the Ctrl-U test (racy because the fake
+  was disposed with the error; rewritten to keep it alive until the byte is recorded, 5/5
+  after, and its injection is still RED).
 - A full-repo `bun test` run before the final fixes showed 5 failures: the two #559 tests
   (the stand-in TUI wrote no transcript; fixed, 21/21), the late-dialog flake above, and two
   gateway tests failing with "System is paused": an escalation test in the full run had
