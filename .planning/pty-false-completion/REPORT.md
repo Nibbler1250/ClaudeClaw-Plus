@@ -929,3 +929,427 @@ REAL `pty-supervisor.ts` / `pty-process.ts`: the real-graph test goes RED on bot
 4. A duplicate of the prompt that is recorded after `runTurn` has returned is not detected.
 5. M4's "executes twice" TUI is a model of a CLI that does not exist; it shows what the reader
    does if it did, not that claude does.
+
+---
+
+# Round 4: final Codex review of `fa2c625d..da096758` (H2 `/compact`, H3, H4, M3 open; 2 new MEDIUM; 1 LOW)
+
+Code commit: `fc147101` (this report and the SPEC / CLAUDE.md lines are in the commit that follows it).
+Binding rule unchanged: the screen never decides acceptance, completion or the answer, and
+never how much of the answer is returned.
+
+## Round 4: summary
+
+| # | Finding | Fix | Where |
+|---|---|---|---|
+| 1 / H3 | delayed identical submission supplies this one's answer | a turn that ends in ANY non-ok outcome is remembered (`abandon()`, called from `_rejectTurn`) per transcript file; an identical payload that matches while one is unresolved fails `ambiguous` | `pty-transcript.ts` `unresolved`, `pty-process.ts` `_rejectTurn` |
+| 2 / H4 + 3 | screen settle decides how much of the final message; text-less final hangs | ONE definition: a terminal `stop_reason` opens `terminal`; the turn ENDS at `turn_duration`, the next entry that is not a line of that message, or `TRANSCRIPT_SETTLE_MS` without file growth. Text no longer matters. | `ingestAssistant`, `ingestTerminal`, `poll` |
+| 4 | literal paste tags reject a healthy prompt | compare the payload unchanged first, then strip only an OUTER wrapper | `payloadForms`, `promptMatches` |
+| 5 / H2 | `/compact` assistant API error ignored | a command still processes the assistant error flags; only ordinary text is not read | `ingestAssistant` |
+| 6 / M3 | element access through a namespace barrel bypasses the guard | resolve literal keys, flag unresolvable computed keys and computed destructuring on a namespace that exposes the API, flag a namespace used whole | `pty-turn-evidence-guard.test.ts` |
+| 7 LOW | single-execution count predetermined | the fake keeps reading and records every executed turn on its own | `pty-false-completion.test.ts` |
+
+## Round 4: decisions
+
+**The end of the final message (H4 + finding 3).** `ended` is no longer set when a terminal
+line is read. The turn is `terminal` until the transcript shows the message is over; the next
+poll that sees `turn_duration`, a different message id, a `user` entry or any other record
+closes the window (`finish()`), and the closed window is what freezes the answer. The
+screen's quiet window runs only after that and can only delay the return. A final message
+with no text (thinking-only, tool-only, empty) takes the same path: the answer is the last
+message that has text, or empty. A message with no `id` is never "the same message" as a later
+line (`finalMessageId !== undefined`).
+
+**Markers seen in real captures and which I assumed.**
+- SEEN (all of `docs/spikes/fixtures/**/*.jsonl` that contain `turn_duration`, 16 distinct
+  messages in the lifecycle fixtures): every final message is ONE `text` block with
+  `stop_reason: end_turn`, and a `system` / `turn_duration` entry is the very next record.
+  `turn_duration` is the marker the CLI writes in interactive sessions.
+- ASSUMED, not in any capture: a final message split over several lines that all carry a
+  terminal `stop_reason` (the reviewer's shape; the fixtures only show single-block finals);
+  a thinking-only or tool-only terminal final; a terminal reason other than `end_turn`
+  (`max_tokens`, `stop_sequence`, `refusal`) followed by `turn_duration`; and that nothing can
+  come between a message's lines except lines of that message.
+
+**Transcript-side settle: `TRANSCRIPT_SETTLE_MS = 1500`.** For a CLI that writes neither
+marker after a terminal line. Measured from the last growth of the file (a late block restarts
+it), by the injected clock `now` (pty-process passes its `_now`), so it is transcript time,
+not screen time. 1500 ms because the CLI writes the lines of one message as it streams them, so a gap this long
+is far past the spacing I could measure: in the 21 end_turn -> `turn_duration` pairs in the
+fixtures the marker is written 4 ms to 117 ms after the final line (median 50 ms). I could not
+measure the spacing between blocks of one message, because no fixture has a multi-block final.
+It stays under the 2 s ceiling and far inside every hard timeout, so a turn never
+waits out the deadline. The cost: if a CLI really writes B more than 1.5 s after A with no
+marker in between, the answer is A alone. That is a transcript-timing limit, stated, and the
+same on a quiet and a repainting screen.
+
+**Paste tags.** `payloadForms` yields the payload unchanged, then (only if the WHOLE payload is
+one `<pasted_content …>…</pasted_content …>`) its inner text. Literal tags inside the text
+survive in both forms. The match is greedy to the last closing tag, so a payload that is two
+wrappers concatenated unwraps to everything between the first open and the last close; that is
+not a shape the CLI writes.
+
+**`/compact` errors.** `ingestOpen` hands every assistant record to `ingestAssistant`; for a
+command it returns after the `isApiErrorMessage` / `error` check and before any text is read.
+
+**Unresolved identical submissions (H3).** Size: about 95 lines of code and comments in
+`pty-transcript.ts` plus 4 in `pty-process.ts`, so within "a small registry"; nothing was
+stopped.
+- `promptKey` = sha256 of the NFC-trimmed payload (a command: its name). A module-level
+  `Map<transcriptPath, Map<key, entry>>`, at most 8 entries per file, entry = `{written, offset at
+  mark, file identity, time}`.
+- Registered by `abandon()` from `_rejectTurn`, which every non-ok outcome goes through: not
+  accepted, timeout, `PtyClosedError`, replaced transcript, API error, stderr, ambiguous.
+  A turn that ended OK is never registered, so a normal hourly cron sequence never touches it.
+- Consulted at `mark()` (`openUnresolvedKeys`), which first drops entries that are over:
+  another file (identity differs, or the file is shorter than the entry's offset), expired
+  (`UNRESOLVED_TTL_MS = 120 s`), or RESOLVED. Resolved = a probe `TranscriptTurn` started at the
+  entry's offset finds its record and its end (`ended` and not `ambiguous`), i.e. both are
+  already in the file and so cannot arrive late. A missing file is not "another file": the late
+  record may be what creates it.
+- A match (the `enqueue` or the `user` record) while the key is open fails `ambiguous` at once.
+- Why a TTL: a prompt that was never submitted (Ctrl-U cleared it) never gets a record; without
+  an expiry every later identical prompt would fail for the life of the session. 120 s: the
+  supervisor retires the process after any of these failures, so a late record can only come
+  from writes already in flight when it died.
+- `promptId` / `uuid` cannot be used instead: the CLI assigns them after the submit, so there
+  is nothing of OURS to correlate. The registry is the available identity.
+- The supervisor respawns with `--resume` on the SAME session id (same transcript path), so
+  the registry outlives the process; a rotated or reset session is another path.
+
+**Guard (M3).** Three additions, each with a negative fixture: (1) `B["literal"]` is resolved
+on the value's type and judged like `B.literal`; (2) any other key on a value whose type
+exposes a forbidden symbol is a violation, as is a computed destructuring pattern
+(`{ [k]: f } = B`); (3) a module namespace that exposes the API and is used other than as
+`B.x`, `B["x"]` or a destructuring source (cast, passed on, spread) is a violation. The real
+graph stays clean.
+
+**Fixture change.** `fakeTurn` now writes `turn_duration` after the answer, as the real CLI
+does. Several older hand-written fakes still end on the final line with no marker; they pass on
+the 1.5 s settle and so exercise it.
+
+## Round 4: tests
+
+New, all in the files they belong to:
+- `pty-transcript.test.ts`: not ended before block B / A+B answer; the next foreign entry ends
+  it; thinking-only and tool-only finals end on the settle (answer = last text / empty); the
+  settle restarts on growth; no settle while a `tool_use` message is current; literal paste
+  tags bare, inside an outer wrapper, and not equal to a stripped record; `/compact` + assistant
+  API error; the unresolved registry (turn 1 late, enqueue-only, other prompt unaffected,
+  already-resolved earlier turn, earlier record without its end, TTL, rotated file, four
+  sequential resolved identical prompts all succeed).
+- `pty-false-completion.test.ts`: quiet and repainting screens return the same answer for a late
+  block B; thinking-only final ends without the hard timeout; turn 1 not accepted then turn 2
+  with the identical prompt through a real PTY (`PtyTurnFailedError` `ambiguous`); the
+  single-execution test rewritten (finding 7).
+- `pty-turn-evidence-guard.test.ts`: six bad fixtures, one precision fixture.
+- Existing tests that assumed "ended on the first terminal line" now close with `turn_duration`
+  (they assert it is NOT ended before it).
+
+## Round 4: fault injection (one site at a time, on a `git archive` copy)
+
+Each fault was named and its failing test predicted before the run. `git archive` of `fc147101`,
+`node_modules` symlinked, a fresh copy per fault. First failing assertion of each run, quoted
+from the run's own output (source line, caret, expected, received). Raw output:
+`inj/<id>/out.txt` in the session scratchpad. `[n fail]` is the number of failing tests of the
+files named in the run.
+
+```
+I1-commit-on-first-text: H4/3: commit (`ended = true`) on the first terminal line that has text (the round-3 shape)   [5 fail]
+  183 |     let s = turn_.poll();
+  184 |     expect(s.answer).toBe("NEW-ANSWER");
+  185 |     // The final message is out, but the transcript has not yet said it is over.
+  186 |     expect(s.ended).toBe(false);
+                            ^
+  error: expect(received).toBe(expected)
+  Expected: false
+  Received: true
+        at <anonymous> (src/__tests__/pty-transcript.test.ts:186:21)
+  (fail) TranscriptTurn — answer and end of reply > the answer is the assistant text after the matched user entry, and the terminal stop ends it
+
+I2-require-text: F3: a terminal message only counts as terminal when it has text   [3 fail]
+  934 |     expect(turn_.poll().ended).toBe(false);
+  935 |     now += 1;
+  936 |     const s = turn_.poll();
+  937 |     expect(s.ended).toBe(true);
+                            ^
+  error: expect(received).toBe(expected)
+  Expected: true
+  Received: false
+        at <anonymous> (src/__tests__/pty-transcript.test.ts:937:21)
+  (fail) TranscriptTurn — one definition of 'the final message is complete' (round 4, H4 + finding 3) > a terminal thinking-only final message with nothing after it ends the turn on the transcript settle, answering with the last message that has text
+
+I3-no-settle: F3: remove the transcript-side settle (no marker ever closes a thinking-only final)   [11 fail]
+  934 |     expect(turn_.poll().ended).toBe(false);
+  935 |     now += 1;
+  936 |     const s = turn_.poll();
+  937 |     expect(s.ended).toBe(true);
+                            ^
+  error: expect(received).toBe(expected)
+  Expected: true
+  Received: false
+        at <anonymous> (src/__tests__/pty-transcript.test.ts:937:21)
+  (fail) TranscriptTurn — one definition of 'the final message is complete' (round 4, H4 + finding 3) > a terminal thinking-only final message with nothing after it ends the turn on the transcript settle, answering with the last message that has text
+
+I4-settle-from-terminal-line: F3: the settle clock stops restarting on growth after the terminal line   [1 fail]
+  970 |     appendFileSync(t.path, nl(assistantLine("B", ids("m1"))));
+  971 |     expect(turn_.poll().ended).toBe(false);
+  972 |     now += TRANSCRIPT_SETTLE_MS - 1;
+  973 |     expect(turn_.poll().ended).toBe(false);
+                                       ^
+  error: expect(received).toBe(expected)
+  Expected: false
+  Received: true
+        at <anonymous> (src/__tests__/pty-transcript.test.ts:973:32)
+  (fail) TranscriptTurn — one definition of 'the final message is complete' (round 4, H4 + finding 3) > the settle runs from the last growth of the file: a late block of the final message restarts it
+
+I5-global-paste-strip: F4: strip every paste tag from the recorded side (the round-3 shape)   [3 fail]
+  155 |         ),
+  156 |       ),
+  157 |     );
+  158 |     expect(turn_.poll().accepted).toBe(true);
+                                          ^
+  error: expect(received).toBe(expected)
+  Expected: true
+  Received: false
+        at <anonymous> (src/__tests__/pty-transcript.test.ts:158:35)
+  (fail) TranscriptTurn — acceptance > a prompt the CLI recorded as a paste is wrapped in pasted_content tags and still matches
+
+I6-compact-skips-assistant: F5/H2: skip every assistant record for a REPL command, error flags included   [1 fail]
+  1031 |     const turn_ = turn(t, "/compact", true);
+  1032 |     appendFileSync(t.path, nl(userLine(cmd), apiErrorLine("API Error: 529 overloaded")));
+  1033 |     const s = turn_.poll();
+  1034 |     expect(s.ended).toBe(true);
+                             ^
+  error: expect(received).toBe(expected)
+  Expected: true
+  Received: false
+        at <anonymous> (src/__tests__/pty-transcript.test.ts:1034:21)
+  (fail) TranscriptTurn — /compact API errors (round 4, finding 5) > an assistant API-error record after /compact fails the turn promptly, with no local_command stderr
+
+I7-no-registry-check: F1/H3: drop the unresolved-earlier-submission check   [4 fail]
+  1072 |       nl(userLine("R17x please"), assistantLine("ANSWER-OF-TURN-1"), systemLine("turn_duration")),
+  1073 |     );
+  1074 |     const s = second.poll();
+  1075 |     expect(s.failure?.kind).toBe("ambiguous");
+                                     ^
+  error: expect(received).toBe(expected)
+  Expected: "ambiguous"
+  Received: undefined
+        at <anonymous> (src/__tests__/pty-transcript.test.ts:1075:29)
+  (fail) TranscriptTurn — an earlier identical submission that is unresolved (round 4, finding 1) > turn 1 not accepted, turn 2 sends the identical prompt, turn 1's record and answer arrive: turn 2 does NOT succeed with them
+
+I8-no-ttl: F1/H3: unresolved submissions never expire   [1 fail]
+  1143 |     const s = second.poll();
+  1144 |     expect(s.failure).toBeNull();
+                               ^
+  error: expect(received).toBeNull()
+  Received: {
+    kind: "ambiguous",
+    text: "an earlier submission of this identical prompt in this session is unresolved: its record may be the one that arrived",
+  }
+        at <anonymous> (src/__tests__/pty-transcript.test.ts:1144:23)
+  (fail) TranscriptTurn — an earlier identical submission that is unresolved (round 4, finding 1) > an unresolved submission expires: its record cannot still be late
+
+I9-never-resolved: F1/H3: an unresolved submission is never resolved by its record + end being in the file   [1 fail]
+  1113 |     const s = second.poll();
+  1114 |     expect(s.failure).toBeNull();
+                               ^
+  error: expect(received).toBeNull()
+  Received: {
+    kind: "ambiguous",
+    text: "an earlier submission of this identical prompt in this session is unresolved: its record may be the one that arrived",
+  }
+        at <anonymous> (src/__tests__/pty-transcript.test.ts:1114:23)
+  (fail) TranscriptTurn — an earlier identical submission that is unresolved (round 4, finding 1) > an earlier submission whose record AND turn end are already in the file is resolved: the identical prompt succeeds
+
+I10-no-abandon-call: F1/H3: `_rejectTurn` does not register the turn as unresolved   [1 fail]
+  715 |       const second = await proc.runTurn(PROMPT, { timeoutMs: 5000 }).then(
+  716 |         (r) => ({ text: r.text }),
+  717 |         (e: unknown) => ({ err: e }),
+  718 |       );
+  719 |       expect((second as { text?: string }).text).toBeUndefined();
+                                                         ^
+  error: expect(received).toBeUndefined()
+  Received: "ANSWER-OF-TURN-1"
+        at <anonymous> (src/__tests__/pty-false-completion.test.ts:719:50)
+  (fail) #562 round 4 — an earlier identical submission that was not accepted > turn 1 is not accepted, turn 2 sends the identical prompt, turn 1's record and answer then arrive: turn 2 is NOT a success
+
+I12-resubmit-on-retry: F7: the submit retry writes the whole prompt again instead of a bare CR   [2 fail]
+  405 |         .filter((x, i, a) => i < a.length - 1);
+  406 |       // One paste (the prompt text, once) and exactly one bare CR. Fault: a retry that
+  407 |       // re-writes the prompt makes the text appear twice.
+  408 |       expect(lines.filter((x) => x.includes(PROMPT)).length).toBe(1);
+                                                                     ^
+  error: expect(received).toBe(expected)
+  Expected: 1
+  Received: 2
+        at <anonymous> (src/__tests__/pty-false-completion.test.ts:408:62)
+  (fail) #562 — the submit retry > evidence that arrives AFTER the confirm deadline: no duplicate submission
+
+G1-no-element-access-branch: F6/M3: the guard ignores element access   [3 fail]
+  470 |   ];
+  471 |   for (const [label, files, opts] of bad) {
+  472 |     test(`flags ${label}`, () => {
+  473 |       expect(violationsOf(files, opts).length).toBeGreaterThan(0);
+                                                       ^
+  error: expect(received).toBeGreaterThan(expected)
+  Expected: > 0
+  Received: 0
+        at <anonymous> (src/__tests__/pty-turn-evidence-guard.test.ts:473:48)
+  (fail) the guard itself can fail > flags element access through a star-barrel namespace import
+
+G2-no-computed-branch: F6/M3: the guard does not flag an unresolvable computed key   [1 fail]
+  470 |   ];
+  471 |   for (const [label, files, opts] of bad) {
+  472 |     test(`flags ${label}`, () => {
+  473 |       expect(violationsOf(files, opts).length).toBeGreaterThan(0);
+                                                       ^
+  error: expect(received).toBeGreaterThan(expected)
+  Expected: > 0
+  Received: 0
+        at <anonymous> (src/__tests__/pty-turn-evidence-guard.test.ts:473:48)
+  (fail) the guard itself can fail > flags a key built at run time on a star-barrel namespace
+
+G3-no-whole-namespace-rule: F6/M3: the guard does not flag a namespace used whole (cast, passed on)   [1 fail]
+  471 |   ];
+  472 |   for (const [label, files, opts] of bad) {
+  473 |     test(`flags ${label}`, () => {
+  474 |       expect(violationsOf(files, opts).length).toBeGreaterThan(0);
+                                                       ^
+  error: expect(received).toBeGreaterThan(expected)
+  Expected: > 0
+  Received: 0
+        at <anonymous> (src/__tests__/pty-turn-evidence-guard.test.ts:474:48)
+  (fail) the guard itself can fail > flags an unresolvable computed access on a namespace that exposes the parser's API
+
+G4-no-computed-destructure: F6/M3: the guard ignores computed destructuring `{ [k]: f } = B`   [1 fail]
+  470 |   ];
+  471 |   for (const [label, files, opts] of bad) {
+  472 |     test(`flags ${label}`, () => {
+  473 |       expect(violationsOf(files, opts).length).toBeGreaterThan(0);
+                                                       ^
+  error: expect(received).toBeGreaterThan(expected)
+  Expected: > 0
+  Received: 0
+        at <anonymous> (src/__tests__/pty-turn-evidence-guard.test.ts:473:48)
+  (fail) the guard itself can fail > flags computed destructuring of a namespace that exposes the parser's API
+
+G5-literal-key-unresolved: F6/M3: a literal key is not resolved to its member (every key is treated as computed)   [1 fail]
+  +   {
+  +     "file": "/var/folders/hj/x3pkkchs389fhmt3hyyn5gkc0000gn/T/pty-guard-TYHETt/mid.ts",
+  +     "line": 5,
+  +     "what": "computed access on a value that exposes the parser's completion API",
+  +   },
+  + ]
+  - Expected  - 1
+  + Received  + 12
+        at <anonymous> (src/__tests__/pty-turn-evidence-guard.test.ts:502:7)
+  (fail) the guard itself can fail > element access that names a harmless member, or on a value that exposes nothing forbidden, is not a violation
+```
+
+PTY level (a real `/bin/sh` child on a real PTY, same faults):
+
+```
+I1-commit-on-first-text (PTY level):
+  663 |     );
+  664 |     expect(quietOut.err).toBeUndefined();
+  665 |     expect(noisyOut.err).toBeUndefined();
+  666 |     expect(quietOut.text).toBe("A-BLOCK B-BLOCK");
+                                  ^
+  error: expect(received).toBe(expected)
+  Expected: "A-BLOCK B-BLOCK"
+  Received: "A-BLOCK "
+        at <anonymous> (src/__tests__/pty-false-completion.test.ts:666:27)
+  (fail) #562 round 4 — the transcript alone decides how much of the answer, and when the turn ends > a quiet screen and a repainting screen return the SAME answer for a final message whose block B arrives late
+
+I2-require-text (PTY level):
+  952 |           if (!this._turnInProgress || this._endedAt !== 0) return;
+  953 |           const elapsed = this._now() - this._turnStartedAt;
+  954 |           this._rejectTurn(new PtyTurnTimeoutError(this.label, elapsed));
+                                   ^
+  PtyTurnTimeoutError: PTY turn timed out for test:89863 after 4002ms
+       label: "test:89863",
+   elapsedMs: 4002,
+        at <anonymous> (src/runner/pty-process.ts:954:28)
+        at <anonymous> (src/__tests__/pty-false-completion.test.ts:686:21)
+  (fail) #562 round 4 — the transcript alone decides how much of the answer, and when the turn ends > a terminal thinking-only final message with no record after it ends the turn: no hard-timeout wait, no replay
+
+I7-no-registry-check (PTY level):
+  715 |       const second = await proc.runTurn(PROMPT, { timeoutMs: 5000 }).then(
+  716 |         (r) => ({ text: r.text }),
+  717 |         (e: unknown) => ({ err: e }),
+  718 |       );
+  719 |       expect((second as { text?: string }).text).toBeUndefined();
+                                                         ^
+  error: expect(received).toBeUndefined()
+  Received: "ANSWER-OF-TURN-1"
+        at <anonymous> (src/__tests__/pty-false-completion.test.ts:719:50)
+  (fail) #562 round 4 — an earlier identical submission that was not accepted > turn 1 is not accepted, turn 2 sends the identical prompt, turn 1's record and answer then arrive: turn 2 is NOT a success
+
+I10-no-abandon-call (PTY level):
+  715 |       const second = await proc.runTurn(PROMPT, { timeoutMs: 5000 }).then(
+  716 |         (r) => ({ text: r.text }),
+  717 |         (e: unknown) => ({ err: e }),
+  718 |       );
+  719 |       expect((second as { text?: string }).text).toBeUndefined();
+                                                         ^
+  error: expect(received).toBeUndefined()
+  Received: "ANSWER-OF-TURN-1"
+        at <anonymous> (src/__tests__/pty-false-completion.test.ts:719:50)
+  (fail) #562 round 4 — an earlier identical submission that was not accepted > turn 1 is not accepted, turn 2 sends the identical prompt, turn 1's record and answer then arrive: turn 2 is NOT a success
+
+I12-resubmit-on-retry (PTY level):
+  609 |     // Count what the CLI executed, not what we wrote. Fault: a retry that resubmits the
+  610 |     // prompt makes the fake run it a second time and this is 2 (the first assertion on
+  611 |     // purpose: it must be the count that goes red, not the outcome after it).
+  612 |     expect(userEntries(t.path)).toBe(1);
+                                        ^
+  error: expect(received).toBe(expected)
+  Expected: 1
+  Received: 2
+        at <anonymous> (src/__tests__/pty-false-completion.test.ts:612:33)
+  (fail) #562 round 3 — executions, not bytes: a late transcript record is one turn > accepted at once, the record flushes late: ONE executed turn, one reply
+```
+
+Two things the runs showed that were not predicted:
+- `G1` (guard ignores element access) did not turn the `export * as P` fixture red: `P["feed"]`
+  is already caught by the older "uses the parser module's namespace" rule. The star-barrel and
+  dynamic-import fixtures carry that rule.
+- `I3` (no settle) turned 11 tests red, not 3: eight older tests end on the final line with no
+  marker and depend on the settle. They are covered by it, not written for it.
+- The first `I4` was a bad injection (dropping the clock update made the settle fire at once, 7
+  red); it was redone as the stated fault (the clock stops restarting after the terminal line).
+
+## Round 4: verification
+
+- 86 test files that mention the PTY runner, supervisor, transcript reader, `runOnPty`,
+  `sendToLiveSession` or the gateway (everything under `src/__tests__` and `tests/` with `pty`,
+  `live-session` or `gateway` in it, minus `tests/integration/*`, which needs a real claude):
+  **1875 pass / 0 fail**, normally and with `CLAUDECLAW_TEST_PLATFORM=linux`.
+- `bun run lint` (full repo): exit 0 (1292 warnings, 325 infos, pre-existing).
+  `bun run typecheck`: 149 errors, baseline 149.
+- `env -u ANTHROPIC_BASE_URL` throughout; test output went to files, never a pipe;
+  `.claude/claudeclaw/paused.json` was left by a run and deleted.
+- Nothing touched `~/.claude` or `~/.claude.json`; no real `claude`, no throwaway config dir.
+
+## Round 4: not done / risks
+
+1. **No real claude.** Still unconfirmed against a live CLI: (a) a multi-block final message is
+   written as several lines of one id, all in a row; (b) `turn_duration` follows a thinking-only
+   or tool-only terminal message; (c) a terminal reason other than `end_turn` is followed by it.
+   If (a) is wrong in the direction of a long gap, the settle returns A alone.
+2. **The settle adds up to 1.5 s** to a turn whose CLI writes no `turn_duration`. Captured CLIs
+   do write it, so this is the backstop, not the common path.
+3. **The unresolved registry is process-memory.** A restart of the daemon forgets it; the
+   transcript offsets would be stale anyway. A record that arrives later than 120 s after a
+   failed identical submission is not caught.
+4. An identical prompt can now fail `ambiguous` once after a non-ok turn, while the earlier
+   submission is still open (up to 120 s or until its record and end are in the file). It fails
+   loud and the supervisor retires the process; it never succeeds with the wrong answer.
+5. A namespace laundered through something the checker cannot type (`Reflect.get(B, name)` on an
+   `any`-typed alias of it) is not seen by the guard; the three rules above close the forms
+   Codex named and their direct variants, not every possible indirection.
+6. A turn that ends with an empty answer (a terminal text-less message and no earlier text) now
+   resolves as success with `""`. The brief asks for that. I did not check how each caller
+   (runner, cron, gateway) treats an empty reply.
