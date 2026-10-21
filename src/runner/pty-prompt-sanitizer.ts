@@ -9,7 +9,7 @@
 // Constructed at module load so the source file contains no literal control
 // chars (biome's `noControlCharactersInRegex` lint would otherwise fire on the
 // intentional NUL/BS/DEL/etc. class).
-const _ptyControlCharStrip = new RegExp("[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f-\\x9f]", "g");
+const _ptyControlCharStrip = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g;
 
 /**
  * Strip control characters from a prompt string before writing to a PTY.
@@ -40,9 +40,8 @@ const REPL_COMMAND_LEADERS = new Set(["/", "!", "#", "@"]);
  * U+200F, U+202A to U+202E). Built from escapes so the source holds no literal control
  * characters.
  */
-const LEADING_SKIPPABLE = new RegExp(
-  "^[\\s\\x00-\\x1f\\x7f-\\x9f\\u200b-\\u200f\\u2028\\u2029\\u202a-\\u202e\\u2060-\\u2064\\ufeff]*",
-);
+const LEADING_SKIPPABLE =
+  /^[\s\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\ufeff]*/;
 
 /**
  * Keep a prompt from being taken as a REPL command. The REPL treats a prompt that

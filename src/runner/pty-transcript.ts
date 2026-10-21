@@ -62,9 +62,20 @@ export function resolveTranscriptPath(opts: {
   );
 }
 
-/** Whitespace-insensitive form used to compare a transcript prompt with what we wrote. */
+/**
+ * The shape the PTY and the transcript agree on, as the bus path compares them
+ * (`normalizePromptForMatch` in `session-agent-process.ts`, #362/#428). Whitespace goes
+ * entirely, not collapsed: `sanitizePtyPromptText` keeps a TAB, but a raw 0x09 typed into
+ * the TUI is a completion key and never reaches the transcript, so `"a\tb"` would be
+ * recorded as `"ab"` and a collapsed `"a b"` would never match. A prompt the TUI took as a
+ * paste is recorded wrapped in `<pasted_content id="..">` tags (every long prompt on CLI
+ * 2.1.296); the tags are the CLI's, so they go too.
+ */
 function normalise(text: string): string {
-  return text.normalize("NFC").replace(/\s+/g, " ").trim();
+  return text
+    .normalize("NFC")
+    .replace(/<\/?pasted_content\b[^>]*>/g, "")
+    .replace(/\s+/g, "");
 }
 
 /** The `<command-name>` of a slash command the CLI recorded, or null. */
@@ -78,11 +89,11 @@ function commandNameOf(text: string): string | null {
  * nothing (it would match everything).
  */
 export function promptMatches(entryText: string, written: string, replCommand: boolean): boolean {
-  const want = normalise(written);
   if (replCommand) {
     const name = commandNameOf(entryText);
-    return name !== null && name === want.split(" ")[0];
+    return name !== null && name === written.trim().split(/\s+/)[0];
   }
+  const want = normalise(written);
   if (want === "") return false;
   return normalise(entryText).includes(want);
 }

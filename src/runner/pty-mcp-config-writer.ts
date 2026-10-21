@@ -142,7 +142,7 @@ export function writeConfigForPty(input: WriteConfigInput): WriteConfigResult {
     // Skip if a shared entry already claimed this name. perPtyOnly + shared
     // is supposed to be mutually exclusive (config validation enforces
     // this); the defensive de-dupe keeps the synthesized JSON well-formed.
-    if (Object.prototype.hasOwnProperty.call(mcpServers, entry.name)) continue;
+    if (Object.hasOwn(mcpServers, entry.name)) continue;
 
     const stdioEntry: Record<string, unknown> = {
       type: "stdio",

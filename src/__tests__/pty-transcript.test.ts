@@ -102,6 +102,31 @@ describe("TranscriptTurn — acceptance", () => {
     expect(turn_.poll().accepted).toBe(true);
   });
 
+  test("a prompt the CLI recorded as a paste is wrapped in pasted_content tags and still matches", () => {
+    // Every long prompt on CLI 2.1.296. Fault: compare without removing the tags AND with
+    // collapsed whitespace and the wrapped entry no longer contains the written text.
+    const t = tx();
+    const turn_ = turn(t, "R17x please do the thing");
+    appendFileSync(
+      t.path,
+      nl(
+        userLine(
+          '<pasted_content id="4c50">\nR17x please do the thing\n</pasted_content id="4c50">',
+        ),
+      ),
+    );
+    expect(turn_.poll().accepted).toBe(true);
+  });
+
+  test("a TAB in the prompt, which the TUI turns into a completion key, does not stop it matching", () => {
+    // Fault: collapse whitespace to one space instead of dropping it and "a\tb" (written)
+    // never matches "ab" (recorded): a permanent non-match that fails every such turn.
+    const t = tx();
+    const turn_ = turn(t, "a\tb");
+    appendFileSync(t.path, nl(userLine("ab")));
+    expect(turn_.poll().accepted).toBe(true);
+  });
+
   test("an empty prompt matches nothing (it would match every entry)", () => {
     const t = tx();
     const turn_ = turn(t, "");
@@ -281,6 +306,20 @@ describe("TranscriptTurn — /compact", () => {
     const s = turn_.poll();
     expect(s.ended).toBe(true);
     expect(s.answer).toBe("Error: Not enough messages to compact.");
+  });
+
+  test("/compact with arguments is still matched by its command name", () => {
+    const t = tx();
+    const turn_ = turn(t, "/compact keep the tests", true);
+    appendFileSync(
+      t.path,
+      nl(
+        userLine(
+          "<command-name>/compact</command-name>\n<command-args>keep the tests</command-args>",
+        ),
+      ),
+    );
+    expect(turn_.poll().accepted).toBe(true);
   });
 
   test("another command's entry is not this /compact", () => {
