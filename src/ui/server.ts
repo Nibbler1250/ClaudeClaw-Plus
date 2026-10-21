@@ -216,7 +216,13 @@ function requireCsrf(req: Request): Response | null {
 export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
   // The agent-turn engine the daemon started with, for the Engines modal's
   // "restart required" (bus agents keep their supervision until a restart).
-  const engineStartup = startupEngines(opts.getSnapshot().settings);
+  // Read once here; a snapshot that is not ready yet is read on the first request.
+  let engineStartup: ReturnType<typeof startupEngines> | undefined;
+  try {
+    engineStartup = startupEngines(opts.getSnapshot().settings);
+  } catch {
+    engineStartup = undefined;
+  }
   // Every response — rejections before routing included — leaves through
   // withSecurityHeaders (CSP, anti-framing, nosniff, no-store on /api/*).
   async function route(req: Request): Promise<Response> {
@@ -501,7 +507,7 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
     // Engines settings (#552): one-shot routing, agent-turn engine, engine probe.
     const enginesResponse = await handleEnginesRoute(req, url, {
       requireCsrf,
-      startup: engineStartup,
+      startup: () => (engineStartup ??= startupEngines(opts.getSnapshot().settings)),
     });
     if (enginesResponse) return enginesResponse;
 

@@ -64,7 +64,7 @@ function restartRequired(saved: AgentEngineView, running: AgentEngineView): bool
 export async function handleEnginesRoute(
   req: Request,
   url: URL,
-  ctx: { requireCsrf: (req: Request) => Response | null; startup: AgentEngineView },
+  ctx: { requireCsrf: (req: Request) => Response | null; startup: () => AgentEngineView },
 ): Promise<Response | null> {
   const path = url.pathname;
   if (
@@ -103,11 +103,12 @@ export async function handleEnginesRoute(
         await updatePtyEnabled(pty.enabled);
       }
       const saved = await readAgentEngineView();
+      const running = ctx.startup();
       return json({
         ok: true,
         saved,
-        running: ctx.startup,
-        restartRequired: restartRequired(saved, ctx.startup),
+        running,
+        restartRequired: restartRequired(saved, running),
       });
     }
 
