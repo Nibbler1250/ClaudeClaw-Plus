@@ -111,6 +111,9 @@ export function fakeTurn(t: FakeTurn): string {
     append(t.tx, userLine(t.prompt)),
     `sleep ${t.think ?? 0.15}`,
     append(t.tx, assistantLine(t.answer)),
+    // The real CLI writes `turn_duration` right after the final message (every capture in
+    // docs/spikes/fixtures does); it is what ends the turn, not the message itself.
+    append(t.tx, systemLine("turn_duration")),
     `printf '\\342\\227\\217 ${t.answer.replace(/'/g, "")}\\n'`,
     `printf '${t.done ?? CHROME_DONE}'`,
   ].join("; ");

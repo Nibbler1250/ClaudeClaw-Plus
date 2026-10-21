@@ -130,6 +130,30 @@ export function graphViolations(
     return null;
   };
 
+  /** Whether any member of `type` finally names a forbidden symbol of the parser. */
+  const exposesForbidden = (type: ts.Type): boolean =>
+    type.getProperties().some((p) => {
+      const name = parserTarget(p);
+      return name !== null && name !== "*" && FORBIDDEN_PARSER_SYMBOLS.has(name);
+    });
+
+  /**
+   * A use of a module-namespace value (`import * as B`, `await import(..)`) that exposes the
+   * parser's completion API, other than the three shapes judged member by member: `B.x`,
+   * `B["x"]` and a destructuring source. Handed on, cast (`B as Record<..>`), spread or
+   * passed to `Object.values`, it can reach any member, so it is a violation.
+   */
+  const isUnjudgedNamespaceUse = (node: ts.Identifier): boolean => {
+    const p = node.parent;
+    if (ts.isVariableDeclaration(p) && p.name === node) return false;
+    if (ts.isPropertyAccessExpression(p) && p.expression === node) return false;
+    if (ts.isElementAccessExpression(p) && p.expression === node) return false;
+    if (ts.isVariableDeclaration(p) && p.initializer === node && ts.isObjectBindingPattern(p.name))
+      return false;
+    const type = checker.getTypeAtLocation(node);
+    return ((type.symbol?.flags ?? 0) & ts.SymbolFlags.ValueModule) !== 0 && exposesForbidden(type);
+  };
+
   const report = (sf: ts.SourceFile, node: ts.Node, what: string): void => {
     const { line } = sf.getLineAndCharacterOfPosition(node.getStart(sf));
     found.push({ file: sf.fileName, line: line + 1, what });
@@ -195,13 +219,34 @@ export function graphViolations(
           report(sf, node, `uses the parser module's namespace (${node.text})`);
         } else if (name !== null && FORBIDDEN_PARSER_SYMBOLS.has(name)) {
           report(sf, node, `uses ${name} (as ${node.text}), which is the parser's`);
+        } else if (name === null && isUnjudgedNamespaceUse(node)) {
+          report(sf, node, `${node.text} is a namespace that exposes the parser's API, used whole`);
+        }
+      } else if (ts.isElementAccessExpression(node)) {
+        // `B["extractResponseText"]`: a literal key is looked up on the value's type and
+        // judged like a property access. Any other key (`B[name]`) cannot be resolved, so it
+        // is a violation when the value exposes a forbidden symbol at all.
+        const type = checker.getTypeAtLocation(node.expression);
+        const key = node.argumentExpression;
+        if (ts.isStringLiteralLike(key)) {
+          const name = parserTarget(type.getProperty(key.text));
+          if (name !== null && name !== "*" && FORBIDDEN_PARSER_SYMBOLS.has(name)) {
+            report(sf, node, `uses ${name} through ["${key.text}"], which is the parser's`);
+          }
+        } else if (exposesForbidden(type)) {
+          report(sf, node, "computed access on a value that exposes the parser's completion API");
         }
       } else if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent)) {
         // `const { feed } = P`: the property is looked up on the destructured value's type.
         const decl = node.parent.parent;
         const source = ts.isVariableDeclaration(decl) ? decl.initializer : undefined;
         const key = (node.propertyName ?? node.name) as ts.Node;
-        if (source && (ts.isIdentifier(key) || ts.isStringLiteralLike(key))) {
+        if (source && node.propertyName && ts.isComputedPropertyName(node.propertyName)) {
+          // `const { [k]: f } = B`: the same unresolvable access, spelled as a pattern.
+          if (exposesForbidden(checker.getTypeAtLocation(source))) {
+            report(sf, node, "computed destructuring of a value that exposes the parser's API");
+          }
+        } else if (source && (ts.isIdentifier(key) || ts.isStringLiteralLike(key))) {
           const prop = checker.getTypeAtLocation(source).getProperty(key.text);
           const name = parserTarget(prop);
           if (name !== null && name !== "*" && FORBIDDEN_PARSER_SYMBOLS.has(name)) {
@@ -357,6 +402,49 @@ describe("the guard itself can fail", () => {
         "main.ts": `import * as B from "./barrel";\nconst { decodeTurn } = B;\ndecodeTurn();`,
       },
     ],
+    // The shapes a property-name scan cannot see (round 4, M3):
+    [
+      "element access through a star-barrel namespace import",
+      {
+        "barrel.ts": `export * from "./pty-output-parser";`,
+        "main.ts": `import * as B from "./barrel";\nB["extractResponseText"]();`,
+      },
+    ],
+    [
+      "element access through a namespace barrel (`export * as P`)",
+      {
+        "barrel.ts": `export * as P from "./pty-output-parser";`,
+        "main.ts": `import { P } from "./barrel";\nP["feed"]();`,
+      },
+    ],
+    [
+      "element access on a dynamically imported barrel",
+      {
+        "barrel.ts": `export * from "./pty-output-parser";`,
+        "main.ts": `const b = await import("./barrel");\nexport const r = b["decodeTurn"]();`,
+      },
+    ],
+    [
+      "an unresolvable computed access on a namespace that exposes the parser's API",
+      {
+        "barrel.ts": `export * from "./pty-output-parser";`,
+        "main.ts": `import * as B from "./barrel";\nconst k = process.argv[2] as string;\n(B as Record<string, () => void>)[k]?.();\nexport const r = (B as unknown as Record<string, () => string>)[k]!();`,
+      },
+    ],
+    [
+      "a key built at run time on a star-barrel namespace",
+      {
+        "barrel.ts": `export * from "./pty-output-parser";`,
+        "main.ts": `import * as B from "./barrel";\nexport const r = B["extract" + "ResponseText"]();`,
+      },
+    ],
+    [
+      "computed destructuring of a namespace that exposes the parser's API",
+      {
+        "barrel.ts": `export * from "./pty-output-parser";`,
+        "main.ts": `import * as B from "./barrel";\nconst k = "decodeTurn";\nconst { [k]: f } = B;\nvoid f;`,
+      },
+    ],
     [
       "a dynamic import of a barrel",
       {
@@ -392,6 +480,24 @@ describe("the guard itself can fail", () => {
         "barrel.ts": `export * from "./pty-output-parser";\nexport { feed as unusedAlias } from "./pty-output-parser";`,
         "main.ts": `import { stripAnsi } from "./pty-output-parser";\nimport { join } from "./other";\nexport const x = stripAnsi(join("a"));`,
         "other.ts": `export const join = (s: string): string => s;`,
+      }),
+    ).toEqual([]);
+  });
+
+  test("element access that names a harmless member, or on a value that exposes nothing forbidden, is not a violation", () => {
+    expect(
+      violationsOf({
+        "barrel.ts": `export * from "./pty-output-parser";\nexport const unrelated = 1;`,
+        "other.ts": `export const join = (s: string): string => s;\nexport const rest = 2;`,
+        "main.ts": [
+          `import * as B from "./barrel";`,
+          `import * as O from "./other";`,
+          `const k = process.argv[2] as string;`,
+          `export const a = B["unrelated"];`,
+          `export const b = B["stripAnsi"]("");`,
+          `export const c = (O as Record<string, unknown>)[k];`,
+          `export const d = O["join"]("x");`,
+        ].join("\n"),
       }),
     ).toEqual([]);
   });

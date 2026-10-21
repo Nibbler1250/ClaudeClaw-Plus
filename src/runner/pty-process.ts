@@ -916,6 +916,7 @@ class PtyProcessImpl implements PtyProcess {
       path: this._transcriptPath,
       written,
       replCommand: opts.allowReplCommand === true,
+      now: this._now,
     });
     this._tx.mark();
 
@@ -1066,6 +1067,9 @@ class PtyProcessImpl implements PtyProcess {
 
   private _rejectTurn(err: Error): void {
     if (!this._turnInProgress) return;
+    // Whatever the reason, the prompt may have run (its record can still arrive): remember
+    // it, so an identical one next cannot take that record for its own.
+    this._tx?.abandon();
     this._turnInProgress = false;
     this._tx = null;
     this._onChunk = undefined;

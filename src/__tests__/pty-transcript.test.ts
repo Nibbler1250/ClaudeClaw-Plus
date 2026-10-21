@@ -11,9 +11,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   promptMatches,
+  resetUnresolvedPrompts,
   resolveTranscriptPath,
+  TRANSCRIPT_SETTLE_MS,
   TranscriptReplacedError,
   TranscriptTurn,
+  type TranscriptTurnOptions,
+  UNRESOLVED_TTL_MS,
 } from "../runner/pty-transcript";
 import {
   assistantLine,
@@ -32,10 +36,16 @@ function tx(): TempTranscript {
 }
 afterEach(() => {
   while (made.length) made.pop()?.cleanup();
+  resetUnresolvedPrompts();
 });
 
-function turn(t: TempTranscript, written = "R17x please", replCommand = false): TranscriptTurn {
-  const turn = new TranscriptTurn({ path: t.path, written, replCommand });
+function turn(
+  t: TempTranscript,
+  written = "R17x please",
+  replCommand = false,
+  extra: Partial<TranscriptTurnOptions> = {},
+): TranscriptTurn {
+  const turn = new TranscriptTurn({ path: t.path, written, replCommand, ...extra });
   turn.mark();
   return turn;
 }
@@ -170,7 +180,12 @@ describe("TranscriptTurn — answer and end of reply", () => {
     const t = tx();
     const turn_ = turn(t);
     appendFileSync(t.path, nl(userLine("R17x please"), assistantLine("NEW-ANSWER")));
-    const s = turn_.poll();
+    let s = turn_.poll();
+    expect(s.answer).toBe("NEW-ANSWER");
+    // The final message is out, but the transcript has not yet said it is over.
+    expect(s.ended).toBe(false);
+    appendFileSync(t.path, nl(systemLine("turn_duration")));
+    s = turn_.poll();
     expect(s.answer).toBe("NEW-ANSWER");
     expect(s.ended).toBe(true);
   });
@@ -205,7 +220,10 @@ describe("TranscriptTurn — answer and end of reply", () => {
     let s = turn_.poll();
     expect(s.ended).toBe(false);
     expect(s.toolLines).toEqual(['● Read({"file_path":"/a"})']);
-    appendFileSync(t.path, nl(assistantLine("FINAL", { id: "m2", stop: "end_turn" })));
+    appendFileSync(
+      t.path,
+      nl(assistantLine("FINAL", { id: "m2", stop: "end_turn" }), systemLine("turn_duration")),
+    );
     s = turn_.poll();
     expect(s.ended).toBe(true);
     // Only the final message: the narration before the tool call is not the answer.
@@ -223,7 +241,10 @@ describe("TranscriptTurn — answer and end of reply", () => {
     );
     expect(turn_.poll().answer).toBe("PART-ONE ");
     appendFileSync(t.path, nl(assistantLine("PART-TWO ", { id: "m1", stop: null })));
-    appendFileSync(t.path, nl(assistantLine("PART-THREE", { id: "m1", stop: "end_turn" })));
+    appendFileSync(
+      t.path,
+      nl(assistantLine("PART-THREE", { id: "m1", stop: "end_turn" }), systemLine("turn_duration")),
+    );
     const s = turn_.poll();
     expect(s.answer).toBe("PART-ONE PART-TWO PART-THREE");
     expect(s.ended).toBe(true);
@@ -256,6 +277,7 @@ describe("TranscriptTurn — delivery shape never changes the verdict", () => {
     userLine("R17x please"),
     assistantLine("PART-A ", { id: "m1", stop: null }),
     assistantLine("PART-B", { id: "m1", stop: "end_turn" }),
+    systemLine("turn_duration"),
   );
   // Cut points are bytes, so every one of these tears a JSON line somewhere.
   const cuts = (n: number): number[] =>
@@ -586,7 +608,10 @@ describe("TranscriptTurn — placeholders are not answers (round 3, H1)", () => 
     expect(s.ended).toBe(false);
     expect(s.answer).toBe("");
     expect(s.failure).toBeNull();
-    appendFileSync(t.path, nl(assistantLine("THE-REAL-REPLY", { id: "real" })));
+    appendFileSync(
+      t.path,
+      nl(assistantLine("THE-REAL-REPLY", { id: "real" }), systemLine("turn_duration")),
+    );
     s = turn_.poll();
     expect(s.ended).toBe(true);
     expect(s.answer).toBe("THE-REAL-REPLY");
@@ -661,6 +686,7 @@ describe("TranscriptTurn — the matched turn is a window, frozen when it ends (
         }),
         assistantLine("The tool ran.", { id: "m2", stop: "tool_use" }),
         assistantLine("FINAL-ANSWER", { id: "m3" }),
+        systemLine("turn_duration"),
       ),
     );
     const s = turn_.poll();
@@ -723,6 +749,9 @@ describe("TranscriptTurn — the matched turn is a window, frozen when it ends (
     let s = turn_.poll();
     expect(s.ended).toBe(false);
     appendFileSync(t.path, nl(assistantLine("THE-TEXT", ids("m1"))));
+    s = turn_.poll();
+    expect(s.ended).toBe(false);
+    appendFileSync(t.path, nl(systemLine("turn_duration")));
     s = turn_.poll();
     expect(s.ended).toBe(true);
     expect(s.answer).toBe("THE-TEXT");
@@ -844,5 +873,309 @@ describe("TranscriptTurn — the file must stay the file the turn started on (ro
     expect(turn_.poll().answer).toBe("A");
     rmSync(t.path);
     expect(turn_.poll().answer).toBe("A");
+  });
+});
+
+describe("TranscriptTurn — one definition of 'the final message is complete' (round 4, H4 + finding 3)", () => {
+  const ids = (id: string) => ({ id });
+
+  test("two text blocks of the final message on separate lines, B arriving late: the answer is A+B and the turn has not ended before B", () => {
+    // Fault: set `ended` on the first terminal line with text (the round-3 code). The turn
+    // would be committed on A alone, so a quiet screen returns "A-BLOCK " and a repainting
+    // one "A-BLOCK B-BLOCK": the answer would depend on the screen.
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(t.path, nl(userLine("R17x please"), assistantLine("A-BLOCK ", ids("m1"))));
+    let s = turn_.poll();
+    expect(s.ended).toBe(false);
+    expect(s.answer).toBe("A-BLOCK ");
+    appendFileSync(t.path, nl(assistantLine("B-BLOCK", ids("m1"))));
+    s = turn_.poll();
+    expect(s.ended).toBe(false);
+    appendFileSync(t.path, nl(systemLine("turn_duration")));
+    s = turn_.poll();
+    expect(s.ended).toBe(true);
+    expect(s.answer).toBe("A-BLOCK B-BLOCK");
+  });
+
+  test("the next entry that is not a line of the final message ends it, with no turn_duration", () => {
+    // A different message id (a background reply) closes the window and is not read.
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(
+        userLine("R17x please"),
+        assistantLine("FINAL", ids("m1")),
+        assistantLine("LATER", ids("m2")),
+      ),
+    );
+    const s = turn_.poll();
+    expect(s.ended).toBe(true);
+    expect(s.answer).toBe("FINAL");
+  });
+
+  test("a terminal thinking-only final message with nothing after it ends the turn on the transcript settle, answering with the last message that has text", () => {
+    // Fault: require text before a terminal message counts (the round-3 code): the turn
+    // waits for a record that never comes, to the hard timeout, and the supervisor replays.
+    const t = tx();
+    let now = 1_000;
+    const turn_ = turn(t, "R17x please", false, { now: () => now });
+    appendFileSync(
+      t.path,
+      nl(
+        userLine("R17x please"),
+        assistantLine("EARLIER-TEXT", { id: "m1", stop: "tool_use" }),
+        assistantLine("", { id: "m2", blocks: [{ type: "thinking", thinking: "hm" }] }),
+      ),
+    );
+    expect(turn_.poll().ended).toBe(false);
+    now += TRANSCRIPT_SETTLE_MS - 1;
+    expect(turn_.poll().ended).toBe(false);
+    now += 1;
+    const s = turn_.poll();
+    expect(s.ended).toBe(true);
+    expect(s.failure).toBeNull();
+    expect(s.answer).toBe("EARLIER-TEXT");
+  });
+
+  test("a terminal tool-only final message with no text anywhere ends the turn with an empty answer", () => {
+    const t = tx();
+    let now = 1_000;
+    const turn_ = turn(t, "R17x please", false, { now: () => now });
+    appendFileSync(
+      t.path,
+      nl(
+        userLine("R17x please"),
+        assistantLine("", { id: "m1", blocks: [{ type: "tool_use", name: "Read", input: {} }] }),
+      ),
+    );
+    turn_.poll();
+    now += TRANSCRIPT_SETTLE_MS;
+    const s = turn_.poll();
+    expect(s.ended).toBe(true);
+    expect(s.failure).toBeNull();
+    expect(s.answer).toBe("");
+  });
+
+  test("the settle runs from the last growth of the file: a late block of the final message restarts it", () => {
+    // Fault: measure the settle from the terminal line (not from the last growth) and the
+    // turn ends 1 ms after B arrives, with B in the answer only by luck of the poll.
+    const t = tx();
+    let now = 1_000;
+    const turn_ = turn(t, "R17x please", false, { now: () => now });
+    appendFileSync(t.path, nl(userLine("R17x please"), assistantLine("A ", ids("m1"))));
+    turn_.poll();
+    now += TRANSCRIPT_SETTLE_MS - 100;
+    appendFileSync(t.path, nl(assistantLine("B", ids("m1"))));
+    expect(turn_.poll().ended).toBe(false);
+    now += TRANSCRIPT_SETTLE_MS - 1;
+    expect(turn_.poll().ended).toBe(false);
+    now += 1;
+    const s = turn_.poll();
+    expect(s.ended).toBe(true);
+    expect(s.answer).toBe("A B");
+  });
+
+  test("the settle does not run while the final message has not been seen (a tool_use stop is not terminal)", () => {
+    const t = tx();
+    let now = 1_000;
+    const turn_ = turn(t, "R17x please", false, { now: () => now });
+    appendFileSync(
+      t.path,
+      nl(userLine("R17x please"), assistantLine("Let me look.", { id: "m1", stop: "tool_use" })),
+    );
+    turn_.poll();
+    now += 10 * TRANSCRIPT_SETTLE_MS;
+    expect(turn_.poll().ended).toBe(false);
+  });
+});
+
+describe("TranscriptTurn — literal paste tags in the prompt (round 4, finding 4)", () => {
+  const literal = 'Explain <pasted_content id="x">hi</pasted_content id="x">';
+
+  test("a prompt that contains paste tags, recorded as is, is accepted", () => {
+    // Fault: strip every paste tag from the recorded side (the round-3 code): the record
+    // becomes "Explain hi", never equals the written text, and a healthy turn is rejected.
+    const t = tx();
+    const turn_ = turn(t, literal);
+    appendFileSync(t.path, nl(userLine(literal)));
+    expect(turn_.poll().accepted).toBe(true);
+  });
+
+  test("the same prompt inside the CLI's outer paste wrapper is accepted, inner tags kept", () => {
+    const t = tx();
+    const turn_ = turn(t, literal);
+    appendFileSync(
+      t.path,
+      nl(userLine(`<pasted_content id="4c50">\n${literal}\n</pasted_content id="4c50">`)),
+    );
+    expect(turn_.poll().accepted).toBe(true);
+  });
+
+  test("a prompt whose inner tags were stripped by the recorder is a different prompt", () => {
+    const t = tx();
+    const turn_ = turn(t, literal);
+    appendFileSync(t.path, nl(userLine("Explain hi")));
+    expect(turn_.poll().accepted).toBe(false);
+  });
+});
+
+describe("TranscriptTurn — /compact API errors (round 4, finding 5)", () => {
+  const cmd = "<command-name>/compact</command-name>\n<command-message>compact</command-message>";
+
+  test("an assistant API-error record after /compact fails the turn promptly, with no local_command stderr", () => {
+    // Fault: skip every assistant record for a command (the round-3 code): the error is
+    // ignored and the call waits to the hard timeout.
+    const t = tx();
+    const turn_ = turn(t, "/compact", true);
+    appendFileSync(t.path, nl(userLine(cmd), apiErrorLine("API Error: 529 overloaded")));
+    const s = turn_.poll();
+    expect(s.ended).toBe(true);
+    expect(s.failure).toEqual({ kind: "api-error", text: "API Error: 529 overloaded" });
+    expect(s.answer).toBe("");
+  });
+
+  test("a command's ordinary assistant text is still not its answer", () => {
+    const t = tx();
+    const turn_ = turn(t, "/compact", true);
+    appendFileSync(
+      t.path,
+      nl(
+        userLine(cmd),
+        assistantLine("chatter", { id: "m1" }),
+        systemLine("compact_boundary", "Done"),
+      ),
+    );
+    const s = turn_.poll();
+    expect(s.failure).toBeNull();
+    expect(s.answer).toBe("Done");
+  });
+});
+
+describe("TranscriptTurn — an earlier identical submission that is unresolved (round 4, finding 1)", () => {
+  /** Turn 1 is not accepted (nothing in the file yet) and is abandoned, as a rejected turn is. */
+  function abandonedFirst(t: TempTranscript, extra: Partial<TranscriptTurnOptions> = {}): void {
+    const first = turn(t, "R17x please", false, extra);
+    expect(first.poll().accepted).toBe(false);
+    first.abandon();
+  }
+
+  test("turn 1 not accepted, turn 2 sends the identical prompt, turn 1's record and answer arrive: turn 2 does NOT succeed with them", () => {
+    // Fault: drop the registry check (`hasOpenEarlierSubmission`) and turn 2 reports
+    // turn 1's answer as its own.
+    const t = tx();
+    abandonedFirst(t);
+    const second = turn(t);
+    appendFileSync(
+      t.path,
+      nl(userLine("R17x please"), assistantLine("ANSWER-OF-TURN-1"), systemLine("turn_duration")),
+    );
+    const s = second.poll();
+    expect(s.failure?.kind).toBe("ambiguous");
+    expect(s.answer).toBe("");
+  });
+
+  test("the same, when only the delayed enqueue arrives", () => {
+    const t = tx();
+    abandonedFirst(t);
+    const second = turn(t);
+    appendFileSync(t.path, nl(enqueueLine("R17x please")));
+    expect(second.poll().failure?.kind).toBe("ambiguous");
+  });
+
+  test("a different prompt is unaffected by an unresolved one", () => {
+    const t = tx();
+    abandonedFirst(t);
+    const other = turn(t, "something else");
+    appendFileSync(
+      t.path,
+      nl(userLine("something else"), assistantLine("OK"), systemLine("turn_duration")),
+    );
+    const s = other.poll();
+    expect(s.failure).toBeNull();
+    expect(s.answer).toBe("OK");
+  });
+
+  test("an earlier submission whose record AND turn end are already in the file is resolved: the identical prompt succeeds", () => {
+    // The hourly cron whose last run failed with an API error. Fault: never resolve and
+    // every later identical prompt fails for the life of the session.
+    const t = tx();
+    const first = turn(t);
+    appendFileSync(t.path, nl(userLine("R17x please"), apiErrorLine("API Error: 500")));
+    expect(first.poll().failure?.kind).toBe("api-error");
+    first.abandon();
+    const second = turn(t);
+    appendFileSync(
+      t.path,
+      nl(userLine("R17x please"), assistantLine("FRESH"), systemLine("turn_duration")),
+    );
+    const s = second.poll();
+    expect(s.failure).toBeNull();
+    expect(s.answer).toBe("FRESH");
+  });
+
+  test("an earlier record that is in the file but whose turn has not ended is still unresolved", () => {
+    const t = tx();
+    const first = turn(t);
+    appendFileSync(
+      t.path,
+      nl(userLine("R17x please"), assistantLine("work", { id: "m1", stop: "tool_use" })),
+    );
+    first.poll();
+    first.abandon();
+    const second = turn(t);
+    appendFileSync(t.path, nl(userLine("R17x please")));
+    expect(second.poll().failure?.kind).toBe("ambiguous");
+  });
+
+  test("an unresolved submission expires: its record cannot still be late", () => {
+    // Fault: no TTL, and a prompt that was never submitted blocks every identical one for ever.
+    const t = tx();
+    let now = 1_000;
+    abandonedFirst(t, { now: () => now });
+    now += UNRESOLVED_TTL_MS;
+    const second = turn(t, "R17x please", false, { now: () => now });
+    appendFileSync(
+      t.path,
+      nl(userLine("R17x please"), assistantLine("LATER-OK"), systemLine("turn_duration")),
+    );
+    const s = second.poll();
+    expect(s.failure).toBeNull();
+    expect(s.answer).toBe("LATER-OK");
+  });
+
+  test("a rotated or replaced transcript (another file) forgets it", () => {
+    const t = tx();
+    writeFileSync(t.path, nl(userLine("history"), assistantLine("old")));
+    abandonedFirst(t);
+    rmSync(t.path);
+    writeFileSync(t.path, "");
+    const second = turn(t);
+    appendFileSync(
+      t.path,
+      nl(userLine("R17x please"), assistantLine("NEW-FILE"), systemLine("turn_duration")),
+    );
+    const s = second.poll();
+    expect(s.failure).toBeNull();
+    expect(s.answer).toBe("NEW-FILE");
+  });
+
+  test("ordinary sequential identical prompts, each fully resolved, succeed every time", () => {
+    const t = tx();
+    for (let i = 0; i < 4; i++) {
+      const turn_ = turn(t);
+      appendFileSync(
+        t.path,
+        nl(
+          userLine("R17x please"),
+          assistantLine(`ANSWER-${i}`, { id: `m${i}` }),
+          systemLine("turn_duration"),
+        ),
+      );
+      const s = turn_.poll();
+      expect(s.failure).toBeNull();
+      expect(s.answer).toBe(`ANSWER-${i}`);
+    }
   });
 });

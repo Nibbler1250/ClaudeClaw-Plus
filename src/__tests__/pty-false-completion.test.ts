@@ -590,24 +590,28 @@ describe("#562 round 3 — executions, not bytes: a late transcript record is on
 
   test("accepted at once, the record flushes late: ONE executed turn, one reply", async () => {
     const t = tx();
-    // The CLI takes the prompt at the first CR, and writes its record 0.35 s later: past
-    // the first submit deadline (200 ms), so the retry CR goes in. Here that CR lands on an
-    // empty input box and does nothing, as in the real TUI.
+    // The CLI takes the prompt at the first CR and writes its record 0.35 s later: past the
+    // first submit deadline (200 ms), so the retry CR goes in. A bare CR on an empty input
+    // box runs nothing, as in the real TUI; a line that carries the prompt runs it AGAIN.
+    // The fake keeps reading input and records every executed turn on its own, so a
+    // resubmission of the whole prompt is counted (the first reply is slow enough for a
+    // second execution's record to land before the turn resolves).
     const script = [
-      "IFS= read -r l1",
-      "sleep 0.35",
-      append(t.path, userLine(PROMPT)),
-      "sleep 0.1",
-      append(t.path, assistantLine("RAN-ONCE")),
-      "sleep 8",
-    ].join("; ");
-    const out = await runOutcome(script, t, { submitConfirmMs: 200 });
+      "n=0",
+      "while IFS= read -r l; do",
+      `case "$l" in *'${PROMPT}'*)`,
+      "n=$((n+1))",
+      `( sleep 0.35; ${append(t.path, userLine(PROMPT))}; if [ "$n" -eq 1 ]; then sleep 0.9; ${append(t.path, assistantLine("RAN-ONCE"))}; ${append(t.path, systemLine("turn_duration"))}; fi ) &`,
+      ";; esac",
+      "done",
+    ].join("\n");
+    const out = await runOutcome(script, t, { submitConfirmMs: 200 }, { timeoutMs: 6000 });
+    // Count what the CLI executed, not what we wrote. Fault: a retry that resubmits the
+    // prompt makes the fake run it a second time and this is 2 (the first assertion on
+    // purpose: it must be the count that goes red, not the outcome after it).
+    expect(userEntries(t.path)).toBe(1);
     expect(out.err).toBeUndefined();
     expect(out.text).toBe("RAN-ONCE");
-    // Count what the CLI executed, not what we wrote. Fault: a retry that resubmits the
-    // prompt makes the fake read a second line, but this fake never would: it is the
-    // `executes twice` test below that proves a second execution is not a success.
-    expect(userEntries(t.path)).toBe(1);
   });
 
   test("a TUI that would execute twice on the retry Enter: two executions, and the turn is NOT a success", async () => {
@@ -629,6 +633,95 @@ describe("#562 round 3 — executions, not bytes: a late transcript record is on
     expect(out.text).toBeUndefined();
     expect(out.err).toBeInstanceOf(PtyTurnFailedError);
     expect((out.err as PtyTurnFailedError).kind).toBe("ambiguous");
+  });
+});
+
+describe("#562 round 4 — the transcript alone decides how much of the answer, and when the turn ends", () => {
+  const noisy = "while true; do printf .; sleep 0.05; done";
+  /** A final message of two text blocks on separate lines (one id), B arriving `gap` s after A. */
+  const twoBlocks = (path: string, gap: number): string[] => [
+    "IFS= read -r l",
+    append(path, userLine(PROMPT)),
+    "sleep 0.1",
+    append(path, assistantLine("A-BLOCK ", { id: "msg_1" })),
+    `sleep ${gap}`,
+    append(path, assistantLine("B-BLOCK", { id: "msg_1" })),
+    append(path, systemLine("turn_duration")),
+  ];
+
+  test("a quiet screen and a repainting screen return the SAME answer for a final message whose block B arrives late", async () => {
+    // Fault: commit the turn on the first terminal line that has text. The quiet screen then
+    // returns "A-BLOCK " (nothing paints for 400 ms, past the 50 ms quiet window) while the
+    // repainting one returns both: the same transcript, two answers.
+    const quiet = tx();
+    const quietOut = await runOutcome(`${twoBlocks(quiet.path, 0.4).join("; ")}; sleep 8`, quiet);
+    const noisyT = tx();
+    const noisyOut = await runOutcome(
+      `${twoBlocks(noisyT.path, 0.4).join("; ")}; ${noisy}`,
+      noisyT,
+      { quietWindowMs: 200, settleCapMs: 1500 },
+    );
+    expect(quietOut.err).toBeUndefined();
+    expect(noisyOut.err).toBeUndefined();
+    expect(quietOut.text).toBe("A-BLOCK B-BLOCK");
+    expect(noisyOut.text).toBe("A-BLOCK B-BLOCK");
+  });
+
+  test("a terminal thinking-only final message with no record after it ends the turn: no hard-timeout wait, no replay", async () => {
+    // Fault: require text before a terminal message counts. The turn then waits for the
+    // 4 s deadline and rejects with PtyTurnTimeoutError, which the supervisor retries.
+    const t = tx();
+    const script = [
+      "IFS= read -r l",
+      append(t.path, userLine(PROMPT)),
+      append(t.path, assistantLine("THE-LAST-TEXT", { id: "msg_1", stop: "tool_use" })),
+      append(
+        t.path,
+        assistantLine("", { id: "msg_2", blocks: [{ type: "thinking", thinking: "done" }] }),
+      ),
+      "sleep 8",
+    ].join("; ");
+    const t0 = Date.now();
+    const out = await runOutcome(script, t, {}, { timeoutMs: 4000 });
+    expect(out.err).toBeUndefined();
+    expect(out.text).toBe("THE-LAST-TEXT");
+    expect(Date.now() - t0).toBeLessThan(3500);
+  });
+});
+
+describe("#562 round 4 — an earlier identical submission that was not accepted", () => {
+  test("turn 1 is not accepted, turn 2 sends the identical prompt, turn 1's record and answer then arrive: turn 2 is NOT a success", async () => {
+    // The fake takes turn 1's two Enters (the paste and the retry) without recording
+    // anything, then records turn 1's late user entry and answer once turn 2's prompt is in.
+    // Fault: drop the unresolved-submission check and turn 2 resolves with turn 1's answer.
+    const t = tx();
+    const script = [
+      "IFS= read -r l1",
+      "IFS= read -r l2",
+      "IFS= read -r l3",
+      "sleep 0.1",
+      append(t.path, userLine(PROMPT)),
+      append(t.path, assistantLine("ANSWER-OF-TURN-1")),
+      append(t.path, systemLine("turn_duration")),
+      "sleep 8",
+    ].join("; ");
+    const proc = await spawnPty(opts(script, t, { submitConfirmMs: 150 }));
+    try {
+      const first = await proc.runTurn(PROMPT, { timeoutMs: 5000 }).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(first).toBeInstanceOf(PtyPromptNotAcceptedError);
+      const second = await proc.runTurn(PROMPT, { timeoutMs: 5000 }).then(
+        (r) => ({ text: r.text }),
+        (e: unknown) => ({ err: e }),
+      );
+      expect((second as { text?: string }).text).toBeUndefined();
+      expect((second as { err?: unknown }).err).toBeInstanceOf(PtyTurnFailedError);
+      expect((second as { err: PtyTurnFailedError }).err.kind).toBe("ambiguous");
+    } finally {
+      await proc.dispose();
+    }
   });
 });
 
