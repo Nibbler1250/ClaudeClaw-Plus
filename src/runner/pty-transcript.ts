@@ -33,8 +33,8 @@ const SYNTHETIC_MODEL = "<synthetic>";
 
 /**
  * Where the CLI writes the transcript of `sessionId` run in `cwd`, or null when it
- * cannot be known: no session id (an untrusted one-shot runs `--no-session-persistence`),
- * or the operator turned transcript confirmation off with `CLAUDECLAW_PTY_TRANSCRIPT=0`.
+ * cannot be known: no session id, or an untrusted one-shot (`--no-session-persistence`).
+ * There is no switch to turn this off: without a transcript a turn cannot succeed.
  *
  * The cwd is realpath'd because the CLI encodes the physical directory it was started in
  * (`/tmp` is `/private/tmp` on macOS), as the bus's session manager does.
@@ -46,7 +46,6 @@ export function resolveTranscriptPath(opts: {
   untrusted?: boolean;
 }): string | null {
   if (opts.untrusted || !opts.sessionId) return null;
-  if (process.env.CLAUDECLAW_PTY_TRANSCRIPT === "0") return null;
   const configDir = opts.env.CLAUDE_CONFIG_DIR || join(opts.env.HOME || homedir(), ".claude");
   let physicalCwd = opts.cwd;
   try {

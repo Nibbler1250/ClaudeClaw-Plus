@@ -607,9 +607,7 @@ class PtyProcessImpl implements PtyProcess {
       ? "an untrusted one-shot runs with --no-session-persistence"
       : hooked
         ? "spawned through a test hook without a transcriptPath"
-        : !this._sessionId
-          ? "no session id"
-          : "transcript confirmation is switched off (CLAUDECLAW_PTY_TRANSCRIPT=0)";
+        : "no session id";
     this._secretValues = collectSecretValues(opts.env);
     this.label = `${opts.agentName ?? "pty"}:${pty.pid}`;
     this._quietWindowMs = opts.quietWindowMs ?? DEFAULT_QUIET_WINDOW_MS;

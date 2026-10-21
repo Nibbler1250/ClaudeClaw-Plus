@@ -188,21 +188,36 @@ describe("#562 — the screen is never evidence the prompt was accepted", () => 
 
   test("a prompt that is never accepted clears the input box before failing, so the next CR cannot submit it", async () => {
     // After the retry CR the fake goes raw and records the next byte it gets. Ctrl-U (0x15)
-    // is what empties claude's input box.
+    // is what empties claude's input box. The process is kept alive until the byte is
+    // recorded: disposing it with the error would kill the fake mid-write on a loaded box.
     const t = tx();
     const dir = mkdtempSync(join(tmpdir(), "pty-562-"));
     const seen = join(dir, "seen.hex");
-    try {
-      const out = await runOutcome(
+    const proc = await spawnPty(
+      opts(
         `IFS= read -r l1; printf '${CHROME_STALE}'; IFS= read -r l2; stty raw -echo; dd bs=1 count=1 2>/dev/null | od -An -tx1 > ${seen}; sleep 8`,
         t,
         { submitConfirmMs: 150 },
+      ),
+    );
+    try {
+      const err = await proc.runTurn(PROMPT, { timeoutMs: 5000 }).then(
+        () => null,
+        (e: unknown) => e,
       );
-      expect(out.err).toBeInstanceOf(PtyPromptNotAcceptedError);
-      await new Promise((r) => setTimeout(r, 300));
+      expect(err).toBeInstanceOf(PtyPromptNotAcceptedError);
+      const read = (): string => {
+        try {
+          return readFileSync(seen, "utf8").trim();
+        } catch {
+          return "";
+        }
+      };
+      for (let i = 0; i < 60 && read() === ""; i++) await new Promise((r) => setTimeout(r, 50));
       // Fault: skip the clear and the fake never receives a byte, so this is empty.
-      expect(readFileSync(seen, "utf8").trim()).toBe("15");
+      expect(read()).toBe("15");
     } finally {
+      await proc.dispose();
       rmSync(dir, { recursive: true, force: true });
     }
   });

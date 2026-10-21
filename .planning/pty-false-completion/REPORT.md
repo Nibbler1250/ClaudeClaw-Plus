@@ -259,3 +259,308 @@ from captured 2.1.269 bytes (#369) and the 2.1.89 fixture, not from a fresh 2.1.
    confirmation is the stronger signal for sessions that have a transcript.
 
 No rebase and no version bump (coordinator's). No PR comments.
+
+
+---
+
+# Round 2: Codex review of `5c28206b` (4 HIGH, 2 MEDIUM) and the operator addendum
+
+Round 2 commits on `feat/550-pty-default`: `f7cc53c9`, `0b9fdeea`, `79bd483d`, and the final
+cleanup/report commit. The addendum (Terry, 2026-10-21) is binding: **the screen is never
+evidence that a prompt was accepted, that a turn finished, or of what the answer was. Only
+the session transcript is.** That supersedes the brief's "keep the screen for TUI-idle
+timing" and its step-5 fallback, so round 1's screen-based edge detection is gone, not
+patched.
+
+## Round 2 design
+
+### Feasibility verdict (brief step 1): small, done
+
+| Question | Answer |
+|---|---|
+| Does the PTY path know the session id at turn time? | Yes, for every trusted entry: `--resume <id>` or `--session-id <uuid>` is always passed (`pty-process.ts:buildClaudeArgs`, supervisor mints one when there is none, `pty-supervisor.ts` ~1476). |
+| Can the transcript path be derived? | Yes: `<CLAUDE_CONFIG_DIR or $HOME/.claude>/projects/<encodeCwdForProjectsDir(realpath(cwd))>/<id>.jsonl`. The env is the child's own env, so a throwaway config dir is honoured. |
+| Does `--resume` append to the same file? | The bus path relies on it (`#402`: the transcript's session id is the stable UUID across a `--resume` restart). Not re-measured here: no authenticated claude. If it were false, every turn would fail loudly with `PtyPromptNotAcceptedError` after ~6 s, never succeed. |
+| Reusable without a bus dependency? | The tailer class is bound to `BusCore`; I did not use it. `pty-transcript.ts` (new, ~300 lines) reuses two leaf exports, `encodeCwdForProjectsDir` and `isTerminalStopReason`, and reads the file itself. |
+| Untrusted one-shots | `UNTRUSTED_CLAUDE_ARGS` carry `--no-session-persistence`: **there is no transcript.** Coordinator ruling A: fail closed. See "Untrusted PTY turns". |
+
+### What a turn is now (`pty-process.ts`, `pty-transcript.ts`)
+
+1. `TranscriptTurn.mark()` records the transcript size, THEN the prompt is written (bracketed
+   paste + CR). Only bytes appended after the mark are read, so an earlier entry, even a
+   byte-identical earlier prompt, can never satisfy acceptance.
+2. **Accepted** = a top-level `user` entry (or a `queue-operation` `enqueue`) whose text
+   matches what was written. Matching is the bus path's (`normalizePromptForMatch`):
+   whitespace dropped, containment (a `<pasted_content>` wrapper is tolerated). Sub-agent
+   (`isSidechain`), tool-result and compact-summary entries never match. `/compact` is matched
+   by its `<command-name>`.
+3. **Answer** = the assistant text of the last assistant message appended after that `user`
+   entry (blocks sharing a `message.id` are joined, so an answer split across appends is
+   whole). `onChunk` streams that text; `onToolEvent` streams `● Name(input)` lines from
+   `tool_use` blocks.
+4. **Done** = that turn's final assistant entry has a terminal `stop_reason`
+   (`isTerminalStopReason`, the bus's own rule), or the CLI wrote `turn_duration`, or a
+   CLI-written API-error line. `/compact`: `compact_boundary` (answer "Conversation
+   compacted") or the `local_command` entry carrying the CLI's error text.
+5. The submit retry and `PtyPromptNotAcceptedError` are keyed on (2): after `submitConfirmMs`
+   the transcript is read once more, and only then is one bare CR written (never the prompt
+   again); after another window, Ctrl-U and the error. The error says when the transcript
+   held user entries that did not match.
+6. The resolve waits for the screen to be quiet for `quietWindowMs`, **capped at
+   `settleCapMs` (2 s)**. That is the only thing the screen still contributes to a turn and
+   it is delay-only: it cannot complete a turn, change the answer, or turn a success into a
+   failure (test and injection below).
+7. A process with no transcript path fails in `runTurn` **before anything is written** with
+   `PtyTranscriptUnavailableError`.
+
+Removed: the sentinel round trip, `tick`/`feed`/`startTurn` use in `pty-process.ts`, the
+turn-start edge, the footer/summary/title gate, `extractResponseText`/`decodeTurn` for the
+answer, the `sentinelMaxWaitMs` deadline. `pty-output-parser.ts` is untouched and still
+exported (it is unit-tested and the bus imports `expandCursorForwardToSpaces`/`stripAnsi`
+from it); nothing that decides a turn imports its completion/answer API (guard test below).
+
+### How each finding is closed
+
+| # | Finding | Closed by |
+|---|---|---|
+| 1 | Edge markers match in echo / old text | There is no screen edge. Acceptance needs a transcript entry for this prompt; the forgery tests put each phrase in the prompt and in old assistant text. |
+| 2 | Pre-edge evidence survives in the same chunk | No chunk-granular offset exists. The transcript is read by byte offset from the pre-send mark; the same bytes in any partition give the same verdict (table-driven tests). |
+| 3 | Answer painted before the edge chunk is dropped | The answer is the transcript's assistant text, not a screen slice. A message split across appends is joined. |
+| 4 | `cleanBoundary=false` is exit 0 | See below. |
+| 5 | Fast turn / `/compact` / different chrome paints no running marker | Acceptance does not read the screen. Tests: no chrome at all, SGR inside the footer, `/compact`. |
+| 6 | Tests manufacture acceptance through the prompt echo | Rewritten: fake TUIs write a real JSONL transcript (`fixtures/fake-claude-tui.ts`), prompts carry no marker phrase except in the forgery tests, and most tests put screen and transcript in disagreement. |
+
+### Finding 4: `cleanBoundary=false` is a failure (I chose: return a complete reply, otherwise fail)
+
+With the sentinel gone a real process now resolves only when the transcript shows the reply
+complete, so `cleanBoundary` is `true` and `replyComplete` is `true` from `PtyProcess`. The
+failure path is kept for any `PtyProcess` that reports otherwise, in BOTH callers, via one
+shared `boundaryVerdict(result)`:
+
+- `cleanBoundary=false` and no `replyComplete`: **failure**, entry retired, never resubmitted
+  (the turn may have run). `runTurnWithRetries`: exit 1, "boundary unconfirmed".
+  `sendToLiveSession`: `status: "failed"`, which `live-session-actions.ts` already maps to
+  `ok: false`.
+- `cleanBoundary=false` and `replyComplete: true` (the transcript shows a complete reply):
+  **success with the answer, and the entry is still retired**, because the TUI never
+  confirmed it was idle. This is the "return it as success" option the brief allowed; I
+  chose it because a complete assistant reply is the answer and discarding it would be
+  silent loss the other way.
+
+### Untrusted PTY turns (coordinator ruling A)
+
+A PTY turn with no transcript fails closed with `PtyTranscriptUnavailableError`
+(`"... an untrusted one-shot runs with --no-session-persistence"`). Nothing is written to the
+PTY first, so the input box is untouched. This breaks nothing live on this branch: the PTY
+engine has `caps.isolation=false` (`src/oneshot/registry.ts:21-23`), so untrusted one-shots
+route to `print`. **Follow-up for #570 / #581** (which enable untrusted PTY): untrusted calls
+must be given a transcript, i.e. run in the throwaway `CLAUDE_CONFIG_DIR` with session
+persistence on, instead of `--no-session-persistence`. Not done here (ruling: not B).
+
+## Remaining screen uses, by permitted category (addendum point 5)
+
+| Use | Where | Category | Can it complete a turn? |
+|---|---|---|---|
+| Boot readiness: wait for the TUI to settle, "tab to cycle" footer | `pty-process.ts` `_waitForReadySettle` (~1100-1200) | readiness | No: before any turn |
+| Boot dialogs: Bypass Permissions, project-MCP approval, trust prompt; answered with a key | `_waitForReadySettle`, `pty-trust-prompt.ts` | dialogs | No |
+| PTY exit and the credential-redacted tail for the "exited before TUI settled" error | `_handleExit`, `_appendToTail`, `_readTailSnapshot` | liveness | No: it can only FAIL a turn (`PtyClosedError`) |
+| Last-paint timestamp, to wait for a repaint to quiet before resolving | `_handleData` `_lastDataAt`, `_tick` | timing / readiness | **No.** Gated by the transcript; waits at most `settleCapMs`; delay-only |
+| Ctrl-U to empty the input box after a failed turn | `_clearInputBox` | input hygiene on failure | No |
+| `CLAUDECLAW_PTY_DUMP` raw trace | `dumpPtyTrace` | diagnostics | No |
+| Bus: boot-dialog gates, idle footer latch | `src/bus/session-agent-process.ts` (not touched) | readiness / dialogs | Out of scope: not the runner's turn path |
+
+`pty-process.ts` imports exactly one thing from the screen parser: `stripAnsi`, for the boot
+text. The guard test lists the rest as forbidden.
+
+## Guard test (addendum point 4)
+
+`src/__tests__/pty-turn-evidence-guard.test.ts` reads the source of
+`pty-process.ts`, `pty-transcript.ts`, `pty-supervisor.ts` and `live-session-actions.ts` and
+fails if any imports, re-exports, `require`s or dynamic-imports the screen parser's
+completion/answer API. Forbidden symbols: `createParser`, `startTurn`, `feed`, `tick`,
+`markSentinelWritten`, `resetTurn`, `buildSentinel`, `encodeSentinel`, `extractResponseText`,
+`decodeTurn`, `normaliseNewlines`, `Parser`, `ParserEvent`, `ParserState`. Allowed readiness
+helpers: `stripAnsi`, `DEFAULT_QUIET_WINDOW_MS`. It scans text rather than the module graph
+so a barrel cannot hide a re-export. It also tests itself (10 shapes it must flag, one it
+must allow). Injection I15 below adds `feed` to the `pty-process.ts` import: RED.
+
+The rule is recorded in `.planning/pty-migration/SPEC.md` (new file, frozen decision 1;
+the long-form SPEC the global rules mention is not in this tree) and in `CLAUDE.md`
+("PTY turn evidence", rule verbatim).
+
+## Round 2: fault injection (one site at a time, on a `git archive` copy of the commit)
+
+Each injection was applied with an exact-match assertion (the driver fails if the text to
+change is not found exactly once), then the named test files were run. Lines are verbatim
+from those runs (first four failures of each; the count is the total). Every injection went
+RED. One did not on its first try, and was fixed first: I19 (a "strip the
+`<pasted_content>` wrapper" step survived the injection because containment already tolerates
+the wrapper, so the step was dead code and was deleted; the injection now targets
+containment itself).
+
+```
+## I1 screen marker forges acceptance + end: exit=1 failing=16
+   (fail) #562 — the screen is never evidence the prompt was accepted > a prompt and old assistant text containing "esc to interrupt": the turn is NOT done [192.41ms]
+   (fail) #562 — the screen is never evidence the prompt was accepted > a prompt and old assistant text containing "esc cancel": the turn is NOT done [114.42ms]
+   (fail) #562 — the screen is never evidence the prompt was accepted > a prompt and old assistant text containing "Compacting conversation": the turn is NOT done [118.76ms]
+```
+
+```
+## I2 mark() at offset 0 (earlier entries count): exit=1 failing=3
+   (fail) TranscriptTurn — acceptance > an EARLIER identical prompt does not count: only bytes after the mark are read [2.43ms]
+   (fail) #562 — the screen is never evidence the prompt was accepted > an earlier identical prompt and its answer in the transcript are not this turn [133.33ms]
+   (fail) #562 — the screen is never evidence the prompt was accepted > a prompt that is never accepted clears the input box before failing, so the next CR cannot submit it [635.66ms]
+```
+
+```
+## I3 torn trailing line is dropped, not carried: exit=1 failing=6
+   (fail) TranscriptTurn — delivery shape never changes the verdict > two halves: same verdict and answer as one write [0.89ms]
+   (fail) TranscriptTurn — delivery shape never changes the verdict > five parts: same verdict and answer as one write [0.55ms]
+   (fail) TranscriptTurn — delivery shape never changes the verdict > a cut inside every line: same verdict and answer as one write [0.54ms]
+```
+
+```
+## I4 repeated message id replaces instead of joining: exit=1 failing=10
+   (fail) TranscriptTurn — answer and end of reply > blocks of ONE message arriving over separate polls are joined, in full [4.23ms]
+   (fail) TranscriptTurn — delivery shape never changes the verdict > one write: same verdict and answer as one write [0.45ms]
+   (fail) TranscriptTurn — delivery shape never changes the verdict > two halves: same verdict and answer as one write [0.40ms]
+```
+
+```
+## I5 assistant lines count before the user entry: exit=1 failing=1
+   (fail) TranscriptTurn — answer and end of reply > an assistant entry BEFORE the user entry is not this turn's answer [4.66ms]
+```
+
+```
+## I6 screen quiet after acceptance completes the turn: exit=1 failing=14
+   (fail) #562 — the screen is never evidence the prompt was accepted > a prompt that is never accepted clears the input box before failing, so the next CR cannot submit it [755.41ms]
+   (fail) #562 — a turn is over only when the transcript says so > accepted, and the screen shows the answer and done chrome, but the reply has no stop: NOT done [120.72ms]
+   (fail) #562 — a turn is over only when the transcript says so > the answer is the transcript's, not the screen's [116.30ms]
+```
+
+```
+## I7 submit retry ignores the transcript (acceptance): exit=1 failing=6
+   (fail) #562 — the screen is never evidence the prompt was accepted > a prompt that is never accepted clears the input box before failing, so the next CR cannot submit it [620.11ms]
+   (fail) #562 — a turn is over only when the transcript says so > accepted, and the screen shows the answer and done chrome, but the reply has no stop: NOT done [824.99ms]
+   (fail) #562 — the same transcript, delivered in any shape, gives the same verdict and answer > byte-sized fragments over the last block [818.21ms]
+```
+
+```
+## I8 submit retry re-writes the prompt: exit=1 failing=1
+   (fail) #562 — the submit retry > evidence that arrives AFTER the confirm deadline: no duplicate submission [406.86ms]
+```
+
+```
+## I9 submit retry CR deleted: exit=1 failing=3
+   (fail) #562 — the screen is never evidence the prompt was accepted > a prompt that is never accepted clears the input box before failing, so the next CR cannot submit it [671.89ms]
+   (fail) #562 — the submit retry > paste swallowed once, the retry lands: completes with only the new output [461.77ms]
+   (fail) #562 — the submit retry > evidence that arrives AFTER the confirm deadline: no duplicate submission [457.77ms]
+```
+
+```
+## I10 Ctrl-U not sent on not-accepted: exit=1 failing=1
+   (fail) #562 — the screen is never evidence the prompt was accepted > a prompt that is never accepted clears the input box before failing, so the next CR cannot submit it [677.76ms]
+```
+
+```
+## I11 quiet window gates completion (no cap): exit=1 failing=1
+   (fail) #562 — the screen's only say is timing, and it can only delay > a screen that never goes quiet still resolves with the transcript answer after the cap [5001.17ms]
+```
+
+```
+## I12 no-transcript refusal removed: exit=1 failing=3
+   (fail) #562 — the screen is never evidence the prompt was accepted > a prompt that is never accepted clears the input box before failing, so the next CR cannot submit it [624.27ms]
+   (fail) #562 — a process with no transcript cannot succeed > an untrusted PTY turn errors before anything is written and never resolves from the screen [1052.53ms]
+   (fail) #562 — a process with no transcript cannot succeed > a hooked process given no transcriptPath is refused the same way [818.45ms]
+```
+
+```
+## I13a runTurnWithRetries ignores cleanBoundary: exit=1 failing=2
+   (fail) pty-supervisor retry and backoff > #562 round 2: an unconfirmed turn boundary is an error (exit 1), runs once, and retires the entry [1.71ms]
+   (fail) pty-supervisor retry and backoff > #562 round 2: an unconfirmed boundary whose transcript shows a COMPLETE reply is returned, and the entry is retired [1.73ms]
+```
+
+```
+## I13b sendToLiveSession ignores cleanBoundary: exit=1 failing=2
+   (fail) sendToLiveSession > #562 round 2: an unconfirmed turn boundary reports failed (not sent) and retires the entry [2.16ms]
+   (fail) sendToLiveSession > #562 round 2: an unconfirmed boundary with a COMPLETE transcript reply is sent, and the entry is retired [1.93ms]
+```
+
+```
+## I14a runTurnWithRetries does not retire on unconfirmed: exit=1 failing=2
+   (fail) pty-supervisor retry and backoff > #562 round 2: an unconfirmed turn boundary is an error (exit 1), runs once, and retires the entry [0.95ms]
+   (fail) pty-supervisor retry and backoff > #562 round 2: an unconfirmed boundary whose transcript shows a COMPLETE reply is returned, and the entry is retired [0.86ms]
+```
+
+```
+## I14b sendToLiveSession does not retire on unconfirmed: exit=1 failing=2
+   (fail) sendToLiveSession > #562 round 2: an unconfirmed turn boundary reports failed (not sent) and retires the entry [0.90ms]
+   (fail) sendToLiveSession > #562 round 2: an unconfirmed boundary with a COMPLETE transcript reply is sent, and the entry is retired [0.59ms]
+```
+
+```
+## I15 guard: parser completion API imported into pty-process: exit=1 failing=1
+   (fail) PTY turn evidence: the modules that decide success do not read the screen parser's completion API > src/runner/pty-process.ts imports nothing from the parser's completion/answer API [5.18ms]
+```
+
+```
+## I16 /compact never matches its command entry: exit=1 failing=3
+   (fail) TranscriptTurn — /compact > accepted by the command entry, ended by compact_boundary [0.49ms]
+   (fail) TranscriptTurn — /compact > a failed compact ends on its local_command error, carrying the CLI's text [0.35ms]
+   (fail) #562 — acceptance does not depend on the screen painting anything > /compact: accepted by its command entry, ended by compact_boundary, not re-submitted or rejected [421.83ms]
+```
+
+```
+## I17 onChunk not fed from the transcript: exit=1 failing=1
+   (fail) #562 — a turn is over only when the transcript says so > onChunk streams the assistant's own text from the transcript [280.82ms]
+```
+
+```
+## I18 whitespace collapsed to one space instead of dropped: exit=1 failing=1
+   (fail) TranscriptTurn — acceptance > a TAB in the prompt, which the TUI turns into a completion key, does not stop it matching [9.11ms]
+```
+
+```
+## I19 containment replaced by equality (wrapped prompt no longer matches): exit=1 failing=2
+   (fail) TranscriptTurn — acceptance > the prompt may arrive wrapped (a paste wrapper, a prefix): containment, whitespace-insensitive [0.39ms]
+   (fail) TranscriptTurn — acceptance > a prompt the CLI recorded as a paste is wrapped in pasted_content tags and still matches [0.29ms]
+```
+
+## Round 2: verification
+
+- Affected suites: every test importing the PTY runner/supervisor/parser plus the new files
+  (27 files): normally **662 pass / 1 fail**, with `CLAUDECLAW_TEST_PLATFORM=linux`
+  **663 pass / 0 fail**. The one failure is `a dialog that paints late gets a fresh
+  hard-timeout window` (#469), a `PtyClosedError` where the fake's dialog script exited 1
+  because its Esc did not arrive in time under the load of the parallel run; it passed 3/3
+  alone straight afterwards and in every other run. That code (`_waitForReadySettle`) is
+  untouched by round 2. Treat it as load-sensitive, not as a regression.
+- A full-repo `bun test` run before the final fixes showed 5 failures: the two #559 tests
+  (the stand-in TUI wrote no transcript; fixed, 21/21), the late-dialog flake above, and two
+  gateway tests failing with "System is paused": an escalation test in the full run had
+  written `.claude/claudeclaw/paused.json` ("Watchdog suspend: Test") into this worktree. It
+  is gitignored runtime state, not code; I deleted it and the tests pass. It will recur on
+  any full-suite run in this worktree (pre-existing cross-test pollution).
+- `bun run lint` (full repo): 0 errors (1291 warnings, 324 infos, pre-existing).
+  `bun run typecheck`: 149 errors, baseline 149.
+- Run with `env -u ANTHROPIC_BASE_URL`; test output went to files, never a pipe.
+
+## Not done / risks
+
+1. **No real claude.** Nothing here was run against an authenticated CLI. The assumptions
+   that only a real run can confirm: `--resume` appends to the same transcript file; the
+   transcript records a pasted prompt in a form the bus-style containment match accepts;
+   the final assistant line of a turn carries a terminal `stop_reason` (or `turn_duration`
+   follows). Each fails LOUD: `PtyPromptNotAcceptedError` after ~6 s, or a turn that runs to
+   its own `timeoutMs`; none can succeed falsely. Nibbler's rerun should show no
+   `PtyPromptNotAcceptedError` on healthy turns.
+2. A turn whose terminal marker is never written would now wait for the caller's
+   `timeoutMs`, where the screen used to end it early. That is the cost of the ruling.
+3. `submitConfirmMs` (3 s) assumes the CLI writes the `user` entry within that. The bus
+   measured p95 0.25 s for an idle session; a prompt queued behind a running turn has an
+   `enqueue` record (also accepted) but its `user` entry can be minutes late. The runner
+   serialises turns per session, so this should not arise.
+4. Untrusted PTY (above) is a follow-up for #570 / #581.
+5. `sentinelMaxWaitMs`, `turnIdleTimeoutMs` and `quietWindowMs` remain in settings so
+   existing files parse; `sentinelMaxWaitMs` is now unused and `quietWindowMs` is the
+   readiness wait.
