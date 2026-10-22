@@ -2129,3 +2129,352 @@ i4  error: expect(received).toBe(expected)   Expected: "ambiguous"   Received: u
 6. **Real-CLI prevalence of interleaved messages is unverified** (Codex said the same). The cost of
    being wrong is a turn failing `ambiguous` where a reply was in fact fine, never a wrong answer.
 7. Cron `retry` still replays a failed PTY job (operator decision, round 6 item 3).
+
+## Round 8 (Codex round-7 findings: quarantine on every writer start, pid identity, visibility)
+
+Input: Codex round-7 review of `f7e3937c`. Head before this round `f7e3937c`; commits
+`93d1a7db` (pid identity), `75f929db` (session-keyed gate, visibility), `92892878` (`_ptySpawn`
+seam, no more `mock.module("bun-pty")`) and `7dfc5530` (pause-controller reset in `triggers.test.ts`). Binding rules unchanged:
+the screen is never evidence; no production guard weakened to make a test red; every injection
+below was one site at a time on a copy.
+
+### What was wrong (verified before fixing)
+
+1. **HIGH.** Round 7 fenced `runOnPty` admission only. (a) `respawnEntry` quarantines the process of
+   a failed crash recovery but keeps the entry; `sendToLiveSession` checked quarantine only when the
+   entry was ABSENT, the retained process reported dead, so it answered `not-live` and
+   `actOnSession` resumed the same session in a one-shot. (b) `skipLive` awaited
+   `retirePtySession`, whose retirement absorbed the disposal rejection into a quarantine and
+   returned normally, so the one-shot started beside the unconfirmed writer. Both read off the code
+   at `f7e3937c`; the regression tests for them go red when the gates are removed (I1a, I1c, I1d).
+2. **MEDIUM.** `confirmExit()` could run long after quarantine and signalled `-pid` and `pid` on
+   existence alone; a reused pid would be killed.
+3. **MEDIUM.** `/kill`, shutdown and status read `state.ptys` only; an idle retirement vanished from
+   status, and nothing retried a quarantine except admission of the same key.
+
+### Design (smallest that closes each finding)
+
+- New `src/runner/pty-quarantine.ts` (about 120 lines). A record holds the process, the supervisor
+  key, a short fixed reason code and a time. A record matches a target by supervisor key OR by the
+  process's claude session id, read live from the process. One gate:
+  `assertSessionWritable({sessionKey?, sessionId?})` asks each matching process to prove its exit
+  again (`confirmExit`, identity-checked) and throws `PtyQuarantinedError` while one lives. It IS the
+  recovery path: the next use of a session from any path releases it, with no timer. The shutdown
+  and `/kill` paths call `confirmAllQuarantined()`.
+- `retirePtySession` now rejects with `PtyQuarantinedError` when the exit is unconfirmed, so a
+  caller that forgets the result still cannot fall through to a resume.
+- `PtyProcessImpl` reads the child's birth identity at spawn (Linux `/proc/<pid>/stat` field 22, a
+  plain file read; macOS/BSD `ps -o lstart=`, one spawn of about 10-20 ms, once at spawn and once per
+  signal, never per poll. Chosen over a handle because bun-pty exposes only the pid). The existence
+  probe becomes a four-way state: `gone`, `replaced` (a different identity holds the pid; both mean
+  the original exited and NOTHING is signalled), `same`, `unknown`. A signal is sent only for `same`,
+  or for `unknown` when no identity was ever recorded AND this is the initial retirement. A later
+  `confirmExit()` with no readable identity sends nothing and stays quarantined. The SIGTERM through
+  bun-pty is skipped for `replaced`.
+
+### Every call site that can start a claude on a session id
+
+`assertSessionWritable` (A) is at the line given; "via" means the path reaches a gated site.
+
+| Call site | Gate |
+|---|---|
+| `pty-supervisor.ts` `spawnEntry` -> `spawn(spawnOpts)` | A at `:2078`, by key and `spawnOpts.sessionId` (the stored or resumed id) |
+| `pty-supervisor.ts` `respawnEntry` -> `spawn(opts)` | A at `:2242`, by key and the resume id |
+| `pty-supervisor.ts` `admitEntry` (every `runOnPty`, incl. ephemeral and `runOnceOnPty`) | A at `:1449` (retry), plus the sync check under the admission lock `:1460`, by key and `resumeSessionId` |
+| `pty-supervisor.ts` `sendToLiveSession` | A via `sessionBlocked` at `:1108`, FIRST in the loop (before any alive/no-entry decision) and again under the lock |
+| `live-session-actions.ts` `actOnSession` one-shot (the `not-live` path, the `skipLive` path, a call with no live key) | A at `:123`, by key and session id; `skipLive` also goes through `retirePtySession` (`:752`) |
+| `oneshot/engine.ts` `runOneShot` with `resumeSessionId` (live-session fallback, `shutdown-memory-save.ts:261`, `commands/discord.ts:661`) | A at `:61` |
+| `oneshot/print.ts:40` `--resume` | via `runOneShot` only (the registry's `print` engine is not called anywhere else outside tests) |
+| `oneshot` `pty` engine -> `runOnceOnPty` -> `runEphemeralWithDeadline` -> `runOnPty` | via `admitEntry` and `spawnEntry` |
+| `runner.ts` `spawnClaude` (legacy `claude -p`): `runClaudeOnce`, `runClaudeStream`, the streamed turn, `runFork` | A in `gateResume` `:791` (reads `--resume <id>` from argv) |
+| `runner.ts` `runClaudeStreaming` direct `Bun.spawn` | A at `:1193`; the function has no callers (dead code), gated anyway |
+| `runner.ts` `runOnPty` calls (primary, recovery, fallback), `runOneShotOnPty` (`:953`, fork) | via `admitEntry` and `spawnEntry`; `execRecovery`'s `retirePtySession` now rejects on an unconfirmed exit |
+| `bus/session-manager.ts` spawn (`spawnPty` / `spawnChild` / `spawnTmux`, `--session-id <agent.session_id>`) | A at `:869`, before all three, inside the cleanup `try` |
+| `runner.ts:166` `claude --version`, `commands/start.ts:1573`, `preflight.ts:195`, `commands/plugin-cli.ts:59`, `skills-tuner/core/llm.ts:75` (`runOneShot` without a resume id) | start no claude on a session id; not gated, nothing to gate |
+
+Found by grepping `--resume`, `resumeSessionId`, `runOneShot(`, `runOnPty(`, `spawnPty`, `Bun.spawn(`
+over `src` minus tests.
+
+### Tests added or changed
+
+- `pty-quarantine-gate.test.ts` (new, 11 tests): both Codex paths end to end through `actOnSession`
+  (no one-shot started); the under-lock re-check with a process that stays alive after a failed
+  dispose; the gate by session id under ANOTHER key (one-shot, `runOneShot`, legacy `--resume`,
+  first spawn from a stored id, crash-recovery respawn); recovery from any path once the pid is
+  gone; status lists the session; `/kill` and shutdown count unconfirmed exits; the `/kill` entry
+  count includes quarantined sessions.
+- `session-manager-quarantine.test.ts` (new): the bus spawn is refused and the stand-in never starts.
+- `pty-process-dispose.test.ts`: the fake OS gained an identity; three new tests (a reused pid is
+  confirmed gone and not signalled; a later confirmation with an unreadable identity sends
+  nothing; no identity at spawn means initial retirement may signal, a later one may not).
+- `pty-process-dispose-real.test.ts`: `readPidIdentity` against real processes.
+- `pty-quarantine.test.ts`: `retirePtySession` now rejects on an unconfirmed exit (round-7 tests
+  updated to the new contract, assertions unchanged otherwise).
+- `runner.test.ts`: the `SupervisorSnapshot` mock gained `quarantined: []` (type only).
+
+### Round 8: red-line evidence (one site per injection, `git archive`-style copy of the working tree)
+
+Every line below is copied from the test output file of that injection, not retyped. Each injection was run on a copy, the edit applied by exact-match replace (it refuses unless exactly one match), the copy discarded afterwards; the real tree was never edited for an injection.
+
+**I1a** `src/runner/pty-supervisor.ts` — `sendToLiveSession`: the gate at the top of the loop (Codex path 1, retained entry)
+
+```
+(fail) the retained entry of a failed crash recovery > sendToLiveSession answers failed, and no one-shot resumes the transcript [131.53ms]
+(fail) quarantine of a key whose process is not proven dead > sendToLiveSession on a quarantined key is failed, never not-live (no one-shot resume) [1.98ms]
+12 pass / 2 fail
+```
+
+**I1b** `src/runner/pty-supervisor.ts` — `sendToLiveSession`: the re-check under the lock
+
+```
+(fail) a send queued behind a turn whose crash recovery quarantines the process > is checked again under the lock and never writes to the process [157.52ms]
+13 pass / 1 fail
+```
+
+**I1c** `src/runner/live-session-actions.ts` — `actOnSession`: the gate before `_runOneShot` (the `not-live` path, and any key-less call)
+
+```
+(fail) the one-shot fallback is gated by session id as well as key > a transcript quarantined under another key is not resumed one-shot [63.02ms]
+13 pass / 1 fail
+```
+
+**I1d** `src/runner/pty-supervisor.ts` — `retirePtySession`: propagate an unconfirmed exit (Codex path 2, `skipLive`)
+
+```
+(fail) skipLive after a retirement that could not prove the exit > fails the call as a retirement failure and starts no one-shot [10.71ms]
+(fail) quarantine of a key whose process is not proven dead > retiring an unconfirmed process quarantines the key: no replacement is spawned [36.24ms]
+12 pass / 2 fail
+```
+
+**I1e** `src/oneshot/engine.ts` — `runOneShot`: the `resumeSessionId` gate
+
+```
+(fail) the one-shot fallback is gated by session id as well as key > runOneShot refuses a resume of a quarantined transcript before any engine runs [50.81ms]
+13 pass / 1 fail
+```
+
+**I1f** `src/runner.ts` — `gateResume`: legacy `claude -p --resume`
+
+```
+(fail) the one-shot fallback is gated by session id as well as key > the legacy `claude -p --resume` is refused too [37.54ms]
+13 pass / 1 fail
+```
+
+**I1g** `src/runner/pty-supervisor.ts` — `admitEntry`: the confirmation-retry gate
+
+```
+(fail) quarantine of a key whose process is not proven dead > the quarantine lifts once the OS confirms the exit, and then the key spawns again [1.33ms]
+13 pass / 1 fail
+```
+
+**I1h** `src/runner/pty-supervisor.ts` — `spawnEntry`: the gate before `spawn` (stored session id of another key)
+
+```
+(fail) a session id held under another key > a first spawn that would resume the stored session id of a quarantined key is refused [2.59ms]
+15 pass / 1 fail
+```
+
+**I1i** `src/runner/pty-supervisor.ts` — `respawnEntry`: the gate before `spawn`
+
+```
+(fail) a session id held under another key > a crash-recovery respawn that would resume a quarantined session id is refused [3.41ms]
+15 pass / 1 fail
+```
+
+**I1k** `src/bus/session-manager.ts` — bus `spawnAgentInternal`: the gate before the spawn
+
+```
+(fail) SessionManager.spawnAgent and the quarantine gate > does not start claude on a session id with an unconfirmed writer [2221.69ms]
+0 pass / 1 fail
+```
+
+**I2a** `src/runner/pty-process.ts` — `_pidState`: skip the identity comparison
+
+```
+(fail) PtyProcess.dispose — the OS decides, not bun-pty's exit event > a pid the OS has handed to another process counts as exited and is never signalled [169.82ms]
+6 pass / 1 fail
+```
+
+**I2b** `src/runner/pty-process.ts` — `_maySignal`: signal on "unknown" always
+
+```
+(fail) PtyProcess.dispose — the OS decides, not bun-pty's exit event > a later confirmation whose identity cannot be read sends no signal and stays unconfirmed [767.34ms]
+(fail) PtyProcess.dispose — the OS decides, not bun-pty's exit event > with no identity recorded at spawn the initial retirement may signal, a later one may not [760.16ms]
+5 pass / 2 fail
+```
+
+**I2c** `src/runner/pty-process.ts` — `_maySignal`: drop the initial-window branch
+
+```
+(fail) PtyProcess.dispose — the OS decides, not bun-pty's exit event > with no identity recorded at spawn the initial retirement may signal, a later one may not [602.89ms]
+6 pass / 1 fail
+```
+
+**I2d** `src/runner/pty-process.ts` — SIGTERM through bun-pty: drop the `replaced` guard
+
+```
+(fail) PtyProcess.dispose — the OS decides, not bun-pty's exit event > a pid the OS has handed to another process counts as exited and is never signalled [2.18ms]
+6 pass / 1 fail
+```
+
+**I2f** `src/runner/pty-process.ts` — `_originalGone`: a replaced pid does not count as gone
+
+```
+(fail) PtyProcess.dispose — the OS decides, not bun-pty's exit event > a pid the OS has handed to another process counts as exited and is never signalled [605.17ms]
+6 pass / 1 fail
+```
+
+**I2e** `src/runner/pty-process.ts` — `readPidIdentity`: return a constant (real reader, `-real` file alone)
+
+```
+(fail) readPidIdentity — the birth identity that tells a reused pid from the original > a live process has a stable identity; a pid nobody holds has none [11.06ms]
+(fail) readPidIdentity — the birth identity that tells a reused pid from the original > two different live processes do not share an identity once their start differs [64.07ms]
+3 pass / 2 fail
+```
+
+**I3a** `src/runner/pty-quarantine.ts` — `tryRelease`: no confirmation retry
+
+```
+(fail) recovery and visibility > the next use from ANY path releases the quarantine once the pid is gone [5.13ms]
+(fail) quarantine of a key whose process is not proven dead > the quarantine lifts once the OS confirms the exit, and then the key spawns again [0.76ms]
+14 pass / 2 fail
+```
+
+**I3b** `src/runner/pty-supervisor.ts` — `snapshotSupervisor`: leave `quarantined` empty
+
+```
+(fail) recovery and visibility > the next use from ANY path releases the quarantine once the pid is gone [1.11ms]
+(fail) recovery and visibility > status lists a quarantined session with its key, pid, reason and time [0.57ms]
+14 pass / 2 fail
+```
+
+**I3c** `src/runner/pty-supervisor.ts` — `killAllPtysReport`: no final confirmation / count
+
+```
+(fail) recovery and visibility > /kill and shutdown count the exits they could not confirm [0.77ms]
+15 pass / 1 fail
+```
+
+**I3d** `src/runner/pty-supervisor.ts` — `shutdownSupervisor`: no final confirmation / count
+
+```
+(fail) recovery and visibility > /kill and shutdown count the exits they could not confirm [0.68ms]
+15 pass / 1 fail
+```
+
+**I3e** `src/runner/pty-supervisor.ts` — `supervisorEntryCount`: ignore quarantined sessions
+
+```
+(fail) recovery and visibility > status lists a quarantined session with its key, pid, reason and time [1.39ms]
+15 pass / 1 fail
+```
+
+**X1** `src/__tests__/escalation/triggers.test.ts` — drop the `afterAll` pause-controller reset (run with `session-id-seam.test.ts` after it, one process)
+
+```
+(fail) gateway records the Claude session id the processor surfaces (#376) > a successful turn with a session id records it on the mapping [3.09ms]
+(fail) gateway records the Claude session id the processor surfaces (#376) > a successful turn with NO session id records nothing and says so once per conversation [0.21ms]
+33 pass / 2 fail
+```
+
+Notes on the injections, stated plainly:
+
+- **Two gates were shadowed at first.** I1h (`spawnEntry`) and I1i (`respawnEntry`) went GREEN
+  on the first run: admission already refused the same key, so no test could tell the spawn-site
+  gates from nothing. They exist for a session id held under ANOTHER key (a stored id of the new
+  key, a respawn resuming a quarantined id), which no test covered. The two "session id held under
+  another key" tests were added and the injections rerun; the lines above are from that rerun.
+- **The `skipLive` path is double-covered on purpose.** Removing the `retirePtySession`
+  propagation alone (I1d) leaves the one-shot blocked by the gate in `actOnSession` (I1c); the test
+  therefore asserts the failure is attributed to the retirement
+  (`could not retire the wedged session`), which is what goes red. It does not prove the one-shot
+  would start with only that gate removed. With BOTH removed the one-shot does start, which is the
+  `f7e3937c` behaviour; that two-site combination was not run as an injection.
+- **I1a also turns a round-7 test red** (the `!entry` branch), as predicted: the gate replaced it.
+- Running `pty-process-dispose.test.ts` and `pty-process-dispose-real.test.ts` in ONE bun process
+  failed the real-child tests (`mock.module("bun-pty")` from the first file leaked into the second).
+  It failed the same way on the `f7e3937c` archive (5 pass / 2 fail), so it predates this round's
+  code. Fixed below (the `_ptySpawn` seam); the two files now pass together, 12 of 12. The injections
+  above were run with those files in separate processes, which is why their counts differ from the
+  combined run.
+
+### Round 8: not done / risks
+
+1. **Quarantine is in memory.** A daemon restart forgets it; the old process is then an orphan
+   (round-4 HIGH 3, still open for the crash case, no reaper).
+2. **A zombie stays quarantined** (its pid exists and its identity matches, and no signal reaps it).
+   Fail-closed and visible in `snapshotSupervisor()`, never fail-open. A pid whose identity cannot be
+   read on a LATER confirmation also stays quarantined (nothing is signalled): on Windows the
+   retirement is still event-based, so there is no identity at all.
+3. **The confirmation retry is not bounded by the caller's budget.** `assertSessionWritable` inside
+   `sendToLiveSession` or the legacy spawn waits for `confirmExit()` (up to the 2 s grace plus 5 s,
+   so 7 s) and does not look at `timeoutMs` or the abort signal. Only a session that IS
+   quarantined pays it, once per use.
+4. **Identity resolution.** macOS `ps -o lstart=` has one-second resolution; Linux `/proc` starttime
+   is in clock ticks. A reused pid that started in the same tick as the original would read as
+   `same`; that needs the pid counter to wrap inside that tick.
+5. **`/kill` has no room for a count in its synchronous boolean reply.** The unconfirmed count is
+   returned by `killAllPtysReport()` and logged as `[pty-supervisor] /kill: N process exit(s) still
+   unconfirmed (quarantined)`; no chat text changed. Shutdown returns the count and logs the same way.
+6. **Group kill still keys on the leader.** If the leader has exited and MCP children survive in its
+   group, the state is `gone` and the group is not signalled (unchanged, not in this round).
+7. **Real-CLI background/interleaving compatibility is unproved** (Codex said the same).
+8. The engine-level gate does not run when a test injects `_runOneShot`; `actOnSession` has its own
+   gate for that reason, and the engine gate has its own test.
+
+### Round 8: the CI-equivalent gate (single process)
+
+CI (`test.yml:62`) runs `bun test src` in ONE process, so file-by-file runs do not prove CI green.
+`env -u ANTHROPIC_BASE_URL bun test src`, on `git archive` copies:
+
+| Head | pass | skip | fail | notes |
+|---|---|---|---|---|
+| `2066150c` (round 4, coordinator) | 4775 | | 2 | the two `gateway ... (#376)` tests |
+| `f7e3937c` (round 7, coordinator) | 4754 | | 70 | none of the 70 in the round-4 list |
+| `75f929db` (round 8 code, mine) | 4781 | 4 | 60 + 4 errors | almost all #562 PTY suites |
+| `92892878` (+ `_ptySpawn` seam) | 4839 | 4 | 2 | the same two `gateway (#376)` tests as round 4 |
+| `7dfc5530` (+ pause-controller reset), run 1 | 4840 | 4 | 1 | `pty-process.test.ts` "a dialog that paints late..." (6 s, `PtyClosedError exit=1`) |
+| `7dfc5530`, run 2 (same archive) | **4841** | 4 | **0** | exit 0 |
+
+Leaks found and fixed at the source:
+
+1. **`mock.module("bun-pty")` in `pty-process-dispose.test.ts`** (rounds 5-7). `mock.module` is
+   process-wide in bun and `mock.restore` does not undo it, so every later file that spawns a real
+   child through `bun-pty` got the fake. This was the source of the PTY failures. `PtyProcessOptions`
+   gained `_ptySpawn` (like `_signalPid`) and the test passes its fake through it. Proof the pair
+   now coexists: `pty-process-dispose.test.ts` and `pty-process-dispose-real.test.ts` in ONE process
+   passed 12/12; before, the real-child tests failed there (also on the `f7e3937c` archive).
+2. **The two `gateway (#376)` failures (present since round 4, not caused by this PR).**
+   `escalation/triggers.test.ts` really pauses the system in its last describe and never reset the
+   controller, whose state is cached in the module; later `Gateway.processInboundEvent` calls
+   refuse admission. Bisected by running each of the four escalation-touching files before
+   `session-id-seam.test.ts` in one process: only `triggers.test.ts` reproduces it. Fixed with a
+   file-level `afterAll` (injection X1: remove it, the two tests fail again).
+3. Other `mock.module` users (`eval-runner`, `judges`, `index` in `plugins/eval-framework`) restore
+   the real module in the same file; none changed.
+
+The one failure in run 1 is a wall-clock test (a 2.5 s boot stream against a 3 s hard timeout whose
+fake CLI exits 1 on any stray byte). It is in `pty-process.test.ts`, which this round did not
+touch, passes alone 3 of 3, passed in both file-by-file passes, and did not recur in run 2 on the
+identical archive. I read it as a load flake, not a leak, but I did not prove that beyond those
+runs; a third single-process run was not made.
+
+### Round 8: verification
+
+- **File-by-file wide gate** at `7dfc5530` (every `.test.ts` under `src/` and `tests/` minus
+  `tests/integration` whose content matches `\bpty\b|Pty[A-Z]|runOnPty|pty-[a-z]|live-session|LiveSession|[Gg]ateway`;
+  each file in its own process, up to 3 attempts, `ANTHROPIC_BASE_URL` unset, output to files):
+  - normal: **101 of 101 green on the first attempt**, 2,287 passing tests.
+  - `CLAUDECLAW_TEST_PLATFORM=linux`: **101 of 101 green on the first attempt**, 2,287 passing tests
+    (the known `skills-fitness.test.ts` judge-cooldown flake did not fire in this pass).
+  - An earlier pair of passes at `75f929db` (before the `_ptySpawn` seam) was 100/100 normal and
+    99/100 linux; the one linux miss was that same known flake (3 attempts). `jsonl-tailer.test.ts`
+    needed a second attempt once there (a 2.2 s timing test, not touched by this round). Both passes
+    were redone on the final head because `pty-process.ts` changed after them.
+- **Single process (what CI runs)**: see the table above. Final head: 4841 pass / 4 skip / 0 fail
+  (exit 0) on the second run; the first run had one load-sensitive failure, discussed there. The
+  gate the coordinator set is "fail no test outside the round-4 list"; the round-4 list is the two
+  `gateway (#376)` tests, now fixed, so the final head fails nothing.
+- `bun run lint` (full repo) exit 0; `bun run typecheck`: 149 errors, baseline 149.
+- No real `claude` started; nothing touched `~/.claude`. The real-child tests spawn `/bin/sh` and
+  `/bin/cat` and `/bin/sleep` only and kill what they start.
