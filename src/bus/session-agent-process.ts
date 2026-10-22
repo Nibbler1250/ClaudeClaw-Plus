@@ -86,6 +86,18 @@ function stripAnsiEscapes(text: string): string {
   );
 }
 
+/** Index of the selected-option pointer of the last option list in `region`,
+ *  or -1. claude draws it as "❯" where the terminal is Unicode-capable and
+ *  falls back to ASCII ">" where it is not — which is every ConPTY on win32
+ *  (issue #586: the dev-channels dialog sat unanswered there, so the bus agent
+ *  never reached its REPL). The ASCII form counts only in front of an option
+ *  number, so a ">" in dialog prose cannot pose as the selection. */
+function lastSelectedOptionIndex(region: string): number {
+  let last = -1;
+  for (const m of region.matchAll(/❯|>(?=\s*\d+[.)])/g)) last = m.index;
+  return last;
+}
+
 export type ExitHandler = (code: number) => void;
 export type DataHandler = (chunk: string) => void;
 
@@ -981,7 +993,7 @@ export class PtyAgentProcess implements AgentProcess {
     const ec = buf.lastIndexOf("Enter to confirm");
     if (ec === -1) return;
     const region = buf.slice(0, ec);
-    const arrow = region.lastIndexOf("❯");
+    const arrow = lastSelectedOptionIndex(region);
     if (arrow === -1) return;
     const eol = region.indexOf("\n", arrow);
     // The selected ("❯") option line identifies the dialog stably regardless of
