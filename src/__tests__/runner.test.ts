@@ -644,7 +644,10 @@ describe("killActive reaches a PTY session that is still booting (#394)", () => 
     // retired. The gate now reads the entry count.
     const sup = await import("../runner/pty-supervisor");
     const count = spyOn(sup, "supervisorEntryCount").mockReturnValue(1);
-    const snapshot = spyOn(sup, "snapshotSupervisor").mockReturnValue({ ptys: [] });
+    const snapshot = spyOn(sup, "snapshotSupervisor").mockReturnValue({
+      ptys: [],
+      quarantined: [],
+    });
     const kill = spyOn(sup, "killAllPtys").mockResolvedValue(0);
     try {
       expect(runnerMod.killActive()).toBe(true);

@@ -143,7 +143,8 @@ describe("quarantine of a key whose process is not proven dead", () => {
     const first = await runOnPty("global", "seed", { timeoutMs: 5000, ...scope() });
     expect(first.exitCode).toBe(0);
 
-    await retirePtySession("global");
+    // The retirement itself reports the unconfirmed exit (#562 round 8): a caller must not go on.
+    await expect(retirePtySession("global")).rejects.toThrow("quarantined");
     expect(liveSessionKeys()).toContain("global");
 
     const second = await runOnPty("global", "again", { timeoutMs: 5000, ...scope() }).catch(
@@ -159,7 +160,7 @@ describe("quarantine of a key whose process is not proven dead", () => {
     const stubborn = makeStubborn();
     queue.push(stubborn);
     await runOnPty("global", "seed", { timeoutMs: 5000, ...scope() });
-    await retirePtySession("global");
+    await retirePtySession("global").catch(() => undefined);
 
     // Still alive: refused, and every refusal asked the process to prove it again.
     await runOnPty("global", "x", { timeoutMs: 5000, ...scope() }).catch(() => undefined);
@@ -180,7 +181,7 @@ describe("quarantine of a key whose process is not proven dead", () => {
     // status "not-live".
     queue.push(makeStubborn());
     await runOnPty("global", "seed", { timeoutMs: 5000, ...scope() });
-    await retirePtySession("global");
+    await retirePtySession("global").catch(() => undefined);
 
     const r = await sendToLiveSession("global", "/compact", { timeoutMs: 1000 });
 

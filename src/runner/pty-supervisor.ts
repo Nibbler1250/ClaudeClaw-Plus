@@ -78,6 +78,17 @@ import {
   PtyTurnFailedError,
   PtyTurnTimeoutError,
 } from "./pty-process.js";
+import {
+  __resetQuarantineForTests,
+  assertSessionWritable,
+  confirmAllQuarantined,
+  isSessionQuarantined,
+  PtyQuarantinedError,
+  quarantinedKeys,
+  quarantineSession,
+  type QuarantineInfo,
+  quarantineSnapshot,
+} from "./pty-quarantine.js";
 import { ensureTrustAccepted } from "./pty-trust-prompt.js";
 import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";
 import { trustedToolFlags, validateIsolation } from "../oneshot/isolation.js";
@@ -312,7 +323,11 @@ export interface SupervisorSnapshot {
     /** "named" → never reaped when `namedAgentsAlwaysAlive` is on; "adhoc"/"global" → reaped after idle. */
     kind: "named" | "adhoc" | "global";
   }>;
+  /** Sessions whose process the OS has not confirmed gone (#562 round 8): nothing starts on them. */
+  quarantined: QuarantineInfo[];
 }
+
+export { PtyQuarantinedError };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test seams.
@@ -450,7 +465,7 @@ export function __resetSupervisorForTests(): void {
     void releaseMcpIdentityFor(entry);
   }
   state.ptys.clear();
-  state.quarantine.clear();
+  __resetQuarantineForTests();
   if (state.reapTimer) {
     clearInterval(state.reapTimer);
     state.reapTimer = null;
@@ -552,30 +567,15 @@ interface SupervisorState {
    *  shutdown never saw. Comparing the epoch captured before the wait catches
    *  that; the flag alone does not. */
   shutdownEpoch: number;
-  /** Keys whose process the OS still shows after SIGKILL (#562 round 7). The entry is gone,
-   *  the process may not be: nothing is spawned or resumed on the key until `confirmExit`
-   *  succeeds, because the old writer could still append to the transcript. */
-  quarantine: Map<string, PtyProcess>;
 }
 
 const state: SupervisorState = {
-  quarantine: new Map(),
   ptys: new Map(),
   reapTimer: null,
   initialised: false,
   shuttingDown: false,
   shutdownEpoch: 0,
 };
-
-/** Thrown by admission while the process on the key has not been proven dead. */
-export class PtyQuarantinedError extends Error {
-  constructor(sessionKey: string) {
-    super(
-      `[pty-supervisor] ${sessionKey} is quarantined: its previous process is still alive after SIGKILL, so nothing is spawned or resumed on the session until the OS confirms it gone`,
-    );
-    this.name = "PtyQuarantinedError";
-  }
-}
 
 /** Thrown by admission while the supervisor is shutting down. */
 class SupervisorShuttingDownError extends Error {
@@ -655,9 +655,11 @@ export async function initSupervisor(): Promise<void> {
 }
 
 /**
- * Graceful shutdown. Disposes all live PTYs.
+ * Graceful shutdown. Disposes all live PTYs, then asks every quarantined process to prove its
+ * exit once more. Returns how many exits are STILL unconfirmed (logged when not zero), so a
+ * caller can tell a clean shutdown from one that left a process behind.
  */
-export async function shutdownSupervisor(): Promise<void> {
+export async function shutdownSupervisor(): Promise<number> {
   if (state.reapTimer) {
     clearInterval(state.reapTimer);
     state.reapTimer = null;
@@ -683,6 +685,13 @@ export async function shutdownSupervisor(): Promise<void> {
   state.initialised = false;
   _initPromise = null;
   _admissionLock = Promise.resolve();
+  const unconfirmed = await confirmAllQuarantined();
+  if (unconfirmed > 0) {
+    console.warn(
+      `[pty-supervisor] shutdown: ${unconfirmed} process exit(s) still unconfirmed (quarantined)`,
+    );
+  }
+  return unconfirmed;
 }
 
 /**
@@ -708,21 +717,39 @@ export async function shutdownSupervisor(): Promise<void> {
  * `dispose()` are swallowed.
  */
 export async function killAllPtys(): Promise<number> {
+  return (await killAllPtysReport()).killed;
+}
+
+/**
+ * `killAllPtys` plus the quarantined processes (#562 round 8): after the entries are retired,
+ * every quarantined process is asked to prove its exit again, and `unconfirmed` is how many
+ * still cannot. Logged when not zero (the sync `/kill` boolean has no room for it).
+ */
+export async function killAllPtysReport(): Promise<{ killed: number; unconfirmed: number }> {
   const entries = [...state.ptys.values()].filter((e) => !e.scope.survivesKill);
-  if (entries.length === 0) return 0;
   const killed = entries.filter((e) => e.pty).length;
   await Promise.allSettled(entries.map(retireEntry));
-  return killed;
+  const unconfirmed = await confirmAllQuarantined();
+  if (unconfirmed > 0) {
+    console.warn(
+      `[pty-supervisor] /kill: ${unconfirmed} process exit(s) still unconfirmed (quarantined)`,
+    );
+  }
+  return { killed, unconfirmed };
 }
 
 /**
  * Retire the entry on `sessionKey`, if any (#546): dispose its PTY and drop
  * the entry, so the next call on the key spawns fresh from its session store.
  * Used when the caller has just reset that store (corrupted fallback session).
+ *
+ * Rejects with `PtyQuarantinedError` when the exit could not be confirmed: the caller must not
+ * go on to start another process on the session (#562 round 8).
  */
 export async function retirePtySession(sessionKey: string): Promise<void> {
   const entry = state.ptys.get(sessionKey);
   if (entry) await retireEntry(entry);
+  await assertSessionWritable({ sessionKey });
 }
 
 /**
@@ -740,7 +767,8 @@ export function supervisorEntryCount(): number {
   // #546: entries `/kill` does not reach (forks) are not counted either.
   let n = 0;
   for (const entry of state.ptys.values()) if (!entry.scope.survivesKill) n += 1;
-  return n;
+  // A quarantined process is something `/kill` still has to deal with (#562 round 8).
+  return n + quarantinedKeys().length;
 }
 
 export function snapshotSupervisor(): SupervisorSnapshot {
@@ -760,7 +788,7 @@ export function snapshotSupervisor(): SupervisorSnapshot {
       kind: entry.kind,
     });
   }
-  return { ptys };
+  return { ptys, quarantined: quarantineSnapshot() };
 }
 
 /**
@@ -1071,6 +1099,19 @@ async function settleBy(
   }
 }
 
+/** `failed` for a session with an unconfirmed process (after one more attempt to confirm it), else null. */
+async function sessionBlocked(
+  sessionKey: string,
+  sessionId: string | undefined,
+): Promise<LiveSendResult | null> {
+  try {
+    await assertSessionWritable({ sessionKey, sessionId });
+    return null;
+  } catch (err) {
+    return { status: "failed", error: (err as Error).message, timedOut: false, aborted: false };
+  }
+}
+
 /**
  * Write `text` as one turn into the live PTY for `sessionKey` and wait for its end
  * of turn (#549). Used for `/compact`, memory saves and the rotation summary, which
@@ -1113,21 +1154,15 @@ export async function sendToLiveSession(
       return { status: "failed", error: "aborted before send", timedOut: false, aborted: true };
     }
     const entry = state.ptys.get(sessionKey);
+    // #562 round 8: the gate comes FIRST, before any "is it alive" decision. A quarantined
+    // session still has a process whether or not an entry is tracked (a failed crash recovery
+    // keeps the entry, a retirement drops it), so neither "no entry" nor "dead process" may
+    // reach the caller as `not-live`: it would resume the transcript in a one-shot beside it.
+    const blocked = await sessionBlocked(sessionKey, entry?.pty?.sessionId);
+    if (blocked) return blocked;
     // No entry: no process (a finished retirement removes it), whatever the
     // supervisor is doing.
-    if (!entry) {
-      // #562 round 7: a quarantined key still has a process, so "no entry" is not "nothing
-      // alive". Say failed, so the caller does not resume the transcript in a one-shot.
-      if (state.quarantine.has(sessionKey)) {
-        return {
-          status: "failed",
-          error: new PtyQuarantinedError(sessionKey).message,
-          timedOut: false,
-          aborted: false,
-        };
-      }
-      return { status: "not-live", reason: "no-entry" };
-    }
+    if (!entry) return { status: "not-live", reason: "no-entry" };
     if (entry.scope.ephemeral) return { status: "not-live", reason: "ephemeral" };
     // The entry is still tracked, so its process may still be alive. A supervisor
     // shutdown marks every entry `retiring` before its first await, so the wait
@@ -1161,7 +1196,13 @@ export async function sendToLiveSession(
       release();
       return { status: "failed", error: "aborted before send", timedOut: false, aborted: true };
     }
-    // The world may have changed while we queued: re-check under the lock.
+    // The world may have changed while we queued: re-check under the lock, the quarantine
+    // included (a process can enter it while we waited, and `release` must run first).
+    const blockedNow = await sessionBlocked(sessionKey, entry.pty?.sessionId);
+    if (blockedNow) {
+      release();
+      return blockedNow;
+    }
     if (!isCurrentEntry(entry) || entry.spawnInFlight || !entry.pty?.isAlive()) {
       release();
       continue;
@@ -1265,7 +1306,7 @@ export function liveSessionKeys(): string[] {
     if (!entry.retiring && !entry.spawnInFlight && !entry.pty?.isAlive()) continue;
     keys.push(entry.sessionKey);
   }
-  for (const key of state.quarantine.keys()) if (!keys.includes(key)) keys.push(key);
+  for (const key of quarantinedKeys()) if (!keys.includes(key)) keys.push(key);
   return keys.sort();
 }
 
@@ -1403,8 +1444,9 @@ async function admitEntry(
       await retiring.catch(() => {});
       continue;
     }
-    // #562 round 7: a key whose last process was not proven dead gets no replacement.
-    await releaseQuarantine(sessionKey);
+    // #562 round 8: a key (or the session an ephemeral run resumes) whose last process was
+    // not proven dead gets no replacement; this also retries the confirmation.
+    await assertSessionWritable({ sessionKey, sessionId: opts.resumeSessionId });
     const prev = _admissionLock;
     let release: () => void = () => {};
     _admissionLock = new Promise<void>((resolve) => {
@@ -1415,7 +1457,9 @@ async function admitEntry(
       // A retirement may have started on this key while we queued for the
       // lock; go back to waiting for it without holding the lock.
       if (state.ptys.get(sessionKey)?.retiring) continue;
-      if (state.quarantine.has(sessionKey)) throw new PtyQuarantinedError(sessionKey);
+      if (isSessionQuarantined({ sessionKey, sessionId: opts.resumeSessionId })) {
+        throw new PtyQuarantinedError(sessionKey);
+      }
       refuseIfShuttingDown();
       // #546: a one-shot run neither counts against the cap nor evicts.
       if (!opts.ephemeral) await enforceMaxConcurrent(sessionKey);
@@ -1909,7 +1953,9 @@ async function landPty(entry: PtyEntry, pty: PtyProcess): Promise<void> {
   try {
     await pty.dispose();
   } catch (err) {
-    if (err instanceof PtyExitUnconfirmedError) quarantinePty(entry.sessionKey, pty);
+    if (err instanceof PtyExitUnconfirmedError) {
+      quarantineSession(entry.sessionKey, pty, "late-pty-exit-unconfirmed");
+    }
   }
   throw new EntryRemovedError(entry.sessionKey, "disposed the late PTY");
 }
@@ -1920,26 +1966,6 @@ async function landPty(entry: PtyEntry, pty: PtyProcess): Promise<void> {
  *  sees `false` — there is no window. */
 function isCurrentEntry(entry: PtyEntry): boolean {
   return state.ptys.get(entry.sessionKey) === entry && !entry.retiring;
-}
-
-/** Put a process whose exit the OS did not confirm under quarantine for its key. */
-function quarantinePty(sessionKey: string, pty: PtyProcess): void {
-  state.quarantine.set(sessionKey, pty);
-}
-
-/**
- * Try to release the key's quarantine: ask the process to prove it is gone again. Resolves
- * when there is none or it is lifted; throws `PtyQuarantinedError` while the process lives.
- */
-async function releaseQuarantine(sessionKey: string): Promise<void> {
-  const pty = state.quarantine.get(sessionKey);
-  if (!pty) return;
-  try {
-    await (pty.confirmExit ? pty.confirmExit() : pty.dispose());
-  } catch {
-    throw new PtyQuarantinedError(sessionKey);
-  }
-  if (state.quarantine.get(sessionKey) === pty) state.quarantine.delete(sessionKey);
 }
 
 /**
@@ -1975,7 +2001,9 @@ function retireEntry(entry: PtyEntry): Promise<void> {
       // #562 round 7: a disposal that could not prove the exit leaves a process that may
       // still write. Quarantine the key before the entry leaves the map, with no await in
       // between, so there is no moment when a replacement could be admitted.
-      if (disposed.status === "rejected" && pty) quarantinePty(entry.sessionKey, pty);
+      if (disposed.status === "rejected" && pty) {
+        quarantineSession(entry.sessionKey, pty, "retire-exit-unconfirmed");
+      }
     } finally {
       // Unconditional: an entry left in the map with `retiring` settled would
       // spin every admission on its key (and the shutdown loop) forever.
@@ -2044,6 +2072,10 @@ async function spawnEntry(
     if (!isCurrentEntry(entry)) {
       throw new EntryRemovedError(entry.sessionKey, "not spawning for a retired entry");
     }
+    // #562 round 8: the gate for a first spawn. `spawnOpts.sessionId` is the stored or
+    // resumed session, so a transcript another process still holds is refused whatever key
+    // asks for it.
+    await assertSessionWritable({ sessionKey: entry.sessionKey, sessionId: spawnOpts.sessionId });
     await landPty(entry, await spawn(spawnOpts));
     // Stamp the (re)spawn time so the reaper's spawn-grace window restarts
     // from now — see PtyEntry.lastSpawnedAt + reapIdle.
@@ -2194,7 +2226,7 @@ async function respawnEntry(
       // with a possibly live writer is the failure this guards. `entry.pty` stays so the
       // retirement that follows joins it.
       if (err instanceof PtyExitUnconfirmedError) {
-        quarantinePty(entry.sessionKey, entry.pty);
+        quarantineSession(entry.sessionKey, entry.pty, "crash-recovery-exit-unconfirmed");
         throw new PtyQuarantinedError(entry.sessionKey);
       }
     }
@@ -2205,6 +2237,9 @@ async function respawnEntry(
   if (!isCurrentEntry(entry)) {
     throw new EntryRemovedError(entry.sessionKey, "not respawning a retired entry");
   }
+  // #562 round 8: the gate for a respawn (it also lifts a quarantine the dispose above
+  // recorded and has since confirmed).
+  await assertSessionWritable({ sessionKey: entry.sessionKey, sessionId: opts.sessionId });
   await landPty(entry, await spawn(opts));
   entry.spawnOpts = opts;
   // Reset the spawn-grace window on respawn so a healthy long-lived PTY that

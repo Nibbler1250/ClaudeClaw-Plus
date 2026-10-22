@@ -81,6 +81,7 @@ import {
   type PtySessionStore,
   runEphemeralWithDeadline,
 } from "./runner/pty-supervisor";
+import { assertSessionWritable } from "./runner/pty-quarantine";
 import { encodeCwdForProjectsDir } from "./bus/jsonl-line-types";
 import { PTY_OUTPUT_FORMAT_CONSTRAINT } from "./runner/pty-output-format";
 import { SPAWN_ENV_STRIP_KEYS, cleanSpawnEnv, shouldStripSpawnEnvKey } from "./runner/spawn-env";
@@ -772,10 +773,22 @@ let _claudeSpawnForTests: ClaudeSpawn | null = null;
 export function _setClaudeSpawnForTests(fn: ClaudeSpawn | null): void {
   _claudeSpawnForTests = fn;
 }
-function spawnClaude(
+/**
+ * #562 round 8: a legacy `claude -p --resume <id>` passes the same gate as every other start
+ * on a session. A transcript whose previous process the OS has not confirmed gone is not
+ * resumed beside it.
+ */
+async function gateResume(args: string[]): Promise<void> {
+  const i = args.indexOf("--resume");
+  const id = i >= 0 ? args[i + 1] : undefined;
+  if (id) await assertSessionWritable({ sessionId: id });
+}
+
+async function spawnClaude(
   args: string[],
   opts: { env: Record<string, string>; cwd?: string },
-): ClaudeProc {
+): Promise<ClaudeProc> {
+  await gateResume(args);
   if (_claudeSpawnForTests) return _claudeSpawnForTests(args, opts);
   return Bun.spawn(args, {
     stdin: "ignore",
@@ -817,7 +830,7 @@ export async function runClaudeOnce(
   if (model.trim() && normalizedModel !== "glm" && normalizedModel !== "kimi-k2p6")
     args.push("--model", model.trim());
 
-  const proc = spawnClaude(args, { env: buildChildEnv(baseEnv, model, api), cwd });
+  const proc = await spawnClaude(args, { env: buildChildEnv(baseEnv, model, api), cwd });
 
   mainActiveProcs.add(proc);
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -999,7 +1012,7 @@ async function runClaudeStream(
   const normalizedModel = model.trim().toLowerCase();
   if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
 
-  const proc = spawnClaude(args, { env: buildChildEnv(baseEnv, model, api), cwd });
+  const proc = await spawnClaude(args, { env: buildChildEnv(baseEnv, model, api), cwd });
 
   mainActiveProcs.add(proc);
   let sessionId: string | undefined;
@@ -1177,6 +1190,7 @@ async function runClaudeStreaming(
   const normalizedModel = model.trim().toLowerCase();
   if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
 
+  await gateResume(args);
   const proc = Bun.spawn(args, {
     stdout: "pipe",
     stderr: "pipe",
@@ -2843,7 +2857,7 @@ async function streamClaude(
     `[${new Date().toLocaleTimeString()}] Running: ${name} (stream-json, session: ${existing?.sessionId?.slice(0, 8) ?? "new"})`,
   );
 
-  const proc = spawnClaude(args, { env: childEnv });
+  const proc = await spawnClaude(args, { env: childEnv });
 
   // Collect stderr in the background so it doesn't back-pressure the process.
   // We need it after proc.exited for stale session detection.
@@ -3130,7 +3144,7 @@ export async function runFork(prompt: string): Promise<RunResult> {
     FORK_SYSTEM_PROMPT,
   ];
 
-  const proc = spawnClaude(args, { env: buildChildEnv(baseEnv, FORK_MODEL, api) });
+  const proc = await spawnClaude(args, { env: buildChildEnv(baseEnv, FORK_MODEL, api) });
 
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
   const timeoutPromise = new Promise<never>((_, reject) => {

@@ -8,6 +8,7 @@ import {
 import { validateIsolation } from "./isolation.js";
 import { engines } from "./registry.js";
 import { printRuntime } from "./print.js";
+import { assertSessionWritable } from "../runner/pty-quarantine.js";
 
 export interface OneShotRequest {
   route: string;
@@ -53,6 +54,12 @@ export interface OneShotEngine {
 
 export async function runOneShot(req: OneShotRequest): Promise<OneShotResult> {
   validateIsolation(req);
+  // #562 round 8: the single entry for every one-shot `--resume` (live-session fallback,
+  // shutdown memory save, discord, tuner). A transcript with an unconfirmed writer is not
+  // resumed beside it.
+  if (req.resumeSessionId !== undefined) {
+    await assertSessionWritable({ sessionId: req.resumeSessionId });
+  }
   // The standalone tuner does not load daemon settings. Only that absence
   // falls back; invalid loaded configuration is never swallowed.
   let settings: ReturnType<typeof parseOneShotSettings> | undefined;

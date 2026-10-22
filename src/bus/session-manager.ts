@@ -50,6 +50,7 @@ import { BUS_MCP_TOOLS } from "./mcp-tools";
 import { confirmTurnReceipt } from "./receipt-wiring";
 import { capturePostMortem, type PostMortemOptions } from "./post-mortem";
 import type { ReceiptRecord } from "./receipt";
+import { assertSessionWritable } from "../runner/pty-quarantine";
 import { ensureTrustAccepted } from "../runner/pty-trust-prompt";
 import {
   type AgentProcess,
@@ -862,6 +863,10 @@ export class SessionManager {
           );
         }
       }
+      // #562 round 8: the same gate every other start on a session passes. The bus names its
+      // agent's session with `--session-id`, so a transcript the PTY supervisor still has an
+      // unconfirmed writer on is not started beside it.
+      await assertSessionWritable({ sessionId: agent.session_id });
       if (mode === "pty-stdin") {
         proc = await this.spawnPty(agent, args, env, realCwd);
       } else if (mode === "process-stream-json" || mode === "process") {
