@@ -44,6 +44,8 @@ import {
 import {
   PtyClosedError,
   PtyPromptNotAcceptedError,
+  PtyTranscriptUncertainError,
+  PtyTranscriptUnavailableError,
   PtyTurnFailedError,
   TranscriptReplacedError,
   PtyTurnTimeoutError,
@@ -52,6 +54,15 @@ import {
   type PtyTurnResult,
   type SpawnPty,
 } from "../runner/pty-process";
+import { spawnPty } from "../runner/pty-process";
+import {
+  append,
+  assistantLine,
+  systemLine,
+  type TempTranscript,
+  tempTranscript,
+  userLine,
+} from "./fixtures/fake-claude-tui";
 import { initConfig, loadSettings, reloadSettings, getSettings } from "../config";
 import * as configMod from "../config";
 
@@ -71,6 +82,10 @@ interface FakePtyOpts {
   initialSessionId?: string;
   /** PID for snapshot tests. */
   pid?: number;
+  /** `dispose()` resolves only once this does (the process has "exited"). */
+  disposeGate?: Promise<void>;
+  /** Shared log: `dispose-start:<label>`, `dispose-exited:<label>`. */
+  events?: string[];
 }
 
 interface FakePtyHandle extends PtyProcess {
@@ -130,6 +145,9 @@ function makeFakePty(label: string, fopts: FakePtyOpts): FakePtyHandle {
     async dispose(): Promise<void> {
       alive = false;
       disposed = true;
+      fopts.events?.push(`dispose-start:${label}`);
+      await fopts.disposeGate;
+      fopts.events?.push(`dispose-exited:${label}`);
     },
     get turnCount() {
       return turnCount;
@@ -449,40 +467,32 @@ describe("pty-supervisor retry and backoff", () => {
     expect(sleeps).toEqual([1000]);
   });
 
-  it("retries on PtyTurnTimeoutError, succeeds after one retry", async () => {
+  it("does NOT retry a PtyTurnTimeoutError: 124, one turn, the process stopped (#562 round 5)", async () => {
+    // A timed-out prompt may have run and its process may still write the record. Fault:
+    // put PtyTurnTimeoutError back in the retry set and the prompt is replayed on a new
+    // process (turns = 2, exit 0).
     const sleeps: number[] = [];
     injectSleep(async (ms) => {
       sleeps.push(ms);
     });
-
-    let globalCalls = 0;
+    let turns = 0;
     const { spawn, spawned } = makeSpawnTracker(() =>
       makeFakePty("retry-timeout", {
-        onTurn: async (prompt) => {
-          const callNum = globalCalls++;
-          if (callNum === 0) {
-            throw new PtyTurnTimeoutError("retry-timeout", 5000);
-          }
-          return {
-            text: `late:${prompt}`,
-            bytesCaptured: 0,
-            cleanBoundary: true,
-            sessionId: "s",
-          };
+        onTurn: async () => {
+          turns += 1;
+          throw new PtyTurnTimeoutError("retry-timeout", 5000);
         },
       }),
     );
     injectSpawnPty(spawn);
     await initSupervisor();
 
-    const result = await runOnPty("thread:t1", "ask", {
-      timeoutMs: 5000,
-      threadId: "t1",
-    });
-    expect(result.exitCode).toBe(0);
-    expect(result.rawStdout).toBe("late:ask");
-    expect(spawned.length).toBe(2);
-    expect(sleeps).toEqual([1000]);
+    const result = await runOnPty("thread:t1", "ask", { timeoutMs: 5000, threadId: "t1" });
+    expect(result.exitCode).toBe(124);
+    expect(turns).toBe(1);
+    expect(sleeps).toEqual([]);
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]?.disposed).toBe(true);
   });
 
   it("a final turn timeout returns 124 and retires the entry, so the next call respawns", async () => {
@@ -502,7 +512,7 @@ describe("pty-supervisor retry and backoff", () => {
     // 124 so the watchdog and the "timed out" messages see it. The TUI may still be busy with
     // the old answer, so the supervisor retires it rather than leave it live (#562 re-review).
     expect(result.exitCode).toBe(124);
-    expect(result.stderr).toContain("max retries");
+    expect(result.stderr).toContain("timed out");
     expect(spawned[0]?.disposed).toBe(true);
     expect(snapshotSupervisor().ptys).toHaveLength(0);
     const next = await runOnPty("global", "again", { timeoutMs: 1000 });
@@ -1563,6 +1573,230 @@ describe("pty-supervisor model + provider env threading (Codex Phase D #1)", () 
       if (before !== undefined) process.env["ANTHROPIC_AUTH_TOKEN"] = before;
     }
   });
+});
+
+describe("#562 round 5 — a turn that is not a proven OK kills the process and resumes the session", () => {
+  const nonOk: Array<[string, () => Error, number]> = [
+    ["uncertain (final message, no boundary)", () => new PtyTranscriptUncertainError("x", 900), 1],
+    ["timeout", () => new PtyTurnTimeoutError("x", 900), 124],
+    [
+      "empty reply",
+      () => new PtyTurnFailedError("x", "empty-reply", "empty reply in transcript"),
+      1,
+    ],
+    ["ambiguous", () => new PtyTurnFailedError("x", "ambiguous", "another prompt"), 1],
+    ["API error", () => new PtyTurnFailedError("x", "api-error", "API Error: 529"), 1],
+    ["closed after the prompt went out", () => new PtyClosedError("x", 1, null, true), 1],
+  ];
+  for (const [name, make, code] of nonOk) {
+    it(`${name}: one turn, no replay, the process disposed, exit ${code}`, async () => {
+      // Fault: skip the retirement for this outcome and `disposed` stays false; add it to the
+      // retry set and turns is 2.
+      injectMaxRetriesForTests(3);
+      injectSleep(async () => {});
+      let turns = 0;
+      const { spawn, spawned } = makeSpawnTracker(() =>
+        makeFakePty("non-ok", {
+          onTurn: async () => {
+            turns += 1;
+            throw make();
+          },
+        }),
+      );
+      injectSpawnPty(spawn);
+      const result = await runOnPty("global", "p", { timeoutMs: 1000 });
+      expect(result.exitCode).toBe(code);
+      expect(result.rawStdout === "" || name === "API error").toBe(true);
+      expect(turns).toBe(1);
+      expect(spawned).toHaveLength(1);
+      expect(spawned[0]?.disposed).toBe(true);
+      expect(snapshotSupervisor().ptys).toHaveLength(0);
+    });
+  }
+
+  it("the error is returned only AFTER the old process has exited", async () => {
+    // Fault: `void retireEntry(entry)` instead of awaiting it, and the result is back while
+    // the old process is still being stopped.
+    const events: string[] = [];
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const { spawn } = makeSpawnTracker(() =>
+      makeFakePty("slow-exit", {
+        events,
+        disposeGate: gate,
+        onTurn: async () => {
+          throw new PtyTranscriptUncertainError("x", 900);
+        },
+      }),
+    );
+    injectSpawnPty(spawn);
+    let returned = false;
+    const run = runOnPty("global", "p", { timeoutMs: 1000 }).then((r) => {
+      returned = true;
+      events.push("returned");
+      return r;
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    expect(events).toContain("dispose-start:slow-exit");
+    expect(returned).toBe(false);
+    release();
+    const result = await run;
+    expect(result.exitCode).toBe(1);
+    expect(events).toEqual(["dispose-start:slow-exit", "dispose-exited:slow-exit", "returned"]);
+  });
+
+  it("a new process is not spawned until the old one has exited, and it resumes the SAME session id", async () => {
+    // Fault (resume): drop the stored-session lookup in `buildSpawnOptions` (`sessionId = ""`)
+    // and the second spawn has no sessionId and a new one: history is lost. Fault (order):
+    // admit the replacement without waiting for `retiring` and the spawn precedes the exit.
+    injectNewSessionId(() => "uuid-kept");
+    const events: string[] = [];
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let calls = 0;
+    const { spawn, spawned, spawnOpts } = makeSpawnTracker((opts, idx) => {
+      events.push(`spawn:${idx}`);
+      return makeFakePty(`proc-${idx}`, {
+        events,
+        initialSessionId: opts.sessionId || opts.newSessionId,
+        ...(idx === 0 ? { disposeGate: gate } : {}),
+        onTurn: async (prompt) => {
+          calls += 1;
+          if (idx === 0) throw new PtyTranscriptUncertainError("x", 900);
+          return {
+            text: `ok:${prompt}`,
+            bytesCaptured: 1,
+            cleanBoundary: true,
+            sessionId: opts.sessionId || opts.newSessionId || "",
+          };
+        },
+      });
+    });
+    injectSpawnPty(spawn);
+    // The next call arrives while the first process is still being stopped.
+    const first = runOnPty("agent:alice", "same prompt", { timeoutMs: 1000, agentName: "alice" });
+    await new Promise((r) => setTimeout(r, 60));
+    const second = runOnPty("agent:alice", "same prompt", { timeoutMs: 1000, agentName: "alice" });
+    await new Promise((r) => setTimeout(r, 60));
+    expect(spawned).toHaveLength(1);
+    release();
+    const [r1, r2] = await Promise.all([first, second]);
+    expect(r1.exitCode).toBe(1);
+    expect(r2.exitCode).toBe(0);
+    expect(r2.rawStdout).toBe("ok:same prompt");
+    expect(calls).toBe(2);
+    expect(events.indexOf("dispose-exited:proc-0")).toBeLessThan(events.indexOf("spawn:1"));
+    expect(spawnOpts[0]?.newSessionId).toBe("uuid-kept");
+    expect(spawnOpts[1]?.sessionId).toBe("uuid-kept");
+    expect(spawnOpts[1]?.newSessionId).toBeUndefined();
+  });
+
+  it("a turn refused before anything was written (no transcript) has nothing to kill", async () => {
+    injectMaxRetriesForTests(3);
+    const { spawn, spawned } = makeSpawnTracker(() =>
+      makeFakePty("no-tx", {
+        onTurn: async () => {
+          throw new PtyTranscriptUnavailableError("x", "no transcript");
+        },
+      }),
+    );
+    injectSpawnPty(spawn);
+    const result = await runOnPty("global", "p", { timeoutMs: 1000 });
+    expect(result.exitCode).toBe(1);
+    expect(spawned[0]?.disposed).toBe(false);
+  });
+
+  it("a PtyClosedError raised before the prompt went out is still retried (nothing ran)", async () => {
+    injectMaxRetriesForTests(2);
+    injectSleep(async () => {});
+    let turns = 0;
+    const { spawn, spawned } = makeSpawnTracker(() =>
+      makeFakePty("pre-write", {
+        onTurn: async (prompt) => {
+          turns += 1;
+          if (turns === 1) throw new PtyClosedError("x", null, null, false);
+          return { text: `ok:${prompt}`, bytesCaptured: 1, cleanBoundary: true, sessionId: "s" };
+        },
+      }),
+    );
+    injectSpawnPty(spawn);
+    const result = await runOnPty("global", "p", { timeoutMs: 1000 });
+    expect(result.exitCode).toBe(0);
+    expect(spawned).toHaveLength(2);
+  });
+});
+
+describe("#562 round 5 — through the supervisor, with the real process and transcript reader", () => {
+  const PROMPT = "R17x please";
+  const made: TempTranscript[] = [];
+  afterEach(() => {
+    while (made.length) made.pop()?.cleanup();
+  });
+
+  /** A real PtyProcess running a /bin/sh script that stands in for the CLI. */
+  function realProcess(script: string, t: TempTranscript): SpawnPty {
+    return (opts) =>
+      spawnPty({
+        ...opts,
+        _skipReadySettle: true,
+        _skipClaudeArgs: true,
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", script],
+        transcriptPath: t.path,
+        cols: 80,
+        rows: 24,
+        quietWindowMs: 50,
+        settleCapMs: 400,
+        submitConfirmMs: 400,
+      });
+  }
+  const txFile = (): TempTranscript => {
+    const t = tempTranscript();
+    made.push(t);
+    return t;
+  };
+
+  it("an empty reply is exit 1 on the supervisor result, with no output, and the process is stopped", async () => {
+    // Fault (reader `finish`): treat an empty answer as OK and this is exit 0 with "".
+    const t = txFile();
+    const script = [
+      "IFS= read -r l",
+      append(t.path, userLine(PROMPT)),
+      append(
+        t.path,
+        assistantLine("", { id: "m1", blocks: [{ type: "tool_use", name: "Read", input: {} }] }),
+      ),
+      append(t.path, systemLine("turn_duration")),
+      "sleep 8",
+    ].join("; ");
+    injectSpawnPty(realProcess(script, t));
+    const result = await runOnPty("global", PROMPT, { timeoutMs: 5000 });
+    expect(result.exitCode).toBe(1);
+    expect(result.rawStdout).toBe("");
+    expect(result.stderr).toContain("empty reply in transcript");
+    expect(snapshotSupervisor().ptys).toHaveLength(0);
+  }, 15_000);
+
+  it("a final message with no boundary is exit 1 (not 124), no output, and the process is stopped", async () => {
+    // Fault (process timeout): always raise PtyTurnTimeoutError and this is exit 124.
+    const t = txFile();
+    const script = [
+      "IFS= read -r l",
+      append(t.path, userLine(PROMPT)),
+      append(t.path, assistantLine("FINAL", { id: "m1" })),
+      "sleep 8",
+    ].join("; ");
+    injectSpawnPty(realProcess(script, t));
+    const result = await runOnPty("global", PROMPT, { timeoutMs: 1200 });
+    expect(result.exitCode).toBe(1);
+    expect(result.rawStdout).toBe("");
+    expect(result.stderr).toContain("uncertain");
+    expect(snapshotSupervisor().ptys).toHaveLength(0);
+  }, 15_000);
 });
 
 describe("pty-supervisor fresh-session persistence (Codex Phase D #2)", () => {

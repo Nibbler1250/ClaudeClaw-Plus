@@ -21,10 +21,13 @@
  *      `PtyPromptNotAcceptedError`.
  *   3. Answer = the text of the turn's FINAL assistant message in the transcript (the print
  *      path's `result`), never between-tool narration and never a later turn.
- *   4. Done = the turn's final assistant message carries a terminal stop reason (or the CLI
- *      wrote `turn_duration`; `/compact`: `compact_boundary`). Failed = the CLI's own API
- *      error, a command's stderr, or an uncertain attribution (`PtyTurnFailedError`); a
- *      transcript that was replaced fails with `TranscriptReplacedError`.
+ *   4. Done = the turn's final assistant message carries a terminal stop reason AND the
+ *      transcript shows an authoritative boundary after it: the CLI's `turn_duration` or the
+ *      next real user prompt (`/compact`: `compact_boundary`). No quiet-file timer. Failed =
+ *      the CLI's own API error (anywhere before the boundary), a command's stderr, an
+ *      uncertain attribution, or a reply with no text (`PtyTurnFailedError`); a transcript
+ *      that was replaced fails with `TranscriptReplacedError`. A final message with no
+ *      boundary by the timeout is `PtyTranscriptUncertainError`: not a success, not replayed.
  *   5. The moment the transcript establishes the outcome it is COMMITTED (`_commitTurn`): the
  *      hard timeout is cancelled and a PTY exit no longer rejects. The screen settle that
  *      follows only delays the return.
@@ -307,6 +310,25 @@ export class PtyTurnFailedError extends Error {
  */
 export type SpawnPty = (opts: PtyProcessOptions) => Promise<PtyProcess>;
 
+/**
+ * A message of the turn carries a terminal stop reason, but the transcript never showed an
+ * authoritative boundary after it (`turn_duration`, the next real prompt) before the
+ * timeout. The reply may be incomplete (a later block can still arrive), so it is not
+ * delivered and the turn is not replayed. The supervisor kills the process and resumes the
+ * session in a new one.
+ */
+export class PtyTranscriptUncertainError extends Error {
+  constructor(
+    public readonly label: string,
+    public readonly elapsedMs: number,
+  ) {
+    super(
+      `PTY turn outcome uncertain for ${label}: the reply ended but the transcript showed no turn boundary within ${elapsedMs}ms; the turn may have run`,
+    );
+    this.name = "PtyTranscriptUncertainError";
+  }
+}
+
 export class PtyTurnTimeoutError extends Error {
   constructor(
     public readonly label: string,
@@ -355,6 +377,11 @@ export class PtyClosedError extends Error {
     public readonly label: string,
     public readonly exitCode: number | null,
     public readonly signal: string | null,
+    /**
+     * The turn's prompt had been written when the process went away, so it may have run.
+     * False (the default) means it never went out and the supervisor may retry it.
+     */
+    public readonly promptSent = false,
   ) {
     super(`PTY closed during turn for ${label} (exit=${exitCode} signal=${signal})`);
     this.name = "PtyClosedError";
@@ -863,6 +890,7 @@ class PtyProcessImpl implements PtyProcess {
         this.label,
         info.exitCode ?? null,
         info.signal != null ? String(info.signal) : null,
+        true,
       );
       this._rejectTurn(err);
     }
@@ -916,7 +944,6 @@ class PtyProcessImpl implements PtyProcess {
       path: this._transcriptPath,
       written,
       replCommand: opts.allowReplCommand === true,
-      now: this._now,
     });
     this._tx.mark();
 
@@ -951,7 +978,13 @@ class PtyProcessImpl implements PtyProcess {
           this._pollTurn();
           if (!this._turnInProgress || this._endedAt !== 0) return;
           const elapsed = this._now() - this._turnStartedAt;
-          this._rejectTurn(new PtyTurnTimeoutError(this.label, elapsed));
+          // A final message with no boundary is UNCERTAIN (it may still gain blocks), which
+          // is not the same as a turn still running.
+          this._rejectTurn(
+            this._tx?.state().finalSeen
+              ? new PtyTranscriptUncertainError(this.label, elapsed)
+              : new PtyTurnTimeoutError(this.label, elapsed),
+          );
         }, opts.timeoutMs);
       }
 
@@ -1067,9 +1100,9 @@ class PtyProcessImpl implements PtyProcess {
 
   private _rejectTurn(err: Error): void {
     if (!this._turnInProgress) return;
-    // Whatever the reason, the prompt may have run (its record can still arrive): remember
-    // it, so an identical one next cannot take that record for its own.
-    this._tx?.abandon();
+    // The prompt may have run and its record may still arrive. Nothing is remembered here:
+    // the supervisor kills this process and waits for its exit before any later turn marks
+    // its offset (`retireEntry`), so no writer is left to append a late record.
     this._turnInProgress = false;
     this._tx = null;
     this._onChunk = undefined;
@@ -1088,7 +1121,7 @@ class PtyProcessImpl implements PtyProcess {
     this._disposed = true;
 
     if (this._turnInProgress) {
-      this._rejectTurn(new PtyClosedError(this.label, null, "SIGTERM"));
+      this._rejectTurn(new PtyClosedError(this.label, null, "SIGTERM", true));
     }
 
     if (this._alive) {

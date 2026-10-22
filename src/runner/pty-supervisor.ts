@@ -21,24 +21,31 @@
  *     on the same PTY (per the §3.1 concurrency contract). Different keys
  *     proceed in parallel.
  *
- *   - Crash-respawn-replay: on PtyClosedError or PtyTurnTimeoutError, the
- *     supervisor disposes the dead PTY, sleeps `backoffMs[i]`, respawns
- *     (via cached spawn options + last-known sessionId for --resume), and
- *     retries the SAME prompt up to `maxRetries` times (outer loop). Each
- *     outer retry first tries to respawn the PTY up to `respawnRetries`
- *     times (inner loop — issue #175). If the inner loop is exhausted the
- *     outer loop terminates early with a "respawn failed after N attempts"
- *     error rather than consuming the remaining outer budget. After
- *     exhaustion the supervisor surfaces a structured error in
- *     RunOnPtyResult.stderr and exitCode=1, or exitCode=124 when the last
- *     failure was a turn timeout (`PtyTurnTimeoutError`), so the watchdog and
- *     the "timed out" messages see it as they do for `claude -p`. A PTY turn
- *     timeout also RETIRES the entry before returning (the TUI may still be
- *     busy with the old answer; the next call on the key respawns and
- *     `--resume`s the stored session id, which is untouched). runner.ts does
- *     NOT compact or re-run on a PTY 124: PTY timeouts are often detection
- *     misses on a healthy session (#369, #316/#317), and the interactive REPL
- *     compacts its own context.
+ *   - Crash-respawn-replay: on a `PtyClosedError` whose prompt was never sent (the
+ *     process was already gone when the turn started), the supervisor disposes the dead
+ *     PTY, sleeps `backoffMs[i]`, respawns (via cached spawn options + last-known
+ *     sessionId for --resume), and retries the SAME prompt up to `maxRetries` times
+ *     (outer loop). Each outer retry first tries to respawn the PTY up to
+ *     `respawnRetries` times (inner loop — issue #175). If the inner loop is exhausted the
+ *     outer loop terminates early with a "respawn failed after N attempts" error rather
+ *     than consuming the remaining outer budget. After exhaustion the supervisor surfaces
+ *     a structured error in RunOnPtyResult.stderr and exitCode=1.
+ *
+ *   - Kill-and-resume (#562 round 5): a turn that ends in ANYTHING but a proven OK (a
+ *     timeout, an uncertain end, a prompt not accepted, an ambiguous or failed turn, an
+ *     API error, a replaced transcript, a process that closed after the prompt went out) is
+ *     never retried or replayed. The supervisor RETIRES the entry before returning the
+ *     error: the PTY is disposed (SIGTERM, SIGKILL after a grace period) and the call waits
+ *     for the process to have exited. The only writer that could append a late record for
+ *     the failed turn is therefore gone before any later turn marks its offset, which is
+ *     what makes the transcript's exact payload match safe without per-submission ids.
+ *     The next call on the key spawns a NEW process that `--resume`s the stored session
+ *     id (untouched), so history is kept, and not before the old one is confirmed exited
+ *     (`admitEntry` waits on `retiring`). A timeout returns exitCode 124 so the watchdog
+ *     and the "timed out" messages see it as they do for `claude -p`. runner.ts does NOT
+ *     compact or re-run on a PTY 124: PTY timeouts are often detection misses on a
+ *     healthy session (#369, #316/#317), and the interactive REPL compacts its own
+ *     context.
  *
  *   - Settings are re-read via getSettings() on every call — never cached
  *     across calls — so hot-reload works. The reap interval is rebuilt
@@ -66,10 +73,9 @@ import {
   boundaryVerdict,
   PtyBoundaryUnconfirmedError,
   PtyClosedError,
-  PtyPromptNotAcceptedError,
+  PtyTranscriptUnavailableError,
   PtyTurnFailedError,
   PtyTurnTimeoutError,
-  TranscriptReplacedError,
 } from "./pty-process.js";
 import { ensureTrustAccepted } from "./pty-trust-prompt.js";
 import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";
@@ -1183,19 +1189,12 @@ export async function sendToLiveSession(
         return { status: "failed", error: "aborted", timedOut: false, aborted: true };
       }
       const timedOut = err instanceof PtyTurnTimeoutError;
-      // #562: a prompt claude never took up leaves the TUI in a state we cannot read;
-      // retire it as on a timeout so the next call respawns and resumes cleanly.
-      // The same for a turn the transcript says failed (API error, command stderr, an
-      // uncertain attribution) or whose transcript was replaced: the TUI is in a state we
-      // cannot read, and the prompt may have run.
-      if (
-        timedOut ||
-        err instanceof PtyPromptNotAcceptedError ||
-        err instanceof PtyTurnFailedError ||
-        err instanceof TranscriptReplacedError
-      ) {
-        await retireEntry(entry);
-      }
+      // #562 round 5, kill-and-resume: any turn that did not end in a proven OK (a timeout,
+      // an uncertain end, a prompt not accepted, a failed or ambiguous turn, a replaced
+      // transcript, a process that closed after the send) leaves a process that may still
+      // write a record for it. Stop it and wait for its exit before reporting; the next
+      // call resumes the stored session in a new one.
+      await retireEntry(entry);
       return { status: "failed", error: (err as Error).message, timedOut, aborted: false };
     }
   }
@@ -2335,18 +2334,31 @@ async function runTurnWithRetries(
       };
     } catch (err) {
       lastErr = err;
-      const retryable = err instanceof PtyClosedError || err instanceof PtyTurnTimeoutError;
+      // Only a process that was already gone BEFORE the prompt went out is retried: nothing
+      // ran, so a replay cannot double anything. Every other outcome is final for this
+      // turn (#562 round 5).
+      const retryable = err instanceof PtyClosedError && !err.promptSent;
       if (!retryable) {
-        // #562: the PTY is alive but never started the turn. Not retried here (a re-sent
-        // prompt could land twice), and not reported as success: the caller gets exit 1.
-        if (err instanceof PtyPromptNotAcceptedError) await retireEntry(entry);
+        // #546: an aborted call retires the entry itself (which closes the process under
+        // the turn); that is an abort, not a failure to report.
+        if (err instanceof PtyClosedError && callOpts.signal?.aborted) {
+          await retireEntry(entry);
+          return errorResult(`[pty-supervisor] ${entry.sessionKey} aborted`);
+        }
+        // #562 round 5, kill-and-resume: the turn did not end in a proven OK (timeout,
+        // uncertain end, prompt not accepted, failed or ambiguous, replaced transcript, a
+        // process that closed after the send), so the prompt may have run and a record for
+        // it may still be written by the process that is still alive. Kill that process and
+        // WAIT for it to exit before returning; the next call spawns a new one that
+        // resumes the same session. No retry, no replay. Only a turn refused before
+        // anything was written has nothing to kill.
+        if (!(err instanceof PtyTranscriptUnavailableError)) await retireEntry(entry);
         // #562 round 3: the transcript says the turn FAILED. Matched to the print path: a
         // non-zero exit, not retried, the session reset left to the runner. For an API
         // error the CLI's own text goes out as the output, because that is what the
         // runner reads to tell a corrupt session from any other failure
         // (`signatureErrorWarrantsReset`, the same input the print path gives it).
         if (err instanceof PtyTurnFailedError) {
-          await retireEntry(entry);
           return {
             ...errorResult(
               `[pty-supervisor] non-retryable error on ${entry.sessionKey}: ${err.message}`,
@@ -2354,7 +2366,14 @@ async function runTurnWithRetries(
             rawStdout: err.kind === "api-error" ? err.text : "",
           };
         }
-        if (err instanceof TranscriptReplacedError) await retireEntry(entry);
+        // 124 so the watchdog and the "timed out" messages see a timeout as they do for
+        // `claude -p`.
+        if (err instanceof PtyTurnTimeoutError) {
+          return errorResult(
+            `[pty-supervisor] turn timed out on ${entry.sessionKey}: ${err.message}; not retried (the prompt may have run), the process was stopped and the next call resumes the session`,
+            124,
+          );
+        }
         return errorResult(
           `[pty-supervisor] non-retryable error on ${entry.sessionKey}: ${(err as Error).message}`,
         );
@@ -2380,14 +2399,8 @@ async function runTurnWithRetries(
     }
   }
 
-  // A timed-out turn leaves the TUI possibly still busy with the previous answer, so the
-  // next paste on this key could land mid-turn. Retire it, as `sendToLiveSession` does on
-  // timeout; the stored session id stays, so the next call respawns and resumes.
-  const timedOut = lastErr instanceof PtyTurnTimeoutError;
-  if (timedOut) await retireEntry(entry);
   return errorResult(
     `[pty-supervisor] max retries (${supervisorOpts.maxRetries}) exhausted for ${entry.sessionKey}: ${(lastErr as Error)?.message ?? "unknown"}`,
-    timedOut ? 124 : 1,
   );
 }
 

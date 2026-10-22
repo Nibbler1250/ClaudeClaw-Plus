@@ -13,6 +13,7 @@ export {
   spawnPty,
   sanitizePtyPromptText,
   PtyTurnTimeoutError,
+  PtyTranscriptUncertainError,
   PtyClosedError,
   PtyPromptNotAcceptedError,
   PtyBoundaryUnconfirmedError,

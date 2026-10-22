@@ -62,7 +62,7 @@ process.stdin.on("data", (buf: Buffer) => {
       if (TRANSCRIPT) {
         appendFileSync(
           TRANSCRIPT,
-          `${JSON.stringify({ type: "user", message: { role: "user", content: line } })}\n${JSON.stringify({ type: "assistant", message: { id: "m1", role: "assistant", model: "t", content: [{ type: "text", text: `SUBMITTED<${line}>` }], stop_reason: "end_turn" } })}\n`,
+          `${JSON.stringify({ type: "user", message: { role: "user", content: line } })}\n${JSON.stringify({ type: "assistant", message: { id: "m1", role: "assistant", model: "t", content: [{ type: "text", text: `SUBMITTED<${line}>` }], stop_reason: "end_turn" } })}\n${JSON.stringify({ type: "system", subtype: "turn_duration" })}\n`,
         );
       }
       line = "";

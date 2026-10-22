@@ -5,19 +5,17 @@
  * Pure: a temp file stands in for the transcript and the tests append to it by hand, in
  * whatever partitions they like. Each assertion names the fault that turns it red.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { appendFileSync, mkdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  EMPTY_REPLY_TEXT,
   promptMatches,
-  resetUnresolvedPrompts,
   resolveTranscriptPath,
-  TRANSCRIPT_SETTLE_MS,
   TranscriptReplacedError,
   TranscriptTurn,
   type TranscriptTurnOptions,
-  UNRESOLVED_TTL_MS,
 } from "../runner/pty-transcript";
 import {
   assistantLine,
@@ -36,7 +34,6 @@ function tx(): TempTranscript {
 }
 afterEach(() => {
   while (made.length) made.pop()?.cleanup();
-  resetUnresolvedPrompts();
 });
 
 function turn(
@@ -451,7 +448,7 @@ describe("TranscriptTurn — a second identical prompt is uncertain, never a suc
     expect(s.answer).toBe("");
   });
 
-  test("the same prompt appended right after the reply (during the settle) downgrades it to ambiguous", () => {
+  test("the same prompt appended right after the reply (before the boundary) downgrades it to ambiguous", () => {
     const t = tx();
     const turn_ = turn(t);
     appendFileSync(t.path, nl(userLine("R17x please"), assistantLine("A")));
@@ -774,7 +771,7 @@ describe("TranscriptTurn — the matched turn is a window, frozen when it ends (
     expect(s.answer).toBe("");
   });
 
-  test("a later assistant message with NO prompt between is not this turn's: the final message ends it", () => {
+  test("a later assistant message with NO prompt between is not this turn's: the turn still ends only at its boundary", () => {
     // A background-task notification can start a reply of its own right after a turn's last
     // message. Fault: accept any assistant message after the final one (drop the id match in
     // the terminal phase) and its text is appended to this turn's answer.
@@ -788,7 +785,12 @@ describe("TranscriptTurn — the matched turn is a window, frozen when it ends (
         assistantLine("UNRELATED-NOTIFICATION-REPLY", ids("n")),
       ),
     );
-    const s = turn_.poll();
+    let s = turn_.poll();
+    // Neither appended nor a boundary (round 5): the turn still waits for `turn_duration`.
+    expect(s.answer).toBe("ANSWER-A");
+    expect(s.ended).toBe(false);
+    appendFileSync(t.path, nl(systemLine("turn_duration")));
+    s = turn_.poll();
     expect(s.answer).toBe("ANSWER-A");
     expect(s.ended).toBe(true);
   });
@@ -876,19 +878,80 @@ describe("TranscriptTurn — the file must stay the file the turn started on (ro
   });
 });
 
-describe("TranscriptTurn — one definition of 'the final message is complete' (round 4, H4 + finding 3)", () => {
+describe("TranscriptTurn — a turn ends only at an authoritative boundary (round 5, HIGH 1 + 2)", () => {
   const ids = (id: string) => ({ id });
+  const t0 = new Date("2026-10-22T10:00:00Z").getTime();
 
-  test("two text blocks of the final message on separate lines, B arriving late: the answer is A+B and the turn has not ended before B", () => {
-    // Fault: set `ended` on the first terminal line with text (the round-3 code). The turn
-    // would be committed on A alone, so a quiet screen returns "A-BLOCK " and a repainting
-    // one "A-BLOCK B-BLOCK": the answer would depend on the screen.
+  afterEach(() => {
+    setSystemTime();
+  });
+
+  test("block B of the final message arriving 5 s after block A is in the answer: a quiet file is not an end", () => {
+    // Fault (site: `poll`): end a terminal turn once the file has not grown for 1.5 s (the
+    // round-4 settle) and A alone is returned, B ignored.
+    setSystemTime(new Date(t0));
     const t = tx();
     const turn_ = turn(t);
     appendFileSync(t.path, nl(userLine("R17x please"), assistantLine("A-BLOCK ", ids("m1"))));
+    expect(turn_.poll().finalSeen).toBe(true);
+    for (const waitedMs of [1_500, 1_501, 3_000]) {
+      setSystemTime(new Date(t0 + waitedMs));
+      const s = turn_.poll();
+      expect(s.ended).toBe(false);
+      expect(s.failure).toBeNull();
+    }
+    setSystemTime(new Date(t0 + 5_000));
+    appendFileSync(t.path, nl(assistantLine("B-BLOCK", ids("m1"))));
+    expect(turn_.poll().ended).toBe(false);
+    appendFileSync(t.path, nl(systemLine("turn_duration")));
+    const s = turn_.poll();
+    expect(s.ended).toBe(true);
+    expect(s.answer).toBe("A-BLOCK B-BLOCK");
+  });
+
+  test("a final message with no boundary never ends: finalSeen says so, there is no success", () => {
+    // Fault (site: `ingestAssistant`, the `phase = "terminal"` branch): end the turn on the
+    // terminal stop_reason itself and this is ended with an answer that may be incomplete.
+    setSystemTime(new Date(t0));
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(t.path, nl(userLine("R17x please"), assistantLine("FINAL", ids("m1"))));
+    setSystemTime(new Date(t0 + 10 * 60_000));
+    const s = turn_.poll();
+    expect(s.finalSeen).toBe(true);
+    expect(s.ended).toBe(false);
+    expect(s.failure).toBeNull();
+  });
+
+  test("a tool_use stop is not a final message: finalSeen stays false", () => {
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(userLine("R17x please"), assistantLine("Let me look.", { id: "m1", stop: "tool_use" })),
+    );
+    expect(turn_.poll().finalSeen).toBe(false);
+  });
+
+  test("progress, hook, attachment and snapshot records between the blocks neither close nor cut the final message", () => {
+    // Fault (site: `ingestInTurn`, the `default:` branch): let any other record type close
+    // the window and B is dropped, the answer "A-BLOCK " committed.
+    const t = tx();
+    const turn_ = turn(t);
+    const bookkeeping = [
+      JSON.stringify({ type: "progress", data: { type: "hook_progress" } }),
+      JSON.stringify({ type: "attachment", attachment: { type: "hook_success" } }),
+      JSON.stringify({ type: "file-history-snapshot", snapshot: {} }),
+      JSON.stringify({ type: "queue-operation", operation: "enqueue", content: "the NEXT prompt" }),
+      systemLine("stop_hook_summary"),
+      systemLine("api_metrics"),
+    ];
+    appendFileSync(
+      t.path,
+      nl(userLine("R17x please"), assistantLine("A-BLOCK ", ids("m1")), ...bookkeeping),
+    );
     let s = turn_.poll();
     expect(s.ended).toBe(false);
-    expect(s.answer).toBe("A-BLOCK ");
     appendFileSync(t.path, nl(assistantLine("B-BLOCK", ids("m1"))));
     s = turn_.poll();
     expect(s.ended).toBe(false);
@@ -898,8 +961,66 @@ describe("TranscriptTurn — one definition of 'the final message is complete' (
     expect(s.answer).toBe("A-BLOCK B-BLOCK");
   });
 
-  test("the next entry that is not a line of the final message ends it, with no turn_duration", () => {
-    // A different message id (a background reply) closes the window and is not read.
+  test("meta entries, tool results, compact summaries and sub-agent lines after the final message are not the next prompt", () => {
+    // Fault (site: `ingestUserInTurn`, the terminal-phase `finish()`): treat any user entry
+    // as the boundary and the first of these ends the turn before B.
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(
+        userLine("R17x please"),
+        assistantLine("A-BLOCK ", ids("m1")),
+        JSON.stringify({ type: "user", isMeta: true, message: { role: "user", content: "meta" } }),
+        JSON.stringify({
+          type: "user",
+          message: { role: "user", content: [{ type: "tool_result", content: "x" }] },
+        }),
+        JSON.stringify({
+          type: "user",
+          isCompactSummary: true,
+          message: { role: "user", content: "summary" },
+        }),
+        JSON.stringify({
+          type: "user",
+          isSidechain: true,
+          message: { role: "user", content: "sub-agent prompt" },
+        }),
+        assistantLine("B-BLOCK", ids("m1")),
+      ),
+    );
+    let s = turn_.poll();
+    expect(s.ended).toBe(false);
+    expect(s.answer).toBe("A-BLOCK B-BLOCK");
+    appendFileSync(t.path, nl(systemLine("turn_duration")));
+    s = turn_.poll();
+    expect(s.ended).toBe(true);
+    expect(s.answer).toBe("A-BLOCK B-BLOCK");
+  });
+
+  test("the next real user prompt is a boundary: the turn ends and that prompt's reply is never read", () => {
+    // Fault (site: `ingestUserInTurn`, drop the terminal-phase boundary): the turn never ends
+    // on the next prompt, so `ended` stays false.
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(
+        userLine("R17x please"),
+        assistantLine("ANSWER-A", ids("a")),
+        userLine("the next prompt"),
+        assistantLine("ANSWER-B", ids("b")),
+      ),
+    );
+    const s = turn_.poll();
+    expect(s.ended).toBe(true);
+    expect(s.failure).toBeNull();
+    expect(s.answer).toBe("ANSWER-A");
+  });
+
+  test("an API error after the final text and before turn_duration fails the turn, with no answer", () => {
+    // Fault (site: `ingestAssistant`, read the error flags AFTER the terminal-phase id
+    // check): the error is ignored, `turn_duration` closes the turn and "FINAL" is a success.
     const t = tx();
     const turn_ = turn(t);
     appendFileSync(
@@ -907,87 +1028,117 @@ describe("TranscriptTurn — one definition of 'the final message is complete' (
       nl(
         userLine("R17x please"),
         assistantLine("FINAL", ids("m1")),
-        assistantLine("LATER", ids("m2")),
+        apiErrorLine("API Error: 529 overloaded"),
+        systemLine("turn_duration"),
       ),
     );
     const s = turn_.poll();
     expect(s.ended).toBe(true);
-    expect(s.answer).toBe("FINAL");
+    expect(s.failure?.kind).toBe("api-error");
+    expect(s.failure?.text).toContain("529");
+    expect(s.answer).toBe("");
   });
 
-  test("a terminal thinking-only final message with nothing after it ends the turn on the transcript settle, answering with the last message that has text", () => {
-    // Fault: require text before a terminal message counts (the round-3 code): the turn
-    // waits for a record that never comes, to the hard timeout, and the supervisor replays.
+  test("an API error that reuses the final message's id is still an error, not a block of it", () => {
+    // The error check comes before the same-id append: a flagged line with the final id.
     const t = tx();
-    let now = 1_000;
-    const turn_ = turn(t, "R17x please", false, { now: () => now });
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(
+        userLine("R17x please"),
+        assistantLine("FINAL", ids("m1")),
+        apiErrorLine("API Error: 500", "m1"),
+      ),
+    );
+    const s = turn_.poll();
+    expect(s.failure?.kind).toBe("api-error");
+    expect(s.answer).toBe("");
+  });
+
+  test("a command's stderr after the final message fails the turn too", () => {
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(
+        userLine("R17x please"),
+        assistantLine("FINAL", ids("m1")),
+        systemLine("local_command", "<local-command-stderr>boom</local-command-stderr>"),
+      ),
+    );
+    const s = turn_.poll();
+    expect(s.failure?.kind).toBe("command-error");
+    expect(s.answer).toBe("");
+  });
+});
+
+describe("TranscriptTurn — an empty reply is a failure (round 5, MEDIUM)", () => {
+  const ids = (id: string) => ({ id });
+  const toolOnly = (id: string) =>
+    assistantLine("", { id, blocks: [{ type: "tool_use", name: "Read", input: {} }] });
+
+  test("a turn whose only message is tool-only fails with the fixed text, and has no answer", () => {
+    // Fault (site: `finish`): treat an empty answer as OK and this is ended with failure null.
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(userLine("R17x please"), toolOnly("m1"), systemLine("turn_duration")),
+    );
+    const s = turn_.poll();
+    expect(s.ended).toBe(true);
+    expect(s.failure).toEqual({ kind: "empty-reply", text: EMPTY_REPLY_TEXT });
+    expect(EMPTY_REPLY_TEXT).toBe("empty reply in transcript");
+    expect(s.answer).toBe("");
+  });
+
+  test("a whitespace-only reply is empty", () => {
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(userLine("R17x please"), assistantLine(" \n\t ", ids("m1")), systemLine("turn_duration")),
+    );
+    const s = turn_.poll();
+    expect(s.failure?.kind).toBe("empty-reply");
+  });
+
+  test("a turn_duration with no assistant message at all is empty too", () => {
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(t.path, nl(userLine("R17x please"), systemLine("turn_duration")));
+    expect(turn_.poll().failure?.kind).toBe("empty-reply");
+  });
+
+  test("an earlier message with text and a tool-only final message is NOT empty: the last message that has text answers", () => {
+    const t = tx();
+    const turn_ = turn(t);
     appendFileSync(
       t.path,
       nl(
         userLine("R17x please"),
         assistantLine("EARLIER-TEXT", { id: "m1", stop: "tool_use" }),
-        assistantLine("", { id: "m2", blocks: [{ type: "thinking", thinking: "hm" }] }),
+        toolOnly("m2"),
+        systemLine("turn_duration"),
       ),
     );
-    expect(turn_.poll().ended).toBe(false);
-    now += TRANSCRIPT_SETTLE_MS - 1;
-    expect(turn_.poll().ended).toBe(false);
-    now += 1;
     const s = turn_.poll();
-    expect(s.ended).toBe(true);
     expect(s.failure).toBeNull();
     expect(s.answer).toBe("EARLIER-TEXT");
   });
 
-  test("a terminal tool-only final message with no text anywhere ends the turn with an empty answer", () => {
+  test("/compact with an empty completion marker is still a success: its result is its own output", () => {
+    // Fault (site: `finish`, drop the `!this.replCommand` guard): /compact fails as empty.
     const t = tx();
-    let now = 1_000;
-    const turn_ = turn(t, "R17x please", false, { now: () => now });
+    const turn_ = turn(t, "/compact", true);
     appendFileSync(
       t.path,
-      nl(
-        userLine("R17x please"),
-        assistantLine("", { id: "m1", blocks: [{ type: "tool_use", name: "Read", input: {} }] }),
-      ),
+      nl(userLine("<command-name>/compact</command-name>"), systemLine("compact_boundary", "")),
     );
-    turn_.poll();
-    now += TRANSCRIPT_SETTLE_MS;
     const s = turn_.poll();
     expect(s.ended).toBe(true);
     expect(s.failure).toBeNull();
-    expect(s.answer).toBe("");
-  });
-
-  test("the settle runs from the last growth of the file: a late block of the final message restarts it", () => {
-    // Fault: measure the settle from the terminal line (not from the last growth) and the
-    // turn ends 1 ms after B arrives, with B in the answer only by luck of the poll.
-    const t = tx();
-    let now = 1_000;
-    const turn_ = turn(t, "R17x please", false, { now: () => now });
-    appendFileSync(t.path, nl(userLine("R17x please"), assistantLine("A ", ids("m1"))));
-    turn_.poll();
-    now += TRANSCRIPT_SETTLE_MS - 100;
-    appendFileSync(t.path, nl(assistantLine("B", ids("m1"))));
-    expect(turn_.poll().ended).toBe(false);
-    now += TRANSCRIPT_SETTLE_MS - 1;
-    expect(turn_.poll().ended).toBe(false);
-    now += 1;
-    const s = turn_.poll();
-    expect(s.ended).toBe(true);
-    expect(s.answer).toBe("A B");
-  });
-
-  test("the settle does not run while the final message has not been seen (a tool_use stop is not terminal)", () => {
-    const t = tx();
-    let now = 1_000;
-    const turn_ = turn(t, "R17x please", false, { now: () => now });
-    appendFileSync(
-      t.path,
-      nl(userLine("R17x please"), assistantLine("Let me look.", { id: "m1", stop: "tool_use" })),
-    );
-    turn_.poll();
-    now += 10 * TRANSCRIPT_SETTLE_MS;
-    expect(turn_.poll().ended).toBe(false);
   });
 });
 
@@ -1050,132 +1201,5 @@ describe("TranscriptTurn — /compact API errors (round 4, finding 5)", () => {
     const s = turn_.poll();
     expect(s.failure).toBeNull();
     expect(s.answer).toBe("Done");
-  });
-});
-
-describe("TranscriptTurn — an earlier identical submission that is unresolved (round 4, finding 1)", () => {
-  /** Turn 1 is not accepted (nothing in the file yet) and is abandoned, as a rejected turn is. */
-  function abandonedFirst(t: TempTranscript, extra: Partial<TranscriptTurnOptions> = {}): void {
-    const first = turn(t, "R17x please", false, extra);
-    expect(first.poll().accepted).toBe(false);
-    first.abandon();
-  }
-
-  test("turn 1 not accepted, turn 2 sends the identical prompt, turn 1's record and answer arrive: turn 2 does NOT succeed with them", () => {
-    // Fault: drop the registry check (`hasOpenEarlierSubmission`) and turn 2 reports
-    // turn 1's answer as its own.
-    const t = tx();
-    abandonedFirst(t);
-    const second = turn(t);
-    appendFileSync(
-      t.path,
-      nl(userLine("R17x please"), assistantLine("ANSWER-OF-TURN-1"), systemLine("turn_duration")),
-    );
-    const s = second.poll();
-    expect(s.failure?.kind).toBe("ambiguous");
-    expect(s.answer).toBe("");
-  });
-
-  test("the same, when only the delayed enqueue arrives", () => {
-    const t = tx();
-    abandonedFirst(t);
-    const second = turn(t);
-    appendFileSync(t.path, nl(enqueueLine("R17x please")));
-    expect(second.poll().failure?.kind).toBe("ambiguous");
-  });
-
-  test("a different prompt is unaffected by an unresolved one", () => {
-    const t = tx();
-    abandonedFirst(t);
-    const other = turn(t, "something else");
-    appendFileSync(
-      t.path,
-      nl(userLine("something else"), assistantLine("OK"), systemLine("turn_duration")),
-    );
-    const s = other.poll();
-    expect(s.failure).toBeNull();
-    expect(s.answer).toBe("OK");
-  });
-
-  test("an earlier submission whose record AND turn end are already in the file is resolved: the identical prompt succeeds", () => {
-    // The hourly cron whose last run failed with an API error. Fault: never resolve and
-    // every later identical prompt fails for the life of the session.
-    const t = tx();
-    const first = turn(t);
-    appendFileSync(t.path, nl(userLine("R17x please"), apiErrorLine("API Error: 500")));
-    expect(first.poll().failure?.kind).toBe("api-error");
-    first.abandon();
-    const second = turn(t);
-    appendFileSync(
-      t.path,
-      nl(userLine("R17x please"), assistantLine("FRESH"), systemLine("turn_duration")),
-    );
-    const s = second.poll();
-    expect(s.failure).toBeNull();
-    expect(s.answer).toBe("FRESH");
-  });
-
-  test("an earlier record that is in the file but whose turn has not ended is still unresolved", () => {
-    const t = tx();
-    const first = turn(t);
-    appendFileSync(
-      t.path,
-      nl(userLine("R17x please"), assistantLine("work", { id: "m1", stop: "tool_use" })),
-    );
-    first.poll();
-    first.abandon();
-    const second = turn(t);
-    appendFileSync(t.path, nl(userLine("R17x please")));
-    expect(second.poll().failure?.kind).toBe("ambiguous");
-  });
-
-  test("an unresolved submission expires: its record cannot still be late", () => {
-    // Fault: no TTL, and a prompt that was never submitted blocks every identical one for ever.
-    const t = tx();
-    let now = 1_000;
-    abandonedFirst(t, { now: () => now });
-    now += UNRESOLVED_TTL_MS;
-    const second = turn(t, "R17x please", false, { now: () => now });
-    appendFileSync(
-      t.path,
-      nl(userLine("R17x please"), assistantLine("LATER-OK"), systemLine("turn_duration")),
-    );
-    const s = second.poll();
-    expect(s.failure).toBeNull();
-    expect(s.answer).toBe("LATER-OK");
-  });
-
-  test("a rotated or replaced transcript (another file) forgets it", () => {
-    const t = tx();
-    writeFileSync(t.path, nl(userLine("history"), assistantLine("old")));
-    abandonedFirst(t);
-    rmSync(t.path);
-    writeFileSync(t.path, "");
-    const second = turn(t);
-    appendFileSync(
-      t.path,
-      nl(userLine("R17x please"), assistantLine("NEW-FILE"), systemLine("turn_duration")),
-    );
-    const s = second.poll();
-    expect(s.failure).toBeNull();
-    expect(s.answer).toBe("NEW-FILE");
-  });
-
-  test("ordinary sequential identical prompts, each fully resolved, succeed every time", () => {
-    const t = tx();
-    for (let i = 0; i < 4; i++) {
-      const turn_ = turn(t);
-      appendFileSync(
-        t.path,
-        nl(
-          userLine("R17x please"),
-          assistantLine(`ANSWER-${i}`, { id: `m${i}` }),
-          systemLine("turn_duration"),
-        ),
-      );
-      const s = turn_.poll();
-      expect(s.failure).toBeNull();
-      expect(s.answer).toBe(`ANSWER-${i}`);
-    }
   });
 });

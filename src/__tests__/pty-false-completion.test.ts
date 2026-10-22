@@ -14,13 +14,21 @@
  * marker phrase, except the forgery tests, which exist to show the phrase proves nothing.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SecurityConfig } from "../config";
 import {
   PtyClosedError,
   PtyPromptNotAcceptedError,
+  PtyTranscriptUncertainError,
   PtyTranscriptUnavailableError,
   PtyTurnFailedError,
   PtyTurnTimeoutError,
@@ -298,13 +306,18 @@ describe("#562 — the same transcript, delivered in any shape, gives the same v
   const A = assistantLine("FIRST ", { id: "m1", stop: null });
   const B = assistantLine("SECOND ", { id: "m1", stop: null });
   const C = assistantLine("THIRD", { id: "m1", stop: "end_turn" });
+  const D = systemLine("turn_duration");
   const user = userLine(PROMPT);
-  const whole = `${user}\n${A}\n${B}\n${C}\n`;
+  const whole = `${user}\n${A}\n${B}\n${C}\n${D}\n`;
+  const cut = whole.indexOf(C) + C.length - 12;
 
   // Each partition tears the stream somewhere different, JSON lines included.
   const partitions: Array<[string, string[]]> = [
     ["one write", [whole]],
-    ["user, then the three blocks in separate writes", [`${user}\n`, `${A}\n`, `${B}\n`, `${C}\n`]],
+    [
+      "user, then the three blocks in separate writes",
+      [`${user}\n`, `${A}\n`, `${B}\n`, `${C}\n`, `${D}\n`],
+    ],
     [
       "torn mid-line, resumed later",
       [
@@ -315,7 +328,7 @@ describe("#562 — the same transcript, delivered in any shape, gives the same v
     ],
     [
       "byte-sized fragments over the last block",
-      [whole.slice(0, whole.length - 12), ...whole.slice(-12).split("")],
+      [whole.slice(0, cut), ...whole.slice(cut, cut + 12).split(""), whole.slice(cut + 12)],
     ],
   ];
   for (const [name, parts] of partitions) {
@@ -334,7 +347,7 @@ describe("#562 — the same transcript, delivered in any shape, gives the same v
 describe("#562 — acceptance does not depend on the screen painting anything", () => {
   test("a fast turn that paints NO running chrome is accepted, once, and not re-submitted", async () => {
     const t = tx();
-    const script = `IFS= read -r l; ${append(t.path, userLine(PROMPT))}; ${append(t.path, assistantLine("QUICK"))}; sleep 8`;
+    const script = `IFS= read -r l; ${append(t.path, userLine(PROMPT))}; ${append(t.path, assistantLine("QUICK"))}; ${append(t.path, systemLine("turn_duration"))}; sleep 8`;
     const { value, wire } = await withTrace(() => runOutcome(script, t, { submitConfirmMs: 150 }));
     expect(value.err).toBeUndefined();
     expect(value.text).toBe("QUICK");
@@ -346,7 +359,7 @@ describe("#562 — acceptance does not depend on the screen painting anything", 
   test("chrome that renders differently (SGR inside the footer) changes nothing", async () => {
     const t = tx();
     const sgr = "\\033[2mesc\\033[0m \\033[2mto\\033[0m \\033[2minterrupt\\033[0m\\n";
-    const script = `IFS= read -r l; printf '${sgr}'; ${append(t.path, userLine(PROMPT))}; sleep 0.3; ${append(t.path, assistantLine("OK"))}; sleep 8`;
+    const script = `IFS= read -r l; printf '${sgr}'; ${append(t.path, userLine(PROMPT))}; sleep 0.3; ${append(t.path, assistantLine("OK"))}; ${append(t.path, systemLine("turn_duration"))}; sleep 8`;
     const { value, wire } = await withTrace(() => runOutcome(script, t, { submitConfirmMs: 150 }));
     expect(value.text).toBe("OK");
     expect(wire).not.toContain("retry submit");
@@ -395,6 +408,7 @@ describe("#562 — the submit retry", () => {
         `IFS= read -r l2; printf '%s\\n' "$l2" >> ${reads}`,
         append(t.path, userLine(PROMPT)),
         append(t.path, assistantLine("LATE-BUT-ONCE")),
+        append(t.path, systemLine("turn_duration")),
         "sleep 8",
       ].join("; ");
       const out = await runOutcome(script, t, { submitConfirmMs: 200 });
@@ -590,8 +604,8 @@ describe("#562 round 3 — executions, not bytes: a late transcript record is on
 
   test("accepted at once, the record flushes late: ONE executed turn, one reply", async () => {
     const t = tx();
-    // The CLI takes the prompt at the first CR and writes its record 0.35 s later: past the
-    // first submit deadline (200 ms), so the retry CR goes in. A bare CR on an empty input
+    // The CLI takes the prompt at the first CR and writes its record 0.5 s later: past the
+    // first submit deadline (300 ms), so the retry CR goes in. A bare CR on an empty input
     // box runs nothing, as in the real TUI; a line that carries the prompt runs it AGAIN.
     // The fake keeps reading input and records every executed turn on its own, so a
     // resubmission of the whole prompt is counted (the first reply is slow enough for a
@@ -601,11 +615,11 @@ describe("#562 round 3 — executions, not bytes: a late transcript record is on
       "while IFS= read -r l; do",
       `case "$l" in *'${PROMPT}'*)`,
       "n=$((n+1))",
-      `( sleep 0.35; ${append(t.path, userLine(PROMPT))}; if [ "$n" -eq 1 ]; then sleep 0.9; ${append(t.path, assistantLine("RAN-ONCE"))}; ${append(t.path, systemLine("turn_duration"))}; fi ) &`,
+      `( sleep 0.5; ${append(t.path, userLine(PROMPT))}; if [ "$n" -eq 1 ]; then sleep 0.9; ${append(t.path, assistantLine("RAN-ONCE"))}; ${append(t.path, systemLine("turn_duration"))}; fi ) &`,
       ";; esac",
       "done",
     ].join("\n");
-    const out = await runOutcome(script, t, { submitConfirmMs: 200 }, { timeoutMs: 6000 });
+    const out = await runOutcome(script, t, { submitConfirmMs: 300 }, { timeoutMs: 6000 });
     // Count what the CLI executed, not what we wrote. Fault: a retry that resubmits the
     // prompt makes the fake run it a second time and this is 2 (the first assertion on
     // purpose: it must be the count that goes red, not the outcome after it).
@@ -616,17 +630,17 @@ describe("#562 round 3 — executions, not bytes: a late transcript record is on
 
   test("a TUI that would execute twice on the retry Enter: two executions, and the turn is NOT a success", async () => {
     const t = tx();
-    // Each Enter the TUI reads runs the buffered prompt. The retry CR (200 ms) triggers a
-    // second execution whose record lands (0.5 s) before the first reply (0.7 s).
+    // Each Enter the TUI reads runs the buffered prompt. The retry CR (300 ms) triggers a
+    // second execution whose record lands (0.75 s) before the first reply (1.05 s).
     const script = [
       "IFS= read -r l1",
-      `( sleep 0.3; ${append(t.path, userLine(PROMPT))}; sleep 0.4; ${append(t.path, assistantLine("FIRST-REPLY", { id: "m1" }))} ) &`,
+      `( sleep 0.45; ${append(t.path, userLine(PROMPT))}; sleep 0.6; ${append(t.path, assistantLine("FIRST-REPLY", { id: "m1" }))} ) &`,
       "IFS= read -r l2",
-      `( sleep 0.3; ${append(t.path, userLine(PROMPT))} ) &`,
+      `( sleep 0.45; ${append(t.path, userLine(PROMPT))} ) &`,
       "wait",
       "sleep 8",
     ].join("\n");
-    const out = await runOutcome(script, t, { submitConfirmMs: 200 }, { timeoutMs: 4000 });
+    const out = await runOutcome(script, t, { submitConfirmMs: 300 }, { timeoutMs: 4000 });
     // Fault: let a second matching user entry through (drop the duplicate check) and this
     // resolves with FIRST-REPLY while the prompt ran twice.
     expect(userEntries(t.path)).toBe(2);
@@ -667,9 +681,9 @@ describe("#562 round 4 — the transcript alone decides how much of the answer, 
     expect(noisyOut.text).toBe("A-BLOCK B-BLOCK");
   });
 
-  test("a terminal thinking-only final message with no record after it ends the turn: no hard-timeout wait, no replay", async () => {
+  test("a terminal thinking-only final message ends at turn_duration, answering with the last message that has text", async () => {
     // Fault: require text before a terminal message counts. The turn then waits for the
-    // 4 s deadline and rejects with PtyTurnTimeoutError, which the supervisor retries.
+    // 4 s deadline and rejects with PtyTurnTimeoutError.
     const t = tx();
     const script = [
       "IFS= read -r l",
@@ -679,6 +693,7 @@ describe("#562 round 4 — the transcript alone decides how much of the answer, 
         t.path,
         assistantLine("", { id: "msg_2", blocks: [{ type: "thinking", thinking: "done" }] }),
       ),
+      append(t.path, systemLine("turn_duration")),
       "sleep 8",
     ].join("; ");
     const t0 = Date.now();
@@ -689,40 +704,160 @@ describe("#562 round 4 — the transcript alone decides how much of the answer, 
   });
 });
 
-describe("#562 round 4 — an earlier identical submission that was not accepted", () => {
-  test("turn 1 is not accepted, turn 2 sends the identical prompt, turn 1's record and answer then arrive: turn 2 is NOT a success", async () => {
-    // The fake takes turn 1's two Enters (the paste and the retry) without recording
-    // anything, then records turn 1's late user entry and answer once turn 2's prompt is in.
-    // Fault: drop the unresolved-submission check and turn 2 resolves with turn 1's answer.
+describe("#562 round 5 — a turn ends only at an authoritative boundary", () => {
+  test("block B arriving 1.8 s after block A, past the old 1.5 s settle, is in the answer", async () => {
+    // Fault: end a terminal turn after 1.5 s without growth (the round-4 settle) and the
+    // answer is "A-BLOCK ", B ignored.
     const t = tx();
     const script = [
+      "IFS= read -r l",
+      append(t.path, userLine(PROMPT)),
+      append(t.path, assistantLine("A-BLOCK ", { id: "msg_1" })),
+      "sleep 1.8",
+      append(t.path, assistantLine("B-BLOCK", { id: "msg_1" })),
+      append(t.path, systemLine("turn_duration")),
+      "sleep 8",
+    ].join("; ");
+    const out = await runOutcome(script, t, {}, { timeoutMs: 6000 });
+    expect(out.err).toBeUndefined();
+    expect(out.text).toBe("A-BLOCK B-BLOCK");
+  }, 10_000);
+
+  test("a final message and no boundary by the timeout: PtyTranscriptUncertainError, no answer", async () => {
+    // Fault: drop the `finalSeen` branch of the hard timeout and this is a plain
+    // PtyTurnTimeoutError; end the turn on the terminal message and `text` is "FINAL".
+    const t = tx();
+    const script = [
+      "IFS= read -r l",
+      append(t.path, userLine(PROMPT)),
+      append(t.path, assistantLine("FINAL", { id: "msg_1" })),
+      "sleep 8",
+    ].join("; ");
+    const out = await runOutcome(script, t, {}, { timeoutMs: 1200 });
+    expect(out.text).toBeUndefined();
+    expect(out.err).toBeInstanceOf(PtyTranscriptUncertainError);
+  });
+
+  test("no final message by the timeout is a plain timeout, not uncertain", async () => {
+    const t = tx();
+    const script = [
+      "IFS= read -r l",
+      append(t.path, userLine(PROMPT)),
+      append(t.path, assistantLine("Let me look.", { id: "msg_1", stop: "tool_use" })),
+      "sleep 8",
+    ].join("; ");
+    const out = await runOutcome(script, t, {}, { timeoutMs: 1200 });
+    expect(out.err).toBeInstanceOf(PtyTurnTimeoutError);
+  });
+
+  test("an API error after the final text, before turn_duration, rejects as api-error", async () => {
+    // Fault: close the turn on the next record without reading the error flags first and
+    // the turn resolves with "FINAL".
+    const t = tx();
+    const script = [
+      "IFS= read -r l",
+      append(t.path, userLine(PROMPT)),
+      append(t.path, assistantLine("FINAL", { id: "msg_1" })),
+      append(
+        t.path,
+        JSON.stringify({
+          type: "assistant",
+          isApiErrorMessage: true,
+          message: {
+            id: "e",
+            role: "assistant",
+            model: "<synthetic>",
+            content: [{ type: "text", text: "API Error: 529 overloaded" }],
+            stop_reason: "stop_sequence",
+          },
+        }),
+      ),
+      append(t.path, systemLine("turn_duration")),
+      "sleep 8",
+    ].join("; ");
+    const out = await runOutcome(script, t);
+    expect(out.text).toBeUndefined();
+    expect(out.err).toBeInstanceOf(PtyTurnFailedError);
+    expect((out.err as PtyTurnFailedError).kind).toBe("api-error");
+  });
+
+  test("a reply with no text rejects as an empty-reply failure", async () => {
+    // Fault: treat an empty answer as OK and the turn resolves with text "".
+    const t = tx();
+    const script = [
+      "IFS= read -r l",
+      append(t.path, userLine(PROMPT)),
+      append(
+        t.path,
+        assistantLine("", { id: "msg_1", blocks: [{ type: "tool_use", name: "Read", input: {} }] }),
+      ),
+      append(t.path, systemLine("turn_duration")),
+      "sleep 8",
+    ].join("; ");
+    const out = await runOutcome(script, t);
+    expect(out.text).toBeUndefined();
+    expect(out.err).toBeInstanceOf(PtyTurnFailedError);
+    expect((out.err as PtyTurnFailedError).kind).toBe("empty-reply");
+    expect((out.err as PtyTurnFailedError).text).toBe("empty reply in transcript");
+  });
+});
+
+describe("#562 round 5 — a stopped process cannot write a late record", () => {
+  test("once dispose() has returned, nothing the process was writing reaches the file any more", async () => {
+    // A process appending to the transcript every 50 ms. Fault: do not stop it in dispose()
+    // (drop the kill) and it never exits, so dispose() hangs and this times out; a dispose()
+    // that returned before the process was gone would let a write land after it.
+    const t = tx();
+    const proc = await spawnPty(
+      opts(`while :; do printf 'late\\n' >> ${t.path}; sleep 0.05; done`, t),
+    );
+    for (let i = 0; i < 100 && !existsSync(t.path); i++)
+      await new Promise((r) => setTimeout(r, 20));
+    expect(existsSync(t.path)).toBe(true);
+    await proc.dispose();
+    expect(proc.isAlive()).toBe(false);
+    const after = readFileSync(t.path, "utf8").length;
+    await new Promise((r) => setTimeout(r, 400));
+    expect(readFileSync(t.path, "utf8").length).toBe(after);
+  }, 10_000);
+
+  test("turn 1 not accepted, process stopped, a new process on the same transcript: turn 2 answers with its OWN reply, never turn 1's late one", async () => {
+    // The first process would write turn 1's record and answer late, once it has read a
+    // third line. Stopped and awaited, it never does. Fault: leave the first process alive
+    // (skip the dispose) and its record lands inside turn 2's window.
+    const t = tx();
+    const late = [
       "IFS= read -r l1",
       "IFS= read -r l2",
-      "IFS= read -r l3",
-      "sleep 0.1",
+      "sleep 0.8",
       append(t.path, userLine(PROMPT)),
       append(t.path, assistantLine("ANSWER-OF-TURN-1")),
       append(t.path, systemLine("turn_duration")),
       "sleep 8",
     ].join("; ");
-    const proc = await spawnPty(opts(script, t, { submitConfirmMs: 150 }));
+    const first = await spawnPty(opts(late, t, { submitConfirmMs: 150 }));
+    const err = await first.runTurn(PROMPT, { timeoutMs: 5000 }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(PtyPromptNotAcceptedError);
+    await first.dispose();
+    expect(first.isAlive()).toBe(false);
+    // Past the point where the first process would have written.
+    await new Promise((r) => setTimeout(r, 1000));
+    expect(existsSync(t.path) ? readFileSync(t.path, "utf8") : "").not.toContain(
+      "ANSWER-OF-TURN-1",
+    );
+    const second = await spawnPty(
+      opts(`${fakeTurn({ tx: t.path, prompt: PROMPT, answer: "ANSWER-OF-TURN-2" })}; sleep 8`, t),
+    );
     try {
-      const first = await proc.runTurn(PROMPT, { timeoutMs: 5000 }).then(
-        () => null,
-        (e: unknown) => e,
-      );
-      expect(first).toBeInstanceOf(PtyPromptNotAcceptedError);
-      const second = await proc.runTurn(PROMPT, { timeoutMs: 5000 }).then(
-        (r) => ({ text: r.text }),
-        (e: unknown) => ({ err: e }),
-      );
-      expect((second as { text?: string }).text).toBeUndefined();
-      expect((second as { err?: unknown }).err).toBeInstanceOf(PtyTurnFailedError);
-      expect((second as { err: PtyTurnFailedError }).err.kind).toBe("ambiguous");
+      const r = await second.runTurn(PROMPT, { timeoutMs: 5000 });
+      expect(r.text).toBe("ANSWER-OF-TURN-2");
     } finally {
-      await proc.dispose();
+      await second.dispose();
     }
-  });
+  }, 15_000);
 });
 
 describe("#562 — a process with no transcript cannot succeed", () => {

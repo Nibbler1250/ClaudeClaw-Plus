@@ -1,5 +1,5 @@
 /**
- * The session transcript as the proof of a PTY turn (#562, rounds 2 and 3).
+ * The session transcript as the proof of a PTY turn (#562, rounds 2 to 5).
  *
  * The TUI's screen is a poor witness: a prompt that was never submitted, a repaint of
  * the old conversation and a prompt echoed into the input box all paint the same chrome
@@ -18,16 +18,21 @@
  *     ("Let me look.") is not the answer. A final message with no text (a turn that ends on
  *     a tool-only message) leaves the last message that has text.
  *   - ENDED OK: a message of that turn carries a terminal `stop_reason`
- *     (`isTerminalStopReason`, the bus's own rule) AND the transcript then shows that message
- *     is over: the CLI's `turn_duration`, or the next entry that is not another line of that
- *     message (a different message id, a `user` entry, any other record), or no new bytes for
- *     `TRANSCRIPT_SETTLE_MS`. One definition, from the transcript alone: whether the final
- *     message has text does not matter (a thinking-only or tool-only final message ends the
- *     turn the same way; the answer is then the last message that has text, or empty), and
- *     the screen never decides how many blocks of it belong to the answer.
+ *     (`isTerminalStopReason`, the bus's own rule) AND the transcript shows an AUTHORITATIVE
+ *     boundary after it: the CLI's `turn_duration` record, or the next real user prompt (not
+ *     meta, not a tool result, not a compact summary, not a command's own output). Nothing
+ *     else ends a turn: not a quiet file (the CLI can pause between the blocks of one
+ *     message, and a timer cannot tell that from the end), and not a progress, hook,
+ *     attachment or other bookkeeping record, which neither close the message nor cut it
+ *     short: lines of the same message id after them still extend the answer. With no
+ *     boundary the turn does not end; at the caller's timeout it is UNCERTAIN (`finalSeen`),
+ *     never a success and never replayed.
  *   - ENDED FAILED: the CLI wrote an API-error line (`isApiErrorMessage` / `error`), a
  *     `local-command-stderr`, or something that makes the attribution uncertain (a second
- *     identical prompt, another prompt inside the turn). A failed turn has no answer.
+ *     identical prompt, another prompt inside the turn), or the reply has no text at all
+ *     (`empty-reply`). Error records are read FIRST, before any boundary decision: an API
+ *     error anywhere after the final message and before the boundary fails the turn. A
+ *     failed turn has no answer.
  *   - NOT EVIDENCE: a non-error `<synthetic>` placeholder ("No response requested.") is
  *     written BEFORE the real reply starts. It is neither text nor an end (the bus
  *     tailer makes the same distinction).
@@ -35,19 +40,17 @@
  *     `compact_boundary` system entry (or the `local_command` entry carrying its error).
  *
  * A turn is a WINDOW in the file: it opens at the matched `user` entry and closes at the
- * first entry that is not part of it. Once the final message is out, only the remaining
- * lines of that SAME message can still extend the answer, and the window closing is what
- * ENDS the turn; a later prompt (and whatever answers it) is never read into this turn,
- * whichever poll it arrives in.
+ * authoritative boundary. A later prompt (and whatever answers it) is never read into this
+ * turn, whichever poll it arrives in.
  *
- * Unresolved submissions: a turn that ends in ANY non-ok outcome (not accepted, timed out,
- * failed, ambiguous, transcript replaced, process closed) may still have run, its record
- * arriving late. Its prompt is remembered for this transcript file (`unresolved`), and a
- * later submission of the identical payload fails as ambiguous while that one is
- * unresolved: the record that arrives could be either's. It is resolved when its own
- * record and its turn's end are in the file, or after `UNRESOLVED_TTL_MS`, or when the
- * file is another one (the session rotated or reset). The transcript offers no per-submission
- * id we could correlate: `uuid` / `promptId` are assigned by the CLI after the submit.
+ * Late records: a turn that ends in anything but a proven OK may still have run, its
+ * record arriving late from a process that is still writing. This module keeps no memory
+ * of that. The supervisor does not let it arise: it kills the process and waits for its
+ * exit before returning the error, and the next turn resumes the same session in a NEW
+ * process (`pty-supervisor.ts`, `retireEntry`). Nothing that could write a late record for
+ * the failed turn is alive when a later turn marks its offset, so the exact payload match
+ * needs no per-submission identity (the transcript has none we could correlate: `uuid` /
+ * `promptId` are assigned by the CLI after the submit).
  *
  * The file must stay the file `mark()` saw: a cut-short, replaced or removed transcript
  * fails the turn (`TranscriptReplacedError`) instead of re-reading retained history as
@@ -61,7 +64,6 @@
  *
  * Pure apart from reading one file; no bus, no PTY. Callers poll.
  */
-import { createHash } from "node:crypto";
 import { closeSync, openSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -71,21 +73,11 @@ import { isTerminalStopReason } from "../bus/jsonl-tailer";
 /** Cap on bytes read per poll, so one huge append cannot stall the event loop. */
 const MAX_READ_PER_POLL = 4 * 1024 * 1024;
 
+/** The failure text of a turn whose reply has no text (`TurnFailure.kind` `empty-reply`). */
+export const EMPTY_REPLY_TEXT = "empty reply in transcript";
+
 /** `message.model` on assistant lines the CLI writes itself (API errors, placeholders). */
 const SYNTHETIC_MODEL = "<synthetic>";
-
-/**
- * With a terminal `stop_reason` seen and no `turn_duration` or other record after it, the
- * turn ends once the file has not grown for this long. Transcript timing, not screen timing.
- * The CLI writes the lines of one message back to back (milliseconds apart), and every real
- * capture (docs/spikes fixtures) has `turn_duration` right after the final line, so this is
- * only the backstop for a CLI that writes neither: long enough to outlast the gap between
- * two blocks of a message, short enough (<= 2 s) that the hard timeout never decides.
- */
-export const TRANSCRIPT_SETTLE_MS = 1500;
-
-/** How long an unresolved earlier submission can still contaminate a later identical one. */
-export const UNRESOLVED_TTL_MS = 120_000;
 
 /**
  * Where the CLI writes the transcript of `sessionId` run in `cwd`, or null when it
@@ -185,7 +177,7 @@ function stripCommandTags(text: string): string {
 const hasStderrTag = (text: string): boolean => text.includes("<local-command-stderr>");
 
 /** Why a finished turn is NOT a success. */
-export type TurnFailureKind = "api-error" | "command-error" | "ambiguous";
+export type TurnFailureKind = "api-error" | "command-error" | "ambiguous" | "empty-reply";
 
 export interface TurnFailure {
   kind: TurnFailureKind;
@@ -202,6 +194,12 @@ export interface TranscriptTurnState {
   failure: TurnFailure | null;
   /** The final assistant message's text (the last one that has any); `/compact`'s result for a command. */
   answer: string;
+  /**
+   * A message of this turn carries a terminal `stop_reason`, but no authoritative boundary
+   * (`turn_duration` or the next real prompt) has followed yet. A turn still in this state
+   * at the caller's timeout is UNCERTAIN: the reply may be incomplete.
+   */
+  finalSeen: boolean;
   /** Top-level user entries appended after the send that were NOT this prompt. */
   foreignUserEntries: number;
   /** One line per tool call the assistant made this turn, in order (`● Name(input)`). */
@@ -214,12 +212,6 @@ export interface TranscriptTurnOptions {
   written: string;
   /** The turn is a deliberate `/compact`. */
   replCommand?: boolean;
-  /** Clock (ms) for the transcript-side settle and the unresolved TTL. Defaults to `Date.now`. */
-  now?: () => number;
-  /** Override `TRANSCRIPT_SETTLE_MS`. */
-  settleMs?: number;
-  /** Internal: read from this offset without `mark()`, ignoring the unresolved registry (a probe). */
-  probeFromOffset?: number;
 }
 
 /**
@@ -241,76 +233,6 @@ export class TranscriptReplacedError extends Error {
 interface FileIdentity {
   dev: bigint;
   ino: bigint;
-}
-
-/** A submission whose outcome is not known: it may have run, its record arriving late. */
-interface UnresolvedPrompt {
-  written: string;
-  replCommand: boolean;
-  /** Where the transcript ended when that turn was marked: its record can only be after this. */
-  offset: number;
-  identity: FileIdentity | null;
-  at: number;
-}
-
-/** Per transcript file, keyed by the normalised payload's hash. Small: one entry per stuck prompt. */
-const unresolved = new Map<string, Map<string, UnresolvedPrompt>>();
-const MAX_UNRESOLVED_PER_FILE = 8;
-
-const payloadKey = (written: string, replCommand: boolean): string =>
-  createHash("sha256")
-    .update(replCommand ? `cmd:${written.trim().split(/\s+/)[0]}` : written.normalize("NFC").trim())
-    .digest("hex");
-
-/** Test hook: forget every unresolved submission. */
-export function resetUnresolvedPrompts(): void {
-  unresolved.clear();
-}
-
-/**
- * Drop the unresolved submissions of `path` that are over (resolved, expired, or of another
- * file), and return the keys of those still open at this instant.
- */
-function openUnresolvedKeys(path: string, now: number): Set<string> {
-  const entries = unresolved.get(path);
-  if (!entries) return new Set();
-  let stat: { dev: bigint; ino: bigint; size: bigint } | null = null;
-  try {
-    stat = statSync(path, { bigint: true });
-  } catch {
-    // no file: nothing in it can resolve or contaminate anything
-  }
-  for (const [key, e] of entries) {
-    // No file yet is not "another file": the late record may be what creates it.
-    const otherFile =
-      stat !== null &&
-      ((e.identity !== null && (stat.dev !== e.identity.dev || stat.ino !== e.identity.ino)) ||
-        Number(stat.size) < e.offset);
-    const over =
-      otherFile ||
-      now - e.at >= UNRESOLVED_TTL_MS ||
-      (stat !== null && submissionResolved(path, e));
-    if (over) entries.delete(key);
-  }
-  if (entries.size === 0) unresolved.delete(path);
-  return new Set(entries.keys());
-}
-
-/** Its own record AND its turn's end are in the file already (so they cannot arrive late). */
-function submissionResolved(path: string, e: UnresolvedPrompt): boolean {
-  const probe = new TranscriptTurn({
-    path,
-    written: e.written,
-    replCommand: e.replCommand,
-    probeFromOffset: e.offset,
-  });
-  for (let i = 0; i < 64; i++) {
-    const before = probe.readOffset();
-    probe.poll();
-    if (probe.readOffset() === before) break;
-  }
-  const s = probe.state();
-  return s.ended && s.failure?.kind !== "ambiguous";
 }
 
 /** Where the turn's window is. `terminal` = the final message was seen; `closed` = done. */
@@ -335,23 +257,11 @@ export class TranscriptTurn {
   private matchedUuid: string | undefined;
   private matchedPromptId: string | undefined;
   private commandResult = "";
-  private readonly now: () => number;
-  private readonly settleMs: number;
-  private readonly probe: boolean;
-  /** When the file last grew (as seen by a poll): the transcript-side settle clock. */
-  private lastGrowthAt = 0;
-  /** Unresolved identical submissions at `mark()`: a match while one is open is ambiguous. */
-  private openUnresolved: ReadonlySet<string> = new Set();
-  private markedOffset = 0;
 
   constructor(opts: TranscriptTurnOptions) {
     this.path = opts.path;
     this.written = opts.written;
     this.replCommand = opts.replCommand === true;
-    this.now = opts.now ?? Date.now;
-    this.settleMs = opts.settleMs ?? TRANSCRIPT_SETTLE_MS;
-    this.probe = opts.probeFromOffset !== undefined;
-    if (opts.probeFromOffset !== undefined) this.offset = opts.probeFromOffset;
   }
 
   /** Call BEFORE the prompt is written: only what is appended after this counts. */
@@ -359,35 +269,7 @@ export class TranscriptTurn {
     const stat = this.stat();
     this.identity = stat ? { dev: stat.dev, ino: stat.ino } : null;
     this.offset = stat ? Number(stat.size) : 0;
-    this.markedOffset = this.offset;
     this.carry = Buffer.alloc(0);
-    this.openUnresolved = openUnresolvedKeys(this.path, this.now());
-  }
-
-  /**
-   * This turn ended in a non-ok outcome (or never got one): it may still have run, so a later
-   * submission of the identical payload on this file is ambiguous until this one is resolved.
-   * The caller says so on every rejection; a turn that ended ok is never passed here.
-   */
-  abandon(): void {
-    if (this.probe) return;
-    const entries = unresolved.get(this.path) ?? new Map<string, UnresolvedPrompt>();
-    const key = payloadKey(this.written, this.replCommand);
-    // The same prompt abandoned again keeps the earliest offset: its record may be anywhere after it.
-    const prev = entries.get(key);
-    const sameFile = prev !== undefined && prev.identity?.ino === this.identity?.ino;
-    entries.delete(key);
-    entries.set(key, {
-      written: this.written,
-      replCommand: this.replCommand,
-      offset: sameFile ? Math.min(prev.offset, this.markedOffset) : this.markedOffset,
-      identity: this.identity,
-      at: this.now(),
-    });
-    while (entries.size > MAX_UNRESOLVED_PER_FILE) {
-      entries.delete(entries.keys().next().value as string);
-    }
-    unresolved.set(this.path, entries);
   }
 
   /** How far into the file this turn has read. */
@@ -416,14 +298,7 @@ export class TranscriptTurn {
       this.identity = { dev: stat.dev, ino: stat.ino };
     }
     const size = stat ? Number(stat.size) : 0;
-    if (size > this.offset) {
-      this.lastGrowthAt = this.now();
-      this.ingestBytes(this.readFrom(this.offset, size));
-    }
-    // A terminal message with nothing after it: the file has gone quiet. Transcript time.
-    if (this.phase === "terminal" && this.now() - this.lastGrowthAt >= this.settleMs) {
-      this.finish();
-    }
+    if (size > this.offset) this.ingestBytes(this.readFrom(this.offset, size));
     return this.state();
   }
 
@@ -433,6 +308,7 @@ export class TranscriptTurn {
       ended: this.ended,
       failure: this.failure,
       answer: this.failure ? "" : this.replCommand ? this.commandResult : this.answerText(),
+      finalSeen: this.phase === "terminal",
       foreignUserEntries: this.foreign,
       toolLines: this.toolLines,
     };
@@ -503,10 +379,8 @@ export class TranscriptTurn {
         this.ingestSeeking(entry);
         return;
       case "open":
-        this.ingestOpen(entry);
-        return;
       case "terminal":
-        this.ingestTerminal(entry);
+        this.ingestInTurn(entry);
         return;
       case "closed":
         return;
@@ -523,7 +397,6 @@ export class TranscriptTurn {
         promptMatches(entry.content, this.written, this.replCommand)
       ) {
         this.enqueued = true;
-        if (this.hasOpenEarlierSubmission()) this.failEarlierSubmission();
       }
       return;
     }
@@ -531,10 +404,6 @@ export class TranscriptTurn {
     const text = userText((entry.message as { content?: unknown } | undefined)?.content);
     if (text === null) return;
     if (promptMatches(text, this.written, this.replCommand)) {
-      if (this.hasOpenEarlierSubmission()) {
-        this.failEarlierSubmission();
-        return;
-      }
       this.phase = "open";
       this.matchedUuid = typeof entry.uuid === "string" ? entry.uuid : undefined;
       this.matchedPromptId = typeof entry.promptId === "string" ? entry.promptId : undefined;
@@ -543,29 +412,26 @@ export class TranscriptTurn {
     }
   }
 
-  /** An earlier submission of this identical payload is unresolved: this record could be its. */
-  private hasOpenEarlierSubmission(): boolean {
-    return this.openUnresolved.has(payloadKey(this.written, this.replCommand));
-  }
-
-  private failEarlierSubmission(): void {
-    this.fail(
-      "ambiguous",
-      "an earlier submission of this identical prompt in this session is unresolved: its record may be the one that arrived",
-    );
-  }
-
-  /** Inside the turn: its assistant lines count; anything else that is not the turn's fails or ends it. */
-  private ingestOpen(entry: Record<string, unknown>): void {
+  /**
+   * Inside the turn, before and after the final message. Error records are read FIRST: an
+   * API error or a command's stderr anywhere in the window fails the turn, whatever else
+   * the record would have done. Only then does a record count as an assistant line, bookkeeping
+   * (ignored) or the turn's boundary.
+   */
+  private ingestInTurn(entry: Record<string, unknown>): void {
     switch (entry.type) {
-      case "user":
-        this.ingestUserInTurn(entry);
-        return;
       case "assistant":
         this.ingestAssistant(entry);
         return;
+      case "user":
+        this.ingestUserInTurn(entry);
+        return;
       case "system":
         this.ingestSystem(entry);
+        return;
+      default:
+        // progress, hook, attachment, queue-operation, snapshots: bookkeeping. They neither
+        // close the final message nor cut it short.
         return;
     }
   }
@@ -580,11 +446,19 @@ export class TranscriptTurn {
     }
     // A command's own output is recorded as a user entry too; it is not a prompt.
     if (text.includes("<local-command-stdout>") || this.isSameRecord(entry)) return;
+    const matches = promptMatches(text, this.written, this.replCommand);
+    if (this.phase === "terminal" && !matches) {
+      // The next real prompt: the authoritative end of this turn (boundary b).
+      this.finish();
+      return;
+    }
     // Another prompt inside this turn (or this one a second time): whose answer is this?
     this.fail(
       "ambiguous",
-      promptMatches(text, this.written, this.replCommand)
-        ? "the same prompt was recorded a second time inside the turn"
+      matches
+        ? this.phase === "terminal"
+          ? "the same prompt was recorded a second time after the reply"
+          : "the same prompt was recorded a second time inside the turn"
         : "another prompt was recorded inside the turn",
     );
   }
@@ -610,6 +484,7 @@ export class TranscriptTurn {
     if (entry.isApiErrorMessage === true || Boolean(entry.error)) {
       // The CLI writes its own error lines as synthetic assistant messages: the turn is
       // over, and it did not produce a reply (the bus publishes it as `system.api_error`).
+      // Before or after the final message alike: an error before the boundary is never a success.
       this.fail("api-error", text !== "" ? text : String(entry.error));
       return;
     }
@@ -619,11 +494,21 @@ export class TranscriptTurn {
     // A placeholder ("No response requested.") is written BEFORE the real reply starts:
     // neither text nor an end.
     if (message.model === SYNTHETIC_MODEL) return;
+    // After the final message only its own remaining lines extend the answer. A message
+    // with another id (a background-task notification can start a reply of its own) is not
+    // this turn's: it is neither appended nor a boundary. The turn still waits for one.
+    if (
+      this.phase === "terminal" &&
+      (message.id === undefined || message.id !== this.finalMessageId)
+    ) {
+      return;
+    }
     this.addAssistantLine(message.id, text, blocks);
-    if (isTerminalStopReason(message.stop_reason)) {
+    if (this.phase === "open" && isTerminalStopReason(message.stop_reason)) {
       // The final message is out, whether or not it has text (a thinking block is its own
-      // line, and a tool-only or empty one has none). The turn ENDS when the transcript shows
-      // the message is over (`ingestTerminal`), never on the first line with text.
+      // line, and a tool-only or empty one has none). The turn ENDS only at an authoritative
+      // boundary (`turn_duration`, the next real prompt), never on the first line with text
+      // and never because the file went quiet.
       this.phase = "terminal";
       this.finalMessageId = message.id;
     }
@@ -650,39 +535,6 @@ export class TranscriptTurn {
     else this.messages.push({ id, text });
   }
 
-  /**
-   * The final message has been seen. Only its own remaining lines can still extend the
-   * answer; the first entry that is anything else closes the window. A user entry that is
-   * this prompt a second time means the CLI took it twice: not a success.
-   */
-  private ingestTerminal(entry: Record<string, unknown>): void {
-    if (entry.type === "assistant") {
-      const message = entry.message as { id?: string; model?: string } | undefined;
-      if (
-        message?.model !== SYNTHETIC_MODEL &&
-        entry.isApiErrorMessage !== true &&
-        !entry.error &&
-        this.finalMessageId !== undefined &&
-        message?.id === this.finalMessageId
-      ) {
-        this.ingestAssistant(entry);
-        return;
-      }
-    }
-    if (entry.type === "user" && entry.isMeta !== true && entry.isCompactSummary !== true) {
-      const text = userText((entry.message as { content?: unknown } | undefined)?.content);
-      if (
-        text !== null &&
-        !this.isSameRecord(entry) &&
-        promptMatches(text, this.written, this.replCommand)
-      ) {
-        this.fail("ambiguous", "the same prompt was recorded a second time after the reply");
-        return;
-      }
-    }
-    this.finish();
-  }
-
   private ingestSystem(entry: Record<string, unknown>): void {
     const subtype = entry.subtype;
     const content = typeof entry.content === "string" ? entry.content : "";
@@ -698,10 +550,17 @@ export class TranscriptTurn {
       }
       return;
     }
+    // The CLI's own record that the turn is over (boundary a). Every other system record is
+    // bookkeeping.
     if (subtype === "turn_duration") this.finish();
   }
 
+  /** The turn's authoritative boundary was seen. A reply with no text at all is not a success. */
   private finish(): void {
+    if (!this.replCommand && this.answerText().trim() === "") {
+      this.fail("empty-reply", EMPTY_REPLY_TEXT);
+      return;
+    }
     this.ended = true;
     this.phase = "closed";
   }

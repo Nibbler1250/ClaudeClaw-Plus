@@ -1353,3 +1353,307 @@ Two things the runs showed that were not predicted:
 6. A turn that ends with an empty answer (a terminal text-less message and no earlier text) now
    resolves as success with `""`. The brief asks for that. I did not check how each caller
    (runner, cron, gateway) treats an empty reply.
+
+# Round 5: Codex review of `2066150c` (5 HIGH, 1 MEDIUM, 1 LOW) and the operator rulings
+
+Binding rule unchanged: the screen never decides acceptance, completion or the answer. The
+rulings below supersede round 4's design where they conflict (the settle and the registry are
+gone).
+
+## Round 5: summary
+
+| # | Finding | Ruling | Where |
+|---|---|---|---|
+| 1 HIGH | the 1.5 s inactivity settle commits a partial answer | a turn ends only at an authoritative boundary: `turn_duration`, or the next real user prompt. `TRANSCRIPT_SETTLE_MS`, the `now` / `settleMs` options and `lastGrowthAt` are deleted. No boundary by the timeout: `PtyTranscriptUncertainError` (no answer, no replay) | `pty-transcript.ts` `ingestInTurn` / `finish`, `pty-process.ts` hard timeout |
+| 2 HIGH | any other record closes the final message; a following API error is a success | error records are read first (`ingestAssistant`, `ingestUserInTurn`, `ingestSystem`), in the `open` and the `terminal` phase alike; progress, hook, attachment, snapshot and other system records are bookkeeping: they neither close nor cut the message, and later lines of the same id still extend it | `pty-transcript.ts` |
+| 3, 4, 5 HIGH, 7 LOW | the unresolved registry (TTL, eviction, restart, text-keyed resolution, TAB-narrower key, unbounded outer map) | the registry is deleted whole: `UNRESOLVED_TTL_MS`, the 8-entry cap, the outer map, `submissionResolved`, the hash key, `abandon()` and its caller, the probe. Kill-and-resume replaces it | `pty-supervisor.ts` `runTurnWithRetries`, `sendToLiveSession`, `retireEntry` |
+| 6 MEDIUM | an empty reply is a silent success on the gateway Telegram path, pending resumes and cron | an answer that is empty after trim fails the turn with `empty reply in transcript` (`TurnFailure.kind` `empty-reply`), so every caller gets exit 1. `/compact`'s own output is exempt | `pty-transcript.ts` `finish` |
+
+## Round 5: decisions
+
+**Boundary (findings 1 + 2).** A terminal `stop_reason` still opens the `terminal` phase, but
+nothing but these ends it: `system` `turn_duration`; the next top-level `user` entry that is not
+meta, not a compact summary, not a tool result, not a sub-agent line, not the matched record
+repeated and not a command's own `<local-command-stdout>`. A user entry that IS this prompt is
+`ambiguous`, as before. Two choices the ruling did not spell out:
+- An assistant line with a DIFFERENT message id after the final message (a background-task
+  notification starting a reply of its own, round 3) is ignored: not appended, and not a
+  boundary. The turn keeps waiting for one. Treating it as a boundary would be a rule the
+  ruling removed ("any other record"); appending it would give the notification's text to this
+  turn.
+- `turn_duration` while still `open` (no terminal message seen) also ends the turn, as before.
+  With no assistant text at all that is now an `empty-reply` failure.
+
+The reader has no clock any more. `state()` gains `finalSeen` (the `terminal` phase). At the
+hard timeout `pty-process.ts` raises `PtyTranscriptUncertainError` when `finalSeen`, and
+`PtyTurnTimeoutError` otherwise. They are different outcomes: a turn still running versus a
+reply that ended without proof it is complete.
+
+**Kill-and-resume (findings 3, 4, 5, 7).** The existing removal primitive, `retireEntry`, is the
+mechanism; no second one was added. It disposes `entry.pty` (or joins `entry.disposing`),
+releases the MCP identity, and takes the entry out of the map, with `retiring` set before the
+first await. `runTurnWithRetries` and `sendToLiveSession` now call it for every turn that is
+not a proven OK and AWAIT it before returning the error:
+- retried: only a `PtyClosedError` whose prompt was never written (`promptSent` false, the
+  process was already gone). Nothing ran, so a replay cannot double anything.
+- everything else, including `PtyTurnTimeoutError` (exit 124 still), `PtyTranscriptUncertainError`,
+  `PtyPromptNotAcceptedError`, `PtyTurnFailedError` (incl. `empty-reply`), `TranscriptReplacedError`,
+  a `PtyClosedError` raised after the prompt went out (`promptSent` true: the exit handler and
+  `dispose()` mid-turn set it) and any unknown error: retire, await, return. Only
+  `PtyTranscriptUnavailableError` skips the retire (refused before anything was written).
+- The next call on the key finds the entry gone, `admitEntry` waits on `retiring` if it is
+  still in progress, then `spawnEntry` builds new options from the STORED session id
+  (persisted at the first spawn), so `--resume <same id>`; a first-ever spawn that never
+  completed a turn still resumes the pre-allocated id if its transcript exists
+  (`_isSessionResumable`), which is the existing phantom-session guard.
+- Why it closes 3 to 5, 7: the only writer that could append a late record for the failed
+  turn is dead before any later turn marks its offset, so the exact payload match is safe
+  without per-submission ids. There is no state to expire, evict, lose on restart, mis-resolve
+  by text equality or leak (finding 7).
+
+**`dispose()` really waits.** `PtyProcessImpl.dispose` sends `kill`, arms a SIGKILL timer for
+2 s and `await`s the PTY's `onExit`. Finding: bun-pty ignores the signal argument (`kill(signal
+= "SIGTERM")` calls `bun_pty_kill(handle)`), and a shell that traps TERM / HUP / INT died within
+~6 ms, so the kill is effectively immediate and the 2 s SIGKILL is only a backstop. The wait is
+the `onExit` event. I could not make a real process exit late, so the `await exited` itself is
+not separately testable at the process level (see injection `R2g`, which survives); the
+supervisor-level tests use a fake PTY whose `dispose()` resolves on a gate, and those do pin
+the ordering (`R2a`, `R2h`).
+
+**Orphans after a daemon crash.** `grep -i orphan` in `pty-supervisor.ts` finds only comments
+about its own double-spawn guard. Nothing in `src/commands/start.ts`, `src/pid.ts` or
+`src/commands/shutdown-sequence.ts` reaps claude processes left by an earlier daemon, and the
+"orphan scan" in `bus/runtime-mount.ts` is `detectOrphanAgents`, which looks for agent
+directories with no config, not processes. A graceful shutdown retires every entry
+(`shutdownSupervisor`). After a hard crash (SIGKILL, power loss) an old claude could still be
+alive and, if it has a pending write, append a late record to the session file the new daemon
+then resumes. Whether the PTY master closing on parent death hangs it up is not verified
+against the real CLI. **Residual, not built this round**: an orphan reaper (kill any claude
+whose cwd and session id match a session about to be resumed) would close it.
+
+**Empty reply (finding 6).** Done in the reader, not per caller, so there is no delivery policy
+to keep in step across the runner, cron, Telegram direct and gateway, Discord and the pending
+resumes: they all see exit 1 and the supervisor's stderr. The failure also takes the
+kill-and-resume path. Not changed: a turn whose FINAL message has no text but an EARLIER message
+in the turn has text still answers with the earlier text (round 4 decision, not revisited).
+
+## Round 5: tests
+
+- `pty-transcript.test.ts`: block B arriving 5 s later (`setSystemTime`) is included and the
+  quiet file does not end the turn; `finalSeen`; progress / hook / attachment / snapshot /
+  `queue-operation` / non-boundary system records between blocks; meta, tool-result,
+  compact-summary and sidechain user entries are not the next prompt; the next real prompt is a
+  boundary; API error after the final text, with the final's id, and a stderr line after it all
+  fail; empty reply (tool-only, whitespace, no assistant at all, earlier text kept, `/compact`
+  exempt). The registry and settle tests are removed.
+- `pty-false-completion.test.ts` (real `/bin/sh` fakes through `spawnPty`): block B 1.8 s later;
+  `PtyTranscriptUncertainError` at the timeout; plain timeout when no final message; API error
+  before `turn_duration`; empty reply; a process stopped by `dispose()` writes nothing more;
+  turn 1 not accepted, process stopped, a new process on the same transcript answers with its
+  own reply and never turn 1's late one (the old fake would have written 0.8 s in). The round 4
+  registry test is removed. Hand-written fakes now write `turn_duration`.
+- `pty-supervisor.test.ts`: six non-ok outcomes each run once, dispose, and are not replayed
+  (timeout stays 124); the error comes back only after a gated `dispose()` resolves; a second call
+  issued while the first process is still being stopped does not spawn until the exit and
+  resumes the same session id (`newSessionId` on spawn 1, `sessionId` on spawn 2); a turn refused
+  before the write has nothing to kill; a `PtyClosedError` before the prompt went out is still
+  retried; and two end-to-end tests through the real process and reader (empty reply = exit 1,
+  final message with no boundary = exit 1 not 124).
+- `pty-integration.test.ts`: the old "timeout is retryable" test now asserts exit 124, one spawn,
+  and a new process on the next call.
+- `fixtures/paste-burst-tui.ts` writes `turn_duration`.
+
+## Round 5: fault injection (one site at a time, on a copy of the tree)
+
+Method: the tracked files copied to a scratch directory (`node_modules` linked), one edit to
+one production file, the named test files run, output to a file, the file restored. The lines
+below are the `(fail)` lines the runs printed, verbatim. `pty-supervisor model + provider env
+threading ... non-glm model with no api leaves ANTHROPIC_AUTH_TOKEN unset` fails at HEAD
+without my change (baseline, environment); it appears in every run that includes
+`pty-supervisor.test.ts` and is not a result of the injection. Where a line is a timing test that
+is red for unrelated reasons under load (`invariant 2: ...`, `accepted at once, the record
+flushes late`), it is shown anyway and called out below.
+
+Faults, in the order of the rulings: R1a settle reinstated; R1b a bookkeeping record closes the
+window; R1c API error after the final ignored; R1d terminal `stop_reason` ends the turn; R1e
+next prompt is not a boundary; R1f meta user entry is a boundary; R1g no uncertain error;
+R2a retirement not awaited; R2b no retirement on uncertain; R2c resume with a new session id;
+R2d timeout retried; R2e post-send close retried; R2f dispose does not kill; R2g dispose does
+not await the exit; R2h `retireEntry` does not await the disposal; R3a empty accepted;
+R3b `/compact` held to the empty rule.
+
+```
+## R1b any bookkeeping record after the final message closes the window: exit=1 77 pass 1 fail
+(fail) TranscriptTurn — a turn ends only at an authoritative boundary (round 5, HIGH 1 + 2) > progress, hook, attachment and snapshot records between the blocks neither close nor cut the final message [38.44ms]
+
+## R1e the next real user prompt is not a boundary: exit=1 75 pass 3 fail
+(fail) TranscriptTurn — the matched turn is a window, frozen when it ends (round 3, H4) > A prompt, A answer, B prompt, B answer in ONE poll: the result is A's [10.56ms]
+(fail) TranscriptTurn — the matched turn is a window, frozen when it ends (round 3, H4) > B arriving AFTER the poll that saw A's end cannot change the result [6.32ms]
+(fail) TranscriptTurn — a turn ends only at an authoritative boundary (round 5, HIGH 1 + 2) > the next real user prompt is a boundary: the turn ends and that prompt's reply is never read [3.59ms]
+
+## R1f meta user entries count as the next prompt: exit=1 76 pass 2 fail
+(fail) TranscriptTurn — a second identical prompt is uncertain, never a success (round 3, H3) > meta entries and tool results inside the turn are the turn's own [3.18ms]
+(fail) TranscriptTurn — a turn ends only at an authoritative boundary (round 5, HIGH 1 + 2) > meta entries, tool results, compact summaries and sub-agent lines after the final message are not the next prompt [8.54ms]
+
+## R3b /compact is held to the empty-reply rule too: exit=1 74 pass 4 fail
+(fail) TranscriptTurn — /compact > accepted by the command entry, ended by compact_boundary [131.33ms]
+(fail) TranscriptTurn — failure is not success (round 3, H2) > a command's own stdout, recorded as a user entry, is not another prompt [30.16ms]
+(fail) TranscriptTurn — an empty reply is a failure (round 5, MEDIUM) > /compact with an empty completion marker is still a success: its result is its own output [1.19ms]
+(fail) TranscriptTurn — /compact API errors (round 4, finding 5) > a command's ordinary assistant text is still not its answer [3.20ms]
+
+## R1a quiet-file settle reinstated (1.5 s without growth ends a terminal turn): exit=1 119 pass 5 fail
+(fail) TranscriptTurn — a turn ends only at an authoritative boundary (round 5, HIGH 1 + 2) > block B of the final message arriving 5 s after block A is in the answer: a quiet file is not an end [16.73ms]
+(fail) #562 — acceptance does not depend on the screen painting anything > a fast turn that paints NO running chrome is accepted, once, and not re-submitted [1027.02ms]
+(fail) #562 — the submit retry > evidence that arrives AFTER the confirm deadline: no duplicate submission [496.50ms]
+(fail) #562 round 3 — executions, not bytes: a late transcript record is one turn > a TUI that would execute twice on the retry Enter: two executions, and the turn is NOT a success [603.89ms]
+(fail) #562 round 5 — a turn ends only at an authoritative boundary > block B arriving 1.8 s after block A, past the old 1.5 s settle, is in the answer [1730.91ms]
+
+## R1c API error after the final message is ignored (error flags read after the terminal check): exit=1 121 pass 3 fail
+(fail) TranscriptTurn — a turn ends only at an authoritative boundary (round 5, HIGH 1 + 2) > an API error after the final text and before turn_duration fails the turn, with no answer [10.19ms]
+(fail) TranscriptTurn — a turn ends only at an authoritative boundary (round 5, HIGH 1 + 2) > an API error that reuses the final message's id is still an error, not a block of it [3.11ms]
+(fail) #562 round 5 — a turn ends only at an authoritative boundary > an API error after the final text, before turn_duration, rejects as api-error [179.86ms]
+
+## R1d the terminal stop_reason itself ends the turn (no boundary needed): exit=1 106 pass 18 fail
+(fail) TranscriptTurn — answer and end of reply > the answer is the assistant text after the matched user entry, and the terminal stop ends it [3.95ms]
+(fail) TranscriptTurn — a second identical prompt is uncertain, never a success (round 3, H3) > the same prompt appended right after the reply (before the boundary) downgrades it to ambiguous [6.00ms]
+(fail) TranscriptTurn — the matched turn is a window, frozen when it ends (round 3, H4) > a final message written as a thinking line first still gets its text line [4.37ms]
+(fail) TranscriptTurn — the matched turn is a window, frozen when it ends (round 3, H4) > a final message with no text at all ends when the next entry closes the window [3.16ms]
+(fail) TranscriptTurn — the matched turn is a window, frozen when it ends (round 3, H4) > a later assistant message with NO prompt between is not this turn's: the turn still ends only at its boundary [2.82ms]
+(fail) TranscriptTurn — a turn ends only at an authoritative boundary (round 5, HIGH 1 + 2) > block B of the final message arriving 5 s after block A is in the answer: a quiet file is not an end [3.40ms]
+(fail) TranscriptTurn — a turn ends only at an authoritative boundary (round 5, HIGH 1 + 2) > a final message with no boundary never ends: finalSeen says so, there is no success [2.15ms]
+(fail) TranscriptTurn — a turn ends only at an authoritative boundary (round 5, HIGH 1 + 2) > progress, hook, attachment and snapshot records between the blocks neither close nor cut the final message [2.38ms]
+(fail) TranscriptTurn — a turn ends only at an authoritative boundary (round 5, HIGH 1 + 2) > meta entries, tool results, compact summaries and sub-agent lines after the final message are not the next prompt [1.75ms]
+(fail) TranscriptTurn — a turn ends only at an authoritative boundary (round 5, HIGH 1 + 2) > an API error after the final text and before turn_duration fails the turn, with no answer [2.90ms]
+(fail) TranscriptTurn — a turn ends only at an authoritative boundary (round 5, HIGH 1 + 2) > an API error that reuses the final message's id is still an error, not a block of it [1.82ms]
+(fail) TranscriptTurn — a turn ends only at an authoritative boundary (round 5, HIGH 1 + 2) > a command's stderr after the final message fails the turn too [1.34ms]
+(fail) #562 round 3 — executions, not bytes: a late transcript record is one turn > accepted at once, the record flushes late: ONE executed turn, one reply [1090.45ms]
+(fail) #562 round 3 — executions, not bytes: a late transcript record is one turn > a TUI that would execute twice on the retry Enter: two executions, and the turn is NOT a success [998.71ms]
+(fail) #562 round 4 — the transcript alone decides how much of the answer, and when the turn ends > a quiet screen and a repainting screen return the SAME answer for a final message whose block B arrives late [876.26ms]
+(fail) #562 round 5 — a turn ends only at an authoritative boundary > block B arriving 1.8 s after block A, past the old 1.5 s settle, is in the answer [209.87ms]
+(fail) #562 round 5 — a turn ends only at an authoritative boundary > a final message and no boundary by the timeout: PtyTranscriptUncertainError, no answer [157.96ms]
+(fail) #562 round 5 — a turn ends only at an authoritative boundary > an API error after the final text, before turn_duration, rejects as api-error [298.59ms]
+
+## R1g no uncertain error: a final message with no boundary times out as a plain timeout: exit=1 138 pass 7 fail
+(fail) pty-supervisor model + provider env threading (Codex Phase D #1) > non-glm model with no api leaves ANTHROPIC_AUTH_TOKEN unset [14.07ms]
+(fail) #562 round 5 — through the supervisor, with the real process and transcript reader > a final message with no boundary is exit 1 (not 124), no output, and the process is stopped [1262.72ms]
+(fail) pty-supervisor retirement — the map's invariants (issue #394) > invariant 2: a retirement joins a failed spawn's identity release, so the replacement's config is not deleted under it [5080.97ms]
+(fail) pty-supervisor retirement — the map's invariants (issue #394) > invariant 2: a spawn that fails after its entry was retired does not release the replacement's identity [279.56ms]
+(fail) #562 round 3 — once the transcript commits the outcome, nothing the screen does changes it > the deadline passing with the reply already in the file, unread, is not a timeout [403.37ms]
+(fail) #562 round 3 — executions, not bytes: a late transcript record is one turn > a TUI that would execute twice on the retry Enter: two executions, and the turn is NOT a success [466.42ms]
+(fail) #562 round 5 — a turn ends only at an authoritative boundary > a final message and no boundary by the timeout: PtyTranscriptUncertainError, no answer [1364.36ms]
+
+## R2a retirement not awaited (void retireEntry) before the error is returned: exit=1 97 pass 2 fail
+(fail) pty-supervisor model + provider env threading (Codex Phase D #1) > non-glm model with no api leaves ANTHROPIC_AUTH_TOKEN unset [5.35ms]
+(fail) #562 round 5 — a turn that is not a proven OK kills the process and resumes the session > the error is returned only AFTER the old process has exited [5073.93ms]
+
+## R2b no retirement for an uncertain turn: exit=1 94 pass 5 fail
+(fail) pty-supervisor model + provider env threading (Codex Phase D #1) > non-glm model with no api leaves ANTHROPIC_AUTH_TOKEN unset [7.07ms]
+(fail) #562 round 5 — a turn that is not a proven OK kills the process and resumes the session > uncertain (final message, no boundary): one turn, no replay, the process disposed, exit 1 [3.70ms]
+(fail) #562 round 5 — a turn that is not a proven OK kills the process and resumes the session > the error is returned only AFTER the old process has exited [5063.73ms]
+(fail) #562 round 5 — a turn that is not a proven OK kills the process and resumes the session > a new process is not spawned until the old one has exited, and it resumes the SAME session id [214.82ms]
+(fail) #562 round 5 — through the supervisor, with the real process and transcript reader > a final message with no boundary is exit 1 (not 124), no output, and the process is stopped [1278.68ms]
+
+## R2c resume with a new session id (stored id dropped on spawn): exit=1 94 pass 5 fail
+(fail) pty-supervisor model + provider env threading (Codex Phase D #1) > non-glm model with no api leaves ANTHROPIC_AUTH_TOKEN unset [6.39ms]
+(fail) #562 round 5 — a turn that is not a proven OK kills the process and resumes the session > a new process is not spawned until the old one has exited, and it resumes the SAME session id [135.72ms]
+(fail) pty-supervisor fresh-session persistence (Codex Phase D #2) > simulated daemon restart: persisted UUID is used as --resume on next runOnPty [67.14ms]
+(fail) pty-supervisor fresh-session persistence (Codex Phase D #2) > does not pre-allocate when stored sessionId exists [46.98ms]
+(fail) pty-supervisor fresh-session persistence (Codex Phase D #2) > issue #89: a resumable stored sessionId is honoured (no regression) [49.36ms]
+
+## R2d timeout is retried and replayed again: exit=1 101 pass 6 fail
+(fail) PTY integration — crash + retry (synthetic) > PtyTurnTimeoutError is NOT retried: 124, the process is stopped, the next call spawns a new one (#562 round 5) [2.52ms]
+(fail) pty-supervisor retry and backoff > does NOT retry a PtyTurnTimeoutError: 124, one turn, the process stopped (#562 round 5) [4.07ms]
+(fail) pty-supervisor retry and backoff > a final turn timeout returns 124 and retires the entry, so the next call respawns [4.66ms]
+(fail) pty-supervisor retry and backoff > retry false permits exactly one turn and no respawn despite global retry settings [1.71ms]
+(fail) pty-supervisor model + provider env threading (Codex Phase D #1) > non-glm model with no api leaves ANTHROPIC_AUTH_TOKEN unset [6.02ms]
+(fail) #562 round 5 — a turn that is not a proven OK kills the process and resumes the session > timeout: one turn, no replay, the process disposed, exit 124 [7.26ms]
+
+## R2e a process that closed after the prompt went out is retried and replayed: exit=1 97 pass 2 fail
+(fail) pty-supervisor model + provider env threading (Codex Phase D #1) > non-glm model with no api leaves ANTHROPIC_AUTH_TOKEN unset [2.92ms]
+(fail) #562 round 5 — a turn that is not a proven OK kills the process and resumes the session > closed after the prompt went out: one turn, no replay, the process disposed, exit 1 [1.98ms]
+
+## R2f dispose() does not stop the process: exit=1 42 pass 4 fail
+(fail) #562 — a turn is over only when the transcript says so > resumed session: thirty old turns repainted are neither the answer nor mistaken for completion [5001.57ms]
+(fail) #562 round 3 — executions, not bytes: a late transcript record is one turn > accepted at once, the record flushes late: ONE executed turn, one reply [2532.76ms]
+(fail) #562 round 4 — the transcript alone decides how much of the answer, and when the turn ends > a quiet screen and a repainting screen return the SAME answer for a final message whose block B arrives late [5017.40ms]
+(fail) #562 round 5 — a stopped process cannot write a late record > turn 1 not accepted, process stopped, a new process on the same transcript: turn 2 answers with its OWN reply, never turn 1's late one [3381.06ms]
+
+## R3a an empty reply is treated as OK: exit=1 214 pass 9 fail
+(fail) TranscriptTurn — an empty reply is a failure (round 5, MEDIUM) > a turn whose only message is tool-only fails with the fixed text, and has no answer [12.14ms]
+(fail) TranscriptTurn — an empty reply is a failure (round 5, MEDIUM) > a whitespace-only reply is empty [2.88ms]
+(fail) TranscriptTurn — an empty reply is a failure (round 5, MEDIUM) > a turn_duration with no assistant message at all is empty too [2.56ms]
+(fail) pty-supervisor model + provider env threading (Codex Phase D #1) > non-glm model with no api leaves ANTHROPIC_AUTH_TOKEN unset [8.42ms]
+(fail) #562 round 5 — through the supervisor, with the real process and transcript reader > an empty reply is exit 1 on the supervisor result, with no output, and the process is stopped [431.29ms]
+(fail) pty-supervisor retirement — the map's invariants (issue #394) > invariant 2: a retirement joins a failed spawn's identity release, so the replacement's config is not deleted under it [5073.84ms]
+(fail) pty-supervisor retirement — the map's invariants (issue #394) > invariant 2: a spawn that fails after its entry was retired does not release the replacement's identity [105.93ms]
+(fail) #562 round 3 — executions, not bytes: a late transcript record is one turn > accepted at once, the record flushes late: ONE executed turn, one reply [443.25ms]
+(fail) #562 round 5 — a turn ends only at an authoritative boundary > a reply with no text rejects as an empty-reply failure [160.37ms]
+
+## R2g dispose() does not wait for the process exit: exit=1 45 pass 1 fail
+(fail) #562 round 3 — executions, not bytes: a late transcript record is one turn > accepted at once, the record flushes late: ONE executed turn, one reply [659.76ms]
+
+## R2h retireEntry does not wait for the PTY disposal: exit=1 92 pass 7 fail
+(fail) pty-supervisor model + provider env threading (Codex Phase D #1) > non-glm model with no api leaves ANTHROPIC_AUTH_TOKEN unset [12.22ms]
+(fail) #562 round 5 — a turn that is not a proven OK kills the process and resumes the session > the error is returned only AFTER the old process has exited [63.08ms]
+(fail) #562 round 5 — a turn that is not a proven OK kills the process and resumes the session > a new process is not spawned until the old one has exited, and it resumes the SAME session id [125.58ms]
+(fail) pty-supervisor bounded respawn (issue #385) > a retirement racing a respawn's dispose of the dead PTY waits for that dispose [1028.21ms]
+(fail) pty-supervisor retirement — the map's invariants (issue #394) > invariant 7: an admission that was evicting a neighbour while the supervisor shut down does not create an entry the shutdown never saw [86.90ms]
+(fail) pty-supervisor retirement — the map's invariants (issue #394) > invariant 7: an admission queued on the global lock behind an eviction the shutdown joined is refused after the shutdown returned [74.48ms]
+(fail) pty-supervisor retirement — the map's invariants (issue #394) > invariant 2: a retirement joins a failed spawn's identity release, so the replacement's config is not deleted under it [5350.69ms]
+
+```
+
+Notes on what the runs showed:
+- Every injection except `R2g` turned at least one test of its own red.
+- `R2g` (drop `await exited` in `dispose()`) is a SURVIVOR at the process level: the only red
+  line is the unrelated load-sensitive timing test. bun-pty's kill is immediate, so a real
+  process is gone before the next statement and no observable difference exists. The ordering is
+  pinned one level up (`R2a`, `R2h`), with a fake whose `dispose()` is gated.
+- `R2f` (dispose does not kill) is not caught by "once dispose() has returned, nothing reaches
+  the file": the 2 s SIGKILL backstop kills the process anyway and that test has a 10 s budget.
+  It is caught by the test where the first process would write 0.8 s in.
+- `R2c` (resume dropped) also turned red three older session-persistence tests that assert the
+  same `--resume` behaviour; the new one is among the red lines.
+- `R1g` and `R3a` list `invariant 2: a retirement joins a failed spawn's identity release` and
+  `accepted at once, the record flushes late`. Both are timing-sensitive and went red only in
+  runs that executed several test files back to back; each passes alone, and neither mentions
+  the injected fault.
+
+## Round 5: verification
+
+- PTY / runner / live-session / gateway / one-shot test files (list built by `find ... | rg
+  'pty|live-session|gateway'`, minus `tests/integration`, plus `src/oneshot/engine.test.ts`):
+  34 files, run file by file with up to 3 attempts each (the machine ran at load average ~55, and
+  several timing tests in these files flake under that load at HEAD too).
+  - normal: **914 pass / 0 fail** (every file green on its first attempt).
+  - `CLAUDECLAW_TEST_PLATFORM=linux`: **913 pass / 1 fail**. The one red is `PtyProcess - project
+    MCP server approval dialog (#469) > a dialog that paints late gets a fresh hard-timeout
+    window...` in `pty-process.test.ts`, red in 3 of 3 attempts inside the gate run, then green in
+    2 of 3 standalone reruns on this tree, and red at the untouched round-4 HEAD in 2 of 5 runs
+    (normal platform). It exercises the boot-screen settle, which round 5 did not touch. I call
+    it a load-sensitive flake, not a regression, but it is a red I did not make green.
+    `pty-false-completion.test.ts` (`accepted at once, the record flushes late`) and
+    `pty-supervisor.test.ts` (`invariant 2`) each needed a second attempt under linux; both are
+    timing tests, and the first was loosened in this round (record delay 0.5 s, confirm 300 ms).
+- `bun run lint` (full repo) exit 0; `bun run typecheck`: 149 errors, baseline 149.
+- The ANTHROPIC_BASE_URL variable was unset for the runs; test output went to files, never a pipe.
+- Nothing touched `~/.claude` or `~/.claude.json`; no real `claude`.
+
+## Round 5: not done / risks
+
+1. **Orphan claude after a daemon crash** (above). Not reaped; residual.
+2. **No real claude.** Still unconfirmed against a live CLI: (a) `turn_duration` follows EVERY
+   terminal message (including thinking-only, tool-only and a terminal reason other than
+   `end_turn`) on 2.1.296; if it does not, such a turn now ends `PtyTranscriptUncertainError`
+   at the timeout instead of returning after 1.5 s; (b) a multi-block final message is written
+   as several lines of one id; (c) a background-notification reply after the final message
+   uses another message id.
+3. **A turn that really did finish but whose `turn_duration` never comes** is an error and a
+   process kill, not a success. That is the ruling; the cost is one lost reply and one
+   respawn-and-resume.
+4. **A `PtyClosedError` before the prompt was written is still replayed** (up to `maxRetries`).
+   That is the one retry left. The prompt was never sent, so nothing can run twice.
+5. **`sendToLiveSession` and an abort.** `LiveSendAborted` still returns without retiring (the
+   caller's abort path owns that, as before); I did not change it.
+6. `dispose()` has no bound on the wait for the exit event. If the OS never delivers it the
+   retire hangs. It never did in any run; unchanged.
