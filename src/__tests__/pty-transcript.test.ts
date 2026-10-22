@@ -12,6 +12,7 @@ import { join } from "node:path";
 import {
   EMPTY_REPLY_TEXT,
   ID_LESS_TEXT,
+  INTERLEAVED_TEXT,
   promptMatches,
   resolveTranscriptPath,
   TranscriptReplacedError,
@@ -1299,6 +1300,149 @@ describe("TranscriptTurn — incomplete assistant shapes (round 6, Fix 3)", () =
       ),
     );
     expect(turn_.poll().failure?.kind).toBe("ambiguous");
+  });
+});
+
+describe("TranscriptTurn — interleaved messages are uncertain, not attributed (round 7, Fix 2)", () => {
+  const toolResult = (): string =>
+    JSON.stringify({
+      type: "user",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "x", content: "ok" }] },
+    });
+
+  test("A starts, B terminates, A finishes: uncertain, never B alone", () => {
+    // Codex's r6 shape (i). Fault (site: the interleave check in `ingestAssistant`, removed):
+    // the first terminal message (B) is frozen as the final one and A's tail is dropped.
+    // Predicted result with the fault: failure null, answer "B-reply".
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(
+        userLine("R17x please"),
+        assistantLine("A-start ", { id: "mA", stop: null }),
+        assistantLine("B-reply", { id: "mB", stop: "end_turn" }),
+        assistantLine("A-end", { id: "mA", stop: "end_turn" }),
+        systemLine("turn_duration"),
+      ),
+    );
+    const s = turn_.poll();
+    expect(s.ended).toBe(true);
+    expect(s.failure).toEqual({ kind: "ambiguous", text: INTERLEAVED_TEXT });
+    expect(s.answer).toBe("");
+  });
+
+  test("A-prefix, a non-terminal B, A-suffix: uncertain, never the suffix alone", () => {
+    // Codex's r6 shape (ii). Same fault: A's blocks are not tied together across B, so the
+    // terminal A-suffix answers by itself. Predicted result: answer "A-suffix".
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(
+        userLine("R17x please"),
+        assistantLine("A-prefix ", { id: "mA", stop: null }),
+        assistantLine("B-working", { id: "mB", stop: null }),
+        assistantLine("A-suffix", { id: "mA", stop: "end_turn" }),
+        systemLine("turn_duration"),
+      ),
+    );
+    const s = turn_.poll();
+    expect(s.failure).toEqual({ kind: "ambiguous", text: INTERLEAVED_TEXT });
+    expect(s.answer).toBe("");
+  });
+
+  test("the final message resumes after another message's line that was ignored: uncertain", () => {
+    // Fault (site: the interleave check, applied only while the turn is still open): B's line
+    // after the final message is ignored without being counted, so A's later block extends the
+    // answer as if nothing came between. Predicted result: failure null, answer "A-one A-two".
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(
+        userLine("R17x please"),
+        assistantLine("A-one ", { id: "mA", stop: "end_turn" }),
+        assistantLine("B-bg", { id: "mB", stop: "end_turn" }),
+        assistantLine("A-two", { id: "mA", stop: "end_turn" }),
+        systemLine("turn_duration"),
+      ),
+    );
+    const s = turn_.poll();
+    expect(s.failure).toEqual({ kind: "ambiguous", text: INTERLEAVED_TEXT });
+  });
+
+  test("interleaving across polls is the same verdict as within one", () => {
+    // The state that decides it (`seenIds`, `lastLineId`) must live across polls.
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(t.path, nl(userLine("R17x please"), assistantLine("A1", { id: "mA", stop: null })));
+    expect(turn_.poll().failure).toBeNull();
+    appendFileSync(t.path, nl(assistantLine("B", { id: "mB", stop: null })));
+    expect(turn_.poll().failure).toBeNull();
+    appendFileSync(t.path, nl(assistantLine("A2", { id: "mA", stop: "end_turn" })));
+    expect(turn_.poll().failure?.kind).toBe("ambiguous");
+  });
+
+  test("the normal tool loop still answers with the final message", () => {
+    // A tool_use message, its result, then the final message: different ids in sequence,
+    // never back to an earlier one. Fault (site: the interleave check, `seenIds.has` made
+    // always true): every second message would be called interleaved. Predicted: ambiguous.
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(
+        userLine("R17x please"),
+        assistantLine("Let me check", { id: "m1", stop: "tool_use" }),
+        toolResult(),
+        assistantLine("Checking more", { id: "m2", stop: "tool_use" }),
+        toolResult(),
+        assistantLine("It is fine.", { id: "m3", stop: "end_turn" }),
+        systemLine("turn_duration"),
+      ),
+    );
+    const s = turn_.poll();
+    expect(s.failure).toBeNull();
+    expect(s.answer).toBe("It is fine.");
+  });
+
+  test("blocks of one message split by bookkeeping records and tool results still join", () => {
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(
+        userLine("R17x please"),
+        assistantLine("Part one. ", { id: "m1", stop: null }),
+        JSON.stringify({ type: "progress" }),
+        toolResult(),
+        assistantLine("Part two.", { id: "m1", stop: "end_turn" }),
+        systemLine("turn_duration"),
+      ),
+    );
+    const s = turn_.poll();
+    expect(s.failure).toBeNull();
+    expect(s.answer).toBe("Part one. Part two.");
+  });
+
+  test("a background reply that starts after the final message and never returns is still ignored", () => {
+    // The round-5 ruling stays: another message AFTER the final one is neither appended nor
+    // a boundary. It is only a return to an earlier message that cannot be placed.
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(
+        userLine("R17x please"),
+        assistantLine("The answer.", { id: "mA", stop: "end_turn" }),
+        assistantLine("bg notification reply", { id: "mB", stop: "end_turn" }),
+        systemLine("turn_duration"),
+      ),
+    );
+    const s = turn_.poll();
+    expect(s.failure).toBeNull();
+    expect(s.answer).toBe("The answer.");
   });
 });
 

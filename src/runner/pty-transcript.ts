@@ -80,6 +80,10 @@ export const EMPTY_REPLY_TEXT = "empty reply in transcript";
 export const ID_LESS_TEXT =
   "an assistant line has no message id, so which lines make up the final message is uncertain";
 
+/** Why a turn whose assistant messages interleave fails as `ambiguous` (`TurnFailure.text`). */
+export const INTERLEAVED_TEXT =
+  "assistant lines of different messages are interleaved, so which message answers this turn is uncertain";
+
 /** `message.model` on assistant lines the CLI writes itself (API errors, placeholders). */
 const SYNTHETIC_MODEL = "<synthetic>";
 
@@ -265,6 +269,10 @@ export class TranscriptTurn {
   private idlessSeen = false;
   private assistantLines = 0;
   private finalMessageId: string | undefined;
+  /** Every message id seen on an assistant line, ignored ones included. */
+  private seenIds = new Set<string>();
+  /** The id of the previous assistant line (ignored ones included). */
+  private lastLineId: string | undefined;
   private matchedUuid: string | undefined;
   private matchedPromptId: string | undefined;
   private commandResult = "";
@@ -326,12 +334,17 @@ export class TranscriptTurn {
   }
 
   /**
-   * The text of the window's LAST assistant message, whether or not it has any. A final
-   * message with none (tool-only, thinking-only) is an empty answer: the message before it
-   * is narration, not the reply (#562 round 6).
+   * The text of the final message, whether or not it has any: the message whose line carried
+   * the terminal stop reason (all its blocks, found by id), else the last message to appear.
+   * A final message with no text (tool-only, thinking-only) is an empty answer: the message
+   * before it is narration, not the reply (#562 round 6).
    */
   private answerText(): string {
-    return this.messages[this.messages.length - 1]?.text ?? "";
+    const final =
+      this.finalMessageId !== undefined
+        ? this.messages.find((m) => m.id === this.finalMessageId)
+        : undefined;
+    return (final ?? this.messages[this.messages.length - 1])?.text ?? "";
   }
 
   private stat(): { dev: bigint; ino: bigint; size: bigint } | null {
@@ -517,6 +530,18 @@ export class TranscriptTurn {
       this.fail("ambiguous", ID_LESS_TEXT);
       return;
     }
+    // One message's lines are not interleaved with another's. A, B, A means a message began,
+    // another ran, and the first went on: the lines cannot be placed in one reply or the
+    // other (a background-task reply starting inside the turn looks like this), so there is
+    // no answer to name. Every line counts, the ignored ones too. (#562 round 7)
+    if (message.id !== undefined) {
+      if (message.id !== this.lastLineId && this.seenIds.has(message.id)) {
+        this.fail("ambiguous", INTERLEAVED_TEXT);
+        return;
+      }
+      this.seenIds.add(message.id);
+    }
+    this.lastLineId = message.id;
     if (this.phase === "terminal" && message.id !== this.finalMessageId) return;
     // Identity is what makes up the final message. A line with no id beside any other
     // assistant line of the turn cannot be placed in one message or another, and a partial
@@ -552,10 +577,11 @@ export class TranscriptTurn {
       }
     }
     // Each content block is its own line; blocks of one message share its id and belong
-    // together. A different id is a later message of the same turn. A line without text
-    // still opens (or joins) its message: that is how a textless final message is seen.
-    const last = this.messages[this.messages.length - 1];
-    if (last && id !== undefined && last.id === id) last.text += text;
+    // together wherever they sit in the window (found by id, not only when adjacent). A
+    // different id is another message of the same turn. A line without text still opens
+    // (or joins) its message: that is how a textless final message is seen.
+    const known = id !== undefined ? this.messages.find((m) => m.id === id) : undefined;
+    if (known) known.text += text;
     else this.messages.push({ id, text });
   }
 
