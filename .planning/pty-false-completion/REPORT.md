@@ -2099,3 +2099,33 @@ i3  (fail) TranscriptTurn — answer and end of reply > a tool_use stop does not
 i4  error: expect(received).toBe(expected)   Expected: "ambiguous"   Received: undefined
     (fail) ... > interleaving across polls is the same verdict as within one [0.76ms]
 ```
+
+### Round 7: verification
+
+- Wide gate: every `.test.ts` under `src/` and `tests/` (minus `tests/integration`) whose content
+  matches `\bpty\b|Pty[A-Z]|runOnPty|pty-[a-z]|live-session|LiveSession|[Gg]ateway`: **98 files**
+  (96 + the two new ones; `pty-process-dispose.test.ts` was rewritten), file by file, up to 3
+  attempts, ANTHROPIC_BASE_URL unset, output to files.
+  - normal: 98 of 98 green on the first attempt, 2,238 passing tests.
+  - `CLAUDECLAW_TEST_PLATFORM=linux`: 98 of 98 green on the first attempt, 2,238 passing tests
+    (the known `skills-fitness.test.ts` judge-cooldown flake did not fire).
+- `bun run lint` (full repo) exit 0; `bun run typecheck`: 149 errors, baseline 149.
+- No real `claude` started; nothing touched `~/.claude`. The real-child tests spawn `/bin/sh` and
+  `/bin/cat` only and kill what they start.
+
+### Round 7: not done / risks
+
+1. **Orphan claude after a daemon crash:** still no reaper (round-4 HIGH 3 stays open for the
+   crash case; the retirement gap that Codex tied to it is closed). Residual.
+2. **Quarantine is in memory.** A daemon restart forgets it. After a restart the old process is an
+   orphan, which is the case above.
+3. **A zombie that is never reaped would read as alive** to `process.kill(pid, 0)`. In the probes
+   the child was reaped promptly; if it ever is not, the key stays quarantined and the turn fails
+   rather than resuming. Fail-closed, not fail-open.
+4. **Quarantine release is lazy:** it is tried when something asks for the key (admission), not on a
+   timer. A key nobody asks for stays quarantined.
+5. **Windows:** no signal-0 probe; keeps the exit-event wait (and bun-pty's no-op SIGKILL there).
+   Linux and macOS are the targets.
+6. **Real-CLI prevalence of interleaved messages is unverified** (Codex said the same). The cost of
+   being wrong is a turn failing `ambiguous` where a reply was in fact fine, never a wrong answer.
+7. Cron `retry` still replays a failed PTY job (operator decision, round 6 item 3).
