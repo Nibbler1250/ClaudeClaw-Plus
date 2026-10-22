@@ -77,6 +77,7 @@ import {
   killAllPtys,
   supervisorEntryCount,
   retirePtySession,
+  liveSessionKeys,
   type PtySessionStore,
   type PtyUnsafeReplayKind,
   runEphemeralWithDeadline,
@@ -796,6 +797,21 @@ async function spawnClaude(
     env: opts.env,
     ...(opts.cwd ? { cwd: opts.cwd } : {}),
   });
+}
+
+/**
+ * #562 connector P1: `pty.enabled` can flip to false while a PTY still owns a session key, and
+ * the next turn then resumes that session on print. Two processes would write one transcript
+ * (or the CLI refuses with "Session ID ... is already in use"). Retire the live PTY on each of
+ * `keys` BEFORE the legacy spawn. `retirePtySession` applies the round 8/9 fence and rejects
+ * with `PtyQuarantinedError` when the exit is unconfirmed, so the turn fails instead of
+ * resuming beside a process that may still be writing. A print-only install has no live key
+ * and pays one empty-array check.
+ */
+async function retireLivePtysBeforePrint(keys: string[]): Promise<void> {
+  const live = liveSessionKeys();
+  if (live.length === 0) return;
+  for (const key of keys) if (live.includes(key)) await retirePtySession(key);
 }
 
 /** A one-shot agent turn on its own PTY (#546); see `runEphemeralWithDeadline`. */
@@ -2043,6 +2059,11 @@ async function execClaude(
         ? `agent:${agentName}`
         : "global";
     const appendSystemPrompt = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
+    // A flip to print leaves the PTYs of this turn's keys alive; retire them before any legacy
+    // spawn below (primary, recovery, fallback) can resume their sessions.
+    if (useLegacyPath) {
+      await retireLivePtysBeforePrint([ptySessionKey, `fallback:${ptySessionKey}`]);
+    }
     let exec: ExecOutcome;
     if (_primaryExecForTests) {
       exec = await _primaryExecForTests({
@@ -2879,6 +2900,8 @@ async function streamClaude(
     `[${new Date().toLocaleTimeString()}] Running: ${name} (stream-json, session: ${existing?.sessionId?.slice(0, 8) ?? "new"})`,
   );
 
+  // The dashboard chat resumes the global session on print; retire its PTY first (see above).
+  await retireLivePtysBeforePrint(["global"]);
   const proc = await spawnClaude(args, { env: childEnv });
 
   // Collect stderr in the background so it doesn't back-pressure the process.
