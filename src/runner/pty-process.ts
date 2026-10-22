@@ -400,7 +400,9 @@ export class PtyExitUnconfirmedError extends Error {
     public readonly label: string,
     public readonly pid: number,
   ) {
-    super(`PTY process ${label} (pid ${pid}) is still alive after SIGKILL; its exit is unconfirmed`);
+    super(
+      `PTY process ${label} (pid ${pid}) is still alive after SIGKILL; its exit is unconfirmed`,
+    );
     this.name = "PtyExitUnconfirmedError";
   }
 }

@@ -1967,3 +1967,135 @@ Received: "THE-LAST-TEXT"
 4. **`PtyTranscriptUnavailableError` in `sendToLiveSession`** retires a process nothing was written
    to; `runTurnWithRetries` does not. Harmless and conservative; not changed.
 
+
+## Round 7: Codex r6 findings
+
+Input: Codex round-6 review of `f25a0272` (one HIGH, one MEDIUM). Both closed; the commits are
+`a882a8de` (Fix 1) and `cc92ff74` (Fix 2).
+
+### Fix 1 (HIGH): retirement proves the OS process exited
+
+**What was wrong, measured.** bun-pty 0.4.9 `kill()` (`node_modules/bun-pty/src/terminal.ts:216`)
+takes a `signal` argument and ignores it, closes the handle, fires `onExit` synchronously, and
+returns at once on every later call (`_closing`). So round 6's `await exited` resolved the moment
+`kill("SIGTERM")` returned, and its 2 s `kill("SIGKILL")` escalation was a literal no-op. Probe
+against the real library (`/bin/sh -c 'trap "" TERM HUP; sleep 300 & while :; do sleep 1; done'`):
+
+```
+exit events right after kill: 1
+alive after 600ms: true
+alive after 2nd kill(SIGKILL): true
+group kill sent
+alive after group kill: false
+```
+
+A child that traps only TERM dies (closing the pty master sends it SIGHUP), so the old R2g note
+("a `trap '' TERM` shell was still alive 400ms later") needs HUP trapped too. Both are ignored in
+the new tests.
+
+**Process-group finding (not guessed).** The child is its own process-group leader:
+`ps -o pid,ppid,pgid` shows `pgid == pid` for the spawned shell, and its `sleep` children share
+that pgid. `process.kill(-pid, "SIGKILL")` reaches them (the real test checks the grandchild is
+dead). A group signal is only ever sent while the leader is still alive after the grace period, so
+a recycled pgid is not a practical risk; the pid is guarded (`> 1`, integer) so `kill(-1)`/`kill(0)`
+can never be issued from a bad `pid`.
+
+**The change.**
+- `PtyProcessImpl.dispose()` (`src/runner/pty-process.ts`): SIGTERM through bun-pty, then poll
+  `process.kill(pid, 0)` (ESRCH = gone, EPERM or anything else = alive) every 20 ms. After the 2 s
+  grace it sends SIGKILL itself, to `-pid` then `pid`, never through bun-pty. At 7 s total it rejects
+  with `PtyExitUnconfirmedError`. A rejected disposal is not cached: the next `dispose()` or
+  `confirmExit()` runs a fresh attempt. Concurrent callers share one attempt. Polling uses the wall
+  clock and real timers on purpose (a frozen injected clock must not hang retirement).
+- win32 (no signal 0) and an unusable pid keep the old wait-for-exit-event behaviour.
+- Supervisor (`src/runner/pty-supervisor.ts`): `retireEntry` puts a key whose disposal rejected into
+  `state.quarantine`, in the same synchronous step before the entry leaves the map, so there is no
+  window to admit a replacement. `admitEntry` calls `releaseQuarantine` (asks the process to prove
+  death again) and throws `PtyQuarantinedError` while it lives. `respawnEntry` no longer swallows a
+  rejected dispose: it quarantines and throws, and `respawnEntryWithRetries` does not retry it.
+  `landPty` quarantines too. `sendToLiveSession` answers `failed`, not `not-live`, for a quarantined
+  key (so no caller resumes the transcript in a one-shot). `liveSessionKeys` lists quarantined keys.
+
+**Tests.**
+- `pty-process-dispose-real.test.ts`: the real library and a real child that traps TERM and HUP with
+  a grandchild in its group. `process.kill(pid, 0)` throws ESRCH for both when `dispose()` resolves;
+  a second `dispose()` joins the first; EPERM from the OS is "unconfirmed", not "gone".
+- `pty-process-dispose.test.ts` (rewritten): a bun-pty stand-in that behaves like 0.4.9 (first
+  `kill()` fires exit and ignores the signal, later calls do nothing) plus a stand-in OS: dispose
+  stays pending while the OS still shows the pid; SIGKILL reaches the OS group-then-pid; an immune
+  process rejects, and `confirmExit()` succeeds later; a pid of -1/0/1 is never signalled.
+- `pty-quarantine.test.ts`: retire with unconfirmed exit quarantines and spawns nothing; lifting;
+  `sendToLiveSession` failed; crash respawn; a confirmed retirement quarantines nothing.
+
+**Injections (one site each, on `git archive` copies of `a882a8de`, RED lines verbatim):**
+
+| # | Fault (site) | Result |
+|---|---|---|
+| a | `_retire`: skip the pid confirmation (trust bun-pty's exit event) | 3 of 4 mock tests, 3 of 3 real tests RED |
+| b | `_confirmGoneByPid`: no direct SIGKILL | 3 of 4 mock, 2 of 3 real RED |
+| b2 | `_confirmGoneByPid`: return instead of throwing at the cap | 1 mock, 1 real RED |
+| g | SIGKILL the leader only, not the group | 1 mock, 1 real RED |
+| c | `retireEntry`: drop `quarantinePty` | 3 of 5 RED |
+| c2 | `respawnEntry`: swallow the dispose rejection | 1 RED |
+| c3 | `sendToLiveSession`: `!entry` branch ignores quarantine | 1 RED |
+| c4 | `admitEntry`: drop `releaseQuarantine` | 1 RED (the lift test; the `has()` check below it still refuses) |
+
+```
+a   error: expect(received).toBe(expected)   Expected: false   Received: true
+    (fail) PtyProcess.dispose — the OS decides, not bun-pty's exit event > a child that outlives SIGTERM keeps dispose pending until SIGKILL has taken it [65.43ms]
+b   (fail) PtyProcess.dispose — real child that ignores SIGTERM and SIGHUP > is dead, with its group, by the time dispose() resolves [1945.84ms]
+b2  error: expect(received).rejects.toBeInstanceOf(expected)
+    Expected promise that rejects
+    Received promise that resolved: Promise { <resolved> }
+    (fail) PtyProcess.dispose — the OS decides, not bun-pty's exit event > a process that survives SIGKILL makes dispose() reject, and a later confirmation succeeds [610.34ms]
+g   error: expect(received).toBe(expected)   Expected: false   Received: true
+    (fail) PtyProcess.dispose — real child that ignores SIGTERM and SIGHUP > is dead, with its group, by the time dispose() resolves [793.48ms]
+c   error: expect(received).toContain(expected)   Expected to contain: "global"   Received: []
+    (fail) quarantine of a key whose process is not proven dead > retiring an unconfirmed process quarantines the key: no replacement is spawned [10.05ms]
+c2  error: expect(received).toBe(expected)   Expected: 1   Received: 2
+    (fail) quarantine of a key whose process is not proven dead > a crash-recovery respawn does not resume over a process that is not proven dead [0.92ms]
+c3  error: expect(received).toBe(expected)   Expected: "failed"   Received: "not-live"
+    (fail) quarantine of a key whose process is not proven dead > sendToLiveSession on a quarantined key is failed, never not-live (no one-shot resume) [0.82ms]
+c4  error: expect(received).toBeGreaterThan(expected)   Expected: > 0   Received: 0
+    (fail) quarantine of a key whose process is not proven dead > the quarantine lifts once the OS confirms the exit, and then the key spawns again [0.66ms]
+```
+
+### Fix 2 (MEDIUM): final-message attribution is order-dependent
+
+**Decision.** The final message is the one whose line carried the first terminal stop reason, with
+all its blocks joined by id wherever they sit (`messages` is searched by id, not only the last
+entry). Any return to an earlier message after another message's line (A, B, A) fails the turn as
+`ambiguous` (`INTERLEAVED_TEXT`), in any phase and counting the lines that are otherwise ignored
+after the final message. Rationale: with a background reply running inside the turn, the lines
+cannot be placed in one reply or the other; "the full A" would be a guess about a message whose
+sibling never closed, and both Codex shapes then return something that is not provably the reply.
+Uncertain is never replayed. The round-5 ruling stays: a message that starts AFTER the final one
+and never returns is ignored, neither appended nor a boundary.
+
+Honest note: with the interleave check in place, same-id lines are always adjacent when a turn
+succeeds, so aggregation by id and the old adjacent merge give the same answer. The by-id lookup
+is kept so the answer does not depend on the check's placement; no test can tell them apart.
+
+**Tests** (`pty-transcript.test.ts`, "round 7, Fix 2"): shape (i), shape (ii), resuming after an
+ignored line, the same across polls, the normal tool loop (tool_use, result, tool_use, result,
+final), a message split by a bookkeeping record and a tool result, and a trailing background reply.
+
+| # | Fault | Result |
+|---|---|---|
+| i1 | remove the interleave check | 4 RED (both Codex shapes, resume-after-ignored, across polls) |
+| i2 | check only while the turn is open | 2 RED (shape (i), resume-after-ignored) |
+| i3 | `seenIds.has(id)` made `size > 0` (over-strict) | 11 RED, every tool loop |
+| i4 | `seenIds.clear()` on every poll | 1 RED (across polls) |
+
+```
+i1  error: expect(received).toEqual(expected)
+    (fail) TranscriptTurn — interleaved messages are uncertain, not attributed (round 7, Fix 2) > A starts, B terminates, A finishes: uncertain, never B alone [18.17ms]
+    (fail) ... > A-prefix, a non-terminal B, A-suffix: uncertain, never the suffix alone [0.81ms]
+    (fail) ... > the final message resumes after another message's line that was ignored: uncertain [0.60ms]
+i2  (fail) ... > A starts, B terminates, A finishes: uncertain, never B alone [0.68ms]
+    (fail) ... > the final message resumes after another message's line that was ignored: uncertain [0.53ms]
+i3  (fail) TranscriptTurn — answer and end of reply > a tool_use stop does not end the turn; the final end_turn message does and is the answer [1.05ms]
+    (fail) ... > the normal tool loop still answers with the final message [0.57ms]
+i4  error: expect(received).toBe(expected)   Expected: "ambiguous"   Received: undefined
+    (fail) ... > interleaving across polls is the same verdict as within one [0.76ms]
+```

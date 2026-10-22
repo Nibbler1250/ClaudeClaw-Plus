@@ -1307,7 +1307,10 @@ describe("TranscriptTurn — interleaved messages are uncertain, not attributed 
   const toolResult = (): string =>
     JSON.stringify({
       type: "user",
-      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "x", content: "ok" }] },
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "x", content: "ok" }],
+      },
     });
 
   test("A starts, B terminates, A finishes: uncertain, never B alone", () => {
@@ -1376,7 +1379,10 @@ describe("TranscriptTurn — interleaved messages are uncertain, not attributed 
     // The state that decides it (`seenIds`, `lastLineId`) must live across polls.
     const t = tx();
     const turn_ = turn(t);
-    appendFileSync(t.path, nl(userLine("R17x please"), assistantLine("A1", { id: "mA", stop: null })));
+    appendFileSync(
+      t.path,
+      nl(userLine("R17x please"), assistantLine("A1", { id: "mA", stop: null })),
+    );
     expect(turn_.poll().failure).toBeNull();
     appendFileSync(t.path, nl(assistantLine("B", { id: "mB", stop: null })));
     expect(turn_.poll().failure).toBeNull();
