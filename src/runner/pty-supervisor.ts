@@ -2171,7 +2171,7 @@ function pendingSpawnStandIn(entry: PtyEntry, isSettled: () => boolean): PtyProc
     isAlive: () => !isSettled(),
     lastTurnEndedAt: () => 0,
     exitInfo: () => null,
-    runTurn: () => Promise.reject(new PtyClosedError(label, null)),
+    runTurn: () => Promise.reject(new PtyClosedError(label, null, null)),
     dispose: confirm,
     confirmExit: confirm,
   };
