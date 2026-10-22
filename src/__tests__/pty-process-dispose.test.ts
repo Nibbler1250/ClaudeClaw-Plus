@@ -62,6 +62,8 @@ interface FakeOs {
   /** SIGKILL does not take it (a process stuck in uninterruptible sleep). */
   immune: boolean;
   log: string[];
+  /** Birth identity the OS reports for the pid; `null` = unreadable. Change it = pid reused. */
+  identity: string | null;
   signalPid: (pid: number, sig: NodeJS.Signals | 0) => void;
 }
 
@@ -69,6 +71,7 @@ function makeOs(): FakeOs {
   const os: FakeOs = {
     alive: true,
     immune: false,
+    identity: "boot-1",
     log: [],
     signalPid(pid, sig) {
       os.log.push(`${pid}:${sig}`);
@@ -82,7 +85,14 @@ function makeOs(): FakeOs {
   return os;
 }
 
-async function spawnWith(os: FakeOs, extra: { _exitGraceMs?: number; _exitCapMs?: number } = {}) {
+async function spawnWith(
+  os: FakeOs,
+  extra: {
+    _exitGraceMs?: number;
+    _exitCapMs?: number;
+    _readPidIdentity?: (pid: number) => string | null;
+  } = {},
+) {
   return spawnPty({
     sessionId: "",
     cwd: "/tmp",
@@ -93,6 +103,7 @@ async function spawnWith(os: FakeOs, extra: { _exitGraceMs?: number; _exitCapMs?
     _skipClaudeArgs: true,
     transcriptPath: "/tmp/never-written.jsonl",
     _signalPid: os.signalPid,
+    _readPidIdentity: () => os.identity,
     _exitGraceMs: 150,
     _exitCapMs: 600,
     ...extra,
@@ -158,6 +169,57 @@ describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () =
     os.immune = false;
     await proc.confirmExit?.();
     expect(os.alive).toBe(false);
+  });
+
+  test("a pid the OS has handed to another process counts as exited and is never signalled", async () => {
+    // Fault (site: `_pidState`, skip the identity comparison): existence alone says "still
+    // there", so the stranger is waited on and then SIGKILLed. Predicted result: a
+    // `-pid:SIGKILL` entry in the OS log and `os.alive` false.
+    const os = makeOs();
+    const proc = await spawnWith(os);
+    os.identity = "boot-2"; // the original exited, the pid was reused
+
+    await proc.dispose();
+
+    expect(os.log.filter((e) => e.endsWith(":SIGKILL"))).toEqual([]);
+    expect(os.alive).toBe(true); // the stranger is untouched
+    expect(child?.kills).toEqual([]);
+  });
+
+  test("a later confirmation whose identity cannot be read sends no signal and stays unconfirmed", async () => {
+    // Fault (site: `_maySignal`, treat "unknown" as signalable on any retirement): the later
+    // confirmation SIGKILLs a pid it cannot vouch for. Predicted result: a second pair of
+    // SIGKILL entries and `os.alive` false.
+    const os = makeOs();
+    os.immune = true;
+    const proc = await spawnWith(os);
+    await expect(proc.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
+    const killsAfterFirst = os.log.filter((e) => e.endsWith(":SIGKILL")).length;
+    expect(killsAfterFirst).toBe(2); // initial window, identity matched
+
+    os.identity = null; // `ps` / `/proc` unreadable now
+    os.immune = false;
+    await expect(proc.confirmExit?.()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
+
+    expect(os.log.filter((e) => e.endsWith(":SIGKILL")).length).toBe(killsAfterFirst);
+    expect(os.alive).toBe(true);
+  });
+
+  test("with no identity recorded at spawn the initial retirement may signal, a later one may not", async () => {
+    // Fault (site: `_maySignal`, drop the `initial` clause): the initial retirement refuses
+    // to signal and the process outlives it. Predicted result: dispose() rejects with
+    // no SIGKILL logged.
+    const os = makeOs();
+    os.immune = true;
+    const proc = await spawnWith(os, { _readPidIdentity: () => null });
+    await expect(proc.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
+    const killsAfterFirst = os.log.filter((e) => e.endsWith(":SIGKILL")).length;
+    expect(killsAfterFirst).toBe(2);
+
+    os.immune = false;
+    await expect(proc.confirmExit?.()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
+
+    expect(os.log.filter((e) => e.endsWith(":SIGKILL")).length).toBe(killsAfterFirst);
   });
 
   test("a pid that cannot be a real child is never signalled (no kill(-1), no kill(0))", async () => {

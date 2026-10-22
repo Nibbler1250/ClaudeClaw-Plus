@@ -63,7 +63,37 @@ import {
 } from "./pty-transcript";
 
 export { TranscriptReplacedError };
-import { appendFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { appendFileSync, readFileSync } from "node:fs";
+
+/**
+ * A process's birth identity: something a reused pid cannot share with the process that held
+ * it before. Linux: field 22 of `/proc/<pid>/stat` (start time in clock ticks since boot, read
+ * with a plain file read). macOS/BSD: `ps -o lstart=` (the start time to the second; one
+ * `ps` spawn, about 10-20 ms, paid once at spawn and once per signal, never per poll).
+ * Reuse inside the same second would need the pid counter to wrap in that second. `null`:
+ * the pid is gone or the identity cannot be read (Windows, no `ps`).
+ */
+export function readPidIdentity(pid: number): string | null {
+  try {
+    if (process.platform === "win32") return null;
+    if (process.platform === "linux") {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      // `comm` (field 2) may hold spaces and parens: split after the LAST ")".
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      return fields[19] || null; // field 22 = index 19 once fields 1-2 are cut
+    }
+    const r = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: "C" },
+      timeout: 2000,
+    });
+    const out = (r.stdout ?? "").trim();
+    return r.status === 0 && out ? out : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Raw PTY trace, off unless `CLAUDECLAW_PTY_DUMP=<file>` is set. Every chunk
@@ -204,6 +234,11 @@ export interface PtyProcessOptions {
    * proves death with it, so a stand-in process with a made-up pid needs a stand-in here.
    */
   _signalPid?: (pid: number, signal: NodeJS.Signals | 0) => void;
+  /**
+   * INTERNAL TEST HOOK: read a pid's birth identity (`readPidIdentity`). A test that stands in
+   * for the pid with `_signalPid` gets "no identity" unless it names a reader too.
+   */
+  _readPidIdentity?: (pid: number) => string | null;
   /** INTERNAL TEST HOOK: wait for a graceful exit before SIGKILL (default 2000ms). */
   _exitGraceMs?: number;
   /** INTERNAL TEST HOOK: total wait for the OS to confirm the exit (default 7000ms). */
@@ -660,6 +695,9 @@ class PtyProcessImpl implements PtyProcess {
   /** The retirement in flight or last settled OK; cleared when it rejects so a retry runs. */
   private _disposal: Promise<void> | null = null;
   private readonly _signalPid: (pid: number, signal: NodeJS.Signals | 0) => void;
+  private readonly _readIdentity: (pid: number) => string | null;
+  /** The child's birth identity, read at spawn; null when it could not be read. */
+  private readonly _identity: string | null;
   private readonly _exitGraceMs: number;
   private readonly _exitCapMs: number;
   /** Listener disposables from bun-pty. */
@@ -717,6 +755,8 @@ class PtyProcessImpl implements PtyProcess {
     this._submitConfirmMs = opts.submitConfirmMs ?? DEFAULT_SUBMIT_CONFIRM_MS;
     this._now = opts._now ?? (() => Date.now());
     this._signalPid = opts._signalPid ?? ((pid, signal) => void process.kill(pid, signal));
+    this._readIdentity = opts._readPidIdentity ?? (opts._signalPid ? () => null : readPidIdentity);
+    this._identity = this._readIdentity(pty.pid);
     this._exitGraceMs = opts._exitGraceMs ?? DEFAULT_EXIT_GRACE_MS;
     this._exitCapMs = opts._exitCapMs ?? DEFAULT_EXIT_CAP_MS;
     this._setTimeout = opts._setTimeout ?? ((cb, ms) => setTimeout(cb, ms));
@@ -1203,17 +1243,20 @@ class PtyProcessImpl implements PtyProcess {
 
     if (firstRun && wasAlive) {
       if (probeable) {
-        try {
-          this._pty.kill("SIGTERM");
-        } catch {
-          // Already dead.
+        // Not through bun-pty if the pid now belongs to someone else.
+        if (this._pidState(this._pid) !== "replaced") {
+          try {
+            this._pty.kill("SIGTERM");
+          } catch {
+            // Already dead.
+          }
         }
       } else {
         await this._retireByExitEvent();
       }
     }
 
-    if (probeable && (wasAlive || !firstRun)) await this._confirmGoneByPid();
+    if (probeable && (wasAlive || !firstRun)) await this._confirmGoneByPid(firstRun);
 
     try {
       this._onDataDisposable?.dispose();
@@ -1235,24 +1278,62 @@ class PtyProcessImpl implements PtyProcess {
   }
 
   /**
-   * Poll until the pid is gone or `ms` pass. Wall clock and real timers on purpose: the
+   * What the pid is now, against the child we spawned (#562 round 8). Existence alone proves
+   * nothing: a later confirmation can run long after the child exited, and the OS reuses pids.
+   *   gone      no process has the pid: the original exited.
+   *   replaced  a process with a different birth identity has it: the original exited.
+   *   same      the identity matches: the original is still there.
+   *   unknown   the pid exists but the identity could not be compared: cannot tell.
+   */
+  private _pidState(pid: number): "gone" | "replaced" | "same" | "unknown" {
+    if (!this._pidExists(pid)) return "gone";
+    if (this._identity === null) return "unknown";
+    const now = this._readIdentity(pid);
+    if (now === null) return "unknown";
+    return now === this._identity ? "same" : "replaced";
+  }
+
+  private _originalGone(pid: number): boolean {
+    const s = this._pidState(pid);
+    return s === "gone" || s === "replaced";
+  }
+
+  /**
+   * May this process be signalled? Only a pid proven to still be the child we spawned. With
+   * no identity recorded at spawn, only inside the initial retirement window (the child was
+   * seen alive moments ago, so reuse is not plausible); a later confirmation sends nothing.
+   */
+  private _maySignal(pid: number, initial: boolean): boolean {
+    const s = this._pidState(pid);
+    return s === "same" || (s === "unknown" && initial && this._identity === null);
+  }
+
+  /**
+   * Poll until the original is gone or `ms` pass. Wall clock and real timers on purpose: the
    * injected clock and timers drive turn timing, and a frozen one must not hang retirement.
+   * The cheap existence probe runs every tick; the identity (a `ps` spawn on macOS) is read
+   * on the first and the last check only.
    */
   private async _waitGone(pid: number, ms: number): Promise<boolean> {
     const until = Date.now() + ms;
+    let first = true;
     for (;;) {
-      if (!this._pidExists(pid)) return true;
-      if (Date.now() >= until) return false;
+      const last = Date.now() >= until;
+      if (first || last ? this._originalGone(pid) : !this._pidExists(pid)) return true;
+      if (last) return false;
+      first = false;
       await new Promise<void>((r) => setTimeout(r, EXIT_PROBE_MS));
     }
   }
 
-  private async _confirmGoneByPid(): Promise<void> {
+  private async _confirmGoneByPid(initial: boolean): Promise<void> {
     const pid = this._pid;
     if (await this._waitGone(pid, this._exitGraceMs)) return;
     // Not obeying SIGTERM: kill the group (MCP children) and the leader directly, not through
-    // bun-pty, whose `kill()` has already run and is now a no-op.
+    // bun-pty, whose `kill()` has already run and is now a no-op. The identity is checked
+    // before EACH signal, so a pid the OS has handed to someone else is never signalled.
     for (const target of [-pid, pid]) {
+      if (!this._maySignal(pid, initial)) continue;
       try {
         this._signalPid(target, "SIGKILL");
       } catch {

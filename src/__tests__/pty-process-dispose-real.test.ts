@@ -7,7 +7,7 @@
  * tests use the real library and a child that traps TERM and HUP, and read death from the OS.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { PtyExitUnconfirmedError, spawnPty } from "../runner/pty-process";
+import { PtyExitUnconfirmedError, readPidIdentity, spawnPty } from "../runner/pty-process";
 
 const alive = (pid: number): boolean => {
   try {
@@ -103,5 +103,29 @@ describe("PtyProcess.dispose — real child that ignores SIGTERM and SIGHUP", ()
     });
     spawned.push(proc.pid);
     await expect(proc.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
+  });
+});
+
+describe("readPidIdentity — the birth identity that tells a reused pid from the original", () => {
+  test("a live process has a stable identity; a pid nobody holds has none", () => {
+    // Fault (site: `readPidIdentity`, return a constant): a pid nobody holds still "has" an
+    // identity, so a reused or vanished pid could never be told from the original.
+    // Predicted result: the `toBeNull()` below fails.
+    const first = readPidIdentity(process.pid);
+    expect(first).not.toBeNull();
+    expect(readPidIdentity(process.pid)).toBe(first);
+    expect(readPidIdentity(2 ** 22 + 12345)).toBeNull();
+  });
+
+  test("two different live processes do not share an identity once their start differs", async () => {
+    // A child started later than this process (the test run is long past its start second)
+    // must not read as the test runner itself.
+    const child = Bun.spawn(["/bin/sleep", "30"]);
+    spawned.push(child.pid);
+    await Bun.sleep(50);
+    const mine = readPidIdentity(process.pid);
+    const theirs = readPidIdentity(child.pid);
+    expect(theirs).not.toBeNull();
+    expect(theirs).not.toBe(mine);
   });
 });
