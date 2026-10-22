@@ -51,6 +51,7 @@ import { withCleanProcessEnv } from "../runner";
 // parser's completion/answer API is deliberately NOT imported here (#562 round 2; the
 // guard test `pty-turn-evidence-guard.test.ts` fails the build if it comes back).
 import { stripAnsi } from "./pty-output-parser";
+import { assertSessionSpawnable } from "./pty-quarantine";
 // Re-export the sanitiser from its standalone home so existing callers that
 // pull it from `pty-process` (and through `runner/index`) keep working without
 // loading bun-pty just to get the helper.
@@ -1556,6 +1557,11 @@ function concatBytes(parts: Uint8Array[], totalLen: number): Uint8Array {
  */
 export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
   return new Promise<PtyProcess>((resolve, reject) => {
+    // #562 round 9: the synchronous final word for a session that is already named. No
+    // await between this check and the `_ptySpawn` call below.
+    if (opts.sessionId && opts.sessionId.length > 0) {
+      assertSessionSpawnable({ sessionId: opts.sessionId });
+    }
     const cmd = opts._commandOverride ?? "claude";
     const args = buildClaudeArgs(opts);
     const cols = opts.cols ?? DEFAULT_COLS;

@@ -81,7 +81,7 @@ import {
   type PtySessionStore,
   runEphemeralWithDeadline,
 } from "./runner/pty-supervisor";
-import { assertSessionWritable } from "./runner/pty-quarantine";
+import { assertSessionSpawnable, assertSessionWritable } from "./runner/pty-quarantine";
 import { encodeCwdForProjectsDir } from "./bus/jsonl-line-types";
 import { PTY_OUTPUT_FORMAT_CONSTRAINT } from "./runner/pty-output-format";
 import { SPAWN_ENV_STRIP_KEYS, cleanSpawnEnv, shouldStripSpawnEnvKey } from "./runner/spawn-env";
@@ -779,9 +779,23 @@ export function _setClaudeSpawnForTests(fn: ClaudeSpawn | null): void {
  * resumed beside it.
  */
 async function gateResume(args: string[]): Promise<void> {
-  const i = args.indexOf("--resume");
-  const id = i >= 0 ? args[i + 1] : undefined;
+  const id = resumeIdOf(args);
   if (id) await assertSessionWritable({ sessionId: id });
+}
+
+function resumeIdOf(args: string[]): string | undefined {
+  const i = args.indexOf("--resume");
+  return i >= 0 ? args[i + 1] : undefined;
+}
+
+/**
+ * #562 round 9: the synchronous final word, run on the line before the process is created.
+ * `gateResume` is async, so a retirement that fails after it passed would quarantine a session
+ * the spawn then goes ahead on.
+ */
+function assertResumeSpawnable(args: string[]): void {
+  const id = resumeIdOf(args);
+  if (id) assertSessionSpawnable({ sessionId: id });
 }
 
 async function spawnClaude(
@@ -789,6 +803,8 @@ async function spawnClaude(
   opts: { env: Record<string, string>; cwd?: string },
 ): Promise<ClaudeProc> {
   await gateResume(args);
+  // Synchronous check; no await between it and the spawn below (#562 round 9).
+  assertResumeSpawnable(args);
   if (_claudeSpawnForTests) return _claudeSpawnForTests(args, opts);
   return Bun.spawn(args, {
     stdin: "ignore",
@@ -1191,6 +1207,8 @@ async function runClaudeStreaming(
   if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
 
   await gateResume(args);
+  // Synchronous check; no await between it and the spawn below (#562 round 9).
+  assertResumeSpawnable(args);
   const proc = Bun.spawn(args, {
     stdout: "pipe",
     stderr: "pipe",

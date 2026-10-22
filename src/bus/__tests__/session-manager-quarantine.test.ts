@@ -8,7 +8,11 @@ import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PtyExitUnconfirmedError, type PtyProcess } from "../../runner/pty-process";
-import { __resetQuarantineForTests, quarantineSession } from "../../runner/pty-quarantine";
+import {
+  __resetQuarantineForTests,
+  fenceSession,
+  quarantineSession,
+} from "../../runner/pty-quarantine";
 import { SessionManager } from "../session-manager";
 
 function stuckPty(sessionId: string): PtyProcess {
@@ -61,6 +65,36 @@ describe("SessionManager.spawnAgent and the quarantine gate", () => {
     });
     chmodSync(recorder, 0o755);
     quarantineSession("global", stuckPty("sess-a"), "retire-exit-unconfirmed");
+    mgr = new SessionManager({ commandOverride: recorder, sessionCollisionDetectMs: 0 });
+
+    await expect(
+      mgr.spawnAgent(
+        {
+          id: "a",
+          cwd,
+          session_id: "sess-a",
+          permission_mode: "bypassPermissions",
+          supervision: "pty-stdin",
+        },
+        "cli",
+      ),
+    ).rejects.toThrow("quarantined");
+
+    await new Promise((r) => setTimeout(r, 200));
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("does not start claude on a session whose retirement began after the async gate passed", async () => {
+    // Fault (site: `spawnPty`, the synchronous check after the `bun-pty` import): the gate
+    // sees no quarantine record (the retirement is only fenced, not yet unconfirmed), so the
+    // stand-in is started. Predicted result: `started.txt` exists and the call resolves.
+    const marker = join(cwd, "started.txt");
+    const recorder = join(cwd, "recorder.sh");
+    writeFileSync(recorder, `#!/bin/sh\necho started > "${marker}"\ncat >/dev/null\n`, {
+      mode: 0o755,
+    });
+    chmodSync(recorder, 0o755);
+    fenceSession("global", stuckPty("sess-a"));
     mgr = new SessionManager({ commandOverride: recorder, sessionCollisionDetectMs: 0 });
 
     await expect(

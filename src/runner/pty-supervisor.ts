@@ -80,14 +80,18 @@ import {
 } from "./pty-process.js";
 import {
   __resetQuarantineForTests,
+  assertSessionSpawnable,
   assertSessionWritable,
   confirmAllQuarantined,
+  fenceSession,
   isSessionQuarantined,
+  liftFence,
   PtyQuarantinedError,
   quarantinedKeys,
   quarantineSession,
   type QuarantineInfo,
   quarantineSnapshot,
+  SessionGateInterrupted,
 } from "./pty-quarantine.js";
 import { ensureTrustAccepted } from "./pty-trust-prompt.js";
 import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";
@@ -1099,16 +1103,33 @@ async function settleBy(
   }
 }
 
-/** `failed` for a session with an unconfirmed process (after one more attempt to confirm it), else null. */
+/**
+ * `failed` for a session with an unconfirmed process (after one more attempt to confirm it),
+ * else null. The wait for that confirmation is bounded by the caller's `deadline` (a
+ * `_clock()` time) and `signal` (#562 round 9): it ends as `timedOut` / `aborted` like every
+ * other wait in `sendToLiveSession`, and the confirmation goes on in the background with the
+ * quarantine kept.
+ */
 async function sessionBlocked(
   sessionKey: string,
   sessionId: string | undefined,
+  deadline: number,
+  signal: AbortSignal | undefined,
 ): Promise<LiveSendResult | null> {
   try {
-    await assertSessionWritable({ sessionKey, sessionId });
+    await assertSessionWritable(
+      { sessionKey, sessionId },
+      { deadline: Date.now() + Math.max(0, deadline - _clock()), signal },
+    );
     return null;
   } catch (err) {
-    return { status: "failed", error: (err as Error).message, timedOut: false, aborted: false };
+    const how = err instanceof SessionGateInterrupted ? err.how : undefined;
+    return {
+      status: "failed",
+      error: (err as Error).message,
+      timedOut: how === "timeout",
+      aborted: how === "aborted",
+    };
   }
 }
 
@@ -1158,8 +1179,13 @@ export async function sendToLiveSession(
     // session still has a process whether or not an entry is tracked (a failed crash recovery
     // keeps the entry, a retirement drops it), so neither "no entry" nor "dead process" may
     // reach the caller as `not-live`: it would resume the transcript in a one-shot beside it.
-    const blocked = await sessionBlocked(sessionKey, entry?.pty?.sessionId);
+    const blocked = await sessionBlocked(sessionKey, entry?.pty?.sessionId, deadline, opts.signal);
     if (blocked) return blocked;
+    // The gate may have waited: an abort that landed meanwhile stops us before anything is
+    // written or resumed.
+    if (opts.signal?.aborted) {
+      return { status: "failed", error: "aborted before send", timedOut: false, aborted: true };
+    }
     // No entry: no process (a finished retirement removes it), whatever the
     // supervisor is doing.
     if (!entry) return { status: "not-live", reason: "no-entry" };
@@ -1198,10 +1224,19 @@ export async function sendToLiveSession(
     }
     // The world may have changed while we queued: re-check under the lock, the quarantine
     // included (a process can enter it while we waited, and `release` must run first).
-    const blockedNow = await sessionBlocked(sessionKey, entry.pty?.sessionId);
+    const blockedNow = await sessionBlocked(
+      sessionKey,
+      entry.pty?.sessionId,
+      deadline,
+      opts.signal,
+    );
     if (blockedNow) {
       release();
       return blockedNow;
+    }
+    if (opts.signal?.aborted) {
+      release();
+      return { status: "failed", error: "aborted before send", timedOut: false, aborted: true };
     }
     if (!isCurrentEntry(entry) || entry.spawnInFlight || !entry.pty?.isAlive()) {
       release();
@@ -1950,12 +1985,16 @@ async function landPty(entry: PtyEntry, pty: PtyProcess): Promise<void> {
     entry.pty = pty;
     return;
   }
+  // #562 round 9: fenced from the start of the disposal, before its first await.
+  fenceSession(entry.sessionKey, pty);
   try {
     await pty.dispose();
   } catch (err) {
     if (err instanceof PtyExitUnconfirmedError) {
       quarantineSession(entry.sessionKey, pty, "late-pty-exit-unconfirmed");
     }
+  } finally {
+    liftFence(pty);
   }
   throw new EntryRemovedError(entry.sessionKey, "disposed the late PTY");
 }
@@ -1980,6 +2019,12 @@ function isCurrentEntry(entry: PtyEntry): boolean {
  */
 function retireEntry(entry: PtyEntry): Promise<void> {
   if (entry.retiring) return entry.retiring;
+  // #562 round 9: the session is fenced the moment its retirement begins, before the first
+  // await below, so a spawn that has already passed the async gate is refused by the
+  // synchronous check at the spawn. The fence becomes the quarantine record if the exit is
+  // not confirmed, with no gap, and is lifted when the retirement ends.
+  const fencedPty = entry.pty;
+  if (fencedPty) fenceSession(entry.sessionKey, fencedPty);
   const run = (async () => {
     // A first-turn spawn failure may be releasing this key right now; let it
     // finish before releasing again, so nothing keyed by sessionKey is still
@@ -2007,6 +2052,8 @@ function retireEntry(entry: PtyEntry): Promise<void> {
     } finally {
       // Unconditional: an entry left in the map with `retiring` settled would
       // spin every admission on its key (and the shutdown loop) forever.
+      if (fencedPty) liftFence(fencedPty);
+      if (entry.pty) liftFence(entry.pty);
       if (state.ptys.get(entry.sessionKey) === entry) state.ptys.delete(entry.sessionKey);
     }
   })();
@@ -2076,7 +2123,10 @@ async function spawnEntry(
     // resumed session, so a transcript another process still holds is refused whatever key
     // asks for it.
     await assertSessionWritable({ sessionKey: entry.sessionKey, sessionId: spawnOpts.sessionId });
-    await landPty(entry, await spawn(spawnOpts));
+    // #562 round 9: the final word, synchronous. No await between this check and `spawn`.
+    assertSessionSpawnable({ sessionKey: entry.sessionKey, sessionId: spawnOpts.sessionId });
+    const spawned = spawn(spawnOpts);
+    await landPty(entry, await spawned);
     // Stamp the (re)spawn time so the reaper's spawn-grace window restarts
     // from now — see PtyEntry.lastSpawnedAt + reapIdle.
     entry.lastSpawnedAt = _clock();
@@ -2215,7 +2265,10 @@ async function respawnEntry(
   // Best-effort dispose of the dead one (may already be exited). Kept on the
   // entry while it runs so a retirement racing this respawn joins it (#385).
   if (entry.pty) {
-    const disposal = entry.pty.dispose().finally(() => {
+    const dying = entry.pty;
+    // #562 round 9: fenced from the start of this disposal (before its first await).
+    fenceSession(entry.sessionKey, dying);
+    const disposal = dying.dispose().finally(() => {
       if (entry.disposing === disposal) entry.disposing = undefined;
     });
     entry.disposing = disposal;
@@ -2226,9 +2279,11 @@ async function respawnEntry(
       // with a possibly live writer is the failure this guards. `entry.pty` stays so the
       // retirement that follows joins it.
       if (err instanceof PtyExitUnconfirmedError) {
-        quarantineSession(entry.sessionKey, entry.pty, "crash-recovery-exit-unconfirmed");
+        quarantineSession(entry.sessionKey, dying, "crash-recovery-exit-unconfirmed");
         throw new PtyQuarantinedError(entry.sessionKey);
       }
+    } finally {
+      liftFence(dying);
     }
   }
   entry.pty = null;
@@ -2240,7 +2295,10 @@ async function respawnEntry(
   // #562 round 8: the gate for a respawn (it also lifts a quarantine the dispose above
   // recorded and has since confirmed).
   await assertSessionWritable({ sessionKey: entry.sessionKey, sessionId: opts.sessionId });
-  await landPty(entry, await spawn(opts));
+  // #562 round 9: the final word, synchronous. No await between this check and `spawn`.
+  assertSessionSpawnable({ sessionKey: entry.sessionKey, sessionId: opts.sessionId });
+  const respawned = spawn(opts);
+  await landPty(entry, await respawned);
   entry.spawnOpts = opts;
   // Reset the spawn-grace window on respawn so a healthy long-lived PTY that
   // crashes doesn't get immediately reaped before its first post-respawn turn

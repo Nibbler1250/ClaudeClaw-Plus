@@ -50,7 +50,7 @@ import { BUS_MCP_TOOLS } from "./mcp-tools";
 import { confirmTurnReceipt } from "./receipt-wiring";
 import { capturePostMortem, type PostMortemOptions } from "./post-mortem";
 import type { ReceiptRecord } from "./receipt";
-import { assertSessionWritable } from "../runner/pty-quarantine";
+import { assertSessionSpawnable, assertSessionWritable } from "../runner/pty-quarantine";
 import { ensureTrustAccepted } from "../runner/pty-trust-prompt";
 import {
   type AgentProcess,
@@ -1132,6 +1132,9 @@ export class SessionManager {
     // fork-time read of `environ`). The bun-pty handle is the first thing
     // returned so the post-spawn restore happens after the child has
     // inherited the stripped env.
+    // #562 round 9: the synchronous final word, after the `bun-pty` import above. No await
+    // between this check and the spawn.
+    assertSessionSpawnable({ sessionId: agent.session_id });
     const pty = withCleanProcessEnv(() =>
       ptySpawn(cmd, args, {
         name: "xterm-256color",
@@ -1157,6 +1160,8 @@ export class SessionManager {
     realCwd: string,
   ): ChildAgentProcess {
     const cmd = this.options.commandOverride ?? "claude";
+    // #562 round 9: the synchronous final word; no await between it and the spawn below.
+    assertSessionSpawnable({ sessionId: agent.session_id });
     // Use node:child_process for broad compatibility and a stable
     // `ChildProcess` interface across Bun + Node runtimes. (`Bun.spawn`
     // returns a different shape; using node:child_process avoids the
@@ -1196,6 +1201,8 @@ export class SessionManager {
         `is not implemented in Sprint 1; stop() will use SIGTERM. Use 'pty-stdin' ` +
         `or 'process-stream-json' for graceful slash-command lifecycle.\n`,
     );
+    // #562 round 9: the synchronous final word; no await between it and the spawn below.
+    assertSessionSpawnable({ sessionId: agent.session_id });
     const claudeBin = this.options.commandOverride ?? "claude";
     const sessionName = `claudeclaw-${agent.id}`;
     const tmuxArgs = ["new-session", "-d", "-s", sessionName, claudeBin, ...args];
