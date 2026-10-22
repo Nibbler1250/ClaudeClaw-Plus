@@ -2707,3 +2707,70 @@ mid-retirement first-spawn test).
    which fences the late PTY at its disposal.
 4. `Date.now()` is used for the gate's deadline (the supervisor's `_clock` is converted at the call), so
    an injected test clock does not drive the gate's timer.
+
+## Round 9 add-on: cron retries
+
+Operator ruling (Terry, 2026-10-22): cron must not apply a job's `retry` to a PTY turn that failed
+UNCERTAIN or TIMED OUT. Such a turn may have completed and done its side effects, and a retry can
+repeat them. A definite failure still retries as configured.
+
+### What changed
+
+- `src/runner/pty-supervisor.ts`: `RunOnPtyResult.failureKind?: "uncertain" | "timeout"`, set where the
+  supervisor maps the error to a result (`errorResult(message, exitCode, failureKind)`):
+
+  | Outcome | exit | `failureKind` |
+  |---|---|---|
+  | `PtyTurnTimeoutError` | 124 | `timeout` |
+  | `PtyTranscriptUncertainError` (no turn boundary), `PtyTurnFailedError` `ambiguous`, `TranscriptReplacedError`, `PtyPromptNotAcceptedError`, `PtyClosedError` with `promptSent`, unconfirmed boundary | 1 | `uncertain` |
+  | `PtyTurnFailedError` `api-error` / `command-error` / `empty-reply`, `PtyTranscriptUnavailableError`, `PtyClosedError` never sent (respawn exhausted), spawn failure, quarantine refusal | 1 | absent |
+
+- `src/runner.ts`: `RunResult.failureKind` carries it from the exec that produced the result, and only
+  while `exitCode !== 0` (both the normal result and the post-compact retry result). The print engine
+  never sets it. A named `ExecOutcome` type now covers `exec` and `execRecovery`'s return.
+- `src/job-loop.ts`: when `r.failureKind` is set the job's `retry` is skipped, `retryState` is cleared,
+  one line is logged (`Job <name> not retried: PTY turn <uncertain|timed out>, it may have completed`),
+  and the failure is forwarded as before. A one-time job's schedule is cleared as for an exhausted
+  retry. The loop reads only the structured field: no error-text match, no exit-code inference (124
+  without the field still retries, and a test pins that).
+
+### Tests (19 new)
+
+- `job-loop.test.ts`: uncertain and timeout with `retry: 2` on a one-time job (no retry state, schedule
+  cleared, failure forwarded, log line, `lastResult` error); recurring job keeps no retry debt; a
+  definite failure with no field retries as before; exit 124 without the field retries.
+- `runner.test.ts`: the field reaches `RunResult` from a failed exec, and is absent on a definite
+  failure and on a success that carried it.
+- `pty-supervisor.test.ts`: 11-row mapping table (6 marked, 5 definite), plus an unconfirmed boundary
+  is `uncertain` and a success carries no field.
+
+### Red-line evidence (one site per injection, `git archive` copy of `3d5b73c9`)
+
+- **A. Ignore the field in the job loop** (`} else if (false && r.failureKind) {`), `job-loop.test.ts`:
+  3 fail, 33 pass. First failure: `Expected: false` / `Received: true` (the retry state exists).
+  Failing: both "retry: 2 is not used" rows and "a recurring job keeps no retry debt".
+- **B. Do not set the field at the PTY mapping site** (`...(false && failureKind ? { failureKind } : {})`
+  in `errorResult`), `pty-supervisor.test.ts -t "round 9 add-on"`: 7 fail, 5 pass. First failure:
+  `Expected: "uncertain"` / `Received: undefined`. The 5 passing are the definite rows, which is right.
+- **C. Do not carry the field into `RunResult`** (`...(false && exec.failureKind ? ...)`),
+  `runner.test.ts -t "round 9 add-on"`: 1 fail, 1 pass. `Expected: "timeout"` / `Received: undefined`.
+
+Restored and GREEN in the real tree afterwards.
+
+### Gates (head `84a93994`)
+
+- `env -u ANTHROPIC_BASE_URL bun test src > /tmp/cron-src.txt 2>&1`: exit 0, **4872 pass / 4 skip / 0 fail**.
+- Wide PTY set (round-8 pattern, one process per file, `ANTHROPIC_BASE_URL` unset): normal **102 of 102**
+  green on the first attempt (2,318 tests); `CLAUDECLAW_TEST_PLATFORM=linux` **102 of 102** green on the
+  first attempt (2,318 tests).
+- `bun run lint` exit 0 (the new tests first needed `biome format`; applied to the files I touched only).
+  `bun run typecheck`: 149, baseline 149. The first version added 2 errors in `runner.ts` because
+  `execRecovery`'s inferred return type was a union without the field; the `ExecOutcome` type fixed it.
+- No real `claude` started. No rebase, no version bump.
+
+### Not done / residuals
+
+1. `execEphemeral`/one-shot and live-session paths do not go through the job loop; they are unchanged.
+2. A `PtyClosedError` after the send is `uncertain` even when the process died instantly. We cannot tell
+   from the error whether the prompt ran, so the safe reading is the one taken.
+3. The soak checklist item on cron retries (item 4) now expects uncertain and timed-out turns not to retry.
