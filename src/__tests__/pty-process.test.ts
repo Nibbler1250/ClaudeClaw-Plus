@@ -1320,7 +1320,11 @@ describe("PtyProcess — spawns the resolved claude executable (#573)", () => {
         const proc = await spawnPty(
           baseOpts({ env: { ...process.env } as Record<string, string>, _argsOverride: [] }),
         );
-        await new Promise<void>((r) => setTimeout(r, 300));
+        // Poll for the fake binary's exit rather than sleep: a fixed wait fails under load.
+        const deadline = Date.now() + 5000;
+        while (!proc.exitInfo() && Date.now() < deadline) {
+          await new Promise<void>((r) => setTimeout(r, 25));
+        }
         const info = proc.exitInfo();
         await proc.dispose();
         expect(info?.tail).toContain("RESOLVED_CLAUDE_573");

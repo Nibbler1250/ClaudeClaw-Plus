@@ -1371,7 +1371,12 @@ describe("spawns the resolved claude executable (#573)", () => {
     ["process-stream-json", "cron"],
   ] as const) {
     it(`${mode} spawns claudeExecutable() when no commandOverride is given`, async () => {
-      const proc = await mgr.spawnAgent(mkAgent({ id: `exe-573-${origin}` }), origin);
+      // Declared, not defaulted: PTY is the default for every origin here, so cron would
+      // otherwise land on pty-stdin and never reach the process-stream-json spawn.
+      const proc = await mgr.spawnAgent(
+        mkAgent({ id: `exe-573-${origin}`, supervision: mode }),
+        origin,
+      );
       spawned.push(proc);
       expect(proc.supervision).toBe(mode);
       let received = "";
