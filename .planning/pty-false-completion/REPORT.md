@@ -2755,7 +2755,7 @@ repeat them. A definite failure still retries as configured.
 - **C. Do not carry the field into `RunResult`** (`...(false && exec.failureKind ? ...)`),
   `runner.test.ts -t "round 9 add-on"`: 1 fail, 1 pass. `Expected: "timeout"` / `Received: undefined`.
 
-Restored and GREEN in the real tree afterwards.
+The real tree was never modified by an injection; its tests are GREEN (gates below).
 
 ### Gates (head `84a93994`)
 
@@ -2773,4 +2773,4 @@ Restored and GREEN in the real tree afterwards.
 1. `execEphemeral`/one-shot and live-session paths do not go through the job loop; they are unchanged.
 2. A `PtyClosedError` after the send is `uncertain` even when the process died instantly. We cannot tell
    from the error whether the prompt ran, so the safe reading is the one taken.
-3. The soak checklist item on cron retries (item 4) now expects uncertain and timed-out turns not to retry.
+3. The 48-hour soak checklist (item 4, "expected notify/retry behavior") is not edited here; an uncertain or timed-out cron turn is now expected to show the "not retried" log line instead of a retry.
