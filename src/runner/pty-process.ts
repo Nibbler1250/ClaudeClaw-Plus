@@ -199,6 +199,15 @@ export interface PtyProcessOptions {
    * targets like /bin/cat are silent on startup). Default false.
    */
   _skipReadySettle?: boolean;
+  /**
+   * INTERNAL TEST HOOK: send a signal to a pid (`0` probes). Default `process.kill`. Retirement
+   * proves death with it, so a stand-in process with a made-up pid needs a stand-in here.
+   */
+  _signalPid?: (pid: number, signal: NodeJS.Signals | 0) => void;
+  /** INTERNAL TEST HOOK: wait for a graceful exit before SIGKILL (default 2000ms). */
+  _exitGraceMs?: number;
+  /** INTERNAL TEST HOOK: total wait for the OS to confirm the exit (default 7000ms). */
+  _exitCapMs?: number;
 }
 
 /**
@@ -243,7 +252,16 @@ export interface PtyProcess {
       allowReplCommand?: boolean;
     },
   ): Promise<PtyTurnResult>;
+  /**
+   * Retire the process. Resolves only once the OS has confirmed the pid is gone (a probe, not
+   * bun-pty's exit event); rejects with `PtyExitUnconfirmedError` when it is not.
+   */
   dispose(): Promise<void>;
+  /**
+   * Re-run the exit confirmation of a process whose `dispose()` rejected: probe, SIGKILL,
+   * probe. Resolves once the pid is gone. Used to release a quarantine.
+   */
+  confirmExit?(): Promise<void>;
 }
 
 export interface PtyTurnResult {
@@ -372,6 +390,21 @@ export class PtyTranscriptUnavailableError extends Error {
   }
 }
 
+/**
+ * The OS still shows the process after SIGTERM, SIGKILL and the hard cap. It may still be
+ * writing its transcript, so nothing may resume that session until a later confirmation
+ * succeeds (the supervisor quarantines the key).
+ */
+export class PtyExitUnconfirmedError extends Error {
+  constructor(
+    public readonly label: string,
+    public readonly pid: number,
+  ) {
+    super(`PTY process ${label} (pid ${pid}) is still alive after SIGKILL; its exit is unconfirmed`);
+    this.name = "PtyExitUnconfirmedError";
+  }
+}
+
 export class PtyClosedError extends Error {
   constructor(
     public readonly label: string,
@@ -395,6 +428,10 @@ const DEFAULT_SETTLE_CAP_MS = 2000;
 const DEFAULT_SUBMIT_CONFIRM_MS = 3000;
 /** How often a turn's transcript is read. */
 const DEFAULT_POLL_MS = 50;
+/** Retirement: how long SIGTERM gets before SIGKILL, and the total wait for the OS to agree. */
+const DEFAULT_EXIT_GRACE_MS = 2000;
+const DEFAULT_EXIT_CAP_MS = 7000;
+const EXIT_PROBE_MS = 20;
 const DEFAULT_COLS = 100;
 const DEFAULT_ROWS = 30;
 const DEFAULT_PERMISSION_MODE_ARGS = ["--dangerously-skip-permissions"];
@@ -618,6 +655,11 @@ class PtyProcessImpl implements PtyProcess {
   /** When the screen last painted: readiness timing only. */
   private _lastDataAt = 0;
   private _disposed = false;
+  /** The retirement in flight or last settled OK; cleared when it rejects so a retry runs. */
+  private _disposal: Promise<void> | null = null;
+  private readonly _signalPid: (pid: number, signal: NodeJS.Signals | 0) => void;
+  private readonly _exitGraceMs: number;
+  private readonly _exitCapMs: number;
   /** Listener disposables from bun-pty. */
   private _onDataDisposable: { dispose(): void } | null = null;
   private _onExitDisposable: { dispose(): void } | null = null;
@@ -672,6 +714,9 @@ class PtyProcessImpl implements PtyProcess {
     this._settleCapMs = opts.settleCapMs ?? DEFAULT_SETTLE_CAP_MS;
     this._submitConfirmMs = opts.submitConfirmMs ?? DEFAULT_SUBMIT_CONFIRM_MS;
     this._now = opts._now ?? (() => Date.now());
+    this._signalPid = opts._signalPid ?? ((pid, signal) => void process.kill(pid, signal));
+    this._exitGraceMs = opts._exitGraceMs ?? DEFAULT_EXIT_GRACE_MS;
+    this._exitCapMs = opts._exitCapMs ?? DEFAULT_EXIT_CAP_MS;
     this._setTimeout = opts._setTimeout ?? ((cb, ms) => setTimeout(cb, ms));
     this._clearTimeout = opts._clearTimeout ?? ((h) => clearTimeout(h));
     this._setInterval = opts._setInterval ?? ((cb, ms) => setInterval(cb, ms));
@@ -1116,44 +1161,57 @@ class PtyProcessImpl implements PtyProcess {
 
   // ─── dispose ────────────────────────────────────────────────────────
 
-  async dispose(): Promise<void> {
-    if (this._disposed) return;
-    this._disposed = true;
+  /**
+   * Retire the process and prove it. bun-pty 0.4.9 `kill()` ignores its signal argument, fires
+   * `onExit` synchronously whether or not the child died, and turns every later `kill()` into a
+   * no-op, so neither its event nor a second `kill("SIGKILL")` says anything about the OS. Death
+   * is read from the OS: `process.kill(pid, 0)` throws ESRCH once the pid is gone (EPERM means
+   * it still exists). If the child outlives the grace period it gets SIGKILL straight from here,
+   * to its process group too (the child is its own group leader, so its MCP children go with it).
+   * Rejects with `PtyExitUnconfirmedError` when the pid is still there at the hard cap.
+   */
+  dispose(): Promise<void> {
+    if (!this._disposal) {
+      const run = this._retire();
+      this._disposal = run;
+      // A rejected retirement is retried by the next `dispose()` / `confirmExit()`.
+      run.catch(() => {
+        if (this._disposal === run) this._disposal = null;
+      });
+    }
+    return this._disposal;
+  }
 
-    if (this._turnInProgress) {
+  confirmExit(): Promise<void> {
+    return this.dispose();
+  }
+
+  private async _retire(): Promise<void> {
+    const firstRun = !this._disposed;
+    this._disposed = true;
+    // Read before kill(): bun-pty's own exit event flips this synchronously.
+    const wasAlive = this._alive;
+
+    if (firstRun && this._turnInProgress) {
       this._rejectTurn(new PtyClosedError(this.label, null, "SIGTERM", true));
     }
 
-    if (this._alive) {
-      const exited = new Promise<void>((resolve) => {
-        if (!this._alive) {
-          resolve();
-          return;
-        }
-        const sub = this._pty.onExit(() => resolve());
-        if (!this._alive) {
-          resolve();
-          try {
-            sub.dispose();
-          } catch {}
-        }
-      });
+    // Win32 has no signal 0 probe; keep waiting for the exit event there.
+    const probeable = process.platform !== "win32" && Number.isInteger(this._pid) && this._pid > 1;
 
-      try {
-        this._pty.kill("SIGTERM");
-      } catch {
-        // Already dead.
-      }
-
-      const killTimer = this._setTimeout(() => {
+    if (firstRun && wasAlive) {
+      if (probeable) {
         try {
-          this._pty.kill("SIGKILL");
-        } catch {}
-      }, 2000);
-
-      await exited;
-      this._clearTimeout(killTimer);
+          this._pty.kill("SIGTERM");
+        } catch {
+          // Already dead.
+        }
+      } else {
+        await this._retireByExitEvent();
+      }
     }
+
+    if (probeable && (wasAlive || !firstRun)) await this._confirmGoneByPid();
 
     try {
       this._onDataDisposable?.dispose();
@@ -1163,6 +1221,73 @@ class PtyProcessImpl implements PtyProcess {
     } catch {}
     this._onDataDisposable = null;
     this._onExitDisposable = null;
+  }
+
+  private _pidExists(pid: number): boolean {
+    try {
+      this._signalPid(pid, 0);
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code !== "ESRCH";
+    }
+  }
+
+  /**
+   * Poll until the pid is gone or `ms` pass. Wall clock and real timers on purpose: the
+   * injected clock and timers drive turn timing, and a frozen one must not hang retirement.
+   */
+  private async _waitGone(pid: number, ms: number): Promise<boolean> {
+    const until = Date.now() + ms;
+    for (;;) {
+      if (!this._pidExists(pid)) return true;
+      if (Date.now() >= until) return false;
+      await new Promise<void>((r) => setTimeout(r, EXIT_PROBE_MS));
+    }
+  }
+
+  private async _confirmGoneByPid(): Promise<void> {
+    const pid = this._pid;
+    if (await this._waitGone(pid, this._exitGraceMs)) return;
+    // Not obeying SIGTERM: kill the group (MCP children) and the leader directly, not through
+    // bun-pty, whose `kill()` has already run and is now a no-op.
+    for (const target of [-pid, pid]) {
+      try {
+        this._signalPid(target, "SIGKILL");
+      } catch {
+        // ESRCH: already gone.
+      }
+    }
+    if (await this._waitGone(pid, Math.max(0, this._exitCapMs - this._exitGraceMs))) return;
+    throw new PtyExitUnconfirmedError(this.label, pid);
+  }
+
+  /** The pre-probe behaviour, for platforms that cannot probe a pid. */
+  private async _retireByExitEvent(): Promise<void> {
+    const exited = new Promise<void>((resolve) => {
+      if (!this._alive) {
+        resolve();
+        return;
+      }
+      const sub = this._pty.onExit(() => resolve());
+      if (!this._alive) {
+        resolve();
+        try {
+          sub.dispose();
+        } catch {}
+      }
+    });
+    try {
+      this._pty.kill("SIGTERM");
+    } catch {
+      // Already dead.
+    }
+    const killTimer = this._setTimeout(() => {
+      try {
+        this._pty.kill("SIGKILL");
+      } catch {}
+    }, this._exitGraceMs);
+    await exited;
+    this._clearTimeout(killTimer);
   }
 
   // ─── internal: used only by spawnPty to await TUI settle ─────────────

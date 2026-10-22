@@ -73,6 +73,7 @@ import {
   boundaryVerdict,
   PtyBoundaryUnconfirmedError,
   PtyClosedError,
+  PtyExitUnconfirmedError,
   PtyTranscriptUnavailableError,
   PtyTurnFailedError,
   PtyTurnTimeoutError,
@@ -449,6 +450,7 @@ export function __resetSupervisorForTests(): void {
     void releaseMcpIdentityFor(entry);
   }
   state.ptys.clear();
+  state.quarantine.clear();
   if (state.reapTimer) {
     clearInterval(state.reapTimer);
     state.reapTimer = null;
@@ -550,15 +552,30 @@ interface SupervisorState {
    *  shutdown never saw. Comparing the epoch captured before the wait catches
    *  that; the flag alone does not. */
   shutdownEpoch: number;
+  /** Keys whose process the OS still shows after SIGKILL (#562 round 7). The entry is gone,
+   *  the process may not be: nothing is spawned or resumed on the key until `confirmExit`
+   *  succeeds, because the old writer could still append to the transcript. */
+  quarantine: Map<string, PtyProcess>;
 }
 
 const state: SupervisorState = {
+  quarantine: new Map(),
   ptys: new Map(),
   reapTimer: null,
   initialised: false,
   shuttingDown: false,
   shutdownEpoch: 0,
 };
+
+/** Thrown by admission while the process on the key has not been proven dead. */
+export class PtyQuarantinedError extends Error {
+  constructor(sessionKey: string) {
+    super(
+      `[pty-supervisor] ${sessionKey} is quarantined: its previous process is still alive after SIGKILL, so nothing is spawned or resumed on the session until the OS confirms it gone`,
+    );
+    this.name = "PtyQuarantinedError";
+  }
+}
 
 /** Thrown by admission while the supervisor is shutting down. */
 class SupervisorShuttingDownError extends Error {
@@ -1098,7 +1115,19 @@ export async function sendToLiveSession(
     const entry = state.ptys.get(sessionKey);
     // No entry: no process (a finished retirement removes it), whatever the
     // supervisor is doing.
-    if (!entry) return { status: "not-live", reason: "no-entry" };
+    if (!entry) {
+      // #562 round 7: a quarantined key still has a process, so "no entry" is not "nothing
+      // alive". Say failed, so the caller does not resume the transcript in a one-shot.
+      if (state.quarantine.has(sessionKey)) {
+        return {
+          status: "failed",
+          error: new PtyQuarantinedError(sessionKey).message,
+          timedOut: false,
+          aborted: false,
+        };
+      }
+      return { status: "not-live", reason: "no-entry" };
+    }
     if (entry.scope.ephemeral) return { status: "not-live", reason: "ephemeral" };
     // The entry is still tracked, so its process may still be alive. A supervisor
     // shutdown marks every entry `retiring` before its first await, so the wait
@@ -1236,6 +1265,7 @@ export function liveSessionKeys(): string[] {
     if (!entry.retiring && !entry.spawnInFlight && !entry.pty?.isAlive()) continue;
     keys.push(entry.sessionKey);
   }
+  for (const key of state.quarantine.keys()) if (!keys.includes(key)) keys.push(key);
   return keys.sort();
 }
 
@@ -1373,6 +1403,8 @@ async function admitEntry(
       await retiring.catch(() => {});
       continue;
     }
+    // #562 round 7: a key whose last process was not proven dead gets no replacement.
+    await releaseQuarantine(sessionKey);
     const prev = _admissionLock;
     let release: () => void = () => {};
     _admissionLock = new Promise<void>((resolve) => {
@@ -1383,6 +1415,7 @@ async function admitEntry(
       // A retirement may have started on this key while we queued for the
       // lock; go back to waiting for it without holding the lock.
       if (state.ptys.get(sessionKey)?.retiring) continue;
+      if (state.quarantine.has(sessionKey)) throw new PtyQuarantinedError(sessionKey);
       refuseIfShuttingDown();
       // #546: a one-shot run neither counts against the cap nor evicts.
       if (!opts.ephemeral) await enforceMaxConcurrent(sessionKey);
@@ -1875,8 +1908,8 @@ async function landPty(entry: PtyEntry, pty: PtyProcess): Promise<void> {
   }
   try {
     await pty.dispose();
-  } catch {
-    // best-effort
+  } catch (err) {
+    if (err instanceof PtyExitUnconfirmedError) quarantinePty(entry.sessionKey, pty);
   }
   throw new EntryRemovedError(entry.sessionKey, "disposed the late PTY");
 }
@@ -1887,6 +1920,26 @@ async function landPty(entry: PtyEntry, pty: PtyProcess): Promise<void> {
  *  sees `false` — there is no window. */
 function isCurrentEntry(entry: PtyEntry): boolean {
   return state.ptys.get(entry.sessionKey) === entry && !entry.retiring;
+}
+
+/** Put a process whose exit the OS did not confirm under quarantine for its key. */
+function quarantinePty(sessionKey: string, pty: PtyProcess): void {
+  state.quarantine.set(sessionKey, pty);
+}
+
+/**
+ * Try to release the key's quarantine: ask the process to prove it is gone again. Resolves
+ * when there is none or it is lifted; throws `PtyQuarantinedError` while the process lives.
+ */
+async function releaseQuarantine(sessionKey: string): Promise<void> {
+  const pty = state.quarantine.get(sessionKey);
+  if (!pty) return;
+  try {
+    await (pty.confirmExit ? pty.confirmExit() : pty.dispose());
+  } catch {
+    throw new PtyQuarantinedError(sessionKey);
+  }
+  if (state.quarantine.get(sessionKey) === pty) state.quarantine.delete(sessionKey);
 }
 
 /**
@@ -1912,12 +1965,17 @@ function retireEntry(entry: PtyEntry): Promise<void> {
     // same PTY returns immediately, which would let this retirement finish
     // while the old process is still being torn down.
     try {
-      const disposal = entry.disposing ?? entry.pty?.dispose() ?? Promise.resolve();
-      await Promise.allSettled([
+      const pty = entry.pty;
+      const disposal = entry.disposing ?? pty?.dispose() ?? Promise.resolve();
+      const [disposed] = await Promise.allSettled([
         disposal,
         // Release multiplexer identity + delete synthesized config (SPEC §4.5).
         releaseMcpIdentityFor(entry),
       ]);
+      // #562 round 7: a disposal that could not prove the exit leaves a process that may
+      // still write. Quarantine the key before the entry leaves the map, with no await in
+      // between, so there is no moment when a replacement could be admitted.
+      if (disposed.status === "rejected" && pty) quarantinePty(entry.sessionKey, pty);
     } finally {
       // Unconditional: an entry left in the map with `retiring` settled would
       // spin every admission on its key (and the shutdown loop) forever.
@@ -2131,8 +2189,14 @@ async function respawnEntry(
     entry.disposing = disposal;
     try {
       await disposal;
-    } catch {
-      // ignore
+    } catch (err) {
+      // #562 round 7: not proven dead is not "ignore". Resuming onto the same transcript
+      // with a possibly live writer is the failure this guards. `entry.pty` stays so the
+      // retirement that follows joins it.
+      if (err instanceof PtyExitUnconfirmedError) {
+        quarantinePty(entry.sessionKey, entry.pty);
+        throw new PtyQuarantinedError(entry.sessionKey);
+      }
     }
   }
   entry.pty = null;
@@ -2241,7 +2305,7 @@ async function respawnEntryWithRetries(
       }
       // Same reason as the check above: the attempt landed on a removed entry.
       // A retry is not a recovery, it is a second spawn for a dead key.
-      if (err instanceof EntryRemovedError) throw err;
+      if (err instanceof EntryRemovedError || err instanceof PtyQuarantinedError) throw err;
       lastErr = err;
       if (isFinalAttempt) break;
       const delay = pickBackoff(opts.backoffMs, i);
