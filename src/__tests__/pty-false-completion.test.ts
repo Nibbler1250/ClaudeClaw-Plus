@@ -681,9 +681,12 @@ describe("#562 round 4 — the transcript alone decides how much of the answer, 
     expect(noisyOut.text).toBe("A-BLOCK B-BLOCK");
   });
 
-  test("a terminal thinking-only final message ends at turn_duration, answering with the last message that has text", async () => {
-    // Fault: require text before a terminal message counts. The turn then waits for the
-    // 4 s deadline and rejects with PtyTurnTimeoutError.
+  test("a terminal thinking-only final message ends at turn_duration as an empty reply, not with the narration before it", async () => {
+    // Round 6, Fix 2: the answer is the FINAL message. This test used to expect the last
+    // message that had text ("THE-LAST-TEXT"); that was the bug, so it is reversed on
+    // purpose. Fault (site: `addAssistantLine`, drop textless messages again): the turn
+    // succeeds with "THE-LAST-TEXT". Fault (site: require text before a terminal message
+    // counts): the turn waits for the 4 s deadline and rejects with PtyTurnTimeoutError.
     const t = tx();
     const script = [
       "IFS= read -r l",
@@ -698,8 +701,9 @@ describe("#562 round 4 — the transcript alone decides how much of the answer, 
     ].join("; ");
     const t0 = Date.now();
     const out = await runOutcome(script, t, {}, { timeoutMs: 4000 });
-    expect(out.err).toBeUndefined();
-    expect(out.text).toBe("THE-LAST-TEXT");
+    expect(out.text).toBeUndefined();
+    expect(out.err).toBeInstanceOf(PtyTurnFailedError);
+    expect((out.err as PtyTurnFailedError).kind).toBe("empty-reply");
     expect(Date.now() - t0).toBeLessThan(3500);
   });
 });
