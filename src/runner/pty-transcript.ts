@@ -76,6 +76,10 @@ const MAX_READ_PER_POLL = 4 * 1024 * 1024;
 /** The failure text of a turn whose reply has no text (`TurnFailure.kind` `empty-reply`). */
 export const EMPTY_REPLY_TEXT = "empty reply in transcript";
 
+/** Why a turn with an id-less assistant line fails as `ambiguous` (`TurnFailure.text`). */
+export const ID_LESS_TEXT =
+  "an assistant line has no message id, so which lines make up the final message is uncertain";
+
 /** `message.model` on assistant lines the CLI writes itself (API errors, placeholders). */
 const SYNTHETIC_MODEL = "<synthetic>";
 
@@ -251,8 +255,15 @@ export class TranscriptTurn {
   private failure: TurnFailure | null = null;
   private foreign = 0;
   private toolLines: string[] = [];
-  /** This turn's assistant messages in order; the blocks of one message share an id. */
+  /**
+   * This turn's assistant messages in order, WITH or without text; the blocks of one message
+   * share an id. The last one is the final message, so a final message with no text is an
+   * empty answer and never leaves an earlier message's text standing in for it.
+   */
   private messages: Array<{ id: string | undefined; text: string }> = [];
+  /** A non-synthetic assistant line carried no message id: it cannot be attributed. */
+  private idlessSeen = false;
+  private assistantLines = 0;
   private finalMessageId: string | undefined;
   private matchedUuid: string | undefined;
   private matchedPromptId: string | undefined;
@@ -315,8 +326,9 @@ export class TranscriptTurn {
   }
 
   /**
-   * The last message of the window that has text. `messages` only ever holds messages with
-   * text, so a final message that has none (tool-only) leaves the one before it.
+   * The text of the window's LAST assistant message, whether or not it has any. A final
+   * message with none (tool-only, thinking-only) is an empty answer: the message before it
+   * is narration, not the reply (#562 round 6).
    */
   private answerText(): string {
     return this.messages[this.messages.length - 1]?.text ?? "";
@@ -473,21 +485,24 @@ export class TranscriptTurn {
     const message = entry.message as
       | { id?: string; model?: string; content?: unknown; stop_reason?: unknown }
       | undefined;
-    if (!message) return;
-    const blocks = Array.isArray(message.content)
-      ? (message.content as Array<{ type?: string; text?: unknown }>)
+    const content = message?.content;
+    const blocks = Array.isArray(content)
+      ? (content as Array<{ type?: string; text?: unknown }>)
       : [];
     const text = blocks
       .filter((b) => b?.type === "text" && typeof b.text === "string")
       .map((b) => b.text as string)
       .join("");
-    if (entry.isApiErrorMessage === true || Boolean(entry.error)) {
+    if (entry.isApiErrorMessage === true || entry.error) {
       // The CLI writes its own error lines as synthetic assistant messages: the turn is
       // over, and it did not produce a reply (the bus publishes it as `system.api_error`).
-      // Before or after the final message alike: an error before the boundary is never a success.
-      this.fail("api-error", text !== "" ? text : String(entry.error));
+      // Before or after the final message alike: an error before the boundary is never a
+      // success. Read on every assistant record whatever its shape, `message` absent
+      // included (#562 round 6): the flags come first, nothing may return ahead of them.
+      this.fail("api-error", text !== "" ? text : entry.error ? String(entry.error) : "API error");
       return;
     }
+    if (!message) return;
     // A command's answer is its own output (`compact_boundary` / `local_command`), so the
     // assistant's ordinary text is not read for it; its error flags above still are.
     if (this.replCommand) return;
@@ -497,10 +512,19 @@ export class TranscriptTurn {
     // After the final message only its own remaining lines extend the answer. A message
     // with another id (a background-task notification can start a reply of its own) is not
     // this turn's: it is neither appended nor a boundary. The turn still waits for one.
-    if (
-      this.phase === "terminal" &&
-      (message.id === undefined || message.id !== this.finalMessageId)
-    ) {
+    if (this.phase === "terminal" && message.id === undefined) {
+      // No id to say whether this line is another message or the rest of the final one.
+      this.fail("ambiguous", ID_LESS_TEXT);
+      return;
+    }
+    if (this.phase === "terminal" && message.id !== this.finalMessageId) return;
+    // Identity is what makes up the final message. A line with no id beside any other
+    // assistant line of the turn cannot be placed in one message or another, and a partial
+    // answer is worse than none: fail as uncertain (never a success, never replayed).
+    this.assistantLines++;
+    if (message.id === undefined) this.idlessSeen = true;
+    if (this.idlessSeen && this.assistantLines > 1) {
+      this.fail("ambiguous", ID_LESS_TEXT);
       return;
     }
     this.addAssistantLine(message.id, text, blocks);
@@ -527,9 +551,9 @@ export class TranscriptTurn {
         );
       }
     }
-    if (text === "") return;
     // Each content block is its own line; blocks of one message share its id and belong
-    // together. A different id is a later message of the same turn.
+    // together. A different id is a later message of the same turn. A line without text
+    // still opens (or joins) its message: that is how a textless final message is seen.
     const last = this.messages[this.messages.length - 1];
     if (last && id !== undefined && last.id === id) last.text += text;
     else this.messages.push({ id, text });

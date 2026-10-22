@@ -552,28 +552,132 @@ describe("sendToLiveSession", () => {
     expect(supervisorEntryCount()).toBe(0);
   });
 
-  it("an abort stops the wait at once but keeps the lock until the turn really ends", async () => {
-    await seed("global");
-    const gate = deferred<PtyTurnResult>();
-    spawned[0].runTurn = ((p: string) => {
-      spawned[0].prompts.push(p);
-      return gate.promise;
-    }) as PtyProcess["runTurn"];
-    const ac = new AbortController();
+  describe("an abort after the prompt was sent (#562 round 6, Fix 1)", () => {
+    const shared = () => {
+      const store = memStore();
+      return { sessionStore: store, cwd: "/tmp/fake-cwd", mcpConfig: { path: undefined } };
+    };
+    /** Make `fake`'s disposal hold until `exit` resolves, logging when it starts and ends. */
+    function slowExit(fake: FakePty, events: string[]): Deferred<void> {
+      const exit = deferred<void>();
+      fake.dispose = async () => {
+        events.push("dispose-start");
+        fake.isAlive = () => false;
+        await exit.promise;
+        events.push("dispose-exited");
+      };
+      return exit;
+    }
+    /** Hold `fake`'s next turn open until the returned deferred settles. */
+    function holdTurn(fake: FakePty): Deferred<PtyTurnResult> {
+      const gate = deferred<PtyTurnResult>();
+      fake.runTurn = ((p: string) => {
+        fake.prompts.push(p);
+        return gate.promise;
+      }) as PtyProcess["runTurn"];
+      return gate;
+    }
 
-    const sending = sendToLiveSession("global", "/compact", { timeoutMs: 5000, signal: ac.signal });
-    await Bun.sleep(5);
-    ac.abort();
-    const r = await sending;
+    it("retires the entry and returns only after the process has exited; the next call resumes the same session in a new process", async () => {
+      // Fault A (site: the abort branch of `sendToLiveSession`, return at once as before):
+      // no disposal ever starts, so `events` stays empty. Fault B (start the retirement but
+      // do not await it): `returned` is true while the exit is still held.
+      const sc = shared();
+      expect((await runOnPty("global", "seed", { timeoutMs: 5000, ...sc })).exitCode).toBe(0);
+      const events: string[] = [];
+      const gate = holdTurn(spawned[0]);
+      const exit = slowExit(spawned[0], events);
+      const ac = new AbortController();
 
-    expect(r.status).toBe("failed");
-    if (r.status !== "failed") throw new Error("unreachable");
-    expect(r.aborted).toBe(true);
-    // the PTY is still mid-turn: a second send must not be written on top of it
-    const again = await sendToLiveSession("global", "/again", { timeoutMs: 40 });
-    expect(again.status).toBe("failed");
-    expect(spawned[0].prompts).toEqual(["seed", "/compact"]);
-    gate.resolve({ text: "late", bytesCaptured: 1, cleanBoundary: true, sessionId: "sess-1" });
+      let returned = false;
+      const sending = sendToLiveSession("global", "/compact", {
+        timeoutMs: 5000,
+        signal: ac.signal,
+      }).then((r) => {
+        returned = true;
+        events.push("returned");
+        return r;
+      });
+      await Bun.sleep(5);
+      ac.abort();
+      await Bun.sleep(30);
+      expect(events).toEqual(["dispose-start"]);
+      expect(returned).toBe(false);
+      exit.resolve();
+      const r = await sending;
+
+      expect(r.status).toBe("failed");
+      if (r.status !== "failed") throw new Error("unreachable");
+      expect(r.aborted).toBe(true);
+      expect(events).toEqual(["dispose-start", "dispose-exited", "returned"]);
+      expect(supervisorEntryCount()).toBe(0);
+      // the abandoned turn failing later changes nothing
+      gate.reject(new Error("process closed"));
+      await Bun.sleep(5);
+
+      const next = await runOnPty("global", "next", { timeoutMs: 5000, ...sc });
+      expect(next.exitCode).toBe(0);
+      expect(spawned).toHaveLength(2);
+      expect(spawnOpts[1]?.sessionId).toBe("sess-1");
+    });
+
+    it("keeps the lock until the disposal has finished, even when the abandoned turn rejects first", async () => {
+      // Fault (site: the release chain, release as soon as the turn settles as before): the
+      // queued turn behind it is let go while the old process is still exiting.
+      const sc = shared();
+      expect((await runOnPty("global", "seed", { timeoutMs: 5000, ...sc })).exitCode).toBe(0);
+      const events: string[] = [];
+      const gate = holdTurn(spawned[0]);
+      const exit = slowExit(spawned[0], events);
+      const ac = new AbortController();
+      const sending = sendToLiveSession("global", "/compact", {
+        timeoutMs: 5000,
+        signal: ac.signal,
+      });
+      await Bun.sleep(5);
+      // a user message queued behind the live send, on the same key
+      let behindReturned = false;
+      const behind = runOnPty("global", "behind", { timeoutMs: 5000, ...sc }).then((r) => {
+        behindReturned = true;
+        return r;
+      });
+      await Bun.sleep(5);
+
+      ac.abort();
+      gate.reject(new Error("process closed")); // the abandoned turn settles at once
+      await Bun.sleep(30);
+      expect(events).toEqual(["dispose-start"]);
+      expect(behindReturned).toBe(false);
+      exit.resolve();
+      await sending;
+      await behind;
+      expect(spawned[0].prompts).toEqual(["seed", "/compact"]);
+    });
+
+    it("an abort while queued behind another turn, before anything was written, retires nothing", async () => {
+      // Fault (site: `settleBy` give-up path, retire on any abort): the entry running the
+      // OTHER turn is killed.
+      const sc = shared();
+      expect((await runOnPty("global", "seed", { timeoutMs: 5000, ...sc })).exitCode).toBe(0);
+      const gate = holdTurn(spawned[0]);
+      const running = runOnPty("global", "running", { timeoutMs: 5000, ...sc });
+      await Bun.sleep(5);
+      const ac = new AbortController();
+      const sending = sendToLiveSession("global", "/compact", {
+        timeoutMs: 5000,
+        signal: ac.signal,
+      });
+      await Bun.sleep(5);
+      ac.abort();
+      const r = await sending;
+
+      expect(r.status).toBe("failed");
+      expect(spawned[0].disposed).toBe(false);
+      expect(supervisorEntryCount()).toBe(1);
+      expect(spawned[0].prompts).toEqual(["seed", "running"]);
+      gate.resolve({ text: "ok", bytesCaptured: 1, cleanBoundary: true, sessionId: "sess-1" });
+      expect((await running).exitCode).toBe(0);
+    });
   });
 
   it("persists the session id under the lock: an entry retired and replaced before its turn settled leaves the replacement's stored id alone", async () => {
@@ -640,6 +744,9 @@ describe("sendToLiveSession", () => {
 
     expect(r.status).toBe("failed");
     expect(spawned[0].prompts).toEqual(["seed"]);
+    // nothing was written, so there is nothing to kill
+    expect(spawned[0].disposed).toBe(false);
+    expect(supervisorEntryCount()).toBe(1);
   });
 
   it("does not treat an in-flight ephemeral one-shot as a live session", async () => {

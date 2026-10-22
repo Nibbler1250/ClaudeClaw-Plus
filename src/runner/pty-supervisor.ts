@@ -1127,6 +1127,11 @@ export async function sendToLiveSession(
       void previousLock.then(release, release);
       return gaveUp("the running turn to end", waited);
     }
+    // An abort that landed while we queued, before anything was written: nothing to kill.
+    if (opts.signal?.aborted) {
+      release();
+      return { status: "failed", error: "aborted before send", timedOut: false, aborted: true };
+    }
     // The world may have changed while we queued: re-check under the lock.
     if (!isCurrentEntry(entry) || entry.spawnInFlight || !entry.pty?.isAlive()) {
       release();
@@ -1161,10 +1166,21 @@ export async function sendToLiveSession(
       },
       () => undefined,
     );
-    persisted.then(release, release);
+    // #562 round 6: the prompt is out, so an abort is not "stop waiting". The process may
+    // still write a record for it, and the next identical prompt would read that record as
+    // its own. The abort retires the entry (kill and await the exit) the moment it fires,
+    // before the turn can settle, and the lock stays held until that disposal has finished,
+    // however soon the abandoned turn rejects.
+    let abortRetirement: Promise<void> | undefined;
+    const onAbort = (): void => {
+      abortRetirement = retireEntry(entry);
+    };
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+    persisted.then(() => abortRetirement?.catch(() => undefined)).then(release, release);
 
     try {
       const result = await raceAbort(turn, opts.signal);
+      opts.signal?.removeEventListener("abort", onAbort);
       await persisted;
       // #562 round 3: a result whose boundary is not clean is a failure, whatever text it
       // carries. The turn may have run, so the entry goes (its TUI is in a state we cannot
@@ -1185,7 +1201,10 @@ export async function sendToLiveSession(
         cleanBoundary: result.cleanBoundary,
       };
     } catch (err) {
+      opts.signal?.removeEventListener("abort", onAbort);
       if (err instanceof LiveSendAborted) {
+        // Awaited: the writer is gone before the caller hears of the abort.
+        await (abortRetirement ?? retireEntry(entry));
         return { status: "failed", error: "aborted", timedOut: false, aborted: true };
       }
       const timedOut = err instanceof PtyTurnTimeoutError;

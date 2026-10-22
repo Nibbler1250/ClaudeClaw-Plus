@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   EMPTY_REPLY_TEXT,
+  ID_LESS_TEXT,
   promptMatches,
   resolveTranscriptPath,
   TranscriptReplacedError,
@@ -707,9 +708,10 @@ describe("TranscriptTurn — the matched turn is a window, frozen when it ends (
     expect(turn_.poll().answer).toBe("PART-A PART-B");
   });
 
-  test("a turn that ends on a tool-only message returns the last message that has text", () => {
-    // The final message has no text block. Fault: take the final message's text without the
-    // fallback and the answer is "".
+  test("a turn that ends on a tool-only message is an empty reply, whatever the narration before it said", () => {
+    // Round 6, Fix 2: the answer is the FINAL message. A tool-only final message has no text,
+    // so "The last words." is narration and must not stand in for it. (This reverses the
+    // round-3 expectation, which returned the last message that had text.)
     const t = tx();
     const turn_ = turn(t);
     appendFileSync(
@@ -727,7 +729,8 @@ describe("TranscriptTurn — the matched turn is a window, frozen when it ends (
     );
     const s = turn_.poll();
     expect(s.ended).toBe(true);
-    expect(s.answer).toBe("The last words.");
+    expect(s.failure).toEqual({ kind: "empty-reply", text: EMPTY_REPLY_TEXT });
+    expect(s.answer).toBe("");
   });
 
   test("a final message written as a thinking line first still gets its text line", () => {
@@ -1111,21 +1114,56 @@ describe("TranscriptTurn — an empty reply is a failure (round 5, MEDIUM)", () 
     expect(turn_.poll().failure?.kind).toBe("empty-reply");
   });
 
-  test("an earlier message with text and a tool-only final message is NOT empty: the last message that has text answers", () => {
+  test("narration, then a thinking-only terminal message, then the boundary: fails as empty, the narration is not the answer (round 6)", () => {
+    // Codex's r5 sequence. Fault (site: `addAssistantLine`, drop a message that has no text
+    // again): the thinking-only message vanishes, "Let me check" is the last message with
+    // text and the turn succeeds with it. Predicted result with the fault: failure null,
+    // answer "Let me check".
+    // This test replaces one that asserted the old behaviour (an earlier message with text
+    // answered when the final message had none): a deliberate reversal, ruling 3.
     const t = tx();
     const turn_ = turn(t);
     appendFileSync(
       t.path,
       nl(
         userLine("R17x please"),
-        assistantLine("EARLIER-TEXT", { id: "m1", stop: "tool_use" }),
-        toolOnly("m2"),
+        assistantLine("Let me check", {
+          id: "m1",
+          stop: "tool_use",
+          blocks: [
+            { type: "text", text: "Let me check" },
+            { type: "tool_use", name: "Read", input: {} },
+          ],
+        }),
+        assistantLine("", {
+          id: "m2",
+          stop: "end_turn",
+          blocks: [{ type: "thinking", thinking: "hmm" }],
+        }),
+        systemLine("turn_duration"),
+      ),
+    );
+    const s = turn_.poll();
+    expect(s.ended).toBe(true);
+    expect(s.failure).toEqual({ kind: "empty-reply", text: EMPTY_REPLY_TEXT });
+    expect(s.answer).toBe("");
+  });
+
+  test("the same sequence with real text in the final message answers with the final message only", () => {
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(
+        userLine("R17x please"),
+        assistantLine("Let me check", { id: "m1", stop: "tool_use" }),
+        assistantLine("It is fine.", { id: "m2", stop: "end_turn" }),
         systemLine("turn_duration"),
       ),
     );
     const s = turn_.poll();
     expect(s.failure).toBeNull();
-    expect(s.answer).toBe("EARLIER-TEXT");
+    expect(s.answer).toBe("It is fine.");
   });
 
   test("/compact with an empty completion marker is still a success: its result is its own output", () => {
@@ -1139,6 +1177,128 @@ describe("TranscriptTurn — an empty reply is a failure (round 5, MEDIUM)", () 
     const s = turn_.poll();
     expect(s.ended).toBe(true);
     expect(s.failure).toBeNull();
+  });
+});
+
+describe("TranscriptTurn — incomplete assistant shapes (round 6, Fix 3)", () => {
+  const ids = (id: string) => ({ id });
+  const idless = (text: string, stop: string | null = "end_turn"): string =>
+    JSON.stringify({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        model: "claude-test",
+        content: [{ type: "text", text }],
+        stop_reason: stop,
+      },
+    });
+
+  test("an error-flagged assistant record with NO message, after the final message, fails the turn", () => {
+    // Codex's r5 sequence. Fault (site: `ingestAssistant`, return on a missing message before
+    // the error flags are read): the record is skipped, the boundary comes, and the turn
+    // succeeds with "FINAL". Predicted result with the fault: failure null, answer "FINAL".
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(
+        userLine("R17x please"),
+        assistantLine("FINAL", ids("m1")),
+        JSON.stringify({ type: "assistant", isApiErrorMessage: true, error: "529" }),
+        systemLine("turn_duration"),
+      ),
+    );
+    const s = turn_.poll();
+    expect(s.ended).toBe(true);
+    expect(s.failure).toEqual({ kind: "api-error", text: "529" });
+    expect(s.answer).toBe("");
+  });
+
+  test("an error flag with no message and no text still fails, with a fixed text", () => {
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(userLine("R17x please"), JSON.stringify({ type: "assistant", isApiErrorMessage: true })),
+    );
+    const s = turn_.poll();
+    expect(s.failure?.kind).toBe("api-error");
+    expect(s.failure?.text).not.toBe("undefined");
+  });
+
+  test("an assistant record with no message and no error flag is ignored", () => {
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(
+        userLine("R17x please"),
+        JSON.stringify({ type: "assistant" }),
+        assistantLine("FINAL", ids("m1")),
+        systemLine("turn_duration"),
+      ),
+    );
+    const s = turn_.poll();
+    expect(s.failure).toBeNull();
+    expect(s.answer).toBe("FINAL");
+  });
+
+  test("id-less lines A then B, A carrying the terminal stop: uncertain, never A alone", () => {
+    // Codex's r5 sequence. Fault (site: the terminal-phase id check, drop an id-less line
+    // silently as before): B is dropped and the turn succeeds with "A". Predicted result with
+    // the fault: failure null, answer "A".
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(userLine("R17x please"), idless("A"), idless("B"), systemLine("turn_duration")),
+    );
+    const s = turn_.poll();
+    expect(s.ended).toBe(true);
+    expect(s.failure?.kind).toBe("ambiguous");
+    expect(s.failure?.text).toBe(ID_LESS_TEXT);
+    expect(s.answer).toBe("");
+  });
+
+  test("id-less lines A (open) then B (terminal): uncertain, never B alone", () => {
+    // Fault (site: the id-less counter, never fail on a second line): the two lines become
+    // two messages and the answer is "B". Predicted result with the fault: failure null.
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(userLine("R17x please"), idless("A", null), idless("B"), systemLine("turn_duration")),
+    );
+    const s = turn_.poll();
+    expect(s.failure?.kind).toBe("ambiguous");
+    expect(s.answer).toBe("");
+  });
+
+  test("a single id-less final line is a complete message, and answers", () => {
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(userLine("R17x please"), idless("ONLY"), systemLine("turn_duration")),
+    );
+    const s = turn_.poll();
+    expect(s.failure).toBeNull();
+    expect(s.answer).toBe("ONLY");
+  });
+
+  test("an id-less line beside an id'd message is uncertain too", () => {
+    const t = tx();
+    const turn_ = turn(t);
+    appendFileSync(
+      t.path,
+      nl(
+        userLine("R17x please"),
+        assistantLine("working", { id: "m1", stop: "tool_use" }),
+        idless("FINAL"),
+        systemLine("turn_duration"),
+      ),
+    );
+    expect(turn_.poll().failure?.kind).toBe("ambiguous");
   });
 });
 
