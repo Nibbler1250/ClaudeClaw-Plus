@@ -23,6 +23,9 @@
  *     dropped when it is);
  *   - `assertSessionSpawnable`, a synchronous check that every spawn site runs on the line
  *     immediately before the process is created, after all its async preparation.
+ * The final round (#592) fences the KEY as well (`fenceKey`, owned by the retiring entry), so a
+ * spawn still in its ready-settle, which has a child and no `PtyProcess` yet, is covered; a
+ * spawn that does not settle within the bound is quarantined through a stand-in record.
  */
 import type { PtyProcess } from "./pty-process.js";
 

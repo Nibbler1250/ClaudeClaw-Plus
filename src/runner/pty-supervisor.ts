@@ -989,7 +989,14 @@ export async function runOnPty(
     return await runOnAdmittedEntry(entry, sessionKey, prompt, opts, supervisorOpts);
   } finally {
     opts.signal?.removeEventListener("abort", onAbort);
-    if (entry.scope.ephemeral) await retireEntry(entry);
+    if (entry.scope.ephemeral) {
+      const retired = retireEntry(entry);
+      // #592: the retirement now waits for a pending spawn. A caller that timed out or was
+      // aborted has spent its deadline and is not held for it: the retirement carries on in the
+      // background with the session fenced, and ends in a confirmed exit or a quarantine.
+      if (opts.signal?.aborted && entry.spawnInFlight) void retired.catch(() => {});
+      else await retired;
+    }
   }
 }
 
