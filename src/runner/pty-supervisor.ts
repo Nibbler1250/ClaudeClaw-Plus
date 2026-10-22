@@ -270,11 +270,21 @@ export interface SupervisorOptions {
   namedAgentsAlwaysAlive: boolean;
 }
 
+/**
+ * Why a PTY turn that failed MAY HAVE COMPLETED: its outcome is unknown, so a caller must
+ * not replay it (a replay can repeat the turn's side effects). Absent on a success and on a
+ * definite failure (prompt never sent, empty reply, API error record, spawn failure,
+ * quarantine refusal), which are safe to retry.
+ */
+export type PtyUnsafeReplayKind = "uncertain" | "timeout";
+
 export interface RunOnPtyResult {
   rawStdout: string;
   stderr: string;
   exitCode: number;
   sessionId?: string;
+  /** Set only when the turn may have run; see `PtyUnsafeReplayKind`. */
+  failureKind?: PtyUnsafeReplayKind;
 }
 
 /**
@@ -2500,6 +2510,8 @@ async function runTurnWithRetries(
         await retireEntry(entry);
         return errorResult(
           `[pty-supervisor] non-retryable error on ${entry.sessionKey}: ${new PtyBoundaryUnconfirmedError(entry.pty?.label ?? entry.sessionKey).message}`,
+          1,
+          "uncertain",
         );
       }
       return {
@@ -2534,10 +2546,14 @@ async function runTurnWithRetries(
         // error the CLI's own text goes out as the output, because that is what the
         // runner reads to tell a corrupt session from any other failure
         // (`signatureErrorWarrantsReset`, the same input the print path gives it).
+        // Only `ambiguous` leaves it unknown whose reply this is; the other kinds are a
+        // definite failure the transcript recorded, so a caller may retry them.
         if (err instanceof PtyTurnFailedError) {
           return {
             ...errorResult(
               `[pty-supervisor] non-retryable error on ${entry.sessionKey}: ${err.message}`,
+              1,
+              err.kind === "ambiguous" ? "uncertain" : undefined,
             ),
             rawStdout: err.kind === "api-error" ? err.text : "",
           };
@@ -2548,10 +2564,16 @@ async function runTurnWithRetries(
           return errorResult(
             `[pty-supervisor] turn timed out on ${entry.sessionKey}: ${err.message}; not retried (the prompt may have run), the process was stopped and the next call resumes the session`,
             124,
+            "timeout",
           );
         }
+        // A refusal before anything was written is definite. Everything else that ends a
+        // turn here (no turn boundary, prompt not accepted, a process that closed after the
+        // send, a replaced transcript) may have run.
         return errorResult(
           `[pty-supervisor] non-retryable error on ${entry.sessionKey}: ${(err as Error).message}`,
+          1,
+          err instanceof PtyTranscriptUnavailableError ? undefined : "uncertain",
         );
       }
       // #546: an aborted call does not respawn what the abort just retired.
@@ -2586,12 +2608,17 @@ function pickBackoff(backoffMs: number[], attempt: number): number {
   return Math.max(0, backoffMs[idx] ?? 0);
 }
 
-function errorResult(message: string, exitCode = 1): RunOnPtyResult {
+function errorResult(
+  message: string,
+  exitCode = 1,
+  failureKind?: PtyUnsafeReplayKind,
+): RunOnPtyResult {
   return {
     rawStdout: "",
     stderr: message,
     exitCode,
     sessionId: undefined,
+    ...(failureKind ? { failureKind } : {}),
   };
 }
 

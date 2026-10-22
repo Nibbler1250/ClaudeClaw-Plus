@@ -79,6 +79,7 @@ import {
   supervisorEntryCount,
   retirePtySession,
   type PtySessionStore,
+  type PtyUnsafeReplayKind,
   runEphemeralWithDeadline,
 } from "./runner/pty-supervisor";
 import { assertSessionSpawnable, assertSessionWritable } from "./runner/pty-quarantine";
@@ -400,6 +401,13 @@ export interface RunResult {
   usedFallback?: true;
   /** Whether the final fallback attempt delivered nonempty text via onChunk. */
   fallbackStreamedText?: boolean;
+  /**
+   * #562: set only when a PTY turn failed with an unknown outcome (no turn boundary,
+   * ambiguous attribution, timeout): it may have completed and done its side effects, so a
+   * caller must not replay it. Absent on a success, on a definite failure and on every
+   * non-PTY engine, which keep their old behaviour.
+   */
+  failureKind?: PtyUnsafeReplayKind;
 }
 
 export interface AgentStreamEvent {
@@ -1782,7 +1790,13 @@ export interface PrimaryExecCall {
 }
 type PrimaryExec = (
   call: PrimaryExecCall,
-) => Promise<{ rawStdout: string; stderr: string; exitCode: number; sessionId?: string }>;
+) => Promise<{
+  rawStdout: string;
+  stderr: string;
+  exitCode: number;
+  sessionId?: string;
+  failureKind?: PtyUnsafeReplayKind;
+}>;
 let _primaryExecForTests: PrimaryExec | null = null;
 export function _setPrimaryExecForTests(fn: PrimaryExec | null): void {
   _primaryExecForTests = fn;
@@ -2048,7 +2062,13 @@ async function execClaude(
         ? `agent:${agentName}`
         : "global";
     const appendSystemPrompt = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
-    let exec: { rawStdout: string; stderr: string; exitCode: number; sessionId?: string };
+    let exec: {
+      rawStdout: string;
+      stderr: string;
+      exitCode: number;
+      sessionId?: string;
+      failureKind?: PtyUnsafeReplayKind;
+    };
     if (_primaryExecForTests) {
       exec = await _primaryExecForTests({
         name,
@@ -2429,6 +2449,8 @@ async function execClaude(
         return reported && reported !== "unknown" ? { sessionId: reported } : {};
       })(),
       ...(usedFallback ? { usedFallback: true as const, fallbackStreamedText } : {}),
+      // From the exec that produced THIS result, and only while it is a failure.
+      ...(exitCode !== 0 && exec.failureKind ? { failureKind: exec.failureKind } : {}),
     };
 
     // Record successful completion WITH the real token usage + cost so the
@@ -2641,6 +2663,9 @@ async function execClaude(
           exitCode: retryExec.exitCode,
           ...(retryExec.sessionId || existing?.sessionId
             ? { sessionId: retryExec.sessionId || existing?.sessionId }
+            : {}),
+          ...(retryExec.exitCode !== 0 && retryExec.failureKind
+            ? { failureKind: retryExec.failureKind }
             : {}),
         };
         emitCompactEvent({

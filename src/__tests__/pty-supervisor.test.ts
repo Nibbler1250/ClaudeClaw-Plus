@@ -1575,6 +1575,66 @@ describe("pty-supervisor model + provider env threading (Codex Phase D #1)", () 
   });
 });
 
+describe("#562 round 9 add-on — failureKind marks a turn that may have completed", () => {
+  // The cron loop reads this field to decide whether a job's `retry` may replay the turn.
+  const cases: Array<[string, () => Error, "uncertain" | "timeout" | undefined]> = [
+    ["no turn boundary", () => new PtyTranscriptUncertainError("x", 900), "uncertain"],
+    ["timeout", () => new PtyTurnTimeoutError("x", 900), "timeout"],
+    ["ambiguous attribution", () => new PtyTurnFailedError("x", "ambiguous", "another"), "uncertain"],
+    ["replaced transcript", () => new TranscriptReplacedError("/x/s.jsonl", "replaced"), "uncertain"],
+    ["prompt not accepted", () => new PtyPromptNotAcceptedError("x", 6000), "uncertain"],
+    ["closed after the prompt went out", () => new PtyClosedError("x", 1, null, true), "uncertain"],
+    ["API error record", () => new PtyTurnFailedError("x", "api-error", "API Error: 529"), undefined],
+    ["command error record", () => new PtyTurnFailedError("x", "command-error", "stderr"), undefined],
+    ["empty reply", () => new PtyTurnFailedError("x", "empty-reply", "empty reply"), undefined],
+    ["no transcript to read", () => new PtyTranscriptUnavailableError("x", "no transcript"), undefined],
+    ["closed before the prompt went out", () => new PtyClosedError("x", 1, null), undefined],
+  ];
+  for (const [name, make, kind] of cases) {
+    it(`${name}: failureKind ${kind ?? "absent"}`, async () => {
+      // Fault: leave the field off the result at its mapping site and the "uncertain" and
+      // "timeout" rows come back undefined; set it on every error and the definite rows do.
+      injectMaxRetriesForTests(0);
+      injectSleep(async () => {});
+      const { spawn } = makeSpawnTracker(() =>
+        makeFakePty("kind", {
+          onTurn: async () => {
+            throw make();
+          },
+        }),
+      );
+      injectSpawnPty(spawn);
+      const result = await runOnPty("global", "p", { timeoutMs: 1000 });
+      expect(result.exitCode).not.toBe(0);
+      expect(result.failureKind).toBe(kind);
+    });
+  }
+
+  it("an unconfirmed boundary is uncertain; a success carries no failureKind", async () => {
+    let turns = 0;
+    const { spawn } = makeSpawnTracker(() =>
+      makeFakePty("kind-boundary", {
+        onTurn: async () => {
+          turns += 1;
+          return {
+            text: turns === 1 ? "partial" : "ok",
+            bytesCaptured: 1,
+            cleanBoundary: turns !== 1,
+            sessionId: "sid",
+          };
+        },
+      }),
+    );
+    injectSpawnPty(spawn);
+    const failed = await runOnPty("global", "p", { timeoutMs: 1000 });
+    expect(failed.exitCode).toBe(1);
+    expect(failed.failureKind).toBe("uncertain");
+    const ok = await runOnPty("global", "again", { timeoutMs: 1000 });
+    expect(ok.exitCode).toBe(0);
+    expect("failureKind" in ok).toBe(false);
+  });
+});
+
 describe("#562 round 5 — a turn that is not a proven OK kills the process and resumes the session", () => {
   const nonOk: Array<[string, () => Error, number]> = [
     ["uncertain (final message, no boundary)", () => new PtyTranscriptUncertainError("x", 900), 1],
