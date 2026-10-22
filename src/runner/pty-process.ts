@@ -46,7 +46,7 @@ import { spawn as ptySpawn, type IPty } from "bun-pty";
 import type { SecurityConfig } from "../config";
 import { UNTRUSTED_CLAUDE_ARGS } from "../oneshot/isolation.js";
 import { cliModelFlag } from "../oneshot/model.js";
-import { withCleanProcessEnv } from "../runner";
+import { claudeExecutable, withCleanProcessEnv } from "../runner";
 // Screen text is used for readiness and dialogs only (`_waitForReadySettle`): the
 // parser's completion/answer API is deliberately NOT imported here (#562 round 2; the
 // guard test `pty-turn-evidence-guard.test.ts` fails the build if it comes back).
@@ -1562,7 +1562,7 @@ export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
     if (opts.sessionId && opts.sessionId.length > 0) {
       assertSessionSpawnable({ sessionId: opts.sessionId });
     }
-    const cmd = opts._commandOverride ?? "claude";
+    const cmd = opts._commandOverride ?? claudeExecutable();
     const args = buildClaudeArgs(opts);
     const cols = opts.cols ?? DEFAULT_COLS;
     const rows = opts.rows ?? DEFAULT_ROWS;

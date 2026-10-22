@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { claudeExecutable } from "../runner/claude-executable.js";
 import { assertSessionSpawnable } from "../runner/pty-quarantine.js";
 import { cleanSpawnEnv } from "../runner/spawn-env.js";
 import type { OneShotRequest, OneShotResult } from "./engine.js";
@@ -80,7 +81,7 @@ export async function runPrint(req: OneShotRequest): Promise<OneShotResult> {
       if (req.resumeSessionId !== undefined && req.isolation !== "untrusted") {
         assertSessionSpawnable({ sessionId: req.resumeSessionId });
       }
-      const child = (overrides?.spawn ?? spawn)("claude", args, {
+      const child = (overrides?.spawn ?? spawn)(claudeExecutable(), args, {
         stdio: [stdinPrompt ? "pipe" : "ignore", "pipe", "pipe"],
         env,
         cwd,

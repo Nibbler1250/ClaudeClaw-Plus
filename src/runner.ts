@@ -1,6 +1,5 @@
 import { mkdir, readFile, writeFile, realpath } from "fs/promises";
 import { join, dirname, resolve, sep } from "path";
-import { execSync } from "child_process";
 import { existsSync, writeFileSync, mkdirSync, readFileSync } from "fs";
 import {
   getSession,
@@ -90,6 +89,11 @@ import {
   endsInRenderedSignatureError,
   signatureErrorWarrantsReset,
 } from "./runner/signature-error";
+import {
+  CLAUDE_EXECUTABLE,
+  _setClaudeExecutableForTests,
+  claudeExecutable,
+} from "./runner/claude-executable";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
 
@@ -122,36 +126,7 @@ const LEGACY_PROJECT_CLAUDE_MD = join(process.cwd(), ".claude", "CLAUDE.md");
 const CLAUDECLAW_BLOCK_START = "<!-- claudeclaw:managed:start -->";
 const CLAUDECLAW_BLOCK_END = "<!-- claudeclaw:managed:end -->";
 
-/**
- * On Windows, `claude` resolves to `claude.cmd`, a batch wrapper that must
- * be run through cmd.exe (8191-char command-line limit). Resolving the
- * underlying `claude.exe` lets us call it directly via CreateProcessW
- * (32767-char limit). Required because --append-system-prompt + prompt
- * files + CLAUDE.md can easily exceed 8K.
- */
-function resolveClaudeExecutable(): string {
-  if (process.platform !== "win32") return "claude";
-  try {
-    const out = execSync("where claude", { encoding: "utf8" });
-    const cmdPath = out
-      .split(/\r?\n/)
-      .map((s) => s.trim())
-      .find((s) => s.toLowerCase().endsWith(".cmd"));
-    if (!cmdPath) return "claude";
-    const exePath = join(
-      dirname(cmdPath),
-      "node_modules",
-      "@anthropic-ai",
-      "claude-code",
-      "bin",
-      "claude.exe",
-    );
-    return existsSync(exePath) ? exePath : "claude";
-  } catch {
-    return "claude";
-  }
-}
-const CLAUDE_EXECUTABLE = resolveClaudeExecutable();
+export { _setClaudeExecutableForTests, claudeExecutable };
 
 /** Versions of the Claude Code CLI whose interactive TTY output the PTY parser
  *  has been validated against (see .planning/pty-migration/SPEC.md §2 and the
