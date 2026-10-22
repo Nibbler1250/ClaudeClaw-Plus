@@ -18,6 +18,7 @@ import {
   injectMcpIdentityIssuer,
   __reapNowForTests,
   shutdownSupervisor,
+  injectPendingSpawnWait,
   snapshotSupervisor,
   injectSpawnPty,
   injectClock,
@@ -215,6 +216,9 @@ beforeEach(async () => {
 afterEach(async () => {
   resetClock();
   resetSleep();
+  // A test that abandons a spawn which never settles would hold the shutdown for the whole
+  // pending-spawn bound (#592); expire the bound at once. Production keeps the real timer.
+  injectPendingSpawnWait(async () => {});
   await shutdownSupervisor();
   // After shutdown, so a test's injected revoker still runs for its retirements.
   injectMcpIdentityIssuer({ issue: null, revoke: null, bridgeBaseUrl: null });
@@ -2640,11 +2644,13 @@ describe("pty-supervisor bounded respawn (issue #385)", () => {
     expect(first.stderr).toContain("respawn failed");
     expect(spawnCalls).toBe(2);
 
-    // Operator kills everything while that respawn is still in flight.
-    await killAllPtys();
+    // Operator kills everything while that respawn is still in flight. The retirement waits
+    // for it (#592) and ends only once the late PTY has been disposed.
+    const killing = killAllPtys();
     expect(snapshotSupervisor().ptys).toHaveLength(0);
 
     releaseRespawn();
+    await killing;
     await new Promise((r) => setTimeout(r, 50));
     // The late PTY landed on a removed entry: disposed, and still untracked.
     expect(inner.spawned).toHaveLength(1);
@@ -2863,8 +2869,10 @@ describe("pty-supervisor bounded respawn (issue #385)", () => {
       await new Promise((r) => setTimeout(r, 5));
     }
     expect(spawnCalls).toBe(2);
-    await killAllPtys();
+    // The retirement waits for the pending respawn (#592): release it, then the kill ends.
+    const killing = killAllPtys();
     releaseRespawn();
+    await killing;
     const r = await first;
 
     expect(r.exitCode).toBe(1);
@@ -2944,9 +2952,11 @@ describe("pty-supervisor bounded respawn (issue #385)", () => {
     const first = runOnPty("agent:alice", "one", { timeoutMs: 30_000, agentName: "alice" });
     await new Promise((r) => setTimeout(r, 30));
     expect(snapshotSupervisor().ptys).toHaveLength(0); // admitted, no PTY yet
-    // Operator kills everything while the options are still being built.
-    await killAllPtys();
+    // Operator kills everything while the options are still being built. The retirement
+    // waits for that pending spawn (#592), so it ends once the options build is released.
+    const killing = killAllPtys();
     releaseAgentDir();
+    await killing;
     const r = await first;
 
     expect(r.exitCode).toBe(1);
@@ -2975,8 +2985,10 @@ describe("pty-supervisor bounded respawn (issue #385)", () => {
     expect(snapshotSupervisor().ptys).toHaveLength(0); // no pid to show yet
     expect(supervisorEntryCount()).toBe(1); // but there IS a session to kill
 
-    await killAllPtys();
+    // The retirement joins the pending spawn (#592): it ends only after the late PTY is disposed.
+    const killing = killAllPtys();
     releaseSpawn();
+    await killing;
     const r = await first;
 
     expect(r.exitCode).toBe(1);
@@ -3510,18 +3522,25 @@ describe("pty-supervisor retirement — the map's invariants (issue #394)", () =
       await initSupervisor();
 
       const old = runOnPty("thread:late", "one", { timeoutMs: 30_000, threadId: "late" });
-      await new Promise((r) => setTimeout(r, 30));
+      const startedBy = Date.now() + 5_000;
+      while (calls < 1 && Date.now() < startedBy) await new Promise((r) => setTimeout(r, 5));
       expect(calls).toBe(1);
-      await killAllPtys(); // retires the old entry (its own release revokes once)
-      const revokesAfterKill = mcp.revoked.length;
-      const fresh = await runOnPty("thread:late", "two", { timeoutMs: 30_000, threadId: "late" });
-      expect(fresh.exitCode).toBe(0);
-      expect(mcp.issued.filter((k) => k === "thread:late")).toHaveLength(2);
-      // Now the OLD spawn rejects. Its failure path must not revoke — the key's
-      // identity now belongs to the replacement.
+      // The retirement joins the pending spawn (#592), so the replacement on the key cannot be
+      // admitted until the OLD spawn has settled. Start both, then let the old one fail.
+      const killing = killAllPtys(); // retires the old entry (its own release revokes once)
+      const replacement = runOnPty("thread:late", "two", { timeoutMs: 30_000, threadId: "late" });
+      await new Promise((r) => setTimeout(r, 30));
+      expect(calls).toBe(1); // the replacement is waiting, not spawned beside the old spawn
       rejectSpawn(new Error("boot failed after all"));
+      await killing;
+      const revokesAfterKill = mcp.revoked.length;
       const r = await old;
       expect(r.exitCode).toBe(1);
+      const fresh = await replacement;
+      expect(fresh.exitCode).toBe(0);
+      expect(mcp.issued.filter((k) => k === "thread:late")).toHaveLength(2);
+      // The OLD spawn's failure path must not revoke — the key's identity now belongs to the
+      // replacement.
       expect(mcp.revoked.length).toBe(revokesAfterKill);
       expect(spawned).toHaveLength(1);
       expect(supervisorEntryCount()).toBe(1);
@@ -3605,8 +3624,9 @@ describe("pty-supervisor retirement — the map's invariants (issue #394)", () =
     await new Promise((r) => setTimeout(r, 30));
     expect(spawnCalls).toBe(2); // the respawn is in flight
     sleeps.length = 0;
-    await killAllPtys();
+    const killing = killAllPtys();
     releaseRespawn();
+    await killing;
     const r = await turn;
     expect(r.exitCode).toBe(1);
     expect(r.stderr).toContain("disposed the late PTY");

@@ -82,7 +82,11 @@ import {
   type PtyUnsafeReplayKind,
   runEphemeralWithDeadline,
 } from "./runner/pty-supervisor";
-import { assertSessionSpawnable, assertSessionWritable } from "./runner/pty-quarantine";
+import {
+  assertSessionSpawnable,
+  assertSessionWritable,
+  PtyQuarantinedError,
+} from "./runner/pty-quarantine";
 import { encodeCwdForProjectsDir } from "./bus/jsonl-line-types";
 import { PTY_OUTPUT_FORMAT_CONSTRAINT } from "./runner/pty-output-format";
 import { SPAWN_ENV_STRIP_KEYS, cleanSpawnEnv, shouldStripSpawnEnvKey } from "./runner/spawn-env";
@@ -2059,10 +2063,11 @@ async function execClaude(
         ? `agent:${agentName}`
         : "global";
     const appendSystemPrompt = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
-    // A flip to print leaves the PTYs of this turn's keys alive; retire them before any legacy
-    // spawn below (primary, recovery, fallback) can resume their sessions.
+    // A flip to print leaves the PTY of this turn's key alive; retire it before the primary
+    // legacy spawn can resume its session. The fallback key is retired only where the
+    // fallback is about to run (below): a quarantined fallback must not fail a healthy primary.
     if (useLegacyPath) {
-      await retireLivePtysBeforePrint([ptySessionKey, `fallback:${ptySessionKey}`]);
+      await retireLivePtysBeforePrint([ptySessionKey]);
     }
     let exec: ExecOutcome;
     if (_primaryExecForTests) {
@@ -2229,7 +2234,21 @@ async function execClaude(
               onToolEvent,
             });
       };
-      exec = await execFallback(fallbackArgs);
+      // The fallback resumes its own session, which a flip to print can leave with a live
+      // PTY: retire it immediately before use. A fallback session that cannot be retired
+      // (quarantined) fails this fallback attempt only; the primary has already run.
+      let fallbackRefused: PtyQuarantinedError | undefined;
+      if (useLegacyPath) {
+        try {
+          await retireLivePtysBeforePrint([fallbackPtyKey]);
+        } catch (err) {
+          if (!(err instanceof PtyQuarantinedError)) throw err;
+          fallbackRefused = err;
+        }
+      }
+      exec = fallbackRefused
+        ? { rawStdout: "", stderr: fallbackRefused.message, exitCode: 1 }
+        : await execFallback(fallbackArgs);
       usedFallback = true;
       let fallbackRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
 

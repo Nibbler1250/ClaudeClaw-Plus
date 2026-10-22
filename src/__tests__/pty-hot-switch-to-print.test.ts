@@ -36,7 +36,8 @@ import {
   runOnPty,
   snapshotSupervisor,
 } from "../runner/pty-supervisor";
-import { PtyQuarantinedError } from "../runner/pty-quarantine";
+import { PtyQuarantinedError, quarantineSession } from "../runner/pty-quarantine";
+import { PtyExitUnconfirmedError } from "../runner/pty-process";
 import type { PtyProcess, PtyProcessOptions } from "../runner/pty-process";
 import { resetFallbackSession, resetSession } from "../sessions";
 
@@ -123,14 +124,64 @@ const LEGACY_RESULT = JSON.stringify({
   result: "legacy-ok",
   session_id: "legacy-session",
 });
+const RATE_LIMITED_RESULT = JSON.stringify({
+  type: "result",
+  result: "You've hit your limit",
+  session_id: "legacy-session",
+});
 
-function stubSettings(ptyEnabled: boolean): void {
+/** The legacy spawn answers the first call with a rate limit, so the fallback runs. */
+function primaryRateLimited(): void {
+  runnerMod._setClaudeSpawnForTests((args) => {
+    legacySpawns.push({ args, ptysDisposed: ptys.map((p) => p.disposed) });
+    return Bun.spawn(
+      ["printf", "%s\\n", legacySpawns.length === 1 ? RATE_LIMITED_RESULT : LEGACY_RESULT],
+      { stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+    );
+  });
+}
+
+/** `retirePtySession` calls with how many legacy spawns had happened at that moment. */
+function recordRetirements(): Array<{ key: string; legacyBefore: number }> {
+  const calls: Array<{ key: string; legacyBefore: number }> = [];
+  const real = supervisorMod.retirePtySession;
+  spyOn(supervisorMod, "retirePtySession").mockImplementation(async (key: string) => {
+    calls.push({ key, legacyBefore: legacySpawns.length });
+    return real(key);
+  });
+  return calls;
+}
+
+/** A PTY on `key` whose exit the OS never confirms: the session is quarantined. */
+function quarantineKey(key: string): void {
+  const stuck = {
+    label: "stuck",
+    pid: 9,
+    sessionId: "stuck-session",
+    cwd: "/tmp",
+    isAlive: () => true,
+    lastTurnEndedAt: () => 0,
+    exitInfo: () => null,
+    runTurn: async () => {
+      throw new Error("not used");
+    },
+    dispose: async () => {
+      throw new PtyExitUnconfirmedError("stuck", 9);
+    },
+    confirmExit: async () => {
+      throw new PtyExitUnconfirmedError("stuck", 9);
+    },
+  } as unknown as PtyProcess;
+  quarantineSession(key, stuck, "test");
+}
+
+function stubSettings(ptyEnabled: boolean, fallbackModel = ""): void {
   const real = getSettings();
   spyOn(configMod, "getSettings").mockReturnValue({
     ...real,
     model: "primary-model",
     api: "",
-    fallback: { model: "", api: "" },
+    fallback: { model: fallbackModel, api: "" },
     agentic: { ...real.agentic, enabled: false },
     session: { ...real.session, autoRotate: false },
     mcp: { ...real.mcp, shared: [] },
@@ -274,6 +325,96 @@ describe("#562 hot switch to print retires the live PTY first", () => {
 
     expect(retire).not.toHaveBeenCalled();
     expect(legacySpawns).toHaveLength(1);
+    expect(r.stdout).toBe("legacy-ok");
+  });
+});
+
+describe("#562 final round: a pending spawn is the retirement's to settle (#592)", () => {
+  it("global: print spawns only after the late PTY is confirmed dead", async () => {
+    // Fault (site: the `joinPendingSpawns` member of `retireEntry`): the retirement does not
+    // join the pending spawn. Predicted result: the legacy spawn happens while the spawn is
+    // still held, so `legacySpawns` is 1 before the release and `ptysDisposed` is `[]`.
+    stubSettings(true);
+    let release!: () => void;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    let started = 0;
+    injectSpawnPty(async (opts) => {
+      started++;
+      await held;
+      const pty = makeFakePty(opts);
+      ptys.push(pty);
+      return pty;
+    });
+    // The caller gives up; the spawn stays pending on the entry.
+    const warm = await runOnPty("global", "warm", { timeoutMs: 60, retry: false });
+    expect(warm.exitCode).toBe(1);
+    const stop = Date.now() + 5000;
+    while (started < 1 && Date.now() < stop) await new Promise((r) => setTimeout(r, 5));
+    expect(started).toBe(1);
+    restoreSettings();
+    stubSettings(false);
+
+    const run = runnerMod.run("hot-switch", "hello");
+    await new Promise((r) => setTimeout(r, 80));
+    expect(legacySpawns).toHaveLength(0); // print waits for the pending spawn
+
+    release();
+    const r = await run;
+
+    expect(legacySpawns).toHaveLength(1);
+    expect(ptys).toHaveLength(1);
+    // Order: the late PTY was already disposed when print spawned.
+    expect(legacySpawns[0].ptysDisposed).toEqual([true]);
+    expect(r.stdout).toBe("legacy-ok");
+  });
+});
+
+describe("#562 final round: the fallback key is retired only where the fallback runs", () => {
+  it("a quarantined fallback does not fail a healthy primary turn", async () => {
+    // Fault (site: `retireLivePtysBeforePrint` in `run()`, restoring the fallback key to the
+    // primary retirement): predicted result: the turn rejects with `PtyQuarantinedError`.
+    stubSettings(false, "fallback-model");
+    quarantineKey("fallback:global");
+    const calls = recordRetirements();
+
+    const r = await runnerMod.run("hot-switch", "hello");
+
+    expect(r.stdout).toBe("legacy-ok");
+    expect(legacySpawns).toHaveLength(1);
+    expect(calls.map((c) => c.key)).not.toContain("fallback:global");
+  });
+
+  it("a turn that needs the fallback: only the fallback attempt is refused", async () => {
+    // Fault (site: the retire inside the fallback branch): none retires the fallback key.
+    // Predicted result: the fallback spawns beside the quarantined session, so `legacySpawns`
+    // is 2.
+    stubSettings(false, "fallback-model");
+    primaryRateLimited();
+    quarantineKey("fallback:global");
+    const calls = recordRetirements();
+
+    const r = await runnerMod.run("hot-switch", "hello");
+
+    expect(legacySpawns).toHaveLength(1); // the primary ran; the fallback did not spawn
+    expect(calls).toEqual([{ key: "fallback:global", legacyBefore: 1 }]);
+    expect(r.exitCode).not.toBe(0);
+  });
+
+  it("a live fallback PTY is retired immediately before the fallback spawn, after the primary", async () => {
+    stubSettings(true, "fallback-model");
+    await livePtyOn("fallback:global");
+    restoreSettings();
+    stubSettings(false, "fallback-model");
+    primaryRateLimited();
+    const calls = recordRetirements();
+
+    const r = await runnerMod.run("hot-switch", "hello");
+
+    expect(calls).toEqual([{ key: "fallback:global", legacyBefore: 1 }]);
+    expect(legacySpawns).toHaveLength(2);
+    expect(legacySpawns[1].ptysDisposed).toEqual([true]);
     expect(r.stdout).toBe("legacy-ok");
   });
 });

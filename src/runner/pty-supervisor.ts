@@ -83,6 +83,7 @@ import {
   assertSessionSpawnable,
   assertSessionWritable,
   confirmAllQuarantined,
+  fenceKey,
   fenceSession,
   isSessionQuarantined,
   liftFence,
@@ -442,6 +443,30 @@ export function resetSleep(): void {
   _sleep = (ms) => new Promise<void>((r) => setTimeout(r, ms));
 }
 
+/**
+ * How long a retirement waits for a pending (re)spawn to settle (#562 #592): the ready-settle
+ * (3 s, `spawnPty`) plus the disposal cap that follows when the spawn lands on a retired entry
+ * (7 s, `DEFAULT_EXIT_CAP_MS`), plus a margin for boot work ahead of the spawn. Past it the
+ * session is quarantined, never released: an unknown process may still be alive.
+ */
+export const PENDING_SPAWN_BOUND_MS = 15_000;
+let _pendingSpawnWait: (ms: number) => Promise<void> = (ms) =>
+  new Promise<void>((r) => {
+    const t = setTimeout(r, ms);
+    (t as { unref?: () => void }).unref?.();
+  });
+
+/** For tests only. Replace the timer that bounds the wait for a pending spawn. */
+export function injectPendingSpawnWait(fn: ((ms: number) => Promise<void>) | null): void {
+  _pendingSpawnWait =
+    fn ??
+    ((ms) =>
+      new Promise<void>((r) => {
+        const t = setTimeout(r, ms);
+        (t as { unref?: () => void }).unref?.();
+      }));
+}
+
 /** For tests only. Inject a deterministic UUID generator so fresh-session
  *  persistence can be pinned without randomness. */
 export function injectNewSessionId(fn: (() => string) | null): void {
@@ -489,6 +514,7 @@ export function __resetSupervisorForTests(): void {
   _initPromise = null;
   _admissionLock = Promise.resolve();
   _spawnPty = null;
+  injectPendingSpawnWait(null);
   _ensureAgentDir = null;
   _cleanSpawnEnv = null;
   _buildSecurityArgs = null;
@@ -2035,6 +2061,13 @@ function retireEntry(entry: PtyEntry): Promise<void> {
   // not confirmed, with no gap, and is lifted when the retirement ends.
   const fencedPty = entry.pty;
   if (fencedPty) fenceSession(entry.sessionKey, fencedPty);
+  // #592: the key is fenced too, whether or not a process has landed. A spawn still in its
+  // ready-settle has a running child and no `entry.pty`; this fence is what covers it.
+  fenceKey(
+    entry.sessionKey,
+    entry,
+    () => entry.pty?.sessionId || entry.spawnOpts?.sessionId || entry.spawnOpts?.newSessionId,
+  );
   const run = (async () => {
     // A first-turn spawn failure may be releasing this key right now; let it
     // finish before releasing again, so nothing keyed by sessionKey is still
@@ -2048,10 +2081,13 @@ function retireEntry(entry: PtyEntry): Promise<void> {
     try {
       const pty = entry.pty;
       const disposal = entry.disposing ?? pty?.dispose() ?? Promise.resolve();
-      const [disposed] = await Promise.allSettled([
+      const [disposed, , joined] = await Promise.allSettled([
         disposal,
         // Release multiplexer identity + delete synthesized config (SPEC §4.5).
         releaseMcpIdentityFor(entry),
+        // #592: a pending spawn or respawn is the entry's to settle. It lands on a retired
+        // entry, so `landPty` disposes and confirms it; the retirement ends after that.
+        joinPendingSpawns(entry),
       ]);
       // #562 round 7: a disposal that could not prove the exit leaves a process that may
       // still write. Quarantine the key before the entry leaves the map, with no await in
@@ -2059,16 +2095,79 @@ function retireEntry(entry: PtyEntry): Promise<void> {
       if (disposed.status === "rejected" && pty) {
         quarantineSession(entry.sessionKey, pty, "retire-exit-unconfirmed");
       }
+      // #592: a pending spawn that did not settle within the bound may have a process alive.
+      // The fence turns into its quarantine record in this same synchronous step.
+      if (joined.status === "fulfilled" && joined.value) {
+        quarantineSession(entry.sessionKey, joined.value, "pending-spawn-unsettled", entry);
+      }
     } finally {
       // Unconditional: an entry left in the map with `retiring` settled would
       // spin every admission on its key (and the shutdown loop) forever.
       if (fencedPty) liftFence(fencedPty);
       if (entry.pty) liftFence(entry.pty);
+      liftFence(entry);
       if (state.ptys.get(entry.sessionKey) === entry) state.ptys.delete(entry.sessionKey);
     }
   })();
   entry.retiring = run;
   return run;
+}
+
+/**
+ * Wait, within `PENDING_SPAWN_BOUND_MS`, for every (re)spawn pending on `entry` to settle (#592).
+ * `spawnInFlight` is cleared only after `landPty` has disposed and confirmed a late arrival (or
+ * quarantined it itself), so settled means the spawn left no unaccounted process. Returns null
+ * when it settled, or a stand-in process for the one that did not: its quarantine record.
+ */
+async function joinPendingSpawns(entry: PtyEntry): Promise<PtyProcess | null> {
+  if (!entry.spawnInFlight) return null;
+  let expired = false;
+  const bound = _pendingSpawnWait(PENDING_SPAWN_BOUND_MS).then(() => {
+    expired = true;
+  });
+  while (entry.spawnInFlight) {
+    const pending = entry.spawnInFlight;
+    let settled = false;
+    const done = pending.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await Promise.race([done, bound]);
+    if (settled) {
+      if (entry.spawnInFlight === pending) break;
+      continue;
+    }
+    if (expired) return pendingSpawnStandIn(entry, () => settled);
+  }
+  return null;
+}
+
+/**
+ * The quarantine record for a spawn that did not settle: a process we cannot name. It is
+ * confirmed gone once the spawn has settled (then `landPty` has disposed what it produced,
+ * and recorded its own quarantine if that disposal was unconfirmed).
+ */
+function pendingSpawnStandIn(entry: PtyEntry, isSettled: () => boolean): PtyProcess {
+  const label = `pending-spawn:${entry.sessionKey}`;
+  const confirm = async (): Promise<void> => {
+    if (!isSettled()) throw new PtyExitUnconfirmedError(label, 0);
+  };
+  return {
+    label,
+    pid: 0,
+    sessionId: entry.spawnOpts?.sessionId || entry.spawnOpts?.newSessionId || "",
+    cwd: entry.spawnOpts?.cwd ?? "",
+    isAlive: () => !isSettled(),
+    lastTurnEndedAt: () => 0,
+    exitInfo: () => null,
+    runTurn: () => Promise.reject(new PtyClosedError(label, null)),
+    dispose: confirm,
+    confirmExit: confirm,
+  };
 }
 
 /**

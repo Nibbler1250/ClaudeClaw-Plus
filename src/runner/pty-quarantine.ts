@@ -87,8 +87,17 @@ interface QuarantineRecord {
 
 let records: QuarantineRecord[] = [];
 
-/** Processes whose retirement has begun and not yet finished: pty -> supervisor key. */
-const fences = new Map<PtyProcess, string>();
+interface Fence {
+  sessionKey: string;
+  /** Read at check time: a pending spawn learns its session id only as it boots. */
+  sessionId: () => string | undefined;
+}
+
+/**
+ * Retirements that have begun and not yet finished, by owner: a process (`fenceSession`) or,
+ * for a session with no landed process, the entry that owns a pending spawn (`fenceKey`).
+ */
+const fences = new Map<object, Fence>();
 
 /**
  * Fence the session of `pty` from the moment its retirement BEGINS. Call it synchronously,
@@ -97,18 +106,41 @@ const fences = new Map<PtyProcess, string>();
  * step) or `liftFence` (confirmed, or the retirement is over).
  */
 export function fenceSession(sessionKey: string, pty: PtyProcess): void {
-  fences.set(pty, sessionKey);
+  fences.set(pty, { sessionKey, sessionId: () => pty.sessionId });
 }
 
-/** End the fence of `pty`. A no-op once `quarantineSession` has taken it over. */
-export function liftFence(pty: PtyProcess): void {
-  fences.delete(pty);
+/**
+ * Fence a session KEY from the moment a retirement begins, whether or not a process has
+ * landed on it (#562 #592). A spawn still in its ready-settle already has a running child, but
+ * no `PtyProcess` to fence; the owner is then the entry. `sessionId` is read on every check.
+ * Idempotent. Ended by `liftFence(owner)`, or handed to `quarantineSession` via `alsoLift`.
+ */
+export function fenceKey(
+  sessionKey: string,
+  owner: object,
+  sessionId: () => string | undefined = () => undefined,
+): void {
+  fences.set(owner, { sessionKey, sessionId });
 }
 
-/** Put a session under quarantine. Logs once per process (pids belong in the daemon log). */
-export function quarantineSession(sessionKey: string, pty: PtyProcess, reason: string): void {
+/** End the fence of `owner` (a process or an entry). A no-op once a quarantine has taken it. */
+export function liftFence(owner: object): void {
+  fences.delete(owner);
+}
+
+/**
+ * Put a session under quarantine. Logs once per process (pids belong in the daemon log).
+ * `alsoLift` is a second fence owner (the retiring entry) that changes hands in the same step.
+ */
+export function quarantineSession(
+  sessionKey: string,
+  pty: PtyProcess,
+  reason: string,
+  alsoLift?: object,
+): void {
   // Record and fence change hands in one synchronous step: no moment with neither.
   fences.delete(pty);
+  if (alsoLift) fences.delete(alsoLift);
   if (records.some((r) => r.pty === pty)) return;
   records.push({ sessionKey, pty, reason, since: Date.now() });
   console.warn(
@@ -127,7 +159,11 @@ function matches(r: QuarantineRecord, t: SessionTarget): boolean {
 }
 
 function isFenced(t: SessionTarget): boolean {
-  for (const [pty, key] of fences) if (matchesIds(key, pty, t)) return true;
+  for (const f of fences.values()) {
+    if (t.sessionKey !== undefined && f.sessionKey === t.sessionKey) return true;
+    const id = f.sessionId();
+    if (t.sessionId && id && id === t.sessionId) return true;
+  }
   return false;
 }
 
