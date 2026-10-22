@@ -99,6 +99,55 @@ describe("PtyAgentProcess boot-dialog watcher (issue #193)", () => {
     expect(writes).toEqual([]);
   });
 
+  /** A dialog laid out the way win32 ConPTY draws it: one CUP per row, CUF
+   *  between words, no newline anywhere. */
+  function conptyScreen(rows: string[]): string {
+    return rows.map((r, i) => `\x1b[${i + 3};3H${r.split(" ").join("\x1b[1C")}`).join("");
+  }
+
+  test("win32 layout: a destructive default is not confirmed because a LATER option reads as proceed (#586)", () => {
+    const { pty, writes, emit } = makeFakePty();
+    new PtyAgentProcess("main", pty);
+    emit(
+      conptyScreen([
+        "Something changed",
+        "> 1. No, exit",
+        "  2. Yes, continue",
+        "Enter to confirm · Esc to cancel",
+      ]),
+    );
+    expect(writes).toEqual([]);
+  });
+
+  test("win32 layout: the new-MCP-server dialog is not approved through its 'Continue without' option (#586, #469)", () => {
+    const { pty, writes, emit } = makeFakePty();
+    new PtyAgentProcess("main", pty);
+    emit(
+      conptyScreen([
+        "New MCP server found in .mcp.json: example",
+        "> 1. Use this and all future MCP servers in this project",
+        "  2. Use this MCP server",
+        "  3. Continue without using this MCP server",
+        "Enter to confirm · Esc to cancel",
+      ]),
+    );
+    expect(writes).toEqual([]);
+  });
+
+  test("win32 layout: a '>' before a number inside prose is not the selection (#586)", () => {
+    const { pty, writes, emit } = makeFakePty();
+    new PtyAgentProcess("main", pty);
+    emit(
+      conptyScreen([
+        "> 1. Exit",
+        "  2. I am using this for local development",
+        "  Needs claude > 2.1 to continue",
+        "Enter to confirm · Esc to cancel",
+      ]),
+    );
+    expect(writes).toEqual([]);
+  });
+
   test("does not trigger on the REPL footer that also says 'bypass permissions on'", () => {
     const { pty, writes, emit } = makeFakePty();
     new PtyAgentProcess("main", pty);

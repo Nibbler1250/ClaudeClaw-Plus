@@ -86,15 +86,26 @@ function stripAnsiEscapes(text: string): string {
   );
 }
 
+/** ConPTY (win32) places each screen row with CUP (`\x1b[<row>;<col>H`), not
+ *  a newline, so once the escapes are stripped a whole dialog reads as one
+ *  line and the selected option runs into the options below it — whose words
+ *  ("Continue", "Yes") would then pass the proceed allowlist (#586). The
+ *  boot-dialog view turns every CUP into a line break first. */
+function cursorPositionToNewline(text: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: CUP is an ANSI CSI sequence.
+  return text.replace(/\x1b\[\d*(?:;\d*)?[Hf]/g, "\n");
+}
+
 /** Index of the selected-option pointer of the last option list in `region`,
  *  or -1. claude draws it as "❯" where the terminal is Unicode-capable and
  *  falls back to ASCII ">" where it is not — which is every ConPTY on win32
  *  (issue #586: the dev-channels dialog sat unanswered there, so the bus agent
- *  never reached its REPL). The ASCII form counts only in front of an option
- *  number, so a ">" in dialog prose cannot pose as the selection. */
+ *  never reached its REPL). The ASCII form counts only at the start of a line
+ *  and in front of an option number, so a ">" in dialog prose cannot pose as
+ *  the selection. */
 function lastSelectedOptionIndex(region: string): number {
   let last = -1;
-  for (const m of region.matchAll(/❯|>(?=\s*\d+[.)])/g)) last = m.index;
+  for (const m of region.matchAll(/❯|^[ \t]*>(?=[ \t]*\d+[.)])/gm)) last = m.index;
   return last;
 }
 
@@ -957,7 +968,7 @@ export class PtyAgentProcess implements AgentProcess {
    *  warning" rather than "blindly pressed the wrong button". */
   private handleBootDialog(chunk: string): void {
     this.bootDialogBuffer = (this.bootDialogBuffer + chunk).slice(-4000);
-    const buf = stripAnsiEscapes(this.bootDialogBuffer);
+    const buf = stripAnsiEscapes(cursorPositionToNewline(this.bootDialogBuffer));
 
     // REPL is up — disengage FIRST so we never inject a key into a live REPL.
     // Every REPL mode footer carries the mode-cycler hint ("shift+tab to
