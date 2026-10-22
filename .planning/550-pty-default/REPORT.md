@@ -359,3 +359,43 @@ Final validation used Bun with --preload <repo>/scripts/test-preload.ts and abso
 | git diff --check | clean |
 
 No requested fix remains undone. Version 2.2.341 is deliberately unchanged under the explicit no-bump dispatch instruction. No new Ultra code was reused. No live Claude, browser or production SSE check was performed; dashboard delivery is proved at its runner stream callback boundary. README and issue 559 remain untouched, existing external integration/operator soak gates remain applicable, and no GitHub comment or thread resolution was posted.
+
+## Hot-switch to print (connector P1)
+
+Codex connector P1 on `docs/pty-migration.md:71` (thread PRRT_kwDOR1KQD86t-zcC): when `pty.enabled`
+flips true → false, the next runner turn resumed the session on `claude -p --resume` while an idle
+PTY still owned the session key, so two writers shared one transcript (or the CLI refused with
+"Session ID ... is already in use").
+
+**Fix.** `retireLivePtysBeforePrint(keys)` in `src/runner.ts`: reads `liveSessionKeys()` first (an
+empty list returns at once, so a print-only install pays nothing), then `retirePtySession(key)` for
+each of the turn's keys that is live. `retirePtySession` carries the round 8/9 fence and rejects
+with `PtyQuarantinedError` when the exit is unconfirmed; nothing catches it, so the turn rejects and
+no legacy process starts (the same propagation as the existing PTY recovery retire).
+
+| Call site | Keys retired | Why |
+| --- | --- | --- |
+| `execClaude`, before the primary/recovery/fallback legacy spawns | `ptySessionKey` (global / `agent:<n>` / `thread:<id>`) and `fallback:<key>` | one retire covers `runClaudeStream` for the primary, `execRecovery` and `execFallback` |
+| `streamClaude`, before its `spawnClaude` | `global` | the dashboard chat resumes the global session on print |
+
+Not changed, because they never resume a session: `runFork` (fresh `fork:<uuid>`), `runAgentJobHeadless`
+(fresh `job:<agent>:<id>`), and `bootstrap` (goes through `execClaude`). Bus agents stay out of scope.
+
+**Tests** (`src/__tests__/pty-hot-switch-to-print.test.ts`, 5): live PTY on `global` and on
+`agent:<name>` then `pty.enabled` false, the PTY is already disposed at the moment of the legacy
+spawn; the dashboard chat does the same; a rejected retirement means no legacy spawn and the turn
+rejects with `PtyQuarantinedError`; no PTY entry means `retirePtySession` is never called.
+
+**Injections**, one site at a time on `git archive` copies (predicted before running):
+
+| Injection | Predicted | Result |
+| --- | --- | --- |
+| remove the `execClaude` retire block | global, agent, quarantine tests RED | 3 fail: `Expected to contain: "global"  Received: []`; `Expected to contain: "agent:hotswitch-agent-30598"  Received: []`; `expect(received).rejects.toBeInstanceOf(expected)  Received promise that resolved` |
+| move the `execClaude` retire block after the legacy exec | global, agent, quarantine RED | 3 fail: `expect(received).toEqual(expected)  [ - true, + false ]` (PTY not yet disposed at the spawn) on global and agent; `Expected length: 0  Received length: 1` on quarantine |
+| remove the `streamClaude` retire call | dashboard test RED | 1 fail: dashboard chat test |
+| move the `streamClaude` retire call after `spawnClaude` | dashboard test RED | 1 fail: `expect(received).toEqual(expected)  [ - true, + false ]` |
+
+A first run of the injections also turned the "no PTY entry" test red, which exposed a test defect:
+`spy.mockRestore()` at the end of a test is skipped when an assertion throws, so recorded calls leaked
+into the next test. Spies are now restored in `afterEach` (`mock.restore()`), and the rerun above is
+the clean one.
