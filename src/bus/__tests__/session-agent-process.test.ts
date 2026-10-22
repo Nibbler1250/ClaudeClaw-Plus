@@ -1419,6 +1419,141 @@ describe("PtyAgentProcess enqueue-confirmed delivery (issue #363)", () => {
   });
 
   /**
+   * Issue #9 — the other direction. A queued prompt the CLI folds into the
+   * running turn never gets a `user` line (fixture 04: `enqueue` → `remove
+   * absorbed_mid_turn` → `queued_command` attachment, nothing else). Paying
+   * the debt on `user` lines only left it open for the full TTL, and the next
+   * delivery of the same text — run at once on an idle CLI — had its OWN
+   * `user` line absorbed as that debt's payment. Unconfirmed, then
+   * re-delivered: the agent runs it twice.
+   *
+   * Across 15 live transcripts, 350 enqueues left the queue as 345 `user`
+   * lines and 5 absorptions, none twice and none never. The ledger is a count
+   * per text, so that conservation is all it needs: paying on the absorption
+   * keeps the count true, and nothing has to guess whose line it is.
+   */
+  it("lets a delivery's own user record confirm it after an earlier copy was absorbed mid-turn", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("absorbed-debt", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+    const text = "heartbeat: any new messages?";
+
+    // Delivery A — queued behind a running turn, confirmed by its enqueue.
+    const first = proc.send_prompt_stream(text);
+    const iv1 = setInterval(() => emit("streaming\n"), 5);
+    setTimeout(() => proc.notePromptIngested(enqueued(text)), 25);
+    await first;
+    clearInterval(iv1);
+
+    // The CLI folds A into the running turn: no `user` line for A, ever.
+    proc.notePromptIngested({ text, source: "absorbed", ingestedAtMs: Date.now() });
+
+    // Delivery B — same text, idle CLI, runs at once: no enqueue, its own
+    // `user` line straight away.
+    const before = writes.length;
+    const second = proc.send_prompt_stream(text);
+    const iv2 = setInterval(() => emit("streaming\n"), 5);
+    setTimeout(
+      () =>
+        proc.notePromptIngested({
+          text,
+          source: "user",
+          promptId: "pid-of-second",
+          ingestedAtMs: Date.now(),
+        }),
+      30,
+    );
+    await second;
+    clearInterval(iv2);
+
+    expect(writes.slice(before)).not.toContain("\x15");
+  });
+
+  it("does not let an earlier copy's absorption confirm the delivery now armed", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("absorbed-armed", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+    const text = "heartbeat: any new messages?";
+
+    const first = proc.send_prompt_stream(text);
+    const iv1 = setInterval(() => emit("streaming\n"), 5);
+    setTimeout(() => proc.notePromptIngested(enqueued(text)), 25);
+    await first;
+    clearInterval(iv1);
+
+    // The first copy is folded into the running turn while the second is
+    // armed: that record is the first copy's, not proof of the second.
+    const before = writes.length;
+    const second = proc.send_prompt_stream(text);
+    const iv2 = setInterval(() => emit("streaming\n"), 5);
+    setTimeout(
+      () => proc.notePromptIngested({ text, source: "absorbed", ingestedAtMs: Date.now() }),
+      30,
+    );
+    await second;
+    clearInterval(iv2);
+
+    expect(writes.slice(before)).toContain("\x15");
+  });
+
+  it("counts an absorption once even when the record is presented twice", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("absorbed-twice", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
+    proc.enableTranscriptConfirmation();
+    const text = "heartbeat: any new messages?";
+    const stamp = Date.now();
+
+    // Two queued copies, both confirmed by their enqueue: the debt is 2.
+    for (const at of [stamp, stamp + 1]) {
+      const p = proc.send_prompt_stream(text);
+      const iv = setInterval(() => emit("streaming\n"), 5);
+      setTimeout(
+        () => proc.notePromptIngested(enqueued(text, { ingestedAtMs: Date.now() + (at - stamp) })),
+        25,
+      );
+      await p;
+      clearInterval(iv);
+    }
+
+    // One absorption, re-read: pays one, not two.
+    const absorbed: PromptIngestion = { text, source: "absorbed", ingestedAtMs: stamp };
+    proc.notePromptIngested(absorbed);
+    proc.notePromptIngested(absorbed);
+
+    // A late `user` line for the surviving copy lands mid-delivery: still
+    // that copy's, so it must not confirm the delivery now armed.
+    const before = writes.length;
+    const third = proc.send_prompt_stream(text);
+    const iv3 = setInterval(() => emit("streaming\n"), 5);
+    setTimeout(
+      () =>
+        proc.notePromptIngested({
+          text,
+          source: "user",
+          promptId: "pid-of-survivor",
+          ingestedAtMs: Date.now(),
+        }),
+      30,
+    );
+    await third;
+    clearInterval(iv3);
+
+    expect(writes.slice(before)).toContain("\x15");
+  });
+
+  /**
    * Adversarial pass, finding 2 — an unusable timestamp used to wave the
    * record through. The enqueue path carries no `promptId`, so the timestamp
    * is the ONLY thing deciding which delivery a record belongs to; treating a

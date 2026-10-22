@@ -567,6 +567,20 @@ export class JsonlTailer {
     }
   }
 
+  private notifyAbsorbed(prompt: unknown, timestamp: unknown): void {
+    if (!this.onPromptIngested || typeof prompt !== "string") return;
+    const ts = typeof timestamp === "string" ? Date.parse(timestamp) : Number.NaN;
+    try {
+      this.onPromptIngested({
+        text: prompt,
+        source: "absorbed",
+        ingestedAtMs: Number.isFinite(ts) ? ts : 0,
+      });
+    } catch (err) {
+      this.onError(err, { where: "onPromptIngested(absorbed)", agent_id: this.agent_id });
+    }
+  }
+
   private dispatch(line: JsonlLine, raw: string): void {
     if (!this.sawAnyLine) {
       this.sawAnyLine = true;
@@ -879,6 +893,9 @@ export class JsonlTailer {
         prompt?: unknown;
         commandMode?: unknown;
       };
+      // Issue #9: an absorbed submission writes no `user` line, so this is the
+      // record that closes its `enqueue` in the delivery-confirm ledger.
+      this.notifyAbsorbed(prompt, line.timestamp);
       if (
         typeof prompt === "string" &&
         commandMode !== "task-notification" &&
