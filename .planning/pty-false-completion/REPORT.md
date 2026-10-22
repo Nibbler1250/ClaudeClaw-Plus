@@ -1657,3 +1657,272 @@ Notes on what the runs showed:
    caller's abort path owns that, as before); I did not change it.
 6. `dispose()` has no bound on the wait for the exit event. If the OS never delivers it the
    retire hangs. It never did in any run; unchanged.
+
+---
+
+# Round 6: Codex review of `e42e67a3` (1 HIGH, 2 MEDIUM, 1 LOW)
+
+Input: the Codex round-5 review (`codex-562r5-review.md`). Worktree `Sonnet`, branch
+`feat/550-pty-default`. Round-5 rulings stay in force (boundary-only turn end, kill-and-resume
+on every non-OK turn, empty = failure, no retry or replay after the prompt was sent).
+
+## Fix 1 (HIGH): an abort after the send now retires the entry and waits for the exit
+
+Cause: `sendToLiveSession` returned at once on `LiveSendAborted`; the abandoned turn's rejection
+handler only released the lock. The live writer survived and could feed delayed records to the next
+identical prompt (Codex probe: disposals 0, entry retained).
+
+Change (`pty-supervisor.ts`, `sendToLiveSession`):
+
+- An `abort` listener is installed synchronously right after `runTurn` is called (no await
+  between), so the entry is retiring before the abandoned turn can settle. It starts
+  `retireEntry(entry)`; the `LiveSendAborted` branch AWAITS it before returning `aborted`.
+- The lock is released only after that retirement finished: the release chain is
+  `persisted -> abortRetirement -> release`, so an abandoned turn that rejects first does not free
+  the lock while the process is still exiting.
+- An abort before anything was written is unchanged (nothing to kill). One gap closed: a signal
+  that fired while queued on the lock, between the wait and the write, is now re-checked under the
+  lock and returns `aborted before send` without writing.
+
+### Early-return audit (any return after the send that does not retire and await)
+
+`sendToLiveSession`:
+
+1. loop-top `signal.aborted` (`aborted before send`): before any write. Fine.
+2. `not-live` (`no-entry`, `ephemeral`, `no-process`): no write. Fine.
+3. `gaveUp` waiting on `entry.retiring` or `entry.spawnInFlight`: no write. Fine.
+4. `gaveUp("the running turn to end")` (timeout or abort while queued behind another turn): no write
+   by us, and the entry belongs to the OTHER turn, so it must NOT be retired. Pinned by a new test.
+5. re-check under the lock (`!isCurrentEntry`, ...): `release(); continue`. No write. Fine.
+6. new: abort re-check under the lock: `release()` then return. No write. Fine.
+7. `runTurn` throwing synchronously: `runTurn` returns rejected promises for every pre-write
+   refusal (disposed, dead, concurrent, no transcript) and does not throw before the write
+   (`preparePtyPromptForWrite` has no `throw`). Fine.
+8. `boundaryVerdict(result) === "failed"`: `await retireEntry`. Already correct.
+9. generic `catch` (timeout, uncertain, not accepted, failed, replaced, closed): `await retireEntry`.
+   Already correct. Note: it also retires on `PtyTranscriptUnavailableError`, which
+   `runTurnWithRetries` deliberately does not. Conservative (kills a process nothing was written
+   to); left alone.
+10. `LiveSendAborted` (the finding): was `return` with no retire. Now awaits the retirement.
+11. success `sent`: a proven OK, nothing to retire.
+
+`runTurnWithRetries` / `runOnPty`:
+
+1. spawn wait `DeadlineExceeded` / spawn failure -> `errorResult`: before any write.
+2. `!entry.pty` after spawn -> `errorResult`: before any write.
+3. success with `boundaryVerdict === "failed"`: `await retireEntry`. Fine.
+4. non-retryable + `PtyClosedError` + `signal.aborted`: `await retireEntry`. Fine. (`runOnPty`'s
+   own abort listener also starts `retireEntry`; this joins it.)
+5. non-retryable, everything else: `await retireEntry` unless `PtyTranscriptUnavailableError`
+   (refused before the write). Fine.
+6. retryable (`PtyClosedError` with `promptSent === false`) then `signal.aborted` -> `errorResult`
+   with no retire: the prompt was never written, and the abort listener has already started the
+   retirement. Fine.
+7. retries exhausted / respawn failure -> `errorResult`: only reachable through (6)'s retryable
+   class, i.e. nothing was sent.
+8. `runOnPty` aborted before `runOnAdmittedEntry`: `await retireEntry`. Fine.
+
+No other post-send return without a retire-and-await was found.
+
+### Tests (`pty-send-to-live.test.ts`)
+
+- Replaced "an abort stops the wait at once but keeps the lock until the turn really ends". It
+  asserted the old behaviour (after an abort the entry stays and a second send fails) and was the
+  finding itself. This is a deliberate reversal, not a weakened guard.
+- New, send -> abort: the disposal starts at the abort, the call does not return until the exit is
+  released, the entry is gone, and the next call spawns a new process that resumes the stored
+  session id (`sess-1`).
+- New: a turn queued behind the live send is not let go until the disposal finished, even when the
+  abandoned turn rejects first.
+- New: an abort while queued behind another turn, before anything was written, retires nothing.
+- The already-aborted test now also asserts nothing was disposed.
+
+## Fix 2 (MEDIUM): a textless final message is an empty reply
+
+Cause: `addAssistantLine` dropped messages with no text, so `answerText()` returned the last
+message WITH text ("Let me check") when the final message was thinking-only or tool-only.
+
+Change (`pty-transcript.ts`): every non-synthetic assistant line opens or joins its message,
+text or not. The answer is the last message's text (the final message by identity); empty after
+trim -> `empty-reply` at the boundary.
+
+Deliberate reversals (the old expectation was the bug, ruling 3):
+
+- `pty-transcript.test.ts` "a turn that ends on a tool-only message returns the last message that
+  has text" (round 3) -> now expects `empty-reply` and answer `""`.
+- `pty-transcript.test.ts` "an earlier message with text and a tool-only final message is NOT
+  empty: the last message that has text answers" (round 5, the test at :1114) -> replaced by
+  Codex's sequence (narration + tool_use, thinking-only terminal message, `turn_duration`), which
+  fails as `empty-reply`. A companion test pins that a real-text final message still answers with
+  itself only.
+
+## Fix 3 (MEDIUM): incomplete assistant shapes no longer fail open
+
+- Error flags (`isApiErrorMessage`, `error`) are read FIRST on every assistant record, before the
+  `message` check. Codex's sequence (final -> `{type:"assistant", isApiErrorMessage:true,
+  error:"529"}` -> boundary) now fails `api-error` with text `529`. No `message`, no text, no
+  `error` string -> the fixed text `API error`, never `undefined`.
+- Message identity decides what the final message is. An id-less assistant line in the terminal
+  phase, or any id-less line beside another assistant line of the turn, fails the turn as
+  `ambiguous` ("an assistant line has no message id, so which lines make up the final message is
+  uncertain"). A lone id-less final line is a complete message and answers.
+  Choice: I used the existing `ambiguous` failure kind (surfaces as `PtyTurnFailedError`, text
+  "outcome uncertain", kill-and-resume, never replayed) instead of waiting for the timeout to
+  raise `PtyTranscriptUncertainError`. Both are non-success, non-replayed, kill-and-resume; this
+  one answers at once instead of after the whole turn timeout, for a shape the real CLI is not
+  known to produce.
+
+## R2g (LOW)
+
+Not pinnable with a real child through bun-pty, and that is shown, not assumed: a `trap '' TERM`
+shell under bun-pty had its exit event delivered ~6 ms after `kill("SIGTERM")` while `kill -0`
+still found the pid alive 400 ms later. bun-pty reports the exit when kill is called, whether or
+not the child obeyed, so `await exited` in `dispose()` is satisfied immediately for any real
+child. It IS pinned with a fake `bun-pty` (`mock.module`, its own file
+`pty-process-dispose.test.ts`): a child that ignores SIGTERM and exits only after SIGKILL, with the
+kill timer driven by hand. `dispose()` must stay pending until the timer fires and SIGKILL took
+the child. The injection (drop `await exited`) now goes RED.
+
+## Round 6: fault injection (one site at a time, on a `git archive` copy of the committed fix)
+
+Each fault was predicted before it was run; the test file named is the only one run on that copy.
+RED lines are pasted from the run output.
+
+### I1a — live-send abort: retirement started but the abort branch does not await it (site: `await (abortRetirement ?? retireEntry(entry));` removed)
+
+Predicted: the call returns while the exit is still held, so `returned` is logged before the
+disposal ends. Exit 1, 1 failing.
+
+```
+604 |       expect(events).toEqual(["dispose-start"]);
+error: expect(received).toEqual(expected)
+@@ -2,2 +2,3 @@
+    "dispose-start",
++   "returned",
+(fail) sendToLiveSession > an abort after the prompt was sent (#562 round 6, Fix 1) > retires the entry and returns only after the process has exited; the next call resumes the same session in a new process
+```
+
+### I1b — live-send abort: the original bug (listener retirement and the awaited retire both removed)
+
+Predicted: no disposal ever starts. Exit 1, 2 failing.
+
+```
+604 |       expect(events).toEqual(["dispose-start"]);
+error: expect(received).toEqual(expected)
+  [
+-   "dispose-start",
++   "returned",
+  ]
+(fail) sendToLiveSession > an abort after the prompt was sent (#562 round 6, Fix 1) > retires the entry and returns only after the process has exited; the next call resumes the same session in a new process
+(fail) sendToLiveSession > an abort after the prompt was sent (#562 round 6, Fix 1) > keeps the lock until the disposal has finished, even when the abandoned turn rejects first
+```
+
+### I1c — release chain ungated (site: `persisted.then(() => abortRetirement?.catch(...)).then(release, release)` -> `persisted.then(release, release)`)
+
+Predicted: the turn queued behind is let go while the old process is still exiting. Exit 1, 1 failing.
+
+```
+650 |       expect(behindReturned).toBe(false);
+error: expect(received).toBe(expected)
+Expected: false
+Received: true
+(fail) sendToLiveSession > an abort after the prompt was sent (#562 round 6, Fix 1) > keeps the lock until the disposal has finished, even when the abandoned turn rejects first
+```
+
+### I1d — retire on an abort that came while queued, before any write (site: `gaveUp("the running turn to end")` path)
+
+Predicted: the entry running the other turn is killed. Exit 1, 2 failing (the new test and the
+existing "busy past the timeout" test).
+
+```
+675 |       expect(spawned[0].disposed).toBe(false);
+error: expect(received).toBe(expected)
+Expected: false
+Received: true
+(fail) sendToLiveSession > an abort after the prompt was sent (#562 round 6, Fix 1) > an abort while queued behind another turn, before anything was written, retires nothing
+(fail) sendToLiveSession > busy past the timeout: failed (no not-live), and the abandoned send is never written later
+```
+
+### I2 — textless messages dropped again (site: `addAssistantLine`, `if (text === "") return;` restored)
+
+Predicted: the thinking-only final message vanishes and "Let me check" answers. Exit 1, 2 failing.
+
+```
+1148 |     expect(s.failure).toEqual({ kind: "empty-reply", text: EMPTY_REPLY_TEXT });
+error: expect(received).toEqual(expected)
+- {
+-   "kind": "empty-reply",
+-   "text": "empty reply in transcript",
+- }
++ null
+(fail) TranscriptTurn — an empty reply is a failure (round 5, MEDIUM) > narration, then a thinking-only terminal message, then the boundary: fails as empty, the narration is not the answer (round 6)
+(fail) TranscriptTurn — the matched turn is a window, frozen when it ends (round 3, H4) > a turn that ends on a tool-only message is an empty reply, whatever the narration before it said
+```
+
+### I3a — `if (!message) return;` ahead of the error flags
+
+Predicted: the message-less error record is skipped and the final answers. Exit 1, 2 failing.
+
+```
+1213 |     expect(s.failure).toEqual({ kind: "api-error", text: "529" });
+error: expect(received).toEqual(expected)
+- {
+-   "kind": "api-error",
+-   "text": "529",
+- }
++ null
+(fail) TranscriptTurn — incomplete assistant shapes (round 6, Fix 3) > an error-flagged assistant record with NO message, after the final message, fails the turn
+(fail) TranscriptTurn — incomplete assistant shapes (round 6, Fix 3) > an error flag with no message and no text still fails, with a fixed text
+```
+
+### I3b — an id-less line in the terminal phase dropped silently again
+
+Predicted: A is returned alone. Exit 1, 1 failing.
+
+```
+1258 |     expect(s.failure?.kind).toBe("ambiguous");
+error: expect(received).toBe(expected)
+Expected: "ambiguous"
+Received: undefined
+(fail) TranscriptTurn — incomplete assistant shapes (round 6, Fix 3) > id-less lines A then B, A carrying the terminal stop: uncertain, never A alone
+```
+
+### I3c — the id-less counter never fails (site: `if (this.idlessSeen && this.assistantLines > 1)` -> `if (false)`)
+
+Predicted: two id-less lines become two messages, B answers. Exit 1, 2 failing.
+
+```
+1273 |     expect(s.failure?.kind).toBe("ambiguous");
+error: expect(received).toBe(expected)
+Expected: "ambiguous"
+Received: undefined
+(fail) TranscriptTurn — incomplete assistant shapes (round 6, Fix 3) > id-less lines A (open) then B (terminal): uncertain, never B alone
+(fail) TranscriptTurn — incomplete assistant shapes (round 6, Fix 3) > an id-less line beside an id'd message is uncertain too
+```
+
+### I2g — R2g: `await exited;` removed from `dispose()` (file `pty-process.ts`)
+
+Predicted: dispose returns right after SIGTERM, `settled` is true before the kill timer. Exit 1.
+
+```
+100 |     expect(settled).toBe(false);
+error: expect(received).toBe(expected)
+
+Expected: false
+Received: true
+(fail) PtyProcess.dispose — waits for the process to exit (R2g) > a child that ignores SIGTERM keeps dispose pending until SIGKILL has taken it
+```
+
+(No test in this round is left as an unfailable shape: every new assertion above was watched going
+red before its comment was written.)
+
+## Cron retry (reported, not changed)
+
+`job-loop.ts:131`: a job with `retry > 0` is re-run after `retryDelay` when its result has
+`exitCode !== 0`, and nothing else is looked at. Every PTY failure maps to a non-zero exit
+(timeout 124, uncertain, empty reply, API error, ambiguous, aborted, all 1), so **an
+uncertain or timed-out PTY turn DOES go through the cron retry** and is replayed as a fresh run of
+the same prompt, even though the prompt may already have run. The runner/supervisor never replays
+it; the cron layer does, when the operator configured `retry`. Left as is, matching the print
+path. The coordinator will raise it with the operator.
+
