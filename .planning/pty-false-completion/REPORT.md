@@ -1926,3 +1926,44 @@ the same prompt, even though the prompt may already have run. The runner/supervi
 it; the cron layer does, when the operator configured `retry`. Left as is, matching the print
 path. The coordinator will raise it with the operator.
 
+## Round 6: a fourth stale test, found by the gate
+
+`pty-false-completion.test.ts` "a terminal thinking-only final message ends at turn_duration,
+answering with the last message that has text" (round 4) asserted the old behaviour through the
+real process and reader, and was the only red in the wide gate. Reversed on purpose (ruling 3): it
+now expects `PtyTurnFailedError` kind `empty-reply`. Injection (I2 again, drop textless messages)
+against this file:
+
+```
+704 |     expect(out.text).toBeUndefined();
+error: expect(received).toBeUndefined()
+
+Received: "THE-LAST-TEXT"
+(fail) #562 round 4 — ... > a terminal thinking-only final message ends at turn_duration as an empty reply, not with the narration before it
+```
+
+## Round 6: verification
+
+- Wide gate: every `.test.ts` under `src/` and `tests/` (minus `tests/integration`) whose content
+  matches `\bpty\b|Pty[A-Z]|runOnPty|pty-[a-z]|live-session|LiveSession|[Gg]ateway`: **96 files**,
+  file by file, up to 3 attempts each, ANTHROPIC_BASE_URL unset, output to files.
+  - normal: 95 files green on the first attempt; `pty-false-completion.test.ts` red (the stale test
+    above, 3 of 3 attempts) and, after the reversal, **46 pass / 0 fail** in both modes.
+  - `CLAUDECLAW_TEST_PLATFORM=linux`: same one red, same fix; `skills-fitness.test.ts` needed a
+    second attempt (the known pre-existing red "does not call the judge again within the failure
+    cooldown" was green on attempt 2, so it is a flake, not a regression).
+  - About 2,219 passing tests per mode across the 96 files.
+- `bun run lint` (full repo) exit 0; `bun run typecheck`: 149 errors, baseline 149.
+- No real `claude`; nothing touched `~/.claude`.
+
+## Round 6: not done / risks
+
+1. **No real claude.** Still unconfirmed against a live CLI: (a) `turn_duration` follows every
+   terminal message on 2.1.296; (b) the real CLI never omits `message.id` on an assistant line
+   (if it does, such turns now fail `ambiguous` instead of answering); (c) a multi-block final
+   message is one id across lines.
+2. **Orphan claude after a daemon crash:** no reaper, per the brief. Residual.
+3. **Cron retry replays a failed PTY job** when `retry` is configured (see above).
+4. **`PtyTranscriptUnavailableError` in `sendToLiveSession`** retires a process nothing was written
+   to; `runTurnWithRetries` does not. Harmless and conservative; not changed.
+
