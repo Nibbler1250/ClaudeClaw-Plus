@@ -2478,3 +2478,232 @@ runs; a third single-process run was not made.
 - `bun run lint` (full repo) exit 0; `bun run typecheck`: 149 errors, baseline 149.
 - No real `claude` started; nothing touched `~/.claude`. The real-child tests spawn `/bin/sh` and
   `/bin/cat` and `/bin/sleep` only and kill what they start.
+
+## Round 9 (FINAL: Codex round-8 HIGH check-to-spawn race, MEDIUM confirmation ignores deadline and abort)
+
+Input: Codex round-8 review of `cebf8bdb`. Commit `b48ae31c` (code and tests), then this report and the
+SPEC and CLAUDE.md sentences. Scope per Terry's ruling: these two findings and nothing else. Quarantine
+visibility (Telegram `/status`, `/kill` wording) and cron retries are untouched.
+
+### What was wrong (verified before fixing)
+
+1. **HIGH, check-to-spawn race.** `assertSessionWritable` is async. `spawnClaude` awaited `gateResume`
+   and then called `Bun.spawn` with nothing in between that could notice a retirement that failed in the
+   meantime (and `runPrint` awaits two dynamic imports after the engine-level gate). Reproduced by the
+   new tests with the quarantine landing inside that gap: before the fix the stub spawn ran.
+2. **MEDIUM, gate ignores the caller's deadline and abort.** `sessionBlocked` and `runOneShot` awaited
+   the confirmation (up to ~7 s in production) with no look at `timeoutMs` or the signal.
+
+### Fix 1: fence at retirement start, synchronous check at each spawn
+
+All in `src/runner/pty-quarantine.ts`, one registry:
+
+- `fenceSession(sessionKey, pty)` / `liftFence(pty)`. The fence is a map pty -> key. `quarantineSession`
+  deletes the fence and adds the record in one synchronous step, so an unconfirmed exit goes from
+  fenced to quarantined with no gap; `liftFence` after that is a no-op.
+- `assertSessionSpawnable(target)`: SYNCHRONOUS, throws `PtyQuarantinedError` for a quarantined or
+  fenced session (matched by supervisor key or claude session id, like the gate). The async gate stays
+  (it does the confirmation retry); the sync check is the final word.
+
+**Fence entry points** (`pty-supervisor.ts`): `retireEntry` (:2027, before the first await; covers
+supervisor reap, LRU, `/kill`, shutdown, abort/timeout retirement, `retirePtySession`, all of which
+call it), `landPty` late-PTY disposal (:1989), `respawnEntry` crash-recovery disposal (:2270). The
+`retireEntry` finally lifts the fence (:2055-2056); the other two lift in their own `finally`.
+
+**Sync-check sites** (every one is on the line before process creation, no await in between; each has a
+one-line comment saying so):
+
+| Site | Where |
+|---|---|
+| runner `spawnClaude` (legacy `claude -p`; `runClaudeOnce`, stream, fork) | `runner.ts:807` via `assertResumeSpawnable`, before `_claudeSpawnForTests`/`Bun.spawn` |
+| runner `runClaudeStreaming` direct `Bun.spawn` | `runner.ts:1211` |
+| print engine | `oneshot/print.ts:81`, inside the promise, right before `spawn("claude", ...)`, after the config/runner imports (not for untrusted: no resume) |
+| PTY first spawn | `pty-supervisor.ts:2127`, before `spawn(spawnOpts)` (covers the one-shot `pty` engine, `runOnceOnPty`, `runEphemeralWithDeadline`) |
+| PTY respawn | `pty-supervisor.ts:2299`, before `spawn(opts)` |
+| `spawnPty` itself (any caller that names a session) | `pty-process.ts:1563`, before the `_ptySpawn` call |
+| bus PTY / child / tmux | `bus/session-manager.ts:1137`, `:1164`, `:1205`, each in its spawn function after the `bun-pty` import |
+
+### Fix 2: the gate honours the caller's deadline and abort
+
+`assertSessionWritable(target, { deadline?, signal? })` races the confirmation against the deadline
+and the signal (`waitBounded`). On either it throws `SessionGateInterrupted` (`how: "timeout" | "aborted"`).
+The confirmation is NOT cancelled and the record is not released on a timeout; if it later succeeds
+the session is writable again. `sessionBlocked` passes the `sendToLiveSession` deadline and signal and
+maps the interruption to `timedOut:true` / `aborted:true`; `signal.aborted` is re-checked after the gate
+(top of the loop and under the lock) before anything is written. `runOneShot` passes `req.timeoutMs`
+and `req.signal`: timeout returns an exit-124 result with `engine: "quarantine-gate"`, abort rejects
+with the signal's reason.
+
+### Tests
+
+New `src/__tests__/pty-spawn-fence.test.ts` (11 tests) and one added to `session-manager-quarantine.test.ts`:
+quarantine landing inside the awaited gap for `spawnClaude` and `runPrint` (Codex's repro shape);
+fence refused synchronously while a retirement is in flight and lifted when it confirms; fence becomes
+the record on an unconfirmed exit; a first spawn resuming the session of a key mid-retirement is refused;
+bus spawn refused on a fenced session; Codex's timing shape (5 ms budget, abort at 10 ms, 200 ms
+confirmation) for `sendToLiveSession` and `runOneShot`, with the quarantine still present afterwards and
+a gone pid released later by the abandoned confirmation.
+
+### Round 9: red-line evidence (one site per injection, `git archive` copy of `b48ae31c`)
+
+Each injection is one edit on a fresh `git archive HEAD | tar -x` copy, with `pty-spawn-fence.test.ts` and `session-manager-quarantine.test.ts` run in it. The predictions are the `Fault ... Predicted result` comments in the tests, written before the run. Lines are verbatim from the run output (stack frames omitted).
+
+**I1. runner.ts `spawnClaude`: delete `assertResumeSpawnable(args);` (line 807)**
+
+```
+error: expect(received).toThrow(expected)
+Expected substring: "quarantined"
+Received message: "must not spawn"
+(fail) a session quarantined during the awaited gap before a spawn > the legacy `claude -p --resume` does not spawn (runner spawnClaude) [15.97ms]
+ 12 pass
+ 1 fail
+```
+
+**I2. print.ts: delete the `assertSessionSpawnable` block before `spawn("claude")` (line 81)**
+
+```
+error: expect(received).toThrow(expected)
+Expected substring: "quarantined"
+Received message: "must not spawn"
+(fail) a session quarantined during the awaited gap before a spawn > the print engine does not spawn after its config and runner imports (print.ts) [1.84ms]
+ 12 pass
+ 1 fail
+```
+
+**I3. pty-supervisor.ts `retireEntry`: delete the `fenceSession` at the start (line 2027)**
+
+```
+error: expect(received).toThrow(expected)
+Expected constructor: PtyQuarantinedError
+Received function did not throw
+Received value: undefined
+(fail) the retirement fence > is refused synchronously from the moment a retirement begins, and lifted when it confirms [5003.65ms]
+error: expect(received).toContain(expected)
+Expected to contain: "quarantined"
+Received: "{\"rawStdout\":\"echo:hello\",\"stderr\":\"\",\"exitCode\":0,\"sessionId\":\"sess-fresh\"}"
+(fail) the retirement fence > refuses a first spawn that would resume the session of a key whose retirement is in flight [5001.17ms]
+ 11 pass
+ 2 fail
+```
+
+**I4. pty-supervisor.ts `spawnEntry`: delete `assertSessionSpawnable` (line 2127)**
+
+```
+error: expect(received).toContain(expected)
+Expected to contain: "quarantined"
+Received: "{\"rawStdout\":\"echo:hello\",\"stderr\":\"\",\"exitCode\":0,\"sessionId\":\"sess-fresh\"}"
+(fail) the retirement fence > refuses a first spawn that would resume the session of a key whose retirement is in flight [5000.64ms]
+ 12 pass
+ 1 fail
+```
+
+**I5. bus/session-manager.ts `spawnPty`: delete `assertSessionSpawnable` (line 1137)**
+
+```
+error: expect(received).rejects.toThrow(expected)
+Expected promise that rejects
+Received promise that resolved: Promise { <resolved> }
+(fail) SessionManager.spawnAgent and the quarantine gate > does not start claude on a session whose retirement began after the async gate passed [2261.63ms]
+ 12 pass
+ 1 fail
+```
+
+**I6. pty-quarantine.ts `assertSessionWritable`: `await confirmation` directly (drop the deadline/signal race)**
+
+```
+error: expect(received).toBe(expected)
+Expected: true
+Received: false
+(fail) the gate honours the caller's deadline and abort > sendToLiveSession returns within its budget and keeps the quarantine [405.77ms]
+error: expect(received).toBe(expected)
+Expected: true
+Received: false
+(fail) the gate honours the caller's deadline and abort > sendToLiveSession returns aborted when the signal fires first [403.06ms]
+error: expect(received).toBe(expected)
+Expected: true
+Received: false
+(fail) the gate honours the caller's deadline and abort > the confirmation keeps running after the caller gave up, and releases a gone pid [52.74ms]
+(fail) the gate honours the caller's deadline and abort > runOneShot gives the timed-out result within its budget and keeps the quarantine [404.12ms]
+error: expect(received).toBeLessThan(expected)
+Expected: < 100
+Received: 202
+(fail) the gate honours the caller's deadline and abort > runOneShot rejects with the abort when the signal fires first [405.44ms]
+ 8 pass
+ 5 fail
+```
+
+**I7. oneshot/engine.ts: call the gate with `{}` (no deadline, no signal)**
+
+```
+(fail) the gate honours the caller's deadline and abort > runOneShot gives the timed-out result within its budget and keeps the quarantine [404.99ms]
+error: expect(received).toBeLessThan(expected)
+Expected: < 100
+Received: 201
+(fail) the gate honours the caller's deadline and abort > runOneShot rejects with the abort when the signal fires first [404.00ms]
+ 11 pass
+ 2 fail
+```
+
+**I8. pty-supervisor.ts `sessionBlocked`: call the gate with `{}`**
+
+```
+error: expect(received).toBe(expected)
+Expected: true
+Received: false
+(fail) the gate honours the caller's deadline and abort > sendToLiveSession returns within its budget and keeps the quarantine [404.23ms]
+error: expect(received).toBe(expected)
+Expected: true
+Received: false
+(fail) the gate honours the caller's deadline and abort > sendToLiveSession returns aborted when the signal fires first [404.37ms]
+error: expect(received).toBe(expected)
+Expected: true
+Received: false
+(fail) the gate honours the caller's deadline and abort > the confirmation keeps running after the caller gave up, and releases a gone pid [51.92ms]
+ 10 pass
+ 3 fail
+```
+
+Note: the fence is tested by I3 and I4 together; I3 alone reds two tests (the fence test and the
+mid-retirement first-spawn test).
+
+### Round 9: gates
+
+- **Single process (CI)**: `env -u ANTHROPIC_BASE_URL bun test src > /tmp/r9-src.txt 2>&1`, final run
+  exit 0, **4853 pass / 4 skip / 0 fail** (4857 tests, 261 files). It took five runs. None of the
+  failures touched a file this round changed, and each run's failure differed:
+
+  | Run | Failure(s) | Reading |
+  |---|---|---|
+  | 1 | `pty-config.test.ts` warn-once; `inject-turn-net.test.ts` (#215) | see below; second is a timing test |
+  | 2 | `pty-config.test.ts` warn-once | stale settings file |
+  | 3 | `jsonl-tailer.test.ts` `startAt: 'end'` (#215) | timing; 3 of 3 green alone |
+  | 4 | `pty-process.test.ts` "a dialog that paints late..." (#469) | the same wall-clock flake round 8 hit once |
+  | 5 | none | exit 0 |
+
+  `pty-config.test.ts` fails on the round-8 head `cebf8bdb` too (same assertion, run in a `git archive`
+  copy seeded with the same settings dir), so it is not round 9. Cause: `.claude/claudeclaw/settings.json`
+  in the worktree (gitignored) held `{"pty":{"enabled":"review-550-invalid-a"}}`, a value left by an
+  earlier aborted run of that very test (it restores from a backup in `afterAll`; an aborted run leaves
+  the poisoned file, and the next run backs the poisoned file up and restores it). The warn-once cache
+  then already counted that value. Deleting the file fixed it. CI starts from a clean checkout, so this
+  was local state, not a CI risk. The remaining flakes are wall-clock tests under load (machine load
+  average 5 to 11 from other workers throughout); I did not change them.
+- **Wide PTY set** (every `.test.ts` under `src/` and `tests/` minus `tests/integration` matching the
+  round-8 pattern, one process per file, `ANTHROPIC_BASE_URL` unset): normal **102 of 102** green on
+  the first attempt (2,299 tests); `CLAUDECLAW_TEST_PLATFORM=linux` **102 of 102** green on the first
+  attempt (2,299 tests). The `skills-fitness` judge-cooldown flake did not fire.
+- `bun run lint` (full repo) exit 0; `bun run typecheck`: 149 errors, baseline 149.
+- No real `claude` started.
+
+### Round 9: not done / residuals (do not fix here)
+
+1. **Quarantine is not in Telegram `/status`, and `/kill` reports before confirmation** (Codex round-8
+   MEDIUM). Follow-up issue, filed by the coordinator.
+2. Everything in "Round 8: not done / risks" still stands, except item 3 (the confirmation retry is now
+   bounded by the caller's deadline and signal). The abandoned confirmation still runs to its end in
+   the background.
+3. The fence is keyed by the process object. A retirement of an entry whose `pty` is still null (spawn
+   in flight) fences nothing; that case is covered by `isCurrentEntry`/`EntryRemovedError` and `landPty`,
+   which fences the late PTY at its disposal.
+4. `Date.now()` is used for the gate's deadline (the supervisor's `_clock` is converted at the call), so
+   an injected test clock does not drive the gate's timer.
