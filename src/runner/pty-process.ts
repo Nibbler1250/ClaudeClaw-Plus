@@ -239,6 +239,12 @@ export interface PtyProcessOptions {
    * for the pid with `_signalPid` gets "no identity" unless it names a reader too.
    */
   _readPidIdentity?: (pid: number) => string | null;
+  /**
+   * INTERNAL TEST HOOK: replace bun-pty's `spawn`. A test that needs a stand-in child uses this
+   * instead of `mock.module("bun-pty")`, which is process-wide in bun and is not undone by
+   * `mock.restore`: it leaks into every later file of a single-process `bun test src` (CI).
+   */
+  _ptySpawn?: typeof ptySpawn;
   /** INTERNAL TEST HOOK: wait for a graceful exit before SIGKILL (default 2000ms). */
   _exitGraceMs?: number;
   /** INTERNAL TEST HOOK: total wait for the OS to confirm the exit (default 7000ms). */
@@ -1567,7 +1573,7 @@ export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
       // the PTY (visible on Discord/Telegram). withCleanProcessEnv strips
       // those keys from process.env around the synchronous FFI call.
       pty = withCleanProcessEnv(() =>
-        ptySpawn(cmd, args, {
+        (opts._ptySpawn ?? ptySpawn)(cmd, args, {
           name: "xterm-256color",
           cols,
           rows,

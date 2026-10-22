@@ -1,15 +1,16 @@
 /**
  * `PtyProcess.dispose()` proves the exit from the OS (#562 round 6 R2g, round 7 Fix 1).
  *
- * `bun-pty` is replaced by a child that behaves like bun-pty 0.4.9: the FIRST `kill()` fires
+ * `bun-pty`'s spawn is replaced (through the `_ptySpawn` option, NOT `mock.module`, which is
+ * process-wide and leaks into every later file of a single-process `bun test src`) by a child
+ * that behaves like bun-pty 0.4.9: the FIRST `kill()` fires
  * the exit event synchronously whatever the signal, and later calls do nothing. The OS is a
  * stand-in too (`_signalPid`), so the escalation order and the unconfirmed case are
  * deterministic. The real library and a real stubborn child are in
  * `pty-process-dispose-real.test.ts`.
- *
- * Its own file because `mock.module` is process-wide for the file that installs it.
  */
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { PtyExitUnconfirmedError, spawnPty } from "../runner/pty-process";
 
 interface FakeChild {
   pid: number;
@@ -27,35 +28,31 @@ interface FakeChild {
 let child: FakeChild | null = null;
 let fakePid = 424242;
 
-mock.module("bun-pty", () => ({
-  spawn: (): FakeChild => {
-    let closing = false;
-    const c: FakeChild = {
-      pid: fakePid,
-      kills: [],
-      exitCbs: [],
-      onData: () => ({ dispose() {} }),
-      onExit: (cb) => {
-        c.exitCbs.push(cb);
-        return { dispose() {} };
-      },
-      write() {},
-      resize() {},
-      kill(sig = "SIGTERM") {
-        // bun-pty 0.4.9: the signal is ignored, the exit event fires at once, and a second
-        // kill() is a no-op.
-        c.kills.push(sig);
-        if (closing) return;
-        closing = true;
-        for (const cb of c.exitCbs) cb({ exitCode: 0, signal: sig });
-      },
-    };
-    child = c;
-    return c;
-  },
-}));
-
-const { spawnPty, PtyExitUnconfirmedError } = await import("../runner/pty-process");
+const fakePtySpawn = (): FakeChild => {
+  let closing = false;
+  const c: FakeChild = {
+    pid: fakePid,
+    kills: [],
+    exitCbs: [],
+    onData: () => ({ dispose() {} }),
+    onExit: (cb) => {
+      c.exitCbs.push(cb);
+      return { dispose() {} };
+    },
+    write() {},
+    resize() {},
+    kill(sig = "SIGTERM") {
+      // bun-pty 0.4.9: the signal is ignored, the exit event fires at once, and a second
+      // kill() is a no-op.
+      c.kills.push(sig);
+      if (closing) return;
+      closing = true;
+      for (const cb of c.exitCbs) cb({ exitCode: 0, signal: sig });
+    },
+  };
+  child = c;
+  return c;
+};
 
 interface FakeOs {
   alive: boolean;
@@ -102,6 +99,7 @@ async function spawnWith(
     _skipReadySettle: true,
     _skipClaudeArgs: true,
     transcriptPath: "/tmp/never-written.jsonl",
+    _ptySpawn: fakePtySpawn as never,
     _signalPid: os.signalPid,
     _readPidIdentity: () => os.identity,
     _exitGraceMs: 150,
