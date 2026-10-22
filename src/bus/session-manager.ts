@@ -390,7 +390,9 @@ function buildChildEnv(agent: AgentConfig, busSocketPath: string): Record<string
   env.CCAW_PERMISSION_MODE = agent.permission_mode ?? "bypassPermissions";
   // Pin the bun runtime path to the daemon's own bun rather than
   // whatever `which bun` resolves to in the spawned claude's PATH.
-  // Used by `scripts/start-bus-mcp` to launch the plus-bus MCP server.
+  // The plugin's `.mcp.json` launches the plus-bus MCP server with
+  // `${CCAW_BUS_BUN_PATH:-bun}` (claude expands it), so no shell script sits
+  // in between — a bash launcher never started on win32 (#586).
   // Codex P2 on PR #133 — without this, restricted-PATH deployments
   // (e.g. daemons launched via absolute bun path with a stripped PATH)
   // would fail to start plus-bus.
