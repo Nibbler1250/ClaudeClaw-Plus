@@ -129,9 +129,7 @@ describe("#562 round 9 add-on: RunResult carries failureKind from the exec that 
 
   it("a definite failure and a success carry none", async () => {
     expect("failureKind" in (await runWith({ exitCode: 1 }))).toBe(false);
-    expect("failureKind" in (await runWith({ exitCode: 0, failureKind: "uncertain" }))).toBe(
-      false,
-    );
+    expect("failureKind" in (await runWith({ exitCode: 0, failureKind: "uncertain" }))).toBe(false);
   });
 });
 

@@ -1788,15 +1788,21 @@ export interface PrimaryExecCall {
   timeoutMs: number;
   route: "legacy" | "pty";
 }
-type PrimaryExec = (
-  call: PrimaryExecCall,
-) => Promise<{
+type PrimaryExec = (call: PrimaryExecCall) => Promise<{
   rawStdout: string;
   stderr: string;
   exitCode: number;
   sessionId?: string;
   failureKind?: PtyUnsafeReplayKind;
 }>;
+/** What one exec (print or PTY) hands back; `failureKind` is set only by the PTY path. */
+type ExecOutcome = {
+  rawStdout: string;
+  stderr: string;
+  exitCode: number;
+  sessionId?: string;
+  failureKind?: PtyUnsafeReplayKind;
+};
 let _primaryExecForTests: PrimaryExec | null = null;
 export function _setPrimaryExecForTests(fn: PrimaryExec | null): void {
   _primaryExecForTests = fn;
@@ -2062,13 +2068,7 @@ async function execClaude(
         ? `agent:${agentName}`
         : "global";
     const appendSystemPrompt = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
-    let exec: {
-      rawStdout: string;
-      stderr: string;
-      exitCode: number;
-      sessionId?: string;
-      failureKind?: PtyUnsafeReplayKind;
-    };
+    let exec: ExecOutcome;
     if (_primaryExecForTests) {
       exec = await _primaryExecForTests({
         name,
@@ -2124,7 +2124,11 @@ async function execClaude(
           onChunk(text);
         }
       : undefined;
-    const execRecovery = async (legacyArgs: string[], config: ModelConfig, fallback = false) => {
+    const execRecovery = async (
+      legacyArgs: string[],
+      config: ModelConfig,
+      fallback = false,
+    ): Promise<ExecOutcome> => {
       if (useLegacyPath) {
         return runClaudeStream(legacyArgs, config.model, config.api, baseEnv, timeoutMs, spawnCwd);
       }

@@ -1580,14 +1580,34 @@ describe("#562 round 9 add-on — failureKind marks a turn that may have complet
   const cases: Array<[string, () => Error, "uncertain" | "timeout" | undefined]> = [
     ["no turn boundary", () => new PtyTranscriptUncertainError("x", 900), "uncertain"],
     ["timeout", () => new PtyTurnTimeoutError("x", 900), "timeout"],
-    ["ambiguous attribution", () => new PtyTurnFailedError("x", "ambiguous", "another"), "uncertain"],
-    ["replaced transcript", () => new TranscriptReplacedError("/x/s.jsonl", "replaced"), "uncertain"],
+    [
+      "ambiguous attribution",
+      () => new PtyTurnFailedError("x", "ambiguous", "another"),
+      "uncertain",
+    ],
+    [
+      "replaced transcript",
+      () => new TranscriptReplacedError("/x/s.jsonl", "replaced"),
+      "uncertain",
+    ],
     ["prompt not accepted", () => new PtyPromptNotAcceptedError("x", 6000), "uncertain"],
     ["closed after the prompt went out", () => new PtyClosedError("x", 1, null, true), "uncertain"],
-    ["API error record", () => new PtyTurnFailedError("x", "api-error", "API Error: 529"), undefined],
-    ["command error record", () => new PtyTurnFailedError("x", "command-error", "stderr"), undefined],
+    [
+      "API error record",
+      () => new PtyTurnFailedError("x", "api-error", "API Error: 529"),
+      undefined,
+    ],
+    [
+      "command error record",
+      () => new PtyTurnFailedError("x", "command-error", "stderr"),
+      undefined,
+    ],
     ["empty reply", () => new PtyTurnFailedError("x", "empty-reply", "empty reply"), undefined],
-    ["no transcript to read", () => new PtyTranscriptUnavailableError("x", "no transcript"), undefined],
+    [
+      "no transcript to read",
+      () => new PtyTranscriptUnavailableError("x", "no transcript"),
+      undefined,
+    ],
     ["closed before the prompt went out", () => new PtyClosedError("x", 1, null), undefined],
   ];
   for (const [name, make, kind] of cases) {
