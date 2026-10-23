@@ -22,6 +22,8 @@ import { untrustedPtyProjectDir } from "./pty-cleanup.js";
 import { buildPrintArgs, withPrintRuntime } from "./print.js";
 import { PtyClosedError, __buildClaudeArgsForTests } from "../runner/pty-process.js";
 import {
+  __resetSupervisorForTests,
+  injectPendingSpawnWait,
   injectSpawnPty,
   snapshotSupervisor,
   injectOneShotTrustForTests,
@@ -115,7 +117,12 @@ beforeEach(async () => {
     throw new Error("unexpected spawn");
   });
 });
-afterEach(() => {
+afterEach(async () => {
+  // A deadline leaves the retirement of a spawn that never lands running in the background
+  // (#592), bounded at 15 s. Expire the bound and let it finish so it cannot reach a later test.
+  injectPendingSpawnWait(async () => {});
+  await new Promise((r) => setTimeout(r, 5));
+  __resetSupervisorForTests();
   injectSpawnPty(null);
   injectOneShotTrustForTests(null);
   _setSettingsFileForTests();
