@@ -3,8 +3,8 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type PtyProcessOptions, spawnPty } from "./pty-process.js";
-import { processStartMs } from "./pty-proc-identity.js";
+import { PtyExitUnconfirmedError, type PtyProcessOptions, spawnPty } from "./pty-process.js";
+import { processStartMs, readPidIdentity } from "./pty-proc-identity.js";
 
 /**
  * #570 r12 (A): retiring a PTY child stops its whole process group and proves it. These run a
@@ -88,7 +88,8 @@ describe("retiring a PTY child", () => {
 
   it("leaves neither the shell nor its background child alive, on SIGTERM and without waiting out the grace", async () => {
     const { child, bg } = await spawnShell(HUP_PROOF_BG, {
-      _groupTermination: { termGraceMs: 4000, killGraceMs: 2000, pollMs: 20 },
+      _exitGraceMs: 4000,
+      _exitCapMs: 6000,
     });
     expect(alive(child.pid)).toBe(true);
     expect(alive(bg)).toBe(true);
@@ -102,20 +103,12 @@ describe("retiring a PTY child", () => {
     expect(Date.now() - started).toBeLessThan(2000);
   });
 
-  it("twin: with the group kill off the background child survives (so the test above can fail)", async () => {
-    const { child, bg } = await spawnShell(HUP_PROOF_BG, { terminateGroup: false });
-    await child.dispose();
-    // bun-pty's kill() returns before the hangup has been delivered, so the shell is still
-    // dying here; it does go. The background child does not.
-    await until(() => !alive(child.pid));
-    expect(alive(bg)).toBe(true); // cleaned up in afterEach
-  });
-
   it("escalates to SIGKILL for a group that ignores SIGTERM and SIGHUP", async () => {
     const { child, bg } = await spawnShell(
       "(trap '' HUP TERM; exec sleep 60) & echo $! > $BG; sleep 60",
       {
-        _groupTermination: { termGraceMs: 300, killGraceMs: 3000, pollMs: 20 },
+        _exitGraceMs: 300,
+        _exitCapMs: 3300,
       },
     );
     const started = Date.now();
@@ -140,24 +133,21 @@ describe("retiring a PTY child", () => {
     const warn = spyOn(console, "warn").mockImplementation(() => {});
     try {
       const sent: Array<[number, unknown]> = [];
-      // The pid still answers `kill(pid, 0)` and its start time cannot be read: the one case in
+      // The pid still answers `kill(pid, 0)` and its identity cannot be read: the one case in
       // which only the first-termination flag lets `-pid` go out. Nothing is really signalled.
       const kernel = (pid: number, name: unknown): void => {
         if (name !== 0) sent.push([pid, name]);
       };
       const { child } = await spawnShell("echo $$ > $BG", {
-        _groupTermination: {
-          leaderStartMs: null,
-          startMs: () => null,
-          signal: kernel as never,
-          termGraceMs: 40,
-          killGraceMs: 40,
-          pollMs: 20,
-          liveMembers: () => undefined,
-        },
+        _readPidIdentity: () => null,
+        _signalPid: kernel as never,
+        _liveMembers: () => undefined,
+        _exitGraceMs: 40,
+        _exitCapMs: 100,
       });
       await until(() => !child.isAlive());
-      await child.dispose();
+      // The kernel never lets the pid go, so the retirement is (rightly) unconfirmed.
+      await expect(child.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
       // Went red ([] sent) with `firstTermination` not passed by dispose.
       expect(sent).toEqual([
         [-child.pid, "SIGTERM"],
@@ -169,33 +159,51 @@ describe("retiring a PTY child", () => {
     }
   });
 
-  it("does not signal the group of a child that exited long ago (its pid may be someone else's now)", async () => {
-    let clock = 1_000_000;
-    const { child, bg } = await spawnShell(BG_THEN_EXIT, {
-      _now: () => clock,
+  it("does not signal a group that answers on the pgid of a leader that left no group behind (it may be someone else's now)", async () => {
+    const survivors: string[] = [];
+    const sent: Array<[number, unknown]> = [];
+    // At the leader's exit nothing answers on `-pid`; afterwards something does. A saved identity
+    // says nothing about a group whose leader is gone, so nothing is signalled and the retirement
+    // stays unconfirmed (plan "Signal authority", point 2). No age is involved.
+    let groupAnswers = false;
+    const kernel = (pid: number, name: unknown): void => {
+      if (name !== 0) {
+        sent.push([pid, name]);
+        return;
+      }
+      if (pid === -child.pid && groupAnswers) return;
+      throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+    };
+    const { child } = await spawnShell("echo $$ > $BG", {
+      _readPidIdentity: () => "recorded-at-spawn",
+      _signalPid: kernel as never,
+      _liveMembers: () => undefined,
+      _exitGraceMs: 40,
+      _exitCapMs: 100,
+      onGroupSurvived: (_pid, _start, cause) => survivors.push(cause),
     });
     await until(() => !child.isAlive());
-    clock += 120_000;
-    await child.dispose();
-    // Went red (the sleep killed) with the age guard removed.
-    expect(alive(bg)).toBe(true); // cleaned up in afterEach
+    groupAnswers = true;
+    await expect(child.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
+    // Went red (signals sent) with the continuity rule replaced by "a recorded identity is enough".
+    expect(sent).toEqual([]);
+    expect(survivors).toEqual(["group"]);
   });
 
-  it("still looks for descendants that left the group when the child exited long ago", async () => {
-    let clock = 1_000_000;
-    let scans = 0;
+  it("still looks for descendants that left the group when the child exited long ago, with only the time that is left", async () => {
+    const budgets: number[] = [];
     const { child } = await spawnShell(BG_THEN_EXIT, {
-      _now: () => clock,
-      reapEscapees: async () => {
-        scans++;
+      reapEscapees: async (leader) => {
+        budgets.push(leader.remainingMs);
         return [];
       },
     });
     await until(() => !child.isAlive());
-    clock += 120_000; // past the window that guards the bare-pid signal
     await child.dispose();
-    // Went red (0 scans) with the scan tied to the 30 s window again.
-    expect(scans).toBe(1);
+    // The scan ran once, and it was handed what is left of the one 7000 ms deadline.
+    expect(budgets.length).toBe(1);
+    expect(budgets[0]).toBeGreaterThan(0);
+    expect(budgets[0]).toBeLessThanOrEqual(7000);
   });
 
   it("reports the pid when the group cannot be made to disappear, and does not claim success", async () => {
@@ -204,15 +212,13 @@ describe("retiring a PTY child", () => {
     const stubborn = (_pid: number, _signal: unknown): void => {};
     const { child } = await spawnShell(HUP_PROOF_BG, {
       onGroupSurvived: (pid) => survived.push(pid),
-      _groupTermination: {
-        signal: stubborn as never,
-        termGraceMs: 60,
-        killGraceMs: 60,
-        pollMs: 20,
-        liveMembers: () => undefined,
-      },
+      _signalPid: stubborn as never,
+      _liveMembers: () => undefined,
+      _exitGraceMs: 60,
+      _exitCapMs: 120,
     });
-    await child.dispose();
+    // Went red (resolved) with the rejection removed: the child is still there.
+    await expect(child.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
     // Went red ([] received) with the report to onGroupSurvived removed.
     expect(survived).toEqual([child.pid]);
   });
@@ -229,21 +235,20 @@ describe("retiring a PTY child", () => {
 
 // #570 r13 (A, B, C): what retirement does with the recorded identity, a failing hook and the scan.
 describe("retirement and the recorded identity", () => {
-  it("signals nothing through the group path when the pid's start time is not the one recorded at spawn", async () => {
+  it("signals nothing through the group path when the pid's identity is not the one recorded at spawn", async () => {
     const sent: Array<[number, unknown]> = [];
     const recorder = (pid: number, name: unknown): void => {
       if (name !== 0) sent.push([pid, name]);
       else process.kill(pid, 0);
     };
+    let reused = false;
     const { child, bg } = await spawnShell(HUP_PROOF_BG, {
-      _groupTermination: {
-        signal: recorder as never,
-        startMs: () => 1, // the pid "now" belongs to a process that started in 1970
-        termGraceMs: 200,
-        killGraceMs: 200,
-        pollMs: 20,
-      },
+      _signalPid: recorder as never,
+      _readPidIdentity: () => (reused ? "another-process" : "recorded-at-spawn"),
+      _exitGraceMs: 200,
+      _exitCapMs: 400,
     });
+    reused = true; // the pid "now" belongs to another process
     await child.dispose();
     expect(sent).toEqual([]);
     expect(alive(bg)).toBe(true); // nothing signalled it; cleaned up in afterEach
@@ -253,16 +258,14 @@ describe("retirement and the recorded identity", () => {
     const seen: Array<[number, number | null]> = [];
     const { child } = await spawnShell(HUP_PROOF_BG, {
       onGroupSurvived: (pid, startMs) => seen.push([pid, startMs]),
-      _groupTermination: {
-        signal: ((_pid: number, _name: unknown): void => {}) as never,
-        termGraceMs: 60,
-        killGraceMs: 60,
-        pollMs: 20,
-        liveMembers: () => undefined,
-      },
+      _readPidIdentity: readPidIdentity,
+      _signalPid: ((_pid: number, _name: unknown): void => {}) as never,
+      _liveMembers: () => undefined,
+      _exitGraceMs: 60,
+      _exitCapMs: 120,
     });
     const readNow = processStartMs(child.pid); // the same reader, while the child is alive
-    await child.dispose();
+    await expect(child.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
     expect(seen.length).toBe(1);
     const [pid, startMs] = seen[0] as [number, number | null];
     expect(pid).toBe(child.pid);
@@ -270,22 +273,22 @@ describe("retirement and the recorded identity", () => {
     expect(startMs).toBe(readNow);
   });
 
-  it("fails closed when the survivor hook throws: it is logged and dispose rejects", async () => {
+  it("fails closed when the survivor hook throws: it is logged and dispose rejects all the same", async () => {
     const error = spyOn(console, "error").mockImplementation(() => {});
     try {
       const { child } = await spawnShell(HUP_PROOF_BG, {
         onGroupSurvived: () => {
           throw new Error("could not record");
         },
-        _groupTermination: {
-          signal: ((_pid: number, _name: unknown): void => {}) as never,
-          termGraceMs: 60,
-          killGraceMs: 60,
-          pollMs: 20,
-          liveMembers: () => undefined,
-        },
+        _readPidIdentity: readPidIdentity,
+        _signalPid: ((_pid: number, _name: unknown): void => {}) as never,
+        _liveMembers: () => undefined,
+        _exitGraceMs: 60,
+        _exitCapMs: 120,
       });
-      await expect(child.dispose()).rejects.toThrow(/survivor hook failed/);
+      // A hook failure can never turn a survivor into a success, or into any other error: the
+      // supervisor quarantines on this exact type.
+      await expect(child.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
       const logged = error.mock.calls.map((call: unknown[]) => String(call[0])).join("\n");
       expect(logged).toContain("survivor hook threw");
     } finally {
@@ -301,7 +304,7 @@ describe("retirement and the recorded identity", () => {
         onGroupSurvived: (pid) => reported.push(pid),
         reapEscapees: async () => [7777],
       });
-      await left.child.dispose();
+      await expect(left.child.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
       expect(reported).toEqual([left.child.pid]);
 
       reported.length = 0;
@@ -311,7 +314,7 @@ describe("retirement and the recorded identity", () => {
           throw new Error("scan failed");
         },
       });
-      await threw.child.dispose();
+      await expect(threw.child.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
       expect(reported).toEqual([threw.child.pid]);
     } finally {
       error.mockRestore();
@@ -326,29 +329,25 @@ describe("retirement and the recorded identity", () => {
         causes.push(cause);
       };
       const stubborn = {
-        signal: ((_pid: number, _name: unknown): void => {}) as never,
-        termGraceMs: 60,
-        killGraceMs: 60,
-        pollMs: 20,
-        liveMembers: () => undefined,
+        _signalPid: ((_pid: number, _name: unknown): void => {}) as never,
+        _liveMembers: () => undefined,
+        _exitGraceMs: 60,
+        _exitCapMs: 120,
       };
-      const group = await spawnShell(HUP_PROOF_BG, {
-        onGroupSurvived: hook,
-        _groupTermination: stubborn,
-      });
-      await group.child.dispose();
+      const group = await spawnShell(HUP_PROOF_BG, { onGroupSurvived: hook, ...stubborn });
+      await expect(group.child.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
       const escapee = await spawnShell(HUP_PROOF_BG, {
         onGroupSurvived: hook,
         reapEscapees: async () => [7777],
       });
-      await escapee.child.dispose();
+      await expect(escapee.child.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
       const unknown = await spawnShell(HUP_PROOF_BG, {
         onGroupSurvived: hook,
         reapEscapees: async () => {
           throw new Error("could not read /proc");
         },
       });
-      await unknown.child.dispose();
+      await expect(unknown.child.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
       // Went red with the escapee cause no longer set.
       expect(causes).toEqual(["group", "escapee", "scan-unknown"]);
     } finally {

@@ -1,3 +1,4 @@
+import { groupUnconfirmedObservedCount } from "../runner/pty-group-confirm";
 import {
   ensureProjectClaudeMd,
   run,
@@ -1227,6 +1228,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       `Created: ${session.createdAt}`,
       `Last used: ${session.lastUsedAt}`,
       `Compact warned: ${(session as any).compactWarned ? "yes" : "no"}`,
+      `PTY groups unconfirmed (observed): ${groupUnconfirmedObservedCount()}`,
     ];
     await sendMessage(config.token, chatId, lines.join("\n"), threadId);
     return;

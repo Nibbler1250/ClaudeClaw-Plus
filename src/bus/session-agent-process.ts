@@ -22,6 +22,16 @@ import type { ChildProcess } from "node:child_process";
 // process-stream-json, tmux) must not require the native PTY dep just to
 // construct an AgentProcess (Codex P1 on PR #149).
 import { sanitizePtyPromptText } from "../runner/pty-prompt-sanitizer";
+// The common termination and confirmation of a PTY child and its process group (#581 cp3). These
+// modules need no native PTY dependency.
+import { type GroupConfirmMode, judgeGroupOutcome } from "../runner/pty-group-confirm";
+import {
+  type GroupDescription,
+  type SignalFn,
+  isSignalablePid,
+  retireProcessGroup,
+} from "../runner/pty-group-kill";
+import { readPidIdentity } from "../runner/pty-proc-identity";
 // `pty-output-parser` is a pure module (no bun-pty), so reusing its
 // cursor-move→space expander does NOT pull the native PTY dep into the bus
 // module — same rationale as importing the sanitiser above.
@@ -174,6 +184,33 @@ export interface AgentProcess {
 }
 
 /**
+ * The bus PTY's exit could not be confirmed by the OS (the leader, or, when enforced, its group).
+ * A transport exit callback is not proof, so the session must not be reused (#581 cp3).
+ */
+export class PtyAgentExitUnconfirmedError extends Error {
+  constructor(
+    public readonly agent_id: string,
+    public readonly pid: number,
+  ) {
+    super(`bus PTY ${agent_id} (pid ${pid}) is not confirmed gone; its exit is unconfirmed`);
+    this.name = "PtyAgentExitUnconfirmedError";
+  }
+}
+
+/** Test seams of `PtyAgentProcess.retire()`. Production passes none. */
+export interface PtyRetireSeams {
+  signalPid?: SignalFn;
+  readPidIdentity?: (pid: number) => string | null;
+  liveMembers?: (pid: number) => number | undefined;
+  describeGroup?: (pid: number) => GroupDescription;
+  /** SIGTERM grace before SIGKILL (default 2000 ms, as #562). */
+  exitGraceMs?: number;
+  /** The one deadline of the whole retirement (default 7000 ms, as #562). */
+  exitCapMs?: number;
+  groupConfirm?: GroupConfirmMode;
+}
+
+/**
  * Minimal subset of bun-pty's `IPty` we depend on. Declared as a structural
  * interface so we can avoid hard-importing `bun-pty` at top-level and tests
  * that don't exercise PTY mode skip the native module entirely.
@@ -200,6 +237,12 @@ export class PtyAgentProcess implements AgentProcess {
     return this._lastDataAt;
   }
   private _exited = false;
+  /** Seams, identity and state of `retire()`. */
+  private readonly retireSeams: PtyRetireSeams;
+  private readonly identity: string | null;
+  private _retirement: Promise<void> | null = null;
+  private _retiredOnce = false;
+  private _groupContinuity = false;
   /** Set with `_exited` (issue #393): the code a late `onExit` subscriber is
    *  replayed with. */
   private _exitCode = -1;
@@ -432,11 +475,16 @@ export class PtyAgentProcess implements AgentProcess {
       transcriptGraceMs?: number;
       /** Bound on the boot-dialog watch window (test seam; default 15 s). */
       bootDialogMaxMs?: number;
+      /** Test seams of `retire()` (signals, probes, deadlines). */
+      retire?: PtyRetireSeams;
     } = {},
   ) {
     this.agent_id = agent_id;
     this.pty = pty;
     this.pid = pty.pid;
+    this.retireSeams = opts.retire ?? {};
+    // The birth identity, recorded while the child is certainly the one we spawned.
+    this.identity = (this.retireSeams.readPidIdentity ?? readPidIdentity)(pty.pid);
     this.submitConfirmMs = opts.submitConfirmMs ?? 1500;
     this.transcriptGraceMs = opts.transcriptGraceMs ?? 3000;
     this.maxSubmitNudges = opts.maxSubmitNudges ?? 2;
@@ -488,6 +536,7 @@ export class PtyAgentProcess implements AgentProcess {
     });
     pty.onExit((e) => {
       this._exited = true;
+      this.noteGroupAtExit();
       // A process that exited is not "stuck at boot": the exit log line
       // (session-manager, issue #393) is the one that speaks for it.
       this.endBootDialogPhase();
@@ -1305,6 +1354,75 @@ export class PtyAgentProcess implements AgentProcess {
       this.pty.kill(signal);
     } catch {
       /* already gone */
+    }
+  }
+
+  /**
+   * Retire the process and prove it from the OS, the leader AND its process group, through the
+   * common primitive (`retireProcessGroup`); an exit callback proves nothing (bun-pty fires it
+   * from `kill()` whether or not the child died). Joined: every caller shares the one in-flight
+   * retirement. A rejection is retryable. Rejects with `PtyAgentExitUnconfirmedError` when the
+   * leader is not proven gone, or when its group is not and `pty.groupConfirm` is "enforce"; in
+   * "observe" an unconfirmed group is logged and counted instead. The graceful `/quit` phase
+   * belongs to the caller (`SessionManager.stop`) and happens before this.
+   */
+  retire(): Promise<void> {
+    if (!this._retirement) {
+      const run = this.retireOnce();
+      this._retirement = run;
+      run.catch(() => {
+        if (this._retirement === run) this._retirement = null;
+      });
+    }
+    return this._retirement;
+  }
+
+  private async retireOnce(): Promise<void> {
+    // The first await comes before anything else: `_kill` below fires the exit callbacks, and
+    // a caller reached through them must find `_retirement` already set and join it.
+    await Promise.resolve();
+    const initial = !this._retiredOnce;
+    this._retiredOnce = true;
+    const seams = this.retireSeams;
+    const wasAlive = !this._exited;
+    if (initial && wasAlive) this._kill("SIGTERM");
+    if (process.platform === "win32" || !isSignalablePid(this.pid)) return; // no probe to make
+    const deadlineAt = Date.now() + (seams.exitCapMs ?? 7000);
+    const outcome = await retireProcessGroup({
+      pid: this.pid,
+      identity: this.identity,
+      readIdentity: seams.readPidIdentity,
+      signal: seams.signalPid,
+      liveMembers: seams.liveMembers,
+      describe: seams.describeGroup,
+      initial,
+      leaderSeenAlive: wasAlive,
+      groupContinuity: this._groupContinuity,
+      // An unrecorded identity is never signalled from the bus: a made-up pid must not reach a
+      // real process.
+      allowUnrecordedInitial: false,
+      sendTerm: initial,
+      deadlineAt,
+      termGraceMs: seams.exitGraceMs ?? 2000,
+    });
+    if (outcome.groupSeen) this._groupContinuity = true;
+    const verdict = judgeGroupOutcome(outcome, {
+      untrusted: false,
+      mode: seams.groupConfirm,
+      key: this.agent_id,
+    });
+    if (verdict.fatal) throw new PtyAgentExitUnconfirmedError(this.agent_id, this.pid);
+  }
+
+  /** The leader just exited: does its group still have members? (see `retire`) */
+  private noteGroupAtExit(): void {
+    if (process.platform === "win32" || !isSignalablePid(this.pid)) return;
+    const signal = this.retireSeams.signalPid ?? process.kill;
+    try {
+      signal(-this.pid, 0);
+      this._groupContinuity = true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EPERM") this._groupContinuity = true;
     }
   }
 

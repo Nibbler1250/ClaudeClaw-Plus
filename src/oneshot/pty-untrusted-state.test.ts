@@ -24,6 +24,7 @@ import {
   type PtyProcessOptions,
 } from "../runner/pty-process.js";
 import { setUntrustedFileMentionNeutralizingForTests } from "../runner/pty-process-test-seams.js";
+import { readPidIdentity } from "../runner/pty-proc-identity.js";
 import { neutralizeFileMentions } from "../runner/pty-prompt-sanitizer.js";
 import {
   __keepRootAfterFailedDisposeForTests,
@@ -528,11 +529,11 @@ describe("r12 A: a process group that outlives retirement fails the call and kee
 // #570 r13 (G): the real PtyProcess retirement, with a kernel that never sees the group go.
 describe("r13 A/G: a survivor keeps the call failed, the root in place, and is signalled again by the sweeper", () => {
   const stubborn = {
-    signal: ((_pid: number, _name: unknown): void => {}) as never, // every probe says "still there"
-    termGraceMs: 40,
-    killGraceMs: 40,
-    pollMs: 10,
-    liveMembers: () => undefined,
+    _signalPid: ((_pid: number, _name: unknown): void => {}) as never, // every probe says "still there"
+    _readPidIdentity: readPidIdentity, // the real reader, so the identity is recorded at spawn
+    _exitGraceMs: 40,
+    _exitCapMs: 80,
+    _liveMembers: () => undefined,
   };
 
   it("does not resolve 0, does not delete the root, retries each tick, and sweeps only after the survivor is gone", async () => {
@@ -544,7 +545,7 @@ describe("r13 A/G: a survivor keeps the call failed, the root in place, and is s
         _commandOverride: "/bin/sh",
         _argsOverride: ["-c", "sleep 60"],
         _skipReadySettle: true,
-        _groupTermination: stubborn,
+        ...stubborn,
       });
       shellPid = real.pid;
       // Only the turn is faked: the claude transcript. Retirement is the real one.
@@ -848,7 +849,7 @@ describe("r14b: an unreadable process is a hold on the root, not a failure", () 
         return [];
       },
     );
-    const left = await options.reapEscapees!({ pid: 4242, startMs: 98_760 });
+    const left = await options.reapEscapees!({ pid: 4242, startMs: 98_760, remainingMs: 7000 });
     expect(left).toEqual([]);
     // Went red (undefined) with the leader's start time not handed to the scan.
     expect((seen[0]!.target as { leaderStartMs?: number }).leaderStartMs).toBe(98_760);

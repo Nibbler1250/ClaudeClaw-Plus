@@ -111,6 +111,7 @@ import { printRuntime } from "../oneshot/print.js";
 import { randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
 import { getSettings, type SecurityConfig } from "../config.js";
+import { groupUnconfirmedObservedCount } from "./pty-group-confirm.js";
 import { getSession, createSession } from "../sessions.js";
 import { getThreadSession, createThreadSession } from "../sessionManager.js";
 import {
@@ -364,6 +365,12 @@ export interface SupervisorSnapshot {
   }>;
   /** Sessions whose process the OS has not confirmed gone (#562 round 8): nothing starts on them. */
   quarantined: QuarantineInfo[];
+  /**
+   * Trusted PTYs whose leader was gone but whose process group could not be confirmed gone, in
+   * `pty.groupConfirm: "observe"` mode: logged and counted, never quarantined (#581 cp3). A soak
+   * that ends with this near zero is the case for flipping the default to "enforce".
+   */
+  groupUnconfirmedObserved: number;
 }
 
 export { PtyQuarantinedError };
@@ -852,7 +859,11 @@ export function snapshotSupervisor(): SupervisorSnapshot {
       kind: entry.kind,
     });
   }
-  return { ptys, quarantined: quarantineSnapshot() };
+  return {
+    ptys,
+    quarantined: quarantineSnapshot(),
+    groupUnconfirmedObserved: groupUnconfirmedObservedCount(),
+  };
 }
 
 /**
@@ -1773,6 +1784,7 @@ async function buildSpawnOptions(
     sessionId,
     newSessionId,
     ...(entry.scope.isolation ? { isolation: entry.scope.isolation } : {}),
+    sessionKey: entry.sessionKey,
     cwd,
     agentName: entry.agentName,
     modelOverride: modelOverride ?? undefined,
@@ -1967,10 +1979,14 @@ function untrustedGroupOptions(
       untrustedCleanup.markGroupSurvivor(root, pid, { startMs, tempCwd, cwds, cause }),
     // Processes the scan could not read are kept as a hold on the root, not as a failure: the
     // reply was already obtained, and the only risk is removing a directory under a live writer.
+    // The scan gets what is left of the retirement's one deadline, split TERM then KILL: it has
+    // no budget of its own to stack on the disposal cap (#581 cp3).
     reapEscapees: (leader) =>
       reap(
         { root, cwds, leaderStartMs: leader.startMs },
         {
+          termGraceMs: Math.floor(leader.remainingMs / 2),
+          killGraceMs: Math.ceil(leader.remainingMs / 2),
           onUnknown: (unknown) =>
             untrustedCleanup.markUnknownProcs(root, leader, unknown, { tempCwd, cwds }),
         },

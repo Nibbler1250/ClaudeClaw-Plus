@@ -50,7 +50,12 @@ import { BUS_MCP_TOOLS } from "./mcp-tools";
 import { confirmTurnReceipt } from "./receipt-wiring";
 import { capturePostMortem, type PostMortemOptions } from "./post-mortem";
 import type { ReceiptRecord } from "./receipt";
-import { assertSessionSpawnable, assertSessionWritable } from "../runner/pty-quarantine";
+import {
+  assertSessionSpawnable,
+  assertSessionWritable,
+  quarantineSession,
+} from "../runner/pty-quarantine";
+import type { PtyProcess } from "../runner/pty-process";
 import { ensureTrustAccepted } from "../runner/pty-trust-prompt";
 import {
   type AgentProcess,
@@ -1272,12 +1277,40 @@ export class SessionManager {
         this.restartHistory.delete(agent_id);
         resolve();
       };
+      // An exit callback is not proof the process (and the group it started) is gone: bun-pty
+      // fires it from kill() whether or not the child died. A PTY agent is retired through the
+      // common primitive and the session is released only on the OS's word; when that cannot be
+      // had the session id is quarantined, so nothing resumes it beside a live writer (#581 cp3).
+      const confirmThenFinalise = (): void => {
+        const proc = record.proc;
+        if (!(proc instanceof PtyAgentProcess)) {
+          finalise();
+          return;
+        }
+        proc.retire().then(finalise, (err: unknown) => {
+          console.error(
+            `[bus-session] agent=${agent_id} stop: exit not confirmed (${(err as Error)?.name ?? "error"}); session ${record.agent.session_id} is quarantined`,
+          );
+          quarantineSession(
+            agent_id,
+            {
+              label: agent_id,
+              pid: proc.pid,
+              sessionId: record.agent.session_id,
+              dispose: () => proc.retire(),
+              confirmExit: () => proc.retire(),
+            } as unknown as PtyProcess,
+            "bus-stop-exit-unconfirmed",
+          );
+          finalise();
+        });
+      };
       if (record.proc._isExited()) {
-        finalise();
+        confirmThenFinalise();
         return;
       }
       record.proc.onExit(() => {
-        finalise();
+        confirmThenFinalise();
       });
       // Try graceful first: /quit via the active relay channel. If that path
       // fails (closed stdin, dead PTY), fall through to SIGTERM.

@@ -670,6 +670,7 @@ describe("killActive reaches a PTY session that is still booting (#394)", () => 
     const snapshot = spyOn(sup, "snapshotSupervisor").mockReturnValue({
       ptys: [],
       quarantined: [],
+      groupUnconfirmedObserved: 0,
     });
     const kill = spyOn(sup, "killAllPtys").mockResolvedValue(0);
     try {

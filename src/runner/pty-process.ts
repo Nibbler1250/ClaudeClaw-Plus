@@ -67,9 +67,14 @@ import {
   TranscriptTurn,
   type TurnFailureKind,
 } from "./pty-transcript";
-// #581 cp3: group termination is wired into dispose() there; the types are kept so the
-// supervisor's isolation hooks (onGroupSurvived/reapEscapees) still type-check meanwhile.
-import type { GroupTerminationOptions, SurvivorCause } from "./pty-group-kill";
+// The common termination and confirmation of the leader AND its process group (#581 cp3).
+import {
+  type GroupDescription,
+  type RetireGroupOutcome,
+  type SurvivorCause,
+  retireProcessGroup,
+} from "./pty-group-kill";
+import { type GroupConfirmMode, judgeGroupOutcome } from "./pty-group-confirm";
 // The one OS identity reader (#581 cp2). The leader's numeric start time is a projection of the
 // same reading, not a second read.
 import { readPidIdentity, sameIdentity, startMsFromIdentity } from "./pty-proc-identity";
@@ -105,21 +110,28 @@ export interface PtyProcessOptions {
   /** One-shot isolation overrides every persona, resume and permission flag. */
   isolation?: "untrusted" | "trusted-session";
   /**
-   * Retire the child's whole process group, and wait until it is gone (pty-group-kill).
-   * Default: on for an untrusted one-shot, off otherwise. Trusted sessions keep the old
-   * retirement: tests drive them with fake pids, and a group signal to a fake pid would
-   * hit a real process.
+   * The supervisor session key (or bus agent id) this process serves. Reported in the
+   * group-unconfirmed log line; never a fence authority by itself.
    */
-  terminateGroup?: boolean;
+  sessionKey?: string;
+  /**
+   * INTERNAL TEST HOOK: overrides `pty.groupConfirm` for this process. An untrusted one-shot
+   * enforces whatever this says (the setting cannot weaken it).
+   */
+  _groupConfirm?: GroupConfirmMode;
+  /** INTERNAL TEST HOOK: live (non-zombie) members of the group; see `retireProcessGroup`. */
+  _liveMembers?: (pid: number) => number | undefined;
+  /** INTERNAL TEST HOOK: names the members left in a group that would not go. */
+  _describeGroup?: (pid: number) => GroupDescription;
   /** Test seam: how long an untrusted spawn waits for the REPL footer. Default 20 s. */
   _replReadyBudgetMs?: number;
   /**
    * Called with the pid, and the leader's start time recorded at spawn (null when it could not be
    * read), and why: the group is still alive, an escapee outside it is, or the escapee scan could
    * not tell (`scan-unknown`). Called when retirement could not get all of that to disappear.
-   * It must not throw: if it does,
-   * the error is logged and `dispose()` rejects, so the caller keeps whatever the child may
-   * still be writing into.
+   * An isolation adapter (root and slot retention): it plugs in AFTER the outcome is decided,
+   * and nothing it does, an exception included, can change that outcome. If it throws, the error
+   * is logged and `dispose()` rejects all the same.
    */
   onGroupSurvived?: (pid: number, startMs: number | null, cause: SurvivorCause) => void;
   /**
@@ -128,9 +140,12 @@ export interface PtyProcessOptions {
    * cannot be ours). Resolves the pids that are still alive; a rejection (`/proc` could not be
    * listed) counts as "could not tell" and fails closed like a survivor.
    */
-  reapEscapees?: (leader: { pid: number; startMs: number | null }) => Promise<number[]>;
-  /** Test seam: signal function, clock and timings of the group termination. */
-  _groupTermination?: GroupTerminationOptions;
+  reapEscapees?: (leader: {
+    pid: number;
+    startMs: number | null;
+    /** Time left in the retirement's one deadline; the scan must not start a budget of its own. */
+    remainingMs: number;
+  }) => Promise<number[]>;
   /** Existing Claude Code session ID to resume via `claude --resume <id>`.
    *  Empty string means "no resume". */
   sessionId: string;
@@ -796,8 +811,12 @@ class PtyProcessImpl implements PtyProcess {
   private readonly _secretValues: string[];
   /** Untrusted one-shot: the prompt and the raw PTY output stay out of `CLAUDECLAW_PTY_DUMP`. */
   private readonly _untrustedTrace: boolean;
-  /** Retirement stops the whole process group and waits for it (pty-group-kill). */
-  private readonly _terminateGroup: boolean;
+  /** An untrusted one-shot: always enforces group confirmation (pty-group-confirm). */
+  private readonly _untrusted: boolean;
+  private readonly _sessionKey: string;
+  private readonly _groupConfirm?: GroupConfirmMode;
+  private readonly _liveMembers?: (pid: number) => number | undefined;
+  private readonly _describeGroup?: (pid: number) => GroupDescription;
   private readonly _onGroupSurvived?: (
     pid: number,
     startMs: number | null,
@@ -806,8 +825,14 @@ class PtyProcessImpl implements PtyProcess {
   private readonly _reapEscapees?: (leader: {
     pid: number;
     startMs: number | null;
+    remainingMs: number;
   }) => Promise<number[]>;
-  private readonly _groupTermination?: GroupTerminationOptions;
+  /**
+   * The group had members when the leader went, or a retirement found survivors in it. Only then
+   * may a later retirement signal `-pid` of a leader that is absent: a saved start time says
+   * nothing about a group whose leader is gone (plan "Signal authority", point 2).
+   */
+  private _groupContinuity = false;
   /** The leader's start time at spawn: every later signal checks that the pid still has it. */
   private readonly _leaderStartMs: number | null;
   /**
@@ -823,8 +848,6 @@ class PtyProcessImpl implements PtyProcess {
   /** Ends a pending ready gate with a failure reason; set only while one is waiting. */
   private _endReplGate: ((reason: string) => void) | null = null;
   private readonly _replReadyBudgetMs: number;
-  /** When `_handleExit` ran; a group of a child that exited long ago is not signalled. */
-  private _exitedAt = 0;
 
   constructor(pty: IPty, opts: PtyProcessOptions) {
     this._pty = pty;
@@ -853,12 +876,15 @@ class PtyProcessImpl implements PtyProcess {
         : "no session id";
     this._secretValues = collectSecretValues(opts.env);
     this._untrustedTrace = opts.isolation === "untrusted";
-    this._terminateGroup = opts.terminateGroup ?? opts.isolation === "untrusted";
+    this._untrusted = untrusted;
+    this._sessionKey = opts.sessionKey ?? opts.agentName ?? "pty";
+    this._groupConfirm = opts._groupConfirm;
+    this._liveMembers = opts._liveMembers;
+    this._describeGroup = opts._describeGroup;
     this._readyGate = opts.isolation === "untrusted" && !opts._skipReadySettle;
     this._replReadyBudgetMs = opts._replReadyBudgetMs ?? UNTRUSTED_REPL_READY_MS;
     this._onGroupSurvived = opts.onGroupSurvived;
     this._reapEscapees = opts.reapEscapees;
-    this._groupTermination = opts._groupTermination;
     this._screen = new Screen(opts.cols ?? DEFAULT_COLS, opts.rows ?? DEFAULT_ROWS);
     this.label = `${opts.agentName ?? "pty"}:${pty.pid}`;
     this._quietWindowMs = opts.quietWindowMs ?? DEFAULT_QUIET_WINDOW_MS;
@@ -877,7 +903,7 @@ class PtyProcessImpl implements PtyProcess {
     this._signalPid = opts._signalPid ?? ((pid, signal) => void process.kill(pid, signal));
     this._readIdentity = opts._readPidIdentity ?? (opts._signalPid ? () => null : readPidIdentity);
     this._identity = this._readIdentity(pty.pid);
-    this._leaderStartMs = this._terminateGroup ? startMsFromIdentity(this._identity) : null;
+    this._leaderStartMs = startMsFromIdentity(this._identity);
     this._exitGraceMs = opts._exitGraceMs ?? DEFAULT_EXIT_GRACE_MS;
     this._exitCapMs = opts._exitCapMs ?? DEFAULT_EXIT_CAP_MS;
     this._setTimeout = opts._setTimeout ?? ((cb, ms) => setTimeout(cb, ms));
@@ -1089,7 +1115,7 @@ class PtyProcessImpl implements PtyProcess {
 
   private _handleExit(info: { exitCode: number; signal?: number | string }): void {
     this._alive = false;
-    this._exitedAt = this._now();
+    this._noteGroupAtExit();
     // Issue #176: capture a diagnostic snapshot the moment the PTY exits.
     // Reading the tail ring buffer now is cheap and avoids the
     // _onDataDisposable race (data events still flush before exit on
@@ -1434,10 +1460,9 @@ class PtyProcessImpl implements PtyProcess {
       }
     }
 
-    if (probeable && (wasAlive || !firstRun)) await this._confirmGoneByPid(firstRun);
-    // #581 cp3: group confirmation (leader AND group, one 7000 ms deadline) and the isolation
-    // hooks (onGroupSurvived / reapEscapees, root and slot retention) are wired in here, mapped
-    // through the staged-enforcement predicate. Until then retirement is #562's leader-only proof.
+    // Always, whether or not the leader was alive: a leader that exited on its own can leave a
+    // group behind, and bun-pty's exit event proves neither the leader's death nor the group's.
+    if (probeable) await this._confirmGone(firstRun, wasAlive);
 
     try {
       this._onDataDisposable?.dispose();
@@ -1550,55 +1575,85 @@ class PtyProcessImpl implements PtyProcess {
     return sameIdentity(now, this._identity) ? "same" : "replaced";
   }
 
-  private _originalGone(pid: number): boolean {
-    const s = this._pidState(pid);
-    return s === "gone" || s === "replaced";
-  }
-
   /**
-   * May this process be signalled? Only a pid proven to still be the child we spawned. With
-   * no identity recorded at spawn, only inside the initial retirement window (the child was
-   * seen alive moments ago, so reuse is not plausible); a later confirmation sends nothing.
+   * Prove the exit from the OS, the leader AND its process group, inside ONE absolute deadline
+   * (`_exitCapMs` from now: wall clock and real timers on purpose, since the injected clock
+   * drives turn timing and a frozen one must not hang retirement). The termination and the
+   * probes are `retireProcessGroup`; the escape scan of an isolated one-shot gets only what is
+   * left of the same deadline. Throws `PtyExitUnconfirmedError` through `_mapGroupOutcome`.
    */
-  private _maySignal(pid: number, initial: boolean): boolean {
-    const s = this._pidState(pid);
-    return s === "same" || (s === "unknown" && initial && this._identity === null);
-  }
-
-  /**
-   * Poll until the original is gone or `ms` pass. Wall clock and real timers on purpose: the
-   * injected clock and timers drive turn timing, and a frozen one must not hang retirement.
-   * The cheap existence probe runs every tick; the identity (a `ps` spawn on macOS) is read
-   * on the first and the last check only.
-   */
-  private async _waitGone(pid: number, ms: number): Promise<boolean> {
-    const until = Date.now() + ms;
-    let first = true;
-    for (;;) {
-      const last = Date.now() >= until;
-      if (first || last ? this._originalGone(pid) : !this._pidExists(pid)) return true;
-      if (last) return false;
-      first = false;
-      await new Promise<void>((r) => setTimeout(r, EXIT_PROBE_MS));
-    }
-  }
-
-  private async _confirmGoneByPid(initial: boolean): Promise<void> {
+  private async _confirmGone(initial: boolean, wasAlive: boolean): Promise<void> {
     const pid = this._pid;
-    if (await this._waitGone(pid, this._exitGraceMs)) return;
-    // Not obeying SIGTERM: kill the group (MCP children) and the leader directly, not through
-    // bun-pty, whose `kill()` has already run and is now a no-op. The identity is checked
-    // before EACH signal, so a pid the OS has handed to someone else is never signalled.
-    for (const target of [-pid, pid]) {
-      if (!this._maySignal(pid, initial)) continue;
+    const deadlineAt = Date.now() + this._exitCapMs;
+    const outcome = await retireProcessGroup({
+      pid,
+      identity: this._identity,
+      readIdentity: this._readIdentity,
+      signal: this._signalPid,
+      liveMembers: this._liveMembers,
+      describe: this._describeGroup,
+      initial,
+      leaderSeenAlive: wasAlive,
+      groupContinuity: this._groupContinuity,
+      allowUnrecordedInitial: true,
+      sendTerm: initial,
+      deadlineAt,
+      termGraceMs: this._exitGraceMs,
+    });
+    if (outcome.groupSeen) this._groupContinuity = true;
+    let scanCause: SurvivorCause | null = null;
+    if (this._reapEscapees) {
       try {
-        this._signalPid(target, "SIGKILL");
+        const left = await this._reapEscapees({
+          pid,
+          startMs: this._leaderStartMs,
+          remainingMs: Math.max(0, deadlineAt - Date.now()),
+        });
+        if (left.length > 0) scanCause = "escapee";
       } catch {
-        // ESRCH: already gone.
+        scanCause = "scan-unknown";
       }
     }
-    if (await this._waitGone(pid, Math.max(0, this._exitCapMs - this._exitGraceMs))) return;
-    throw new PtyExitUnconfirmedError(this.label, pid);
+    this._mapGroupOutcome(outcome, scanCause);
+  }
+
+  /**
+   * The outcome of `_confirmGone` becomes a verdict in `judgeGroupOutcome` (pty-group-confirm),
+   * the one place the staged enforcement is applied. A fatal verdict tells the isolation adapter
+   * first (root and slot retention); whatever that does, an exception included, it cannot undo
+   * the verdict.
+   */
+  private _mapGroupOutcome(outcome: RetireGroupOutcome, scanCause: SurvivorCause | null): void {
+    const verdict = judgeGroupOutcome(
+      outcome,
+      { untrusted: this._untrusted, mode: this._groupConfirm, key: this._sessionKey },
+      scanCause,
+    );
+    if (!verdict.fatal) return;
+    if (this._onGroupSurvived) {
+      try {
+        this._onGroupSurvived(this._pid, this._leaderStartMs, verdict.cause);
+      } catch (err) {
+        console.error(
+          `[pty-process] ${this.label}: survivor hook threw (${(err as Error)?.message ?? "error"}); the retirement is rejected all the same`,
+        );
+      }
+    }
+    throw new PtyExitUnconfirmedError(this.label, this._pid);
+  }
+
+  /**
+   * The leader just exited: remember whether its group still has members. That is the evidence
+   * that a later retirement may signal `-pid` of an absent leader (see `_groupContinuity`).
+   */
+  private _noteGroupAtExit(): void {
+    if (process.platform === "win32" || !Number.isInteger(this._pid) || this._pid <= 1) return;
+    try {
+      this._signalPid(-this._pid, 0);
+      this._groupContinuity = true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EPERM") this._groupContinuity = true;
+    }
   }
 
   /** The pre-probe behaviour, for platforms that cannot probe a pid. */

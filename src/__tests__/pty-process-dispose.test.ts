@@ -76,7 +76,8 @@ function makeOs(): FakeOs {
         if (!os.alive) throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
         return;
       }
-      if (sig === "SIGKILL" && pid > 0 && !os.immune) os.alive = false;
+      // SIGKILL to the leader or to its group (-pid) takes it, unless it is immune.
+      if (sig === "SIGKILL" && !os.immune) os.alive = false;
     },
   };
   return os;
@@ -115,7 +116,7 @@ afterEach(() => {
 
 describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () => {
   test("a child that outlives SIGTERM keeps dispose pending until SIGKILL has taken it", async () => {
-    // Fault (site: `_retire`, drop the pid confirmation): dispose() resolves as soon as
+    // Fault (site: `_retire`, drop the OS confirmation): dispose() resolves as soon as
     // bun-pty's synthetic exit event has fired. Predicted result: `settled` is already true
     // at the check below, and the OS still shows the child.
     const os = makeOs();
@@ -140,8 +141,8 @@ describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () =
     expect(fake.kills).toEqual(["SIGTERM"]);
   });
 
-  test("SIGKILL goes straight to the OS, to the group first and then the leader", async () => {
-    // Fault (site: `_confirmGoneByPid`, send SIGKILL through bun-pty instead of the OS): the
+  test("SIGKILL goes straight to the OS, to the group (which already reaches the leader)", async () => {
+    // Fault (site: `retireProcessGroup`, send SIGKILL through bun-pty instead of the OS): the
     // fake bun-pty's second kill() is a no-op, so the OS never sees a SIGKILL. Predicted
     // result: no `SIGKILL` in the OS log and dispose() rejects at the cap.
     const os = makeOs();
@@ -150,11 +151,13 @@ describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () =
     await proc.dispose();
 
     const kills = os.log.filter((e) => e.endsWith(":SIGKILL"));
-    expect(kills).toEqual([`-${proc.pid}:SIGKILL`, `${proc.pid}:SIGKILL`]);
+    // The group signal reaches the leader, a member of its own group, so no second, bare-pid
+    // signal goes out: it would only be one more chance to hit a reused pid.
+    expect(kills).toEqual([`-${proc.pid}:SIGKILL`]);
   });
 
   test("a process that survives SIGKILL makes dispose() reject, and a later confirmation succeeds", async () => {
-    // Fault (site: `_confirmGoneByPid`, return instead of throwing at the cap): dispose()
+    // Fault (site: `_confirmGone`, return instead of throwing at the cap): dispose()
     // resolves with the child still alive. Predicted result: the rejects assertion fails.
     const os = makeOs();
     os.immune = true;
@@ -226,7 +229,7 @@ describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () =
   });
 
   test("a later confirmation whose identity cannot be read sends no signal and stays unconfirmed", async () => {
-    // Fault (site: `_maySignal`, treat "unknown" as signalable on any retirement): the later
+    // Fault (site: `GroupTarget.sendGroup`, treat "unknown" as signalable on any retirement): the later
     // confirmation SIGKILLs a pid it cannot vouch for. Predicted result: a second pair of
     // SIGKILL entries and `os.alive` false.
     const os = makeOs();
@@ -234,7 +237,7 @@ describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () =
     const proc = await spawnWith(os);
     await expect(proc.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
     const killsAfterFirst = os.log.filter((e) => e.endsWith(":SIGKILL")).length;
-    expect(killsAfterFirst).toBe(2); // initial window, identity matched
+    expect(killsAfterFirst).toBe(1); // initial window, identity matched: the group signal
 
     os.identity = null; // `ps` / `/proc` unreadable now
     os.immune = false;
@@ -245,7 +248,7 @@ describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () =
   });
 
   test("with no identity recorded at spawn the initial retirement may signal, a later one may not", async () => {
-    // Fault (site: `_maySignal`, drop the `initial` clause): the initial retirement refuses
+    // Fault (site: `GroupTarget.sendGroup`, drop the `initial` clause): the initial retirement refuses
     // to signal and the process outlives it. Predicted result: dispose() rejects with
     // no SIGKILL logged.
     const os = makeOs();
@@ -253,7 +256,7 @@ describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () =
     const proc = await spawnWith(os, { _readPidIdentity: () => null });
     await expect(proc.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
     const killsAfterFirst = os.log.filter((e) => e.endsWith(":SIGKILL")).length;
-    expect(killsAfterFirst).toBe(2);
+    expect(killsAfterFirst).toBe(1);
 
     os.immune = false;
     await expect(proc.confirmExit?.()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);

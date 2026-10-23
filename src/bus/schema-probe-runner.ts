@@ -155,6 +155,10 @@ export const defaultPtyRunnerFactory: ProbeRunnerFactory = async ({
     kill() {
       proc._kill("SIGTERM");
     },
+    pid: proc.pid,
+    retire() {
+      return proc.retire();
+    },
   };
   return runner;
 };

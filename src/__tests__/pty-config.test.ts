@@ -222,11 +222,38 @@ describe("parseSettings — pty defaults", () => {
         maxConcurrent: 32,
         quietWindowMs: 500,
         sentinelMaxWaitMs: 30_000,
+        groupConfirm: "observe" as const,
       },
     };
     await writeRawSettings(explicitDefaults);
     await reloadSettings();
     expect(getSettings().pty).toEqual(explicitDefaults.pty);
+  });
+
+  it("defaults pty.groupConfirm to 'observe' and accepts 'enforce' (#581 cp3)", async () => {
+    await writeRawSettings({});
+    await reloadSettings();
+    expect(getSettings().pty.groupConfirm).toBe("observe");
+
+    await writeRawSettings({ pty: { groupConfirm: "enforce" } });
+    await reloadSettings();
+    expect(getSettings().pty.groupConfirm).toBe("enforce");
+  });
+
+  it("falls back to 'observe' for any other pty.groupConfirm, with one warning", async () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const bad of ["Enforce", "off", true, 1, null]) {
+        await writeRawSettings({ pty: { groupConfirm: bad } });
+        await reloadSettings();
+        expect(getSettings().pty.groupConfirm).toBe("observe");
+      }
+      expect(
+        warn.mock.calls.some((c: unknown[]) => String(c[0]).includes("pty.groupConfirm")),
+      ).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("defaults respawnRetries to 3 when omitted (#175)", async () => {

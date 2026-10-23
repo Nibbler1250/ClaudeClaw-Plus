@@ -1,3 +1,4 @@
+import { groupUnconfirmedObservedCount } from "../runner/pty-group-confirm";
 import {
   ensureProjectClaudeMd,
   run,
@@ -1593,6 +1594,7 @@ async function handleInteractionCreate(
         `Created: ${session.createdAt}`,
         `Last used: ${session.lastUsedAt}`,
         `Compact warned: ${(session as any).compactWarned ? "yes" : "no"}`,
+        `PTY groups unconfirmed (observed): ${groupUnconfirmedObservedCount()}`,
       ];
       if (threadSessions.length > 0) {
         lines.push("", `**Thread Sessions:** ${threadSessions.length}`);
