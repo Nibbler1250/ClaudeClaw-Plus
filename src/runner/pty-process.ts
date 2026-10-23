@@ -57,7 +57,7 @@ import { claudeExecutable, withCleanProcessEnv } from "../runner";
 // parser's completion/answer API is deliberately NOT imported here (#562 round 2; the
 // guard test `pty-turn-evidence-guard.test.ts` fails the build if it comes back).
 import { stripAnsi } from "./pty-output-parser";
-import { assertSessionSpawnable } from "./pty-quarantine";
+import { assertSessionSpawnable, PtyQuarantinedError } from "./pty-quarantine";
 // Re-export the sanitiser from its standalone home so existing callers that
 // pull it from `pty-process` (and through `runner/index`) keep working without
 // loading bun-pty just to get the helper.
@@ -118,7 +118,8 @@ export interface PtyProcessOptions {
   isolation?: "untrusted" | "trusted-session";
   /**
    * The supervisor session key (or bus agent id) this process serves. Reported in the
-   * group-unconfirmed log line; never a fence authority by itself.
+   * group-unconfirmed log line, and carried to the final spawn assertion (an untrusted
+   * one-shot's ephemeral key is its only fence key: the CLI session id is unknown).
    */
   sessionKey?: string;
   /**
@@ -1921,11 +1922,6 @@ function concatBytes(parts: Uint8Array[], totalLen: number): Uint8Array {
  */
 export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
   return new Promise<PtyProcess>((resolve, reject) => {
-    // #562 round 9: the synchronous final word for a session that is already named. No
-    // await between this check and the `_ptySpawn` call below.
-    if (opts.sessionId && opts.sessionId.length > 0) {
-      assertSessionSpawnable({ sessionId: opts.sessionId });
-    }
     const cmd = opts._commandOverride ?? claudeExecutable();
     const args = buildClaudeArgs(opts);
     const cols = opts.cols ?? DEFAULT_COLS;
@@ -1945,20 +1941,34 @@ export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
       // spawn passes `opts.env` as the exact policy instead: every other key of the
       // parent environment is removed for the call (and `opts.env` has already had
       // the strip list applied, see the supervisor's untrustedChildEnv).
-      // #581 cp6: the key/session spawn assertion moves inside this callback, directly
-      // before the native call, and runs unconditionally for untrusted one-shots.
       pty = withCleanProcessEnv(
-        () =>
-          (opts._ptySpawn ?? ptySpawn)(cmd, args, {
+        () => {
+          // #562 round 9, moved here by #581 cp6: the synchronous final word, on the line
+          // before the native call and inside the environment callback, so nothing (env
+          // preparation included) sits between it and the fork. Unconditional: an untrusted
+          // one-shot names no CLI session id, so the key (its ephemeral key) is what the
+          // fence matches. The ids are the ones the argv names, as `PtyProcessImpl` records.
+          assertSessionSpawnable({
+            sessionKey: opts.sessionKey,
+            sessionId: opts.sessionId || opts.newSessionId,
+          });
+          return (opts._ptySpawn ?? ptySpawn)(cmd, args, {
             name: "xterm-256color",
             cols,
             rows,
             cwd: opts.cwd,
             env: opts.env,
-          }),
+          });
+        },
         opts.isolation === "untrusted" ? opts.env : undefined,
       );
     } catch (err) {
+      // A fenced session is the caller's typed refusal (the supervisor maps it), not a
+      // failed spawn: it must not be wrapped into a plain Error.
+      if (err instanceof PtyQuarantinedError) {
+        reject(err);
+        return;
+      }
       reject(
         new Error(
           `Failed to spawn PTY for ${cmd}: ${err instanceof Error ? err.message : String(err)}`,

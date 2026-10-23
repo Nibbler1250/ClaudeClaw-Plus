@@ -2667,9 +2667,11 @@ async function spawnEntry(
     // #562 round 8: the gate for a first spawn. `spawnOpts.sessionId` is the stored or
     // resumed session, so a transcript another process still holds is refused whatever key
     // asks for it.
-    await assertSessionWritable({ sessionKey: entry.sessionKey, sessionId: spawnOpts.sessionId });
+    // #581 cp6: the session the spawn names is the resumed one, else the new id it pre-allocates.
+    const named = spawnOpts.sessionId || spawnOpts.newSessionId;
+    await assertSessionWritable({ sessionKey: entry.sessionKey, sessionId: named });
     // #562 round 9: the final word, synchronous. No await between this check and `spawn`.
-    assertSessionSpawnable({ sessionKey: entry.sessionKey, sessionId: spawnOpts.sessionId });
+    assertSessionSpawnable({ sessionKey: entry.sessionKey, sessionId: named });
     const spawned = spawn(spawnOpts);
     await landPty(entry, await spawned);
     // Stamp the (re)spawn time so the reaper's spawn-grace window restarts
@@ -2839,9 +2841,11 @@ async function respawnEntry(
   }
   // #562 round 8: the gate for a respawn (it also lifts a quarantine the dispose above
   // recorded and has since confirmed).
-  await assertSessionWritable({ sessionKey: entry.sessionKey, sessionId: opts.sessionId });
+  // #581 cp6: the resumed session, else the new id the replacement pre-allocates.
+  const named = opts.sessionId || opts.newSessionId;
+  await assertSessionWritable({ sessionKey: entry.sessionKey, sessionId: named });
   // #562 round 9: the final word, synchronous. No await between this check and `spawn`.
-  assertSessionSpawnable({ sessionKey: entry.sessionKey, sessionId: opts.sessionId });
+  assertSessionSpawnable({ sessionKey: entry.sessionKey, sessionId: named });
   const respawned = spawn(opts);
   await landPty(entry, await respawned);
   entry.spawnOpts = opts;

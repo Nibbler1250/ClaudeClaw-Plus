@@ -4,7 +4,7 @@
  * supervisor has an unconfirmed writer on is not started beside it.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PtyExitUnconfirmedError, type PtyProcess } from "../../runner/pty-process";
@@ -112,5 +112,94 @@ describe("SessionManager.spawnAgent and the quarantine gate", () => {
 
     await new Promise((r) => setTimeout(r, 200));
     expect(existsSync(marker)).toBe(false);
+  });
+
+  /** A stand-in that records that it was started, then exits. */
+  function stand(name: string): { script: string; marker: string } {
+    const marker = join(cwd, `${name}.txt`);
+    const script = join(cwd, `${name}.sh`);
+    writeFileSync(script, `#!/bin/sh\necho started > "${marker}"\n`, { mode: 0o755 });
+    chmodSync(script, 0o755);
+    return { script, marker };
+  }
+
+  const agentOn = (supervision: "process-stream-json" | "tmux") => ({
+    id: "a",
+    cwd,
+    session_id: "sess-a",
+    permission_mode: "bypassPermissions" as const,
+    supervision,
+  });
+
+  it("does not start the child process on a session whose retirement began after the async gate passed", async () => {
+    // Fault (site: `spawnChild`, the synchronous check before `nodeSpawnChildProcess`): the gate
+    // sees no record, so the stand-in is started. Predicted result: `child.txt` exists and the
+    // call resolves.
+    const { script, marker } = stand("child");
+    fenceSession("global", stuckPty("sess-a"));
+    mgr = new SessionManager({ commandOverride: script, sessionCollisionDetectMs: 0 });
+
+    await expect(mgr.spawnAgent(agentOn("process-stream-json"), "cli")).rejects.toThrow(
+      "quarantined",
+    );
+
+    await new Promise((r) => setTimeout(r, 200));
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("positive control: the same child is started when nothing is fenced", async () => {
+    // Without this, the absent marker above could mean the stand-in never runs here at all.
+    const { script, marker } = stand("child-control");
+    mgr = new SessionManager({ commandOverride: script, sessionCollisionDetectMs: 0 });
+
+    await mgr.spawnAgent(agentOn("process-stream-json"), "cli").catch(() => undefined);
+
+    await new Promise((r) => setTimeout(r, 300));
+    expect(existsSync(marker)).toBe(true);
+  });
+
+  describe("tmux", () => {
+    let savedPath: string | undefined;
+    let tmuxMarker: string;
+
+    beforeEach(() => {
+      // tmux itself is replaced by a stand-in first on PATH, so a spawn is observable and
+      // no real tmux session is ever created.
+      savedPath = process.env.PATH;
+      tmuxMarker = join(cwd, "tmux.txt");
+      const bin = join(cwd, "bin");
+      mkdirSync(bin);
+      writeFileSync(join(bin, "tmux"), `#!/bin/sh\necho started > "${tmuxMarker}"\n`, {
+        mode: 0o755,
+      });
+      chmodSync(join(bin, "tmux"), 0o755);
+      process.env.PATH = `${bin}:${savedPath ?? ""}`;
+    });
+    afterEach(() => {
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
+    });
+
+    it("does not start tmux on a session whose retirement began after the async gate passed", async () => {
+      // Fault (site: `spawnTmux`, the synchronous check before `nodeSpawnChildProcess`): the gate
+      // sees no record, so tmux is started. Predicted result: `tmux.txt` exists and the call
+      // does not reject with "quarantined".
+      fenceSession("global", stuckPty("sess-a"));
+      mgr = new SessionManager({ commandOverride: "/bin/true", sessionCollisionDetectMs: 0 });
+
+      await expect(mgr.spawnAgent(agentOn("tmux"), "cli")).rejects.toThrow("quarantined");
+
+      await new Promise((r) => setTimeout(r, 200));
+      expect(existsSync(tmuxMarker)).toBe(false);
+    });
+
+    it("positive control: tmux is started when nothing is fenced", async () => {
+      mgr = new SessionManager({ commandOverride: "/bin/true", sessionCollisionDetectMs: 0 });
+
+      await mgr.spawnAgent(agentOn("tmux"), "cli").catch(() => undefined);
+
+      await new Promise((r) => setTimeout(r, 300));
+      expect(existsSync(tmuxMarker)).toBe(true);
+    });
   });
 });

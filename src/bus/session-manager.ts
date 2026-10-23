@@ -1140,18 +1140,18 @@ export class SessionManager {
     // fork-time read of `environ`). The bun-pty handle is the first thing
     // returned so the post-spawn restore happens after the child has
     // inherited the stripped env.
-    // #562 round 9: the synchronous final word, after the `bun-pty` import above. No await
-    // between this check and the spawn.
-    assertSessionSpawnable({ sessionId: agent.session_id });
-    const pty = withCleanProcessEnv(() =>
-      ptySpawn(cmd, args, {
+    const pty = withCleanProcessEnv(() => {
+      // #562 round 9, moved into the callback by #581 cp6: the synchronous final word, after
+      // the `bun-pty` import above, on the line before the native call. No await between.
+      assertSessionSpawnable({ sessionId: agent.session_id });
+      return ptySpawn(cmd, args, {
         name: "xterm-256color",
         cols: 120,
         rows: 30,
         cwd: realCwd,
         env,
-      }),
-    );
+      });
+    });
     // Boot-dialog handling lives in PtyAgentProcess's output-driven watcher
     // (issue #193): it answers the dev-channels confirmation with Enter and the
     // new "Bypass Permissions mode" confirmation by selecting "Yes, I accept"
