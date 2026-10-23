@@ -209,6 +209,22 @@ describe("a late confirmation that succeeds releases once", () => {
     expect(freeSlots()).toBe(2); // exactly the cap: not more, not fewer
   });
 
+  it("with the retirement's 15 s bound already passed, the call still waits for the landed child", async () => {
+    // The retirement ends at the stand-in with the spawn still in flight; `lateRetire` must not
+    // settle there. Predicted without the wait on `spawnInFlight` in `lateRetirement`: it settles
+    // at the stand-in, the second pass finds the pending-spawn hold and keeps the root, and the
+    // root is still there when the child has been confirmed gone.
+    injectPendingSpawnWait(async () => {});
+    const rootOf = slowSpawn(250, (opts) => latePty(opts, () => sleep(150)));
+    await run({ timeoutMs: 100 });
+    await until(() => rootOf() !== "");
+    const root = rootOf();
+    await until(() => !existsSync(root) && cleanup.untrustedOneShotsInFlight() === 0);
+    expect(existsSync(root)).toBe(false);
+    expect(cleanup.pendingSpawnHoldCount()).toBe(0);
+    expect(freeSlots()).toBe(2);
+  });
+
   it("a survivor later confirmed gone by the sweeper's retry frees its slot once", async () => {
     const rootOf = slowSpawn(150, (opts) => latePty(opts, unconfirmed));
     await run({ timeoutMs: 80 });
