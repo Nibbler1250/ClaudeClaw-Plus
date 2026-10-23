@@ -1908,7 +1908,7 @@ Every injection went RED, each independently. The RED lines below are verbatim f
 
 ### 5. Gates (HEAD `257ca8ae`)
 
-- Gate files run one per process (a single combined process shows cross-file pollution: 870 tests, 5 failures that pass alone). 870 tests in 35 files, all pass per file: spawn-fence (12+12+5+11+5), bus (6+3+7+27), native environment (runner 34, pty-isolation 8, libc-fallthrough 6), routing (21+8+38+61), argv (5+11), and the #562 safety files (transcript 93, false-completion 46, turn-evidence-guard 31, process 71, supervisor 111, send-to-live 34, boot-dialog 16, trust-prompt 18, hot-switch-to-print 9, dispose 9, dispose-real 5), plus the isolated-turn, reply, slot, late-retire and untrusted-state files.
+- Gate files run one per process (a single combined process of the same 870 tests showed 5 failures: three pass alone, one was my own positive control, flaky under load and since made to poll, and one is the environment case in the next bullet). 870 tests in 35 files, all pass per file: spawn-fence (12+12+5+11+5), bus (6+3+7+27), native environment (runner 34, pty-isolation 8, libc-fallthrough 6), routing (21+8+38+61), argv (5+11), and the #562 safety files (transcript 93, false-completion 46, turn-evidence-guard 31, process 71, supervisor 111, send-to-live 34, boot-dialog 16, trust-prompt 18, hot-switch-to-print 9, dispose 9, dispose-real 5), plus the isolated-turn, reply, slot, late-retire and untrusted-state files.
 - `pty-supervisor.test.ts` has one failure only when `ANTHROPIC_BASE_URL` is set in the shell (the local proxy sets it); identical on `9443134b`. With it unset: 111 pass, 0 fail on both.
 - tsc ratchet: 149 (baseline 149). `bun run lint`: exit 0, 0 errors.
 
