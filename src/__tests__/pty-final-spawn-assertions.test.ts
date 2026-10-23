@@ -30,6 +30,7 @@ import {
   __resetSupervisorForTests,
   injectIsSessionResumable,
   injectMaxRetriesForTests,
+  injectNewSessionId,
   injectRespawnRetriesForTests,
   injectSleep,
   injectSpawnPty,
@@ -333,6 +334,27 @@ describe("the supervisor's spawns", () => {
     expect(first.disposeCalls).toBeGreaterThan(0);
     const text = result instanceof Error ? result.message : JSON.stringify(result);
     expect(text).not.toContain('"exitCode":0');
+  });
+
+  it("a first spawn on a fresh session does not go ahead when the id it pre-allocates is fenced", async () => {
+    // A fresh session has no stored id, so the spawn names the new one it mints. Fault (site:
+    // `newSessionId` left out of `spawnEntry`'s effective id): the fence on that id is not seen.
+    // Predicted result: `spawnCount` is 1.
+    let spawnCount = 0;
+    injectNewSessionId(() => "new-fixed");
+    fenceKey("thread:other", {}, () => "new-fixed");
+    injectSpawnPty(async () => {
+      spawnCount++;
+      return fakePty({});
+    });
+
+    const r = await runOnPty("thread:fresh", "hello", { timeoutMs: 5000, ...scope() }).catch(
+      (err: unknown) => err,
+    );
+
+    injectNewSessionId(null);
+    expect(r instanceof Error ? r.message : JSON.stringify(r)).toContain("quarantined");
+    expect(spawnCount).toBe(0);
   });
 
   it("a first spawn does not go ahead on a fenced KEY, though the session it names is free", async () => {
