@@ -1423,9 +1423,12 @@ class PtyProcessImpl implements PtyProcess {
    * `onExit` synchronously whether or not the child died, and turns every later `kill()` into a
    * no-op, so neither its event nor a second `kill("SIGKILL")` says anything about the OS. Death
    * is read from the OS: `process.kill(pid, 0)` throws ESRCH once the pid is gone (EPERM means
-   * it still exists). If the child outlives the grace period it gets SIGKILL straight from here,
-   * to its process group too (the child is its own group leader, so its MCP children go with it).
-   * Rejects with `PtyExitUnconfirmedError` when the pid is still there at the hard cap.
+   * it still exists). The group is signalled first (`retireProcessGroup`: the child is its own
+   * group leader, so its MCP children go with it): SIGTERM at once, SIGKILL if the leader or any
+   * member outlives the grace. Resolves only when the leader AND its group are proven gone.
+   * Rejects with `PtyExitUnconfirmedError` when the leader is still there at the hard cap, and
+   * when a group member is, for an untrusted one-shot or `pty.groupConfirm: "enforce"`; a trusted
+   * PTY in "observe" mode logs and counts the surviving member instead (pty-group-confirm).
    */
   dispose(): Promise<void> {
     if (!this._disposal) {
