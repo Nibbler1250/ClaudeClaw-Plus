@@ -123,6 +123,8 @@ export interface PtyProcessOptions {
   _liveMembers?: (pid: number) => number | undefined;
   /** INTERNAL TEST HOOK: names the members left in a group that would not go. */
   _describeGroup?: (pid: number) => GroupDescription;
+  /** INTERNAL TEST HOOK: how long group continuity evidence stays fresh (default 30 s). */
+  _groupContinuityMaxAgeMs?: number;
   /** Test seam: how long an untrusted spawn waits for the REPL footer. Default 20 s. */
   _replReadyBudgetMs?: number;
   /**
@@ -520,6 +522,13 @@ const DEFAULT_POLL_MS = 50;
 const DEFAULT_EXIT_GRACE_MS = 2000;
 const DEFAULT_EXIT_CAP_MS = 7000;
 const EXIT_PROBE_MS = 20;
+/**
+ * How long evidence that a group was seen alive (at the leader's exit, or by an earlier
+ * retirement) may authorise `-pid` for a leader that is absent. Past it nothing is signalled
+ * without fresh evidence: between the exit and a late dispose a stranger can take the pid and
+ * leave a group on it (security review of cp3). Not an authority by itself: age only narrows.
+ */
+const GROUP_CONTINUITY_MAX_AGE_MS = 30_000;
 const DEFAULT_COLS = 100;
 const DEFAULT_ROWS = 30;
 const DEFAULT_PERMISSION_MODE_ARGS = ["--dangerously-skip-permissions"];
@@ -833,6 +842,9 @@ class PtyProcessImpl implements PtyProcess {
    * nothing about a group whose leader is gone (plan "Signal authority", point 2).
    */
   private _groupContinuity = false;
+  /** Wall-clock ms when `_groupContinuity` was last established by a probe. */
+  private _groupContinuityAt = 0;
+  private readonly _groupContinuityMaxAgeMs: number;
   /** The leader's start time at spawn: every later signal checks that the pid still has it. */
   private readonly _leaderStartMs: number | null;
   /**
@@ -881,6 +893,7 @@ class PtyProcessImpl implements PtyProcess {
     this._groupConfirm = opts._groupConfirm;
     this._liveMembers = opts._liveMembers;
     this._describeGroup = opts._describeGroup;
+    this._groupContinuityMaxAgeMs = opts._groupContinuityMaxAgeMs ?? GROUP_CONTINUITY_MAX_AGE_MS;
     this._readyGate = opts.isolation === "untrusted" && !opts._skipReadySettle;
     this._replReadyBudgetMs = opts._replReadyBudgetMs ?? UNTRUSTED_REPL_READY_MS;
     this._onGroupSurvived = opts.onGroupSurvived;
@@ -1594,13 +1607,20 @@ class PtyProcessImpl implements PtyProcess {
       describe: this._describeGroup,
       initial,
       leaderSeenAlive: wasAlive,
-      groupContinuity: this._groupContinuity,
+      groupContinuity:
+        this._groupContinuity &&
+        Date.now() - this._groupContinuityAt <= this._groupContinuityMaxAgeMs,
       allowUnrecordedInitial: true,
       sendTerm: initial,
       deadlineAt,
       termGraceMs: this._exitGraceMs,
     });
-    if (outcome.groupSeen) this._groupContinuity = true;
+    // Continuity is fresh evidence only: a group found absent revokes it (see retireProcessGroup).
+    if (outcome.groupAbsentSeen) this._groupContinuity = false;
+    else if (outcome.groupSeen) {
+      this._groupContinuity = true;
+      this._groupContinuityAt = Date.now();
+    }
     let scanCause: SurvivorCause | null = null;
     if (this._reapEscapees) {
       try {
@@ -1651,8 +1671,12 @@ class PtyProcessImpl implements PtyProcess {
     try {
       this._signalPid(-this._pid, 0);
       this._groupContinuity = true;
+      this._groupContinuityAt = Date.now();
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "EPERM") this._groupContinuity = true;
+      if ((err as NodeJS.ErrnoException).code === "EPERM") {
+        this._groupContinuity = true;
+        this._groupContinuityAt = Date.now();
+      }
     }
   }
 

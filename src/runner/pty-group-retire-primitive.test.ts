@@ -205,6 +205,17 @@ describe("retireProcessGroup", () => {
     expect(out.groupGone).toBe(true);
   });
 
+  it("a probe that finds the group absent says so, so the caller revokes the continuity it held", async () => {
+    const w = world({ leader: false, members: 0 });
+    const out = await retireProcessGroup(
+      input(w, { initial: false, leaderSeenAlive: false, groupContinuity: true, sendTerm: false }),
+    );
+    // Went red (false) with the report removed: a stale `true` would outlive the group it vouched for.
+    expect(out.groupAbsentSeen).toBe(true);
+    expect(out.groupGone).toBe(true);
+    expect(w.log).toEqual([]);
+  });
+
   it("an identity that cannot be read on a delayed confirmation signals nothing", async () => {
     const w = world({ members: 1, immuneMembers: true });
     const out = await retireProcessGroup(

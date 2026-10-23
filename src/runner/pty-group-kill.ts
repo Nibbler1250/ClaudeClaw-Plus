@@ -87,7 +87,7 @@ export interface GroupTerminationOptions {
    *    window (`firstTermination`), and never because the PTY "still owns" the pid;
    *  - the bare leader pid is signalled only when its identity matches.
    */
-  retire?: { absentLeaderGroupIsOurs: boolean };
+  retire?: { absentLeaderGroupIsOurs: () => boolean };
 }
 
 const defaultSleep = (ms: number): Promise<void> =>
@@ -294,7 +294,7 @@ class GroupTarget {
     // leader, or this is the first termination (r14e, H2). The retirement narrows that further:
     // a saved start time alone proves nothing about a group whose leader is gone (#581 cp3).
     const absentOk = this.retire
-      ? this.retire.absentLeaderGroupIsOurs
+      ? this.retire.absentLeaderGroupIsOurs()
       : this.recorded || unrecordedOk;
     const unknownOk = this.retire ? unrecordedOk : this.owned() || unrecordedOk;
     const known =
@@ -443,6 +443,8 @@ export interface RetireGroupOutcome {
   comm: string[];
   /** Whether the group was seen with members: the continuity a later confirmation may rely on. */
   groupSeen: boolean;
+  /** Whether a probe found the group absent: that revokes any continuity (see above). */
+  groupAbsentSeen: boolean;
 }
 
 /** How often a SIGTERM that could not be sent yet is tried again, inside the TERM grace. */
@@ -531,21 +533,29 @@ export async function retireProcessGroup(input: RetireGroupInput): Promise<Retir
     survivors: undefined,
     comm: [],
     groupSeen: false,
+    groupAbsentSeen: false,
   };
   if (!isSignalablePid(pid)) return unknown;
   const target = new GroupTarget(pid, signal, liveMembers, {
     identityState: () => rawIdentityState(pid, identity, signal, readIdentity),
     identityRecorded: identity !== null,
     firstTermination: input.initial && input.allowUnrecordedInitial,
-    retire: {
-      absentLeaderGroupIsOurs: input.groupContinuity || (input.initial && input.leaderSeenAlive),
-    },
+    retire: { absentLeaderGroupIsOurs: () => continuity },
   });
 
+  // Evidence that a group answering on this pgid, beside an absent leader, is ours. It is fresh
+  // evidence only: the moment any probe finds the group ABSENT it is revoked, because a group
+  // that is seen again after that is not the one that was seen before (a stranger's, on a
+  // recycled pid). Security review of cp3.
+  let continuity = input.groupContinuity || (input.initial && input.leaderSeenAlive);
   let groupSeen = false;
+  let groupAbsentSeen = false;
   const look = (withIdentity: boolean): GroupProbe => {
     const probe = target.probe(withIdentity);
-    if (!probe.groupGone && (probe.live === undefined || probe.live > 0)) groupSeen = true;
+    if (probe.groupGone) {
+      groupAbsentSeen = true;
+      continuity = false;
+    } else if (probe.live === undefined || probe.live > 0) groupSeen = true;
     return probe;
   };
   // Identity is read on the first and the last check of a wait only (a `ps` spawn on macOS).
@@ -576,10 +586,17 @@ export async function retireProcessGroup(input: RetireGroupInput): Promise<Retir
     probe = await waitGone(input.deadlineAt);
   }
   if (probe.groupGone) {
-    return { ...unknown, leaderGone: true, groupGone: true, survivors: 0, groupSeen };
+    return {
+      ...unknown,
+      leaderGone: true,
+      groupGone: true,
+      survivors: 0,
+      groupSeen,
+      groupAbsentSeen,
+    };
   }
   if (!probe.leaderGone) {
-    return { ...unknown, leaderGone: false, survivors: probe.live, groupSeen };
+    return { ...unknown, leaderGone: false, survivors: probe.live, groupSeen, groupAbsentSeen };
   }
   const described = describe(pid);
   const reason: GroupReason = probe.eperm
@@ -596,5 +613,6 @@ export async function retireProcessGroup(input: RetireGroupInput): Promise<Retir
     survivors: described.count ?? probe.live,
     comm: described.comm,
     groupSeen: true,
+    groupAbsentSeen,
   };
 }

@@ -208,6 +208,8 @@ export interface PtyRetireSeams {
   /** The one deadline of the whole retirement (default 7000 ms, as #562). */
   exitCapMs?: number;
   groupConfirm?: GroupConfirmMode;
+  /** How long group continuity evidence stays fresh (default 30 s; see PtyProcess). */
+  groupContinuityMaxAgeMs?: number;
 }
 
 /**
@@ -243,6 +245,8 @@ export class PtyAgentProcess implements AgentProcess {
   private _retirement: Promise<void> | null = null;
   private _retiredOnce = false;
   private _groupContinuity = false;
+  /** Wall-clock ms when `_groupContinuity` was last established by a probe. */
+  private _groupContinuityAt = 0;
   /** Set with `_exited` (issue #393): the code a late `onExit` subscriber is
    *  replayed with. */
   private _exitCode = -1;
@@ -1397,7 +1401,9 @@ export class PtyAgentProcess implements AgentProcess {
       describe: seams.describeGroup,
       initial,
       leaderSeenAlive: wasAlive,
-      groupContinuity: this._groupContinuity,
+      groupContinuity:
+        this._groupContinuity &&
+        Date.now() - this._groupContinuityAt <= (seams.groupContinuityMaxAgeMs ?? 30_000),
       // An unrecorded identity is never signalled from the bus: a made-up pid must not reach a
       // real process.
       allowUnrecordedInitial: false,
@@ -1405,7 +1411,11 @@ export class PtyAgentProcess implements AgentProcess {
       deadlineAt,
       termGraceMs: seams.exitGraceMs ?? 2000,
     });
-    if (outcome.groupSeen) this._groupContinuity = true;
+    if (outcome.groupAbsentSeen) this._groupContinuity = false;
+    else if (outcome.groupSeen) {
+      this._groupContinuity = true;
+      this._groupContinuityAt = Date.now();
+    }
     const verdict = judgeGroupOutcome(outcome, {
       untrusted: false,
       mode: seams.groupConfirm,
@@ -1421,8 +1431,12 @@ export class PtyAgentProcess implements AgentProcess {
     try {
       signal(-this.pid, 0);
       this._groupContinuity = true;
+      this._groupContinuityAt = Date.now();
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "EPERM") this._groupContinuity = true;
+      if ((err as NodeJS.ErrnoException).code === "EPERM") {
+        this._groupContinuity = true;
+        this._groupContinuityAt = Date.now();
+      }
     }
   }
 

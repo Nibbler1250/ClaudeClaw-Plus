@@ -242,6 +242,26 @@ describe("natural leader exit before dispose", () => {
     expect(groupUnconfirmedObservedCount()).toBe(0);
   });
 
+  test("exit-time evidence goes stale: a late dispose signals nothing on a group it cannot vouch for", async () => {
+    // Fault (site: `_confirmGone`, drop the freshness bound): the late dispose KILLs `-pid`, which
+    // by now may be a stranger's. Predicted result: `-pid:SIGKILL` in the log.
+    const os = makeOs({ leader: false, members: 2, immuneMembers: true });
+    const proc = await spawnOver(os, { _groupContinuityMaxAgeMs: 20 });
+    (native as FakeNative).fireExit(); // the group was alive when the leader went
+    await new Promise((r) => setTimeout(r, 60));
+    await proc.dispose();
+    expect(os.log).toEqual([]);
+    expect(groupUnconfirmedObservedCount()).toBe(1); // reported (reason unknown-identity), not signalled
+  });
+
+  test("within the window the same dispose does signal the group it saw", async () => {
+    const os = makeOs({ leader: false, members: 2 });
+    const proc = await spawnOver(os, { _groupContinuityMaxAgeMs: 5000 });
+    (native as FakeNative).fireExit();
+    await proc.dispose();
+    expect(os.log).toEqual([`-${proc.pid}:SIGTERM`, `-${proc.pid}:SIGKILL`]);
+  });
+
   test("an exit that left no group behind signals nothing, even if something answers on the pgid later", async () => {
     // The exit event finds no group (continuity not established); a stranger's group then
     // appears on that pgid. Without evidence it is ours, nothing is sent.
