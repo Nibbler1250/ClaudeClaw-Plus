@@ -105,8 +105,16 @@ function callerEnv(extra: Record<string, string> = {}): Record<string, string> {
   };
 }
 
+/**
+ * What the process read from the transcript for the turn just faked. The supervisor returns the
+ * process's own reply (#581 cp4) and reads no transcript after it, so a fake process hands back
+ * the text its fake claude "wrote". The real observer is exercised in pty-isolated-turn.test.ts.
+ */
+let lastReplyText = "ok";
+
 /** What the child's claude writes: a transcript under ITS config root (the throwaway one). */
 function reply(opts: PtyProcessOptions, sessionId = SID, text = "ok"): void {
+  lastReplyText = text;
   const project = cleanup.untrustedPtyProjectDir(opts.cwd, opts.env.CLAUDE_CONFIG_DIR!);
   mkdirSync(project, { recursive: true });
   writeFileSync(
@@ -128,7 +136,7 @@ function fakeSpawn(onTurn: (opts: PtyProcessOptions) => void | Promise<void> = (
       runTurn: async () => {
         await onTurn(opts);
         reply(opts);
-        return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
+        return { text: lastReplyText, sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
       },
       dispose: async () => {},
     } as never;
@@ -507,7 +515,7 @@ describe("r12 A: a process group that outlives retirement fails the call and kee
         lastTurnEndedAt: () => 0,
         runTurn: async () => {
           reply(opts);
-          return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
+          return { text: lastReplyText, sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
         },
         dispose: async () => opts.onGroupSurvived?.(424242, null, "group"),
       } as never;
@@ -552,7 +560,7 @@ describe("r13 A/G: a survivor keeps the call failed, the root in place, and is s
       return Object.assign(real, {
         runTurn: async () => {
           reply(opts);
-          return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
+          return { text: lastReplyText, sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
         },
       });
     });
@@ -639,7 +647,7 @@ describe("r13 A6: a disposal that rejects keeps the root, as a survivor does", (
         lastTurnEndedAt: () => 0,
         runTurn: async () => {
           reply(opts);
-          return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
+          return { text: lastReplyText, sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
         },
         dispose: async () => {
           throw new Error("survivor hook failed");
@@ -680,7 +688,7 @@ describe("r14 D: the failed call names the real cause", () => {
           lastTurnEndedAt: () => 0,
           runTurn: async () => {
             reply(opts);
-            return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
+            return { text: lastReplyText, sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
           },
           dispose: async () => opts.onGroupSurvived?.(424242, null, cause),
         } as never;
@@ -794,7 +802,7 @@ describe("r14b: an unreadable process is a hold on the root, not a failure", () 
           lastTurnEndedAt: () => 0,
           runTurn: async () => {
             reply(opts);
-            return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
+            return { text: lastReplyText, sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
           },
           // What the supervisor's escape-scan hook does with a process it could not read.
           dispose: async () =>
@@ -869,7 +877,7 @@ describe("r14b: an unreadable process is a hold on the root, not a failure", () 
         lastTurnEndedAt: () => 0,
         runTurn: async () => {
           reply(opts);
-          return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
+          return { text: lastReplyText, sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
         },
         dispose: async () => opts.onGroupSurvived?.(424242, null, "escapee"),
       } as never;
@@ -924,19 +932,18 @@ describe("r12 E: a REPL that never became ready fails the call with nothing sent
   });
 });
 
-describe("r12 F1: a failure while building the call's state leaks nothing", () => {
-  it("removes the temp cwd and the config root when the project dir cannot be resolved", async () => {
-    fakeSpawn();
-    const before = oneShotTempDirs("claudeclaw-oneshot-");
-    const failing = spyOn(cleanup, "untrustedPtyProjectDir").mockImplementation(() => {
+describe("r12 F1: a failure after the call's state is built leaks nothing", () => {
+  // #581 cp4: the supervisor no longer resolves the project directory (the process does, from the
+  // root it was given), so the failure that stands for "something throws once the state exists"
+  // is the spawn itself.
+  it("removes the temp cwd and the config root when the spawn throws", async () => {
+    injectSpawnPty(async (opts) => {
+      spawned.push(opts);
       throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
     });
-    try {
-      await expect(run()).rejects.toThrow("ENOENT");
-    } finally {
-      failing.mockRestore();
-    }
-    expect(spawned).toHaveLength(0);
+    const before = oneShotTempDirs("claudeclaw-oneshot-");
+    expect((await run()).exitCode).not.toBe(0);
+    expect(spawned).toHaveLength(1);
     expect(oneShotTempDirs("claudeclaw-oneshot-")).toEqual(before);
   });
 });
@@ -989,25 +996,30 @@ describe("B2: the spawn strip list applies to the untrusted policy env", () => {
 });
 
 describe("B3: `@` file mentions are neutralised for untrusted prompts only", () => {
+  /**
+   * What reached the PTY. The screen no longer carries a turn's result (#562, #581 cp4), so the
+   * child records what it is sent, and the turn (which finds no transcript) may end unsuccessfully.
+   */
   async function echoed(isolation: "untrusted" | undefined): Promise<string> {
+    const sink = join(dir, `wire-${isolation ?? "trusted"}.txt`);
     const child = await spawnPty({
       sessionId: "",
       cwd: dir,
       ...(isolation ? { isolation } : {}),
-      env: { PATH: "/usr/bin:/bin" },
+      env: { PATH: "/usr/bin:/bin", CLAUDE_CONFIG_DIR: join(dir, "b3-config") },
+      ...(isolation ? {} : { transcriptPath: join(dir, "b3-session.jsonl") }),
       security: { level: "moderate", allowedTools: [], disallowedTools: [] },
-      _commandOverride: "/bin/cat",
-      _argsOverride: [],
+      _commandOverride: "/bin/sh",
+      _argsOverride: ["-c", `exec cat > '${sink}'`],
       _skipReadySettle: true,
       quietWindowMs: 50,
-      sentinelMaxWaitMs: 1000,
+      submitConfirmMs: 100,
     });
     try {
-      return (
-        await child.runTurn("hire @/path/to/secret and @x ✻ shift+tab to cycle", {
-          timeoutMs: 2000,
-        })
-      ).text;
+      await child
+        .runTurn("hire @/path/to/secret and @x ✻ shift+tab to cycle", { timeoutMs: 600 })
+        .catch(() => {});
+      return readFileSync(sink, "utf8");
     } finally {
       await child.dispose();
     }
@@ -1192,7 +1204,7 @@ describe("C: the reply gets its `@` back, on both engines, in one place", () => 
           // The real process writes the prompt through this same helper.
           modelSaw = neutralizeFileMentions(prompt);
           reply(opts, SID, modelSaw);
-          return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
+          return { text: lastReplyText, sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
         },
         dispose: async () => {},
       } as never;
@@ -1269,7 +1281,7 @@ describe("r15 A4: concurrent untrusted PTY one-shots are capped", () => {
         lastTurnEndedAt: () => 0,
         runTurn: async () => {
           reply(opts);
-          return { text: "screen", sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
+          return { text: lastReplyText, sessionId: SID, cleanBoundary: true, bytesCaptured: 1 };
         },
         dispose: async () => {},
       } as never;

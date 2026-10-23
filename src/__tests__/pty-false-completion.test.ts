@@ -865,7 +865,7 @@ describe("#562 round 5 — a stopped process cannot write a late record", () => 
 });
 
 describe("#562 — a process with no transcript cannot succeed", () => {
-  test("an untrusted PTY turn errors before anything is written and never resolves from the screen", async () => {
+  test("an untrusted PTY turn with no throwaway config root errors before anything is written and never resolves from the screen", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pty-562-"));
     const got = join(dir, "got.log");
     try {
@@ -873,8 +873,10 @@ describe("#562 — a process with no transcript cannot succeed", () => {
       // sees any input at all. It must never see any.
       const t = tx();
       const script = `: > ${got}; IFS= read -r l && printf 'got\\n' >> ${got}; printf '${CHROME_BUSY}\\342\\227\\217 SCREEN\\n${CHROME_DONE}'; sleep 8`;
+      // No `CLAUDE_CONFIG_DIR` in the env: an untrusted turn reads only the transcript of its
+      // own throwaway root (#581 cp4), never a caller's path and never the operator's config.
       const { transcriptPath: _omit, ...rest } = opts(script, t, { isolation: "untrusted" });
-      const proc = await spawnPty(rest);
+      const proc = await spawnPty({ ...rest, env: { PATH: "/usr/bin:/bin" } });
       const err = await proc.runTurn(PROMPT, { timeoutMs: 3000 }).then(
         () => null,
         (e: unknown) => e,
@@ -883,7 +885,7 @@ describe("#562 — a process with no transcript cannot succeed", () => {
       await proc.dispose();
       // Fault: drop the refusal and the screen path resolves (or the fake logs the prompt).
       expect(err).toBeInstanceOf(PtyTranscriptUnavailableError);
-      expect((err as Error).message).toContain("--no-session-persistence");
+      expect((err as Error).message).toContain("throwaway config root");
       expect(readFileSync(got, "utf8")).toBe("");
     } finally {
       rmSync(dir, { recursive: true, force: true });

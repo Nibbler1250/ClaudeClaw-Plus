@@ -35,7 +35,9 @@ async function spawnScreen(
     sessionId: "",
     cwd: dir,
     isolation: "untrusted",
-    env: { PATH: "/usr/bin:/bin" },
+    // The throwaway root the transcript is read from: without one the turn is refused before
+    // it writes anything (#581 cp4), which would hide what these tests are about.
+    env: { PATH: "/usr/bin:/bin", CLAUDE_CONFIG_DIR: join(dir, "config") },
     security: { level: "moderate", allowedTools: [], disallowedTools: [] },
     _commandOverride: "/bin/sh",
     _argsOverride: ["-c", `printf '%s\\n' ${printed}; exec cat > '${sink}'`],

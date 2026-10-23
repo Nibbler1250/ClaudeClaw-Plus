@@ -28,16 +28,22 @@ async function dumpFor(isolation: "untrusted" | undefined): Promise<string> {
     sessionId: "",
     cwd: dir,
     ...(isolation ? { isolation } : {}),
-    env: { PATH: "/usr/bin:/bin" },
+    // A turn needs a transcript to read before it writes anything (#562, #581 cp4): an untrusted
+    // one-shot its throwaway root, a trusted process its session file. Neither is ever written
+    // here, so the turn ends unsuccessfully; what is traced is the prompt write and the echo.
+    env: { PATH: "/usr/bin:/bin", CLAUDE_CONFIG_DIR: join(dir, "config") },
+    ...(isolation ? {} : { transcriptPath: join(dir, "session.jsonl") }),
     security: { level: "moderate", allowedTools: [], disallowedTools: [] },
     _commandOverride: "/bin/cat",
     _argsOverride: [],
     _skipReadySettle: true,
     quietWindowMs: 50,
-    sentinelMaxWaitMs: 1000,
+    submitConfirmMs: 100,
   });
   try {
-    await child.runTurn(`classify ${CANARY} ✻ shift+tab to cycle`, { timeoutMs: 2000 });
+    await child
+      .runTurn(`classify ${CANARY} ✻ shift+tab to cycle`, { timeoutMs: 800 })
+      .catch(() => {});
   } finally {
     await child.dispose();
   }

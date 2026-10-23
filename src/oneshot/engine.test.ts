@@ -462,14 +462,15 @@ describe("one-shot isolation contract", () => {
         cwd = opts.cwd;
         return {
           runTurn: async () => {
-            // The untrusted result is the transcript reply (#570), not the screen.
+            // The untrusted result is the transcript reply the process read (#570, #581 cp4), not
+            // the screen; the fake claude's transcript is still left on disk for cleanup to remove.
             const project = untrustedPtyProjectDir(opts.cwd, opts.env.CLAUDE_CONFIG_DIR!);
             mkdirSync(project, { recursive: true });
             writeFileSync(
               join(project, "s.jsonl"),
               `${JSON.stringify({ type: "assistant", message: { id: "m", model: "haiku", content: [{ type: "text", text: "ok" }] } })}\n`,
             );
-            return { text: "screen", sessionId: "s", bytesCaptured: 2, cleanBoundary: true };
+            return { text: "ok", sessionId: "s", bytesCaptured: 2, cleanBoundary: true };
           },
           dispose: async () => {},
         } as never;

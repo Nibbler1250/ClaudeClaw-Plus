@@ -31,8 +31,14 @@
  *   5. The moment the transcript establishes the outcome it is COMMITTED (`_commitTurn`): the
  *      hard timeout is cancelled and a PTY exit no longer rejects. The screen settle that
  *      follows only delays the return.
- *   6. No transcript to read (untrusted one-shot, no session id, switched off) = the
- *      turn fails before anything is written: `PtyTranscriptUnavailableError`.
+ *   6. No transcript to read (no session id, switched off, an untrusted one-shot with no
+ *      throwaway config root) = the turn fails before anything is written:
+ *      `PtyTranscriptUnavailableError`.
+ *   7. An untrusted one-shot reads the same way from the isolated source (#581 cp4): the project
+ *      directory of its own throwaway config root, where the CLI names the session file. The
+ *      file is discovered and bound by inode, and only appended records that carry the exact
+ *      bytes written (after the `@` neutralising) count. Acceptance retries, the deadline and
+ *      the answer all come from that one observer; the supervisor reads nothing after the turn.
  *
  * ─── OR-6 decision (session-ID) ──────────────────────────────────────────────
  *   Pre-allocate via `--session-id <uuid>` for fresh spawns when
@@ -62,6 +68,7 @@ import {
 } from "./pty-prompt-sanitizer";
 import { promptPrepareOverride, untrustedFileMentionNeutralizing } from "./pty-process-test-seams";
 import {
+  resolveIsolatedProjectDir,
   resolveTranscriptPath,
   TranscriptReplacedError,
   TranscriptTurn,
@@ -773,7 +780,12 @@ class PtyProcessImpl implements PtyProcess {
   private _turnStartedAt = 0;
   /** Where the CLI writes this session's transcript; null when there is none to read. */
   private readonly _transcriptPath: string | null;
-  /** Why there is no transcript path (for the refusal message). */
+  /**
+   * An untrusted one-shot's own project directory, where the CLI names the session file itself
+   * (the isolated transcript source); null for every other process.
+   */
+  private readonly _isolatedProjectDir: string | null;
+  /** Why there is no transcript to read (for the refusal message). */
   private readonly _noTranscriptWhy: string;
   /** The transcript reader for the turn in flight. */
   private _tx: TranscriptTurn | null = null;
@@ -871,18 +883,24 @@ class PtyProcessImpl implements PtyProcess {
     // transcript unless the test names one.
     const hooked = Boolean(opts._commandOverride || opts._argsOverride || opts._skipClaudeArgs);
     const untrusted = opts.isolation === "untrusted";
-    this._transcriptPath =
-      opts.transcriptPath ??
-      (hooked
-        ? null
-        : resolveTranscriptPath({
-            cwd: opts.cwd,
-            sessionId: this._sessionId,
-            env: opts.env,
-            untrusted,
-          }));
+    // An untrusted one-shot reads only the transcript its own throwaway root receives. It never
+    // takes a caller's `transcriptPath` and never falls back to a session id or the operator's
+    // config root (`resolveIsolatedProjectDir`).
+    this._isolatedProjectDir = untrusted
+      ? resolveIsolatedProjectDir({ cwd: opts.cwd, env: opts.env })
+      : null;
+    this._transcriptPath = untrusted
+      ? null
+      : (opts.transcriptPath ??
+        (hooked
+          ? null
+          : resolveTranscriptPath({
+              cwd: opts.cwd,
+              sessionId: this._sessionId,
+              env: opts.env,
+            })));
     this._noTranscriptWhy = untrusted
-      ? "an untrusted one-shot runs with --no-session-persistence"
+      ? "an untrusted one-shot has no throwaway config root to read a transcript from"
       : hooked
         ? "spawned through a test hook without a transcriptPath"
         : "no session id";
@@ -903,8 +921,8 @@ class PtyProcessImpl implements PtyProcess {
     this._quietWindowMs = opts.quietWindowMs ?? DEFAULT_QUIET_WINDOW_MS;
     // Untrusted text also loses its `@` file mentions (see neutralizeFileMentions). The
     // trusted path is untouched. The two seams are test-only (pty-process-test-seams).
-    // The exact bytes this produces are what the transcript turn must see in the user record
-    // (#581 cp4 makes the isolated transcript source match them).
+    // The exact bytes this produces are what the transcript turn must see in the user record:
+    // `runTurn` hands them to the observer, so neutralised text is matched as neutralised.
     const prepare = promptPrepareOverride() ?? preparePtyPromptForWrite;
     this._preparePrompt =
       opts.isolation === "untrusted" && untrustedFileMentionNeutralizing()
@@ -1221,10 +1239,10 @@ class PtyProcessImpl implements PtyProcess {
     }
     // Nothing but the session transcript can say a turn was accepted, what the answer is
     // or that it is over. A process with no transcript to read has no way to succeed, so
-    // it fails BEFORE the prompt is written rather than after a turn it cannot verify.
-    // #581 cp4: an untrusted one-shot has no transcript path here yet; the isolated transcript
-    // source (discovered under its unique config root) replaces this refusal.
-    if (!this._transcriptPath) {
+    // it fails BEFORE the prompt is written rather than after a turn it cannot verify. An
+    // untrusted one-shot reads the isolated source (its own throwaway root); the trusted
+    // routes read their session's file.
+    if (!this._transcriptPath && !this._isolatedProjectDir) {
       return Promise.reject(new PtyTranscriptUnavailableError(this.label, this._noTranscriptWhy));
     }
 
@@ -1237,17 +1255,33 @@ class PtyProcessImpl implements PtyProcess {
     this._endedAt = 0;
     this._turnStartedAt = this._now();
 
-    // What goes on the wire, once: the transcript is matched against exactly this. Marked
-    // BEFORE the write, so only what the CLI appends after it can count.
+    // What goes on the wire, once: the transcript is matched against exactly this (after the
+    // untrusted `@` neutralising, not before). Marked BEFORE the write, so only what the CLI
+    // appends after it can count.
     const written = this._preparePrompt(prompt, {
       allowReplCommand: opts.allowReplCommand,
     });
-    this._tx = new TranscriptTurn({
-      path: this._transcriptPath,
+    const tx = new TranscriptTurn({
+      ...(this._isolatedProjectDir
+        ? { isolatedProjectDir: this._isolatedProjectDir }
+        : { path: this._transcriptPath as string }),
       written,
       replCommand: opts.allowReplCommand === true,
     });
-    this._tx.mark();
+    try {
+      tx.mark();
+    } catch {
+      // The isolated directory cannot be listed, so nothing sent could be told apart from what
+      // was there. Refused before the write, like a missing transcript.
+      this._turnInProgress = false;
+      return Promise.reject(
+        new PtyTranscriptUnavailableError(
+          this.label,
+          "the isolated transcript directory could not be read",
+        ),
+      );
+    }
+    this._tx = tx;
 
     // Write prompt + CR (TUI submits on Enter). Sanitize embedded CR/LF so
     // they don't submit mid-prompt.

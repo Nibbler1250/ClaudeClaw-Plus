@@ -74,6 +74,8 @@ import {
   PtyBoundaryUnconfirmedError,
   PtyClosedError,
   PtyExitUnconfirmedError,
+  PtyPromptNotAcceptedError,
+  PtyTranscriptUncertainError,
   PtyTranscriptUnavailableError,
   PtyTurnFailedError,
   PtyTurnTimeoutError,
@@ -102,11 +104,6 @@ import { validateRouteEngine } from "../oneshot/config.js";
 import * as untrustedCleanup from "../oneshot/pty-cleanup.js";
 import { terminateEscapees } from "./pty-escape-scan.js";
 import type { SurvivorCause } from "./pty-group-kill.js";
-import {
-  TRANSCRIPT_WAIT_MS,
-  awaitLastAssistantReply,
-  transcriptWaitBudget,
-} from "../oneshot/pty-transcript.js";
 import { printRuntime } from "../oneshot/print.js";
 import { randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
@@ -295,6 +292,12 @@ export interface RunOnPtyResult {
   sessionId?: string;
   /** Set only when the turn may have run; see `PtyUnsafeReplayKind`. */
   failureKind?: PtyUnsafeReplayKind;
+  /**
+   * A one-shot diagnostic reason, from the fixed set `runOnceOnPty` reports, when the failure is
+   * one the transcript observer named (a timeout, an API error, no complete reply). Absent
+   * otherwise, and then the reason is read from `stderr`.
+   */
+  reason?: string;
   /**
    * Ephemeral call that gave up on its deadline while the entry was still being admitted or
    * its claude still starting: settles once that late entry has been retired or its late PTY
@@ -1923,12 +1926,6 @@ function cloneSecurity(security: SecurityConfig): SecurityConfig {
 // every PTY spawn. Don't add a local copy — always go through
 // `getCleanSpawnEnv()`.
 
-let oneShotTranscriptWaitMs = TRANSCRIPT_WAIT_MS;
-/** Test seam: bound the untrusted reply wait. `null` restores the default. */
-export function injectOneShotTranscriptWaitForTests(ms: number | null): void {
-  oneShotTranscriptWaitMs = ms ?? TRANSCRIPT_WAIT_MS;
-}
-
 /**
  * The env an untrusted PTY child gets: the caller's policy (print's override, else the
  * clean default) minus the spawn strip list. One function for the spawn builder and for
@@ -2064,7 +2061,6 @@ interface UntrustedOneShotState {
   tempCwd: string;
   /** The throwaway `CLAUDE_CONFIG_DIR`: holds everything claude writes about the call. */
   configRoot: string;
-  projectDir: string;
 }
 
 function errorCode(error: unknown): string {
@@ -2217,9 +2213,8 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
       }
       untrustedCleanup.markOneShotDirActive(configRoot);
       // The state exists before anything else can throw, so the `finally` below removes both
-      // directories whatever happens next (the project dir needs a realpath of the cwd).
-      untrustedState = { tempCwd, configRoot, projectDir: "" };
-      untrustedState.projectDir = untrustedCleanup.untrustedPtyProjectDir(tempCwd, configRoot);
+      // directories whatever happens next.
+      untrustedState = { tempCwd, configRoot };
       untrustedConfig = { root: configRoot, secureStorageDir };
     }
     const { PTY_OUTPUT_FORMAT_CONSTRAINT } = await import("./pty-output-format.js");
@@ -2260,42 +2255,18 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
     }
     if (exec.exitCode !== 0) {
       console.warn(`[pty-supervisor] one-shot ${req.route} failed: ${exec.stderr}`);
-      return result(exec.exitCode, "", undefined, execFailureReason(exec.stderr));
+      // A turn that ran out of time with no complete reply is a timeout (124) as on every other
+      // path, whichever way the observer named it; the diagnostic keeps the observer's reason.
+      const reason = exec.reason ?? execFailureReason(exec.stderr);
+      const expired = Date.now() - startedAt >= req.timeoutMs;
+      const code = reason === "no-reply:timeout" && expired ? 124 : exec.exitCode;
+      return result(code, "", undefined, reason);
     }
-    if (untrustedState) {
-      // The rendered screen carries the echoed prompt (for the classifier, its
-      // example JSON), so an untrusted caller must never parse it. Return the
-      // model's own reply from the transcript, which the finally below removes.
-      // The wait counts against the caller's deadline: what the turn left of timeoutMs,
-      // capped, with a 1 s floor so a turn that used its whole budget still gets one look.
-      // #581 cp4: this second post-turn transcript wait (`awaitLastAssistantReply`) goes away; the
-      // common TranscriptTurn observer returns the isolated reply before cleanup. Until then an
-      // untrusted turn is refused by the process (no transcript path) and never reaches here.
-      const transcriptStartedAt = Date.now();
-      const waited = await awaitLastAssistantReply(untrustedState.projectDir, {
-        waitMs: transcriptWaitBudget(
-          req.timeoutMs,
-          Date.now() - startedAt,
-          oneShotTranscriptWaitMs,
-        ),
-        signal: req.signal,
-      });
-      phasesMs.transcript = Date.now() - transcriptStartedAt;
-      const reply = waited.text;
-      if (reply === undefined) {
-        // Abort, or the caller's own deadline running out during the wait, is a timeout
-        // (124) as on every other path; a turn the CLI ended on an error is a failure (1).
-        const expired = Date.now() - startedAt >= req.timeoutMs;
-        const code = req.signal?.aborted || (waited.failure === "timeout" && expired) ? 124 : 1;
-        console.warn(
-          `[pty-supervisor] one-shot ${req.route}: no assistant reply in transcript (${waited.failure ?? "timeout"})`,
-        );
-        return result(code, "", exec.sessionId, `no-reply:${waited.failure ?? "timeout"}`);
-      }
-      return result(0, reply, exec.sessionId);
-    }
-    // Trusted routes: `rawStdout` is the final assistant message the turn read from the session
-    // transcript (`PtyProcess.runTurn`), never the screen.
+    // The reply is `rawStdout`: the final assistant message of THIS turn, which the process read
+    // from the session transcript (`PtyProcess.runTurn`; the isolated source for an untrusted
+    // call) before it returned. Never the screen, whose paint carries the echoed prompt (for the
+    // classifier, its example JSON), and nothing is read after the turn: the root's removal
+    // below cannot race a second wait.
     return result(0, exec.rawStdout, exec.sessionId);
   } finally {
     if (untrustedState) {
@@ -3090,6 +3061,7 @@ async function runTurnWithRetries(
               `[pty-supervisor] non-retryable error on ${entry.sessionKey}: ${err.message}`,
               1,
               err.kind === "ambiguous" ? "uncertain" : undefined,
+              turnFailureReason(err),
             ),
             rawStdout: err.kind === "api-error" ? err.text : "",
           };
@@ -3101,6 +3073,7 @@ async function runTurnWithRetries(
             `[pty-supervisor] turn timed out on ${entry.sessionKey}: ${err.message}; not retried (the prompt may have run), the process was stopped and the next call resumes the session`,
             124,
             "timeout",
+            turnFailureReason(err),
           );
         }
         // A refusal before anything was written is definite. Everything else that ends a
@@ -3110,6 +3083,7 @@ async function runTurnWithRetries(
           `[pty-supervisor] non-retryable error on ${entry.sessionKey}: ${(err as Error).message}`,
           1,
           err instanceof PtyTranscriptUnavailableError ? undefined : "uncertain",
+          turnFailureReason(err),
         );
       }
       // #546: an aborted call does not respawn what the abort just retired.
@@ -3148,6 +3122,7 @@ function errorResult(
   message: string,
   exitCode = 1,
   failureKind?: PtyUnsafeReplayKind,
+  reason?: string,
 ): RunOnPtyResult {
   return {
     rawStdout: "",
@@ -3155,7 +3130,34 @@ function errorResult(
     exitCode,
     sessionId: undefined,
     ...(failureKind ? { failureKind } : {}),
+    ...(reason ? { reason } : {}),
   };
+}
+
+/**
+ * The one-shot diagnostic reason for a turn the transcript observer ended without a complete
+ * reply, from the reasons `runOnceOnPty` already reports (the classifier retries on `timeout`
+ * and `no-reply:*` only, and nothing else; `retryableClassifierFailure`). The observer's
+ * verdicts map onto them without adding any:
+ *   - the CLI wrote an API error: `no-reply:api-error`;
+ *   - no complete reply by the deadline (prompt not accepted, a reply with no text, a final
+ *     message with no boundary): `no-reply:timeout`;
+ *   - an attribution the observer could not make (ambiguous, a command's stderr, a replaced
+ *     or unreadable transcript, a process that closed after the send): `turn-error`, which
+ *     repeats and is not retried.
+ * The supervisor itself never replays any of them: whether the prompt ran is unknown.
+ */
+function turnFailureReason(err: unknown): string | undefined {
+  if (err instanceof PtyTurnFailedError) {
+    if (err.kind === "api-error") return "no-reply:api-error";
+    if (err.kind === "empty-reply") return "no-reply:timeout";
+    return "turn-error";
+  }
+  if (err instanceof PtyTurnTimeoutError) return "timeout";
+  if (err instanceof PtyTranscriptUncertainError || err instanceof PtyPromptNotAcceptedError) {
+    return "no-reply:timeout";
+  }
+  return undefined;
 }
 
 async function persistSessionId(entry: PtyEntry, sessionId: string): Promise<void> {

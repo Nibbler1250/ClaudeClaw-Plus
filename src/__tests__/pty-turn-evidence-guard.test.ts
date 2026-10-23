@@ -511,3 +511,44 @@ describe("the guard itself can fail", () => {
     ).toEqual([]);
   });
 });
+
+// #581 cp4: the untrusted one-shot's reply is read by the same observer as every other turn.
+// A second production scanner (the old `oneshot/pty-transcript.ts`: "the last assistant message
+// under the project dir, once it has been quiet for a moment") is a second definition of "the
+// answer", and a turn the observer failed could be rescued by it. It must stay gone.
+describe("one answer observer: no second transcript reply scanner in production code", () => {
+  const SECOND_SCANNER_NAMES = [
+    "awaitLastAssistantReply",
+    "readLastAssistantReply",
+    "scanTranscript",
+    "transcriptWaitBudget",
+    "oneshot/pty-transcript",
+  ];
+
+  function productionSources(dirPath: string, out: string[] = []): string[] {
+    for (const entry of ts.sys.readDirectory(dirPath, [".ts"], undefined, undefined)) {
+      if (
+        /\.test\.ts$/.test(entry) ||
+        entry.includes("/__tests__/") ||
+        entry.includes("/fixtures/")
+      ) {
+        continue;
+      }
+      out.push(entry);
+    }
+    return out;
+  }
+
+  test("the old scanner module is gone and nothing in src/ names it", () => {
+    expect(ts.sys.fileExists(join(root, "src/oneshot/pty-transcript.ts"))).toBe(false);
+    const offenders: string[] = [];
+    for (const file of productionSources(join(root, "src"))) {
+      const text = ts.sys.readFile(file) ?? "";
+      for (const name of SECOND_SCANNER_NAMES) {
+        if (text.includes(name)) offenders.push(`${file}: ${name}`);
+      }
+    }
+    // Fault: restore `awaitLastAssistantReply` (or the module) and use it after a turn.
+    expect(offenders).toEqual([]);
+  });
+});

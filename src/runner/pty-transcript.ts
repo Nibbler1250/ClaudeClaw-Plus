@@ -64,9 +64,9 @@
  *
  * Pure apart from reading one file; no bus, no PTY. Callers poll.
  */
-import { closeSync, openSync, readSync, realpathSync, statSync } from "node:fs";
+import { closeSync, openSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { encodeCwdForProjectsDir } from "../bus/jsonl-line-types";
 import { isTerminalStopReason } from "../bus/jsonl-tailer";
 
@@ -115,6 +115,44 @@ export function resolveTranscriptPath(opts: {
     encodeCwdForProjectsDir(physicalCwd),
     `${opts.sessionId}.jsonl`,
   );
+}
+
+/**
+ * Where an untrusted one-shot's claude keeps its transcripts: the physical project directory
+ * of `cwd` under the call's own throwaway config root (#581 cp4). Null when that cannot be
+ * stated safely, and then the call has no transcript to read and cannot succeed.
+ *
+ * The root comes only from the env the supervisor built for this child (`CLAUDE_CONFIG_DIR`),
+ * never from a caller-supplied path, and it must be absolute and must not be the operator's
+ * own config root (the daemon's `CLAUDE_CONFIG_DIR`, or `~/.claude`): an untrusted turn never
+ * reads, or is credited with, an operator session.
+ */
+export function resolveIsolatedProjectDir(opts: {
+  cwd: string;
+  env: Record<string, string | undefined>;
+}): string | null {
+  const root = opts.env.CLAUDE_CONFIG_DIR;
+  if (!root || !isAbsolute(root)) return null;
+  const operatorRoots = [
+    process.env.CLAUDE_CONFIG_DIR,
+    join(process.env.HOME || homedir(), ".claude"),
+    join(opts.env.HOME || homedir(), ".claude"),
+  ].filter((r): r is string => !!r);
+  const physical = (path: string): string => {
+    try {
+      return realpathSync(path);
+    } catch {
+      return resolve(path);
+    }
+  };
+  if (operatorRoots.some((r) => physical(r) === physical(root))) return null;
+  let physicalCwd = opts.cwd;
+  try {
+    physicalCwd = realpathSync(opts.cwd);
+  } catch {
+    // The CLI would have failed to start in a missing directory; keep the logical path.
+  }
+  return join(root, "projects", encodeCwdForProjectsDir(physicalCwd));
 }
 
 /**
@@ -215,12 +253,26 @@ export interface TranscriptTurnState {
 }
 
 export interface TranscriptTurnOptions {
-  path: string;
+  /** A known transcript file: a trusted session's own. Exactly one of `path` and `isolatedProjectDir`. */
+  path?: string;
+  /**
+   * The isolated source (#581 cp4): an untrusted one-shot's project directory under its own
+   * throwaway config root (`resolveIsolatedProjectDir`). The CLI names the session file itself, so
+   * the file is discovered, not given: see "Isolated source" on the class.
+   */
+  isolatedProjectDir?: string;
   /** Exactly what was written to the PTY (after sanitising / neutralising). */
   written: string;
   /** The turn is a deliberate `/compact`. */
   replCommand?: boolean;
 }
+
+/** Why a turn whose prompt appears in more than one transcript file fails as `ambiguous`. */
+export const MULTIPLE_FILES_TEXT =
+  "more than one transcript file recorded this prompt, so which one is this turn's is uncertain";
+
+/** Most transcript files one isolated turn will watch; a one-shot root holds one session. */
+const MAX_ISOLATED_FILES = 64;
 
 /**
  * The transcript was cut short, replaced or removed after `mark()`. What is in the file
@@ -246,6 +298,25 @@ interface FileIdentity {
 /** Where the turn's window is. `terminal` = the final message was seen; `closed` = done. */
 type Phase = "seeking" | "open" | "terminal" | "closed";
 
+/**
+ * One turn's window in a transcript.
+ *
+ * Isolated source (`isolatedProjectDir`): an untrusted one-shot runs with a fresh config root
+ * and no session id, so the CLI picks the session file's name. The same state machine reads it,
+ * through one per-file `TranscriptTurn` (a "candidate") for every top-level regular `*.jsonl`
+ * file of that directory:
+ *   - `mark()` (before the send) snapshots each file's identity and size. A candidate starts at
+ *     its snapshot offset (a file that was not there starts at 0), and that offset is never
+ *     recomputed once the prompt is written: a record the CLI appended between the send and the
+ *     first poll is read, not skipped.
+ *   - The candidate whose appended records show THIS prompt (the exact written bytes, as for
+ *     a known file) is bound, with its inode. A prompt recorded by two files, now or later, is
+ *     `ambiguous`; so is any file that is replaced, cut short, removed, unreadable or a
+ *     directory that cannot be listed. Nothing else is read: subdirectories and symlinks are
+ *     not candidates.
+ *   - Everything after the bind (acceptance, boundary, failure, answer) is the bound
+ *     candidate's, so trusted and untrusted turns share one set of rules.
+ */
 export class TranscriptTurn {
   private readonly path: string;
   private readonly written: string;
@@ -276,24 +347,56 @@ export class TranscriptTurn {
   private matchedUuid: string | undefined;
   private matchedPromptId: string | undefined;
   private commandResult = "";
+  /** Isolated source: the directory watched; null for a known file. */
+  private readonly isolatedDir: string | null;
+  /** Isolated source: each top-level file as `mark()` saw it. */
+  private snapshot = new Map<string, FileIdentity & { size: number }>();
+  /** Isolated source: a per-file reader, created for each file the first poll after the send finds. */
+  private candidates = new Map<string, TranscriptTurn>();
+  /** Isolated source: the candidate that recorded this prompt. */
+  private bound: TranscriptTurn | null = null;
+  private isolatedFailure: TurnFailure | null = null;
+  /** A candidate of an isolated turn: a file that cannot be read fails the turn. */
+  private strictRead = false;
 
   constructor(opts: TranscriptTurnOptions) {
-    this.path = opts.path;
+    if ((opts.path === undefined) === (opts.isolatedProjectDir === undefined)) {
+      throw new Error("TranscriptTurn needs exactly one of `path` and `isolatedProjectDir`");
+    }
+    this.path = opts.path ?? "";
+    this.isolatedDir = opts.isolatedProjectDir ?? null;
     this.written = opts.written;
     this.replCommand = opts.replCommand === true;
   }
 
-  /** Call BEFORE the prompt is written: only what is appended after this counts. */
+  /**
+   * Call BEFORE the prompt is written: only what is appended after this counts. For the
+   * isolated source this throws `TranscriptReplacedError` when the directory cannot be listed,
+   * so the caller can refuse the turn before anything is sent.
+   */
   mark(): void {
+    if (this.isolatedDir !== null) {
+      this.candidates.clear();
+      this.bound = null;
+      this.isolatedFailure = null;
+      this.snapshot = new Map();
+      for (const name of this.listIsolatedFiles()) {
+        const stat = this.statOf(join(this.isolatedDir, name));
+        if (stat) {
+          this.snapshot.set(name, { dev: stat.dev, ino: stat.ino, size: Number(stat.size) });
+        }
+      }
+      return;
+    }
     const stat = this.stat();
     this.identity = stat ? { dev: stat.dev, ino: stat.ino } : null;
     this.offset = stat ? Number(stat.size) : 0;
     this.carry = Buffer.alloc(0);
   }
 
-  /** How far into the file this turn has read. */
+  /** How far into the file this turn has read (the bound file's, for the isolated source). */
   readOffset(): number {
-    return this.offset;
+    return this.isolatedDir !== null ? (this.bound?.readOffset() ?? 0) : this.offset;
   }
 
   /**
@@ -302,6 +405,7 @@ export class TranscriptTurn {
    * longer the one `mark()` saw.
    */
   poll(): TranscriptTurnState {
+    if (this.isolatedDir !== null) return this.pollIsolated();
     if (this.phase === "closed") return this.state();
     const stat = this.stat();
     if (this.identity !== null) {
@@ -322,6 +426,7 @@ export class TranscriptTurn {
   }
 
   state(): TranscriptTurnState {
+    if (this.isolatedDir !== null) return this.isolatedState();
     return {
       accepted: this.enqueued || this.phase !== "seeking",
       ended: this.ended,
@@ -348,8 +453,12 @@ export class TranscriptTurn {
   }
 
   private stat(): { dev: bigint; ino: bigint; size: bigint } | null {
+    return this.statOf(this.path);
+  }
+
+  private statOf(path: string): { dev: bigint; ino: bigint; size: bigint } | null {
     try {
-      return statSync(this.path, { bigint: true });
+      return statSync(path, { bigint: true });
     } catch {
       return null;
     }
@@ -362,14 +471,107 @@ export class TranscriptTurn {
     try {
       fd = openSync(this.path, "r");
     } catch {
+      // A known file that cannot be opened is a poll that saw nothing. A file of an isolated
+      // turn that cannot be read may hold the turn's own record: that fails it.
+      if (this.strictRead) throw new TranscriptReplacedError(this.path, "could not be read");
       return Buffer.alloc(0);
     }
     try {
       const n = readSync(fd, buf, 0, want, from);
       return buf.subarray(0, n);
+    } catch (err) {
+      if (this.strictRead) throw new TranscriptReplacedError(this.path, "could not be read");
+      throw err;
     } finally {
       closeSync(fd);
     }
+  }
+
+  // ─── Isolated source ────────────────────────────────────────────────────
+
+  /** The top-level regular `*.jsonl` files of the isolated directory. A missing directory has none. */
+  private listIsolatedFiles(): string[] {
+    const dir = this.isolatedDir as string;
+    try {
+      return readdirSync(dir, { withFileTypes: true })
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+        .map((entry) => entry.name)
+        .sort();
+    } catch (err) {
+      // The CLI creates the directory itself, so before its first write there is none.
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return [];
+      throw new TranscriptReplacedError(dir, "could not be listed");
+    }
+  }
+
+  /** A reader for one file of the isolated directory, positioned where `mark()` left it. */
+  private candidateFor(name: string): TranscriptTurn {
+    const dir = this.isolatedDir as string;
+    const candidate = new TranscriptTurn({
+      path: join(dir, name),
+      written: this.written,
+      replCommand: this.replCommand,
+    });
+    candidate.strictRead = true;
+    // The offset comes from the snapshot taken before the send, never from the file as it is
+    // now: the CLI may already have appended this turn's records. A file the snapshot did not
+    // have was created since, so all of it is new.
+    const before = this.snapshot.get(name);
+    candidate.identity = before ? { dev: before.dev, ino: before.ino } : null;
+    candidate.offset = before ? before.size : 0;
+    return candidate;
+  }
+
+  private pollIsolated(): TranscriptTurnState {
+    if (this.isolatedFailure !== null || this.bound?.state().ended === true) return this.state();
+    const names = this.listIsolatedFiles();
+    for (const name of names) {
+      if (!this.candidates.has(name)) {
+        if (this.candidates.size >= MAX_ISOLATED_FILES) {
+          throw new TranscriptReplacedError(
+            this.isolatedDir as string,
+            "holds more transcript files than one call can write",
+          );
+        }
+        this.candidates.set(name, this.candidateFor(name));
+      }
+    }
+    // Every candidate is read, the bound one included: a file that is replaced, cut short or
+    // removed throws here, and a second file carrying the prompt shows up as a second hit.
+    for (const candidate of this.candidates.values()) candidate.poll();
+    const hits = [...this.candidates.values()].filter((c) => c.state().accepted);
+    if (this.bound === null && hits.length === 1) this.bound = hits[0] as TranscriptTurn;
+    else if (hits.length > 1) {
+      this.isolatedFailure = { kind: "ambiguous", text: MULTIPLE_FILES_TEXT };
+    }
+    return this.state();
+  }
+
+  private isolatedState(): TranscriptTurnState {
+    if (this.isolatedFailure !== null) {
+      return {
+        accepted: true,
+        ended: true,
+        failure: this.isolatedFailure,
+        answer: "",
+        finalSeen: false,
+        foreignUserEntries: 0,
+        toolLines: [],
+      };
+    }
+    if (this.bound !== null) return this.bound.state();
+    let foreign = 0;
+    for (const candidate of this.candidates.values())
+      foreign += candidate.state().foreignUserEntries;
+    return {
+      accepted: false,
+      ended: false,
+      failure: null,
+      answer: "",
+      finalSeen: false,
+      foreignUserEntries: foreign,
+      toolLines: [],
+    };
   }
 
   private ingestBytes(bytes: Buffer): void {

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { _setSettingsFileForTests, loadSettings } from "../config.js";
@@ -90,21 +90,26 @@ it("the internal prompt-write test seam reaches the wire without changing the de
     called = true;
     return "✻ TEST_SEAM_VISIBLE shift+tab to cycle";
   });
+  // The screen no longer carries a turn's result (#562, #581 cp4), so the child records what it
+  // is sent in a file: what reached the wire is read from there, and the turn (which has no
+  // transcript to find) is allowed to end unsuccessfully.
+  const sink = join(dir, "wire.txt");
   const child = await spawnPty({
     sessionId: "",
     cwd: dir,
     env: { PATH: "/usr/bin:/bin" },
+    transcriptPath: join(dir, "session.jsonl"),
     security: { level: "moderate", allowedTools: [], disallowedTools: [] },
-    _commandOverride: "/bin/cat",
-    _argsOverride: [],
+    _commandOverride: "/bin/sh",
+    _argsOverride: ["-c", `exec cat > '${sink}'`],
     _skipReadySettle: true,
     quietWindowMs: 50,
-    sentinelMaxWaitMs: 1000,
+    submitConfirmMs: 100,
   });
   try {
-    const result = await child.runTurn("/probe ✻ shift+tab to cycle", { timeoutMs: 2000 });
+    await child.runTurn("/probe ✻ shift+tab to cycle", { timeoutMs: 600 }).catch(() => {});
     expect(called).toBe(true);
-    expect(result.text.includes("TEST_SEAM_VISIBLE")).toBe(true);
+    expect(readFileSync(sink, "utf8").includes("TEST_SEAM_VISIBLE")).toBe(true);
   } finally {
     setPromptPrepareForTests(null);
     await child.dispose();
