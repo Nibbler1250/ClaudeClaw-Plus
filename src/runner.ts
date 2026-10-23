@@ -1305,6 +1305,13 @@ function extractToolResultText(content: unknown): string {
 }
 
 /**
+ * Test seam (#581 cp6): `runClaudeStreaming` has no caller in production, but it is a native
+ * `Bun.spawn` site with its own final spawn assertion, and that assertion is reached only
+ * through this export. Pass a stand-in as `baseArgs[0]`, never the real `claude`.
+ */
+export const _runClaudeStreamingForTests = runClaudeStreaming;
+
+/**
  * Run claude with --output-format stream-json, emitting text chunks via onChunk
  * and tool call/result lines via onToolEvent as they arrive.
  * Session ID and final result come from the result event.
