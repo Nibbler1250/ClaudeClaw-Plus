@@ -175,7 +175,8 @@ describe("a late PTY whose disposal fails keeps the root and the slot", () => {
   });
 
   it("an unknown identity is held: no start time recorded, nothing signalled, root and slot kept", async () => {
-    // Went red with a hold released when the leader's identity could not be compared.
+    // Went red with the survivor guard in `cleanupUntrustedOneShot` skipped, with the first pass
+    // left in place, and with the slot handed over as clear.
     const rootOf = slowSpawn(200, (opts) => latePty(opts, unconfirmed, null));
     await run({ timeoutMs: 80 });
     await until(() => rootOf() !== "" && cleanup.groupSurvivorOf(rootOf()) !== undefined);
@@ -193,7 +194,7 @@ describe("a late PTY whose disposal fails keeps the root and the slot", () => {
 
 describe("a late confirmation that succeeds releases once", () => {
   it("removes the root and frees the slot exactly once when the late exit is confirmed", async () => {
-    // Went red with the root removed on the first pass, and with the slot freed twice (3 slots granted).
+    // Went red with the first pass left in place, and with the ceiling's timer freeing the slot.
     const rootOf = slowSpawn(250, (opts) => latePty(opts, () => sleep(250)));
     await run({ timeoutMs: 100 });
     await until(() => rootOf() !== "");
@@ -252,7 +253,7 @@ describe("the 60 s late-slot ceiling only logs", () => {
   }
 
   it("logs once past the ceiling and the root and slot are still held, also after a failed disposal", async () => {
-    // Went red with the ceiling's timer freeing the slot, and with it removing the root.
+    // Went red with the ceiling's timer freeing the slot.
     await withCeiling(60, async () => {
       const rootOf = slowSpawn(400, (opts) => latePty(opts, unconfirmed));
       await run({ timeoutMs: 100 });
@@ -338,7 +339,8 @@ describe("the pending-spawn stand-in (pid 0) holds the root and the slot", () =>
   }
 
   it("keeps the root against cleanup and the sweep, and the slot, while the spawn is unsettled", async () => {
-    // Went red with the hold at the stand-in removed (the root was swept and the slot freed).
+    // Went red with the hold at the stand-in removed (none registered), and with the hold's
+    // `pending` predicate never clearing.
     const { root, release, call } = await standIn((opts) => latePty(opts, async () => {}));
     expect(cleanup.pendingSpawnHoldCount()).toBe(1);
     expect(cleanup.pendingSpawnHoldActive(root)).toBe(true);

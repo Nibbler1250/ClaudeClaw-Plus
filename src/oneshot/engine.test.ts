@@ -443,8 +443,8 @@ describe("one-shot isolation contract", () => {
     });
     it("is kept while the spawn has not landed, and removed once it has landed and its exit is confirmed", async () => {
       // #581 cp5: a claude that may still land is a writer, so nothing of the call is removed
-      // until that child is confirmed gone. Went red (kept forever) with the late retirement
-      // not waiting for the landing, and (removed at once) with the first pass left in place.
+      // until that child is confirmed gone. Went red with the first pass left in place (the
+      // directory was removed at once).
       let cwd = "";
       let land!: (pty: never) => void;
       injectSpawnPty((opts) => {
