@@ -300,12 +300,13 @@ export interface RunOnPtyResult {
   reason?: string;
   /**
    * Ephemeral call that handed back while its entry was still being admitted or its claude
-   * still starting: settles once that late entry's retirement is over AND the late PTY it
-   * produced has been disposed and its exit confirmed, or the failure recorded as a survivor, an
-   * unknown hold or a quarantine (late disposal and confirmation, not the native spawn
-   * returning; #581 cp5, see `lateRetirement`). It never rejects and carries no verdict: the
-   * verdict is the registry (`pty-cleanup`). A caller that owns state a late claude may write
-   * into removes and frees nothing until it settles, then cleans up once.
+   * still starting: settles once that late entry has been retired or its late PTY disposed AND
+   * its exit confirmed through `PtyProcess.dispose` (the group-confirmation primitive and verdict
+   * of cp3), or the failure recorded as a survivor, an unknown hold or a quarantine (`landPty`).
+   * That is late disposal and confirmation, not the native spawn returning. It never rejects and
+   * carries no verdict: the verdict is the registry (`pty-cleanup`). A caller that owns state a
+   * late claude may write into removes and frees nothing until it settles (#581 cp5), then
+   * cleans up once.
    */
   lateRetire?: Promise<void>;
 }
@@ -1004,7 +1005,7 @@ export async function runOnPty(
       // late claude has landed and been retired (#570).
       const lateRetire = opts.ephemeral
         ? admission.then(
-            ({ entry: e }) => lateRetirement(e, retireEntry(e)),
+            ({ entry: e }) => retireEntry(e),
             () => {},
           )
         : undefined;
@@ -1027,14 +1028,12 @@ export async function runOnPty(
     void retireEntry(entry);
   };
   opts.signal?.addEventListener("abort", onAbort, { once: true });
-  let outcome: RunOnPtyResult | undefined;
   try {
     if (opts.signal?.aborted) {
       await retireEntry(entry);
       return errorResult(`[pty-supervisor] ${sessionKey} aborted`);
     }
-    outcome = await runOnAdmittedEntry(entry, sessionKey, prompt, opts, supervisorOpts);
-    return outcome;
+    return await runOnAdmittedEntry(entry, sessionKey, prompt, opts, supervisorOpts);
   } finally {
     opts.signal?.removeEventListener("abort", onAbort);
     if (entry.scope.ephemeral) {
@@ -1044,12 +1043,6 @@ export async function runOnPty(
       // background with the session fenced, and ends in a confirmed exit or a quarantine.
       if (opts.signal?.aborted && entry.spawnInFlight) void retired.catch(() => {});
       else await retired;
-      // #581 cp5: a call that hands back with a spawn still in flight hands back the late
-      // retirement too, covering the entry's own retirement as well as the landing, so what it
-      // cleans up after is the child confirmed (or its failure recorded), not the spawn returning.
-      if (outcome && (outcome.lateRetire || entry.spawnInFlight)) {
-        outcome.lateRetire = lateRetirement(entry, retired);
-      }
     }
   }
 }
@@ -2553,22 +2546,6 @@ function holdRootForPendingSpawn(entry: PtyEntry): void {
       `[pty-supervisor] ${entry.sessionKey} pending-spawn hold failed (${errorCode(error)}); quarantine kept`,
     );
   }
-}
-
-/**
- * What `lateRetire` is: a retirement that outlived its call is over. The entry's own retirement
- * has finished (its disposal, quarantine and root retention are recorded) AND every spawn it
- * left pending has landed, been disposed and had its exit confirmed or its failure recorded as
- * a survivor, an unknown hold or a quarantine (#581 cp5). `retireEntry` alone settles at the
- * #592 stand-in with the spawn still in flight, which is not the child gone. Never rejects: what
- * the child's confirmation came to is read from the registry (`OneShotSlot.settle`).
- */
-function lateRetirement(entry: PtyEntry, retired: Promise<void>): Promise<void> {
-  return retired
-    .catch(() => {})
-    .then(async () => {
-      while (entry.spawnInFlight) await entry.spawnInFlight.catch(() => {});
-    });
 }
 
 /**

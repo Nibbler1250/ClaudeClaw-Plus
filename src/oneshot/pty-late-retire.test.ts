@@ -210,10 +210,9 @@ describe("a late confirmation that succeeds releases once", () => {
   });
 
   it("with the retirement's 15 s bound already passed, the call still waits for the landed child", async () => {
-    // The retirement ends at the stand-in with the spawn still in flight; `lateRetire` must not
-    // settle there. Predicted without the wait on `spawnInFlight` in `lateRetirement`: it settles
-    // at the stand-in, the second pass finds the pending-spawn hold and keeps the root, and the
-    // root is still there when the child has been confirmed gone.
+    // The retirement ends at the stand-in with the spawn still in flight and the pending-spawn
+    // hold covering the root. The call's late retirement is the landing, so the root goes as
+    // soon as the child is confirmed gone, not later when the sweeper looks.
     injectPendingSpawnWait(async () => {});
     const rootOf = slowSpawn(250, (opts) => latePty(opts, () => sleep(150)));
     await run({ timeoutMs: 100 });
