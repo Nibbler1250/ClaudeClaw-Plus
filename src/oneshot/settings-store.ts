@@ -189,7 +189,8 @@ export function oneShotView(rawBlock: unknown, ptyEnabled = false): OneShotView 
   for (const route of KNOWN_ROUTES)
     choices[route] = ids.filter((id) => accepted(raw, { routes: { [route]: id } }));
   const effective: Record<string, string> = {};
-  for (const route of KNOWN_ROUTES) effective[route] = resolveOneShotEngine(settings, route, ptyEnabled);
+  for (const route of KNOWN_ROUTES)
+    effective[route] = resolveOneShotEngine(settings, route, ptyEnabled);
   return {
     default: settings.default ?? "print",
     defaultImplicit: settings.default === undefined,
