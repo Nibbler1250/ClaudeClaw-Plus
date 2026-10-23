@@ -357,6 +357,60 @@ describe("the supervisor's spawns", () => {
     expect(spawnCount).toBe(0);
   });
 
+  it("the final respawn attempt does not go ahead when the replacement id it mints is fenced", async () => {
+    // The first process dies mid-turn, the first respawn attempt fails, and the final attempt
+    // abandons the stored session and mints a new id (`dropResume`). Only that new id is
+    // fenced: the stored one the first spawn resumed is free. Fault (site: `newSessionId`
+    // left out of `respawnEntry`'s effective id, `opts.sessionId` alone): the minted id is
+    // not asked about. Predicted result: `spawnCount` is 3 instead of 2.
+    let spawnCount = 0;
+    injectNewSessionId(() => "new-fixed");
+    fenceKey("thread:other", {}, () => "new-fixed");
+    injectMaxRetriesForTests(1);
+    injectRespawnRetriesForTests(2);
+    injectSpawnPty(async (_o: PtyProcessOptions) => {
+      spawnCount++;
+      if (spawnCount === 1) return fakePty({ failTurn: true });
+      if (spawnCount === 2) throw new Error("respawn attempt fails");
+      return fakePty({});
+    });
+
+    const r = await runOnPty("thread:fresh", "hello", {
+      timeoutMs: 5000,
+      ...scope(),
+      sessionStore: memStore("sess-stored"),
+    }).catch((err: unknown) => err);
+
+    injectNewSessionId(null);
+    expect(spawnCount).toBe(2);
+    const text = r instanceof Error ? r.message : JSON.stringify(r);
+    expect(text).not.toContain('"exitCode":0');
+  });
+
+  it("positive control: the same final respawn attempt spawns when the minted id is free", async () => {
+    // Without this, `spawnCount` of 2 above could just mean the harness never reaches the
+    // final attempt.
+    let spawnCount = 0;
+    injectNewSessionId(() => "new-fixed");
+    injectMaxRetriesForTests(1);
+    injectRespawnRetriesForTests(2);
+    injectSpawnPty(async (_o: PtyProcessOptions) => {
+      spawnCount++;
+      if (spawnCount === 1) return fakePty({ failTurn: true });
+      if (spawnCount === 2) throw new Error("respawn attempt fails");
+      return fakePty({});
+    });
+
+    await runOnPty("thread:fresh", "hello", {
+      timeoutMs: 5000,
+      ...scope(),
+      sessionStore: memStore("sess-stored"),
+    }).catch((err: unknown) => err);
+
+    injectNewSessionId(null);
+    expect(spawnCount).toBe(3);
+  });
+
   it("a first spawn does not go ahead on a fenced KEY, though the session it names is free", async () => {
     // Fault (site: `sessionKey` dropped from `spawnEntry`'s assertion): the key is the only
     // thing fenced, and the stored session id is not. Predicted result: `spawnCount` is 1.

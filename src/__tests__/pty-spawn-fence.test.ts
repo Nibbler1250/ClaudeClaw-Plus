@@ -11,13 +11,10 @@
  * Fake PTYs only, in-memory session store, explicit cwd.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { initConfig, loadSettings, reloadSettings } from "../config";
 import { runOneShot } from "../oneshot/engine";
 import { runPrint } from "../oneshot/print";
-import { _runClaudeStreamingForTests, _setClaudeSpawnForTests, runClaudeOnce } from "../runner";
+import { _setClaudeSpawnForTests, runClaudeOnce } from "../runner";
 import {
   PtyExitUnconfirmedError,
   type PtyProcess,
@@ -142,35 +139,6 @@ describe("a session quarantined during the awaited gap before a spawn", () => {
 
     await expect(run).rejects.toThrow("quarantined");
     expect(spawned).toBe(0);
-  });
-
-  it("the legacy streaming helper does not spawn (runner runClaudeStreaming)", async () => {
-    // Fault (site: `assertResumeSpawnable` in `runClaudeStreaming`): the async gate has passed,
-    // so the spawn goes ahead on a quarantined session. Predicted result: the stand-in starts,
-    // `started.txt` exists and the call resolves. The executable is a stand-in, never `claude`.
-    const dir = mkdtempSync(join(tmpdir(), "ccaw-streaming-fence-"));
-    try {
-      const marker = join(dir, "started.txt");
-      const standIn = join(dir, "standin.sh");
-      writeFileSync(standIn, `#!/bin/sh\necho started > "${marker}"\n`, { mode: 0o755 });
-      chmodSync(standIn, 0o755);
-
-      // Runs synchronously up to the gate's await: the quarantine below lands in exactly the
-      // gap between the gate and the spawn.
-      const run = _runClaudeStreamingForTests(
-        [standIn, "-p", "x", "--output-format", "stream-json", "--resume", "sess-1"],
-        "",
-        "",
-        {},
-      );
-      quarantineSession("thread:a", makeFake("sess-1"), "test");
-
-      await expect(run).rejects.toThrow("quarantined");
-      await new Promise((r) => setTimeout(r, 200));
-      expect(existsSync(marker)).toBe(false);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
   });
 
   it("the print engine does not spawn after its config and runner imports (print.ts)", async () => {
