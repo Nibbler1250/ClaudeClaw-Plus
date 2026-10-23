@@ -84,10 +84,9 @@ describe("oneshot set", () => {
     });
   });
 
-  it("sets the default, and refuses pty while untrusted routes would inherit it", async () => {
-    const refused = await cli("set", "default", "pty");
-    expect(refused.code).toBe(1);
-    expect(refused.err[0]).toContain("untrusted route 'discord.classifier' cannot use 'pty'");
+  it("sets the default to pty even where untrusted routes would inherit it: the call checks isolation", async () => {
+    // The claude version gate runs after settings load, so the save cannot refuse (#570 r11);
+    // `runOneShot` does, for an untrusted route on an unisolated pty.
     for (const route of ["discord.classifier", "memory.recall"])
       expect((await cli("set", route, "print")).code).toBe(0);
     const { code } = await cli("set", "default", "pty");

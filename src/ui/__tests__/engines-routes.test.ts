@@ -104,7 +104,14 @@ async function post(path: string, payload: unknown): Promise<Response> {
   });
 }
 
+// These tests are about the isolation spike being OFF (an untrusted route may not go to pty).
+// The test preload turns it on for the rest of the suite (#570), so pin it here and put it back.
+let ptyIsolationWas: boolean | undefined;
+
 beforeAll(async () => {
+  const pty = engines.get("pty");
+  ptyIsolationWas = pty?.caps.isolation;
+  if (pty) pty.caps.isolation = false;
   engines.set("mock-ok", mockOk);
   engines.set("mock-leak", mockLeak);
   tempDir = await mkdtemp(join(tmpdir(), "engines-routes-"));
@@ -115,6 +122,8 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  const pty = engines.get("pty");
+  if (pty && ptyIsolationWas !== undefined) pty.caps.isolation = ptyIsolationWas;
   handle.stop();
   engines.delete("mock-ok");
   engines.delete("mock-leak");
@@ -174,8 +183,9 @@ describe("/api/settings/oneshot", () => {
     expect(oneShot.effective.compact).toBe("print");
     // resume routes: print / pty only
     expect(oneShot.choices.compact).toEqual(["print", "pty"]);
-    // untrusted routes: isolation only, so no pty
-    expect(oneShot.choices["tuner.judge"]).not.toContain("pty");
+    // untrusted routes: pty is offered, since its isolation is decided by the claude version
+    // gate AFTER settings load and is refused at the call, not here (#570 r11)
+    expect(oneShot.choices["tuner.judge"]).toContain("pty");
     expect(oneShot.choices["tuner.judge"]).toContain("print");
     expect(oneShot.choices["tuner.judge"]).toContain("local");
   });
@@ -216,12 +226,11 @@ describe("/api/settings/oneshot", () => {
     expect(await readFile(settingsFile, "utf-8")).toBe(`${BASE_TEXT}\n`);
   });
 
-  it("an untrusted route on pty → 400 (no isolation)", async () => {
+  it("an untrusted route on pty is accepted at save: its isolation is checked at the call", async () => {
+    // The version gate runs after settings load, so the save cannot know; `runOneShot` refuses
+    // an unisolated pty (pty-untrusted-state.test.ts, claude-version.test.ts). #570 r11.
     const res = await post("/api/settings/oneshot", { routes: { "tuner.propose": "pty" } });
-    expect(res.status).toBe(400);
-    expect(((await res.json()) as { error: string }).error).toContain(
-      "does not advertise isolation",
-    );
+    expect(res.status).toBe(200);
   });
 
   it("an engine with an apiKey → 400, the key is never written", async () => {
