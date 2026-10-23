@@ -551,12 +551,14 @@ describe("PtyProcess — Bypass Permissions boot dialog (issue #460)", () => {
 
 function fakeMcpDialogCli(dialog: string, gapAfterAnswer = "", beforeRead = ""): string {
   return [
-    "t0=$(date +%s%N)",
+    // perl, not `date +%s%N`: macOS's date has no %N.
+    "now() { perl -MTime::HiRes=time -e 'printf q(%d), time * 1000'; }",
+    "t0=$(now)",
     `printf '${dialog}'`,
     "stty raw -echo",
     beforeRead,
     // Like the real CLI, drop what arrives while the dialog is painting.
-    "while :; do key=$(dd bs=1 count=1 2>/dev/null); [ $(($(date +%s%N) - t0)) -lt 150000000 ] || break; done",
+    "while :; do key=$(dd bs=1 count=1 2>/dev/null); [ $(($(now) - t0)) -lt 150 ] || break; done",
     "stty sane -echo",
     '[ "$key" = "$(printf "\\033")" ] || exit 1',
     gapAfterAnswer,
