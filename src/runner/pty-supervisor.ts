@@ -299,11 +299,13 @@ export interface RunOnPtyResult {
    */
   reason?: string;
   /**
-   * Ephemeral call that gave up on its deadline while the entry was still being admitted or
-   * its claude still starting: settles once that late entry has been retired or its late PTY
-   * disposed AND its exit confirmed (late disposal/confirmation, not merely the native spawn
-   * returning; #581 cp5 connects it to landed-child confirmation). Whatever the claude wrote lands before it settles, so a caller that cleans up
-   * state on the way out cleans up again after it.
+   * Ephemeral call that handed back while its entry was still being admitted or its claude
+   * still starting: settles once that late entry's retirement is over AND the late PTY it
+   * produced has been disposed and its exit confirmed, or the failure recorded as a survivor, an
+   * unknown hold or a quarantine (late disposal and confirmation, not the native spawn
+   * returning; #581 cp5, see `lateRetirement`). It never rejects and carries no verdict: the
+   * verdict is the registry (`pty-cleanup`). A caller that owns state a late claude may write
+   * into removes and frees nothing until it settles, then cleans up once.
    */
   lateRetire?: Promise<void>;
 }
@@ -1002,7 +1004,7 @@ export async function runOnPty(
       // late claude has landed and been retired (#570).
       const lateRetire = opts.ephemeral
         ? admission.then(
-            ({ entry: e }) => retireEntry(e),
+            ({ entry: e }) => lateRetirement(e, retireEntry(e)),
             () => {},
           )
         : undefined;
@@ -1025,12 +1027,14 @@ export async function runOnPty(
     void retireEntry(entry);
   };
   opts.signal?.addEventListener("abort", onAbort, { once: true });
+  let outcome: RunOnPtyResult | undefined;
   try {
     if (opts.signal?.aborted) {
       await retireEntry(entry);
       return errorResult(`[pty-supervisor] ${sessionKey} aborted`);
     }
-    return await runOnAdmittedEntry(entry, sessionKey, prompt, opts, supervisorOpts);
+    outcome = await runOnAdmittedEntry(entry, sessionKey, prompt, opts, supervisorOpts);
+    return outcome;
   } finally {
     opts.signal?.removeEventListener("abort", onAbort);
     if (entry.scope.ephemeral) {
@@ -1040,6 +1044,12 @@ export async function runOnPty(
       // background with the session fenced, and ends in a confirmed exit or a quarantine.
       if (opts.signal?.aborted && entry.spawnInFlight) void retired.catch(() => {});
       else await retired;
+      // #581 cp5: a call that hands back with a spawn still in flight hands back the late
+      // retirement too, covering the entry's own retirement as well as the landing, so what it
+      // cleans up after is the child confirmed (or its failure recorded), not the spawn returning.
+      if (outcome && (outcome.lateRetire || entry.spawnInFlight)) {
+        outcome.lateRetire = lateRetirement(entry, retired);
+      }
     }
   }
 }
@@ -2101,6 +2111,15 @@ async function cleanupUntrustedOneShot(state: UntrustedOneShotState): Promise<vo
       );
       return;
     }
+    if (untrustedCleanup.pendingSpawnHoldActive(state.configRoot)) {
+      // A spawn that never settled may still start a claude here (#581 cp5). Nothing was sent
+      // to it, so no prompt is on disk; the root and the temp cwd stay until the sweeper finds
+      // the hold gone.
+      console.warn(
+        "[pty-supervisor] untrusted one-shot: config root kept while a spawn that did not settle is pending",
+      );
+      return;
+    }
     await untrustedCleanup.removeUntrustedConfigRoot(state.configRoot);
   } catch (error) {
     console.error(
@@ -2273,28 +2292,33 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
       const state = untrustedState;
       // Interactive claude ignores --no-session-persistence, so its on-disk state is
       // removed here, on success, failure and abort alike. The PTY is normally retired
-      // before this point; when admission outlived the deadline it is retired later, so
-      // the same cleanup runs again once that late retirement settles. The concurrency slot
-      // follows the child until it is confirmed gone: a late claude keeps it until retired (the
-      // ceiling only logs), and a survivor or an unknown hold keeps it until the sweeper confirms
-      // it gone (`OneShotSlot.settle`).
+      // before this point; when the call handed back with a claude still starting, nothing is
+      // removed until its late retirement is over, and the cleanup then runs once. The
+      // concurrency slot follows the child until it is confirmed gone: a late claude keeps it
+      // until retired (the ceiling only logs), and a survivor, an unknown hold or a spawn that
+      // never settled keeps it until the sweeper confirms it gone (`OneShotSlot.settle`).
       const release = (): void => {
         untrustedCleanup.releaseOneShotDir(state.configRoot);
         untrustedCleanup.releaseOneShotDir(state.tempCwd);
       };
-      try {
-        await cleanupUntrustedOneShot(state);
-      } finally {
+      if (lateRetire) {
+        // #581 cp5: a claude may still land in the root. Nothing is removed and no slot is freed
+        // now (the directories stay a live call's, so the sweeper leaves them): one pass, once
+        // the late retirement is over, and the slot follows the registry's verdict on it. No
+        // prompt was ever sent to a child that had not landed, so deferring leaves none on disk.
         slot?.settle(state.configRoot, lateRetire);
-        if (lateRetire) {
-          void lateRetire
-            .catch(() => {})
-            .then(() => cleanupUntrustedOneShot(state))
-            .catch(() => {
-              /* already logged by step; there is no caller left to return to */
-            })
-            .finally(release);
-        } else {
+        void lateRetire
+          .catch(() => {})
+          .then(() => cleanupUntrustedOneShot(state))
+          .catch(() => {
+            /* already logged by step; there is no caller left to return to */
+          })
+          .finally(release);
+      } else {
+        try {
+          await cleanupUntrustedOneShot(state);
+        } finally {
+          slot?.settle(state.configRoot, undefined);
           release();
         }
       }
@@ -2487,8 +2511,10 @@ function retireEntry(entry: PtyEntry): Promise<void> {
       // The fence turns into its quarantine record in this same synchronous step.
       if (joined.status === "fulfilled" && joined.value) {
         quarantineSession(entry.sessionKey, joined.value, "pending-spawn-unsettled", entry);
-        // #581 cp5: the stand-in has no pid to name, so the isolated root and slot hold for an
-        // unsettled spawn needs its own pid-less hold; keepRootAfterFailedDispose cannot take it.
+        // #581 cp5: the stand-in has no pid to name, so the isolated root and slot get their own
+        // pid-less hold (`keepRootAfterFailedDispose` cannot take it). After the quarantine, and
+        // guarded: a hold failure cannot undo the quarantine or skip the lifts below.
+        holdRootForPendingSpawn(entry);
       }
       // Root retention for an isolated one-shot, after the quarantines are recorded; a hook
       // failure cannot undo them (#581).
@@ -2504,6 +2530,45 @@ function retireEntry(entry: PtyEntry): Promise<void> {
   })();
   entry.retiring = run;
   return run;
+}
+
+/**
+ * The root and slot of an isolated one-shot whose spawn did not settle within the retirement's
+ * bound: held while that spawn is in flight (#581 cp5). A claude it starts later is disposed by
+ * `landPty`, which records its own survivor if the exit is not confirmed. Not for a trusted
+ * entry, which has no root. Failure is logged and swallowed: the quarantine already stands.
+ */
+function holdRootForPendingSpawn(entry: PtyEntry): void {
+  const config = entry.scope.untrustedConfig;
+  if (entry.scope.isolation !== "untrusted" || !config) return;
+  try {
+    untrustedCleanup.markPendingSpawnHold(
+      config.root,
+      () => entry.spawnInFlight !== undefined,
+      { tempCwd: entry.spawnOpts?.cwd },
+      entry.spawnInFlight,
+    );
+  } catch (error) {
+    console.error(
+      `[pty-supervisor] ${entry.sessionKey} pending-spawn hold failed (${errorCode(error)}); quarantine kept`,
+    );
+  }
+}
+
+/**
+ * What `lateRetire` is: a retirement that outlived its call is over. The entry's own retirement
+ * has finished (its disposal, quarantine and root retention are recorded) AND every spawn it
+ * left pending has landed, been disposed and had its exit confirmed or its failure recorded as
+ * a survivor, an unknown hold or a quarantine (#581 cp5). `retireEntry` alone settles at the
+ * #592 stand-in with the spawn still in flight, which is not the child gone. Never rejects: what
+ * the child's confirmation came to is read from the registry (`OneShotSlot.settle`).
+ */
+function lateRetirement(entry: PtyEntry, retired: Promise<void>): Promise<void> {
+  return retired
+    .catch(() => {})
+    .then(async () => {
+      while (entry.spawnInFlight) await entry.spawnInFlight.catch(() => {});
+    });
 }
 
 /**

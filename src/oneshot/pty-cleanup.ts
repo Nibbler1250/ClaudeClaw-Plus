@@ -227,6 +227,13 @@ export function untrustedOneShotsInFlight(): number {
  */
 const survivorSlots = new Map<string, () => void>();
 
+/**
+ * Roots whose call has returned (or is returning) with its slot still waiting on a late
+ * retirement: `settle` is pending for them. A hold registered meanwhile (a pending-spawn stand-in
+ * from any retirement path) must not reserve a second slot for the same call.
+ */
+const settlingRoots = new Set<string>();
+
 /** One counted reservation. `free` is idempotent, so a second release cannot inflate capacity. */
 function reserveCount(): () => void {
   untrustedInFlight++;
@@ -257,7 +264,9 @@ export function acquireUntrustedOneShotSlot(): OneShotSlot | undefined {
   // Transfer the reservation to the root's survivor or unknown hold, or free it when nothing of
   // the call is left. `unknownHoldActive` first: it prunes a hold whose processes are gone.
   const handOver = (root: string): void => {
-    const held = unknownHoldActive(root) || survivingGroups.has(root);
+    settlingRoots.delete(root);
+    const held =
+      unknownHoldActive(root) || pendingSpawnHoldActive(root) || survivingGroups.has(root);
     if (held && !survivorSlots.has(root)) survivorSlots.set(root, free);
     else free();
   };
@@ -265,6 +274,7 @@ export function acquireUntrustedOneShotSlot(): OneShotSlot | undefined {
     free,
     settle(root, retired) {
       if (!retired) return handOver(root);
+      settlingRoots.add(root);
       const ceiling = setTimeout(() => {
         console.warn("[pty-supervisor] one-shot slot held past ceiling: retirement pending");
       }, lateSlotCeilingMs);
@@ -296,7 +306,7 @@ function releaseSurvivorSlot(root: string): void {
  * entry for a root. Reads the maps, not `unknownHoldActive`: callers have just pruned.
  */
 function releaseIfClear(root: string): void {
-  if (survivingGroups.has(root) || unknownHolds.has(root)) return;
+  if (survivingGroups.has(root) || unknownHolds.has(root) || pendingSpawnHolds.has(root)) return;
   releaseSurvivorSlot(root);
 }
 
@@ -376,6 +386,20 @@ interface UnknownHold {
   procs: HeldProc[];
 }
 const unknownHolds = new Map<string, UnknownHold>();
+
+/**
+ * A spawn the retirement could not wait out (#592's pending-spawn stand-in, pid 0): a claude
+ * that may still start, with no pid to name. The root and the slot follow it exactly as they
+ * follow a survivor, but nothing can be signalled and nothing is persisted: a restart has no pid
+ * to re-check and sweeps the root by age like any leftover of an earlier run. It stands while
+ * `pending()` says the spawn has not settled; `landPty` records its own survivor if what the
+ * spawn produced then could not be confirmed gone (#581 cp5).
+ */
+interface PendingSpawnHold {
+  tempCwd?: string;
+  pending: () => boolean;
+}
+const pendingSpawnHolds = new Map<string, PendingSpawnHold>();
 const loggedUnknown = new Set<string>();
 const loggedUnrecorded = new Set<string>();
 
@@ -521,6 +545,49 @@ function holdStands(root: string, deps: SweepDeps = {}): boolean {
 export function unknownHoldActive(root: string): boolean {
   return holdStands(root);
 }
+
+/**
+ * Hold `root` (and the temp cwd) and one slot while a spawn that never settled may still start a
+ * claude (#581 cp5). `pending` is the live truth ("is that spawn still in flight"), read when
+ * anything asks, so no ordering between this hold and the spawn's own settling can free it early.
+ * `until` only lets the hold release the slot the moment the spawn settles, with nobody asking.
+ * A call whose slot is still waiting on a late retirement (`settle`) keeps that one reservation;
+ * otherwise the hold takes its own, which may pass the cap like an adopted survivor.
+ */
+export function markPendingSpawnHold(
+  root: string,
+  pending: () => boolean,
+  extra: { tempCwd?: string } = {},
+  until?: Promise<unknown>,
+): void {
+  if (!pending()) return; // already settled: whatever it produced is the caller's to account for
+  if (!pendingSpawnHolds.has(root)) {
+    console.warn(
+      "[oneshot] config root kept: a spawn that did not settle may still start a claude in it",
+    );
+  }
+  pendingSpawnHolds.set(root, { tempCwd: extra.tempCwd, pending });
+  if (!settlingRoots.has(root)) reserveSurvivorSlot(root);
+  const prune = (): void => {
+    pendingSpawnHoldActive(root);
+  };
+  void until?.then(prune, prune);
+}
+
+/** Drop the hold once its spawn has settled, and release its slot unless another hold stands. True while it stands. */
+export function pendingSpawnHoldActive(root: string): boolean {
+  const hold = pendingSpawnHolds.get(root);
+  if (!hold) return false;
+  if (hold.pending()) return true;
+  pendingSpawnHolds.delete(root);
+  releaseIfClear(root);
+  return false;
+}
+
+/** Test seam: how many roots are held for a spawn that never settled. */
+export function pendingSpawnHoldCount(): number {
+  return pendingSpawnHolds.size;
+}
 export function groupSurvivorOf(root: string): number | undefined {
   return survivingGroups.get(root)?.pid;
 }
@@ -541,6 +608,8 @@ export function resetGroupSurvivorsForTests(): void {
   for (const root of [...survivorSlots.keys()]) releaseSurvivorSlot(root);
   survivingGroups.clear();
   unknownHolds.clear();
+  pendingSpawnHolds.clear();
+  settlingRoots.clear();
   loggedUnknown.clear();
   loggedUnrecorded.clear();
 }
@@ -550,6 +619,9 @@ const protectedBySurvivor = (path: string, deps: SweepDeps = {}): boolean => {
   }
   for (const [root, hold] of [...unknownHolds]) {
     if ((root === path || hold.tempCwd === path) && holdStands(root, deps)) return true;
+  }
+  for (const [root, hold] of [...pendingSpawnHolds]) {
+    if ((root === path || hold.tempCwd === path) && pendingSpawnHoldActive(root)) return true;
   }
   return false;
 };
@@ -660,6 +732,7 @@ export async function retrySurvivingGroups(deps: SurvivorRetryDeps = {}): Promis
   // A hold is pruned here too, so the slot that follows it comes back on the timer, not only when
   // the sweep happens to look at an old directory. Nothing is signalled for a hold.
   for (const root of [...unknownHolds.keys()]) holdStands(root);
+  for (const root of [...pendingSpawnHolds.keys()]) pendingSpawnHoldActive(root);
   return cleared;
 }
 

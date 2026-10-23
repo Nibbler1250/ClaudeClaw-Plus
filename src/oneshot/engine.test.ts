@@ -441,17 +441,28 @@ describe("one-shot isolation contract", () => {
       expect(cwd).not.toBe("");
       expect(existsSync(cwd)).toBe(false);
     });
-    it("is removed when the spawn never lands", async () => {
+    it("is kept while the spawn has not landed, and removed once it has landed and its exit is confirmed", async () => {
+      // #581 cp5: a claude that may still land is a writer, so nothing of the call is removed
+      // until that child is confirmed gone. Went red (kept forever) with the late retirement
+      // not waiting for the landing, and (removed at once) with the first pass left in place.
       let cwd = "";
+      let land!: (pty: never) => void;
       injectSpawnPty((opts) => {
         cwd = opts.cwd;
-        return new Promise(() => {});
+        return new Promise((resolve) => {
+          land = resolve;
+        });
       });
       const result = await withPtyIsolation(() =>
         engines.get("pty")!.run({ ...req, timeoutMs: 30 }),
       );
       expect(result.exitCode).toBe(124);
       expect(cwd).not.toBe("");
+      expect(existsSync(cwd)).toBe(true);
+      land(ptyDouble(() => new Promise(() => {})));
+      for (let i = 0; i < 300 && existsSync(cwd); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
       expect(existsSync(cwd)).toBe(false);
     });
     it("is removed after a normal turn", async () => {
