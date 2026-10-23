@@ -15,6 +15,12 @@ import {
 } from "../../runner/pty-quarantine";
 import { SessionManager } from "../session-manager";
 
+/** Poll for a stand-in's marker: a positive control must not depend on one fixed sleep. */
+async function waitForFile(path: string, budgetMs = 5000): Promise<void> {
+  const end = Date.now() + budgetMs;
+  while (!existsSync(path) && Date.now() < end) await new Promise((r) => setTimeout(r, 25));
+}
+
 function stuckPty(sessionId: string): PtyProcess {
   return {
     label: "fake:4242",
@@ -154,7 +160,7 @@ describe("SessionManager.spawnAgent and the quarantine gate", () => {
 
     await mgr.spawnAgent(agentOn("process-stream-json"), "cli").catch(() => undefined);
 
-    await new Promise((r) => setTimeout(r, 300));
+    await waitForFile(marker);
     expect(existsSync(marker)).toBe(true);
   });
 
@@ -198,7 +204,7 @@ describe("SessionManager.spawnAgent and the quarantine gate", () => {
 
       await mgr.spawnAgent(agentOn("tmux"), "cli").catch(() => undefined);
 
-      await new Promise((r) => setTimeout(r, 300));
+      await waitForFile(tmuxMarker);
       expect(existsSync(tmuxMarker)).toBe(true);
     });
   });

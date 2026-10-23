@@ -1209,11 +1209,12 @@ export class SessionManager {
         `is not implemented in Sprint 1; stop() will use SIGTERM. Use 'pty-stdin' ` +
         `or 'process-stream-json' for graceful slash-command lifecycle.\n`,
     );
-    // #562 round 9: the synchronous final word; no await between it and the spawn below.
-    assertSessionSpawnable({ sessionId: agent.session_id });
     const claudeBin = this.options.commandOverride ?? "claude";
     const sessionName = `claudeclaw-${agent.id}`;
     const tmuxArgs = ["new-session", "-d", "-s", sessionName, claudeBin, ...args];
+    // #562 round 9, after the argv is prepared by #581 cp6: the synchronous final word, on the
+    // line before the spawn. No await between.
+    assertSessionSpawnable({ sessionId: agent.session_id });
     const child = nodeSpawnChildProcess("tmux", tmuxArgs, {
       cwd: realCwd,
       env,

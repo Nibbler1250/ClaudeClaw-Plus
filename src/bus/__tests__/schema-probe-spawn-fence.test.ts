@@ -49,7 +49,9 @@ describe("defaultPtyRunnerFactory and the spawn gate", () => {
     // Without this, the absent marker below could mean the stand-in never runs here at all.
     const runner = await defaultPtyRunnerFactory(spawnArgs("probe-free"));
 
-    await new Promise((r) => setTimeout(r, 300));
+    // Poll: a positive control must not depend on one fixed sleep.
+    const end = Date.now() + 5000;
+    while (!existsSync(marker) && Date.now() < end) await new Promise((r) => setTimeout(r, 25));
     expect(existsSync(marker)).toBe(true);
     await runner.retire?.().catch(() => undefined);
   });
