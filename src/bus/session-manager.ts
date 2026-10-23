@@ -4,9 +4,12 @@
  * Spec: `docs/ClaudeClaw_Plus_Bus_Architecture_Spec.md` §5.3
  *
  * Responsibility: spawn + supervise one `claude` process per Plus agent.
- * Picks a `SupervisionMode` based on origin (channel-driven origins need the
- * PTY-backed REPL; non-channel origins use the lighter `process-stream-json`
- * runner). Provides a stable per-agent handle (`AgentProcess`) with
+ * Uses the PTY-backed REPL for every origin unless the agent explicitly
+ * selects another `SupervisionMode`, including `process-stream-json`. The one
+ * default exception is win32: an `AgentConfig` with no `supervision` falls back,
+ * for non-channel origins, to `process-stream-json` (`defaultSupervisionFor`).
+ * Declared agents always carry `supervision` (resolver default `pty-stdin`).
+ * Provides a stable per-agent handle (`AgentProcess`) with
  * lifecycle methods and slash-command relay.
  *
  * Empirical foundations:
@@ -47,6 +50,7 @@ import { BUS_MCP_TOOLS } from "./mcp-tools";
 import { confirmTurnReceipt } from "./receipt-wiring";
 import { capturePostMortem, type PostMortemOptions } from "./post-mortem";
 import type { ReceiptRecord } from "./receipt";
+import { assertSessionSpawnable, assertSessionWritable } from "../runner/pty-quarantine";
 import { ensureTrustAccepted } from "../runner/pty-trust-prompt";
 import {
   type AgentProcess,
@@ -862,6 +866,10 @@ export class SessionManager {
           );
         }
       }
+      // #562 round 8: the same gate every other start on a session passes. The bus names its
+      // agent's session with `--session-id`, so a transcript the PTY supervisor still has an
+      // unconfirmed writer on is not started beside it.
+      await assertSessionWritable({ sessionId: agent.session_id });
       if (mode === "pty-stdin") {
         proc = await this.spawnPty(agent, args, env, realCwd);
       } else if (mode === "process-stream-json" || mode === "process") {
@@ -1127,6 +1135,9 @@ export class SessionManager {
     // fork-time read of `environ`). The bun-pty handle is the first thing
     // returned so the post-spawn restore happens after the child has
     // inherited the stripped env.
+    // #562 round 9: the synchronous final word, after the `bun-pty` import above. No await
+    // between this check and the spawn.
+    assertSessionSpawnable({ sessionId: agent.session_id });
     const pty = withCleanProcessEnv(() =>
       ptySpawn(cmd, args, {
         name: "xterm-256color",
@@ -1152,6 +1163,8 @@ export class SessionManager {
     realCwd: string,
   ): ChildAgentProcess {
     const cmd = this.options.commandOverride ?? claudeExecutable();
+    // #562 round 9: the synchronous final word; no await between it and the spawn below.
+    assertSessionSpawnable({ sessionId: agent.session_id });
     // Use node:child_process for broad compatibility and a stable
     // `ChildProcess` interface across Bun + Node runtimes. (`Bun.spawn`
     // returns a different shape; using node:child_process avoids the
@@ -1191,6 +1204,8 @@ export class SessionManager {
         `is not implemented in Sprint 1; stop() will use SIGTERM. Use 'pty-stdin' ` +
         `or 'process-stream-json' for graceful slash-command lifecycle.\n`,
     );
+    // #562 round 9: the synchronous final word; no await between it and the spawn below.
+    assertSessionSpawnable({ sessionId: agent.session_id });
     const claudeBin = this.options.commandOverride ?? "claude";
     const sessionName = `claudeclaw-${agent.id}`;
     const tmuxArgs = ["new-session", "-d", "-s", sessionName, claudeBin, ...args];

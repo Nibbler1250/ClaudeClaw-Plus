@@ -221,10 +221,14 @@ const DEFAULT_SETTINGS: Settings = {
   // service manager's stop timeout (systemd TimeoutStopSec defaults to 90s).
   shutdown: { drainTurnsMs: 30_000 },
   pty: {
-    // Opt-in by default. Operators flip this to true ONLY after the MCP
-    // multiplexer follow-up lands and they've validated OAuth refresh on a
-    // test deployment. See README "PTY runner mode" + PR #62 rollout notes.
-    enabled: false,
+    // Official engine for agent turns and cron jobs (#550). The MCP multiplexer
+    // has shipped but is opt-in and dormant by default (it needs `mcp.shared`, an
+    // `mcp-proxy.json` and `web.enabled`); without it each PTY spawns its own MCP
+    // servers, and startup warns. OAuth refresh through it is NOT shipped code: the
+    // operator validates it in the pre-release soak. false keeps print. Windows is the
+    // exception: no evidence the PTY path works there, so win32 defaults to print
+    // and `pty.enabled: true` opts in (see `defaultPtyEnabled`).
+    enabled: defaultPtyEnabled(),
     idleReapMinutes: 30,
     maxRetries: 5,
     respawnRetries: 3,
@@ -511,7 +515,8 @@ export interface McpConfig {
    * with the per-server crash/failure events already emitted by the proxy
    * substrate. Filed in response to Nibbler review on #64: the silent
    * degradation mode (one shared MCP crashes → all PTYs lose that tool)
-   * needs an operator-visible signal before `pty.enabled: true` ships.
+   * needed an operator-visible signal before `pty.enabled` could default to true
+   * (#550; on win32 it defaults to false, see `defaultPtyEnabled`).
    */
   healthProbeIntervalMs: number;
   /**
@@ -663,10 +668,10 @@ export interface ShutdownConfig {
 }
 
 export interface PtyConfig {
-  /** Master switch. When false (default), runner uses today's `claude -p` path
-   *  for every callsite. Operators flip to true ONLY after the MCP multiplexer
-   *  follow-up ships and they've validated OAuth refresh on a test deployment.
-   *  See README "PTY runner mode". */
+  /** Master switch for runner turns. Defaults to true (#550), except on win32 where
+   *  it defaults to false (`defaultPtyEnabled`); an explicit boolean always wins.
+   *  An explicit false selects the `claude -p` path for every callsite.
+   *  See README "Execution Modes and Engine Policy" and docs/pty-migration.md. */
   enabled: boolean;
   /** Ad-hoc thread PTYs are disposed after this many minutes of inactivity.
    *  Named agents are NEVER reaped when namedAgentsAlwaysAlive is true.
@@ -709,20 +714,16 @@ export interface PtyConfig {
    */
   maxConcurrent: number;
   /**
-   * Quiet window before the supervisor writes the turn-end sentinel into the
-   * PTY (issue #81 — claude 2.1.89 dropped OSC 9;4 progress markers, so we
-   * detect turn completion via a sentinel-echo round-trip instead). When the
-   * byte stream has been silent for this many ms, the supervisor writes the
-   * sentinel and waits for claude's TUI to echo it back. Lower values reduce
-   * per-turn latency overhead but risk false-positives during legitimate
-   * mid-turn pauses (model thinking, slow streaming, etc.). Default: 500.
+   * How long the TUI's output must be quiet, after the session transcript shows the
+   * reply complete, before the next prompt may be sent (#562 round 2). It is a
+   * readiness delay only: it can postpone the end of a turn (by at most 2 s), never
+   * decide it. Default: 500.
    */
   quietWindowMs: number;
   /**
-   * Hard cap on how long the supervisor waits for the sentinel echo after
-   * writing it. If the sentinel never echoes back (claude crashed, TUI
-   * stalled), the turn completes with `cleanBoundary=false` and whatever
-   * bytes have been captured so far. Default: 30000 (30s).
+   * Unused since #562 round 2: there is no sentinel any more, and a turn ends only when
+   * the session transcript shows the reply complete. Kept so existing settings files
+   * and callers still parse. Default: 30000.
    */
   sentinelMaxWaitMs: number;
 }
@@ -1046,6 +1047,40 @@ function parseAgenticConfig(raw: any): AgenticConfig {
   };
 }
 
+/**
+ * #550 made the PTY supervisor the default engine for runner turns. Nothing in this
+ * codebase shows that path working on win32: `claude` resolves to a `.cmd` wrapper
+ * there (runner.ts `CLAUDE_EXECUTABLE`) and the spec (§5.3) names `process` as the
+ * Windows fallback. So win32 keeps print by default and `pty.enabled: true` opts in,
+ * mirroring `defaultSupervisionFor` in `src/bus/types.ts`. `platform` is a parameter
+ * so the choice is testable on any host.
+ *
+ * Scope: `pty.enabled` governs `runner.ts` turns only. Declared bus agents are not
+ * affected: `resolveBusAgentConfig` defaults them to `pty-stdin` on every platform, win32
+ * included.
+ */
+export function defaultPtyEnabled(platform: NodeJS.Platform = process.platform): boolean {
+  return platform !== "win32";
+}
+
+const invalidPtyEnabledWarned = new Set<string>();
+/** An explicit boolean wins; anything else gets the platform default (non-booleans warn once). */
+export function resolvePtyEnabled(
+  value: unknown,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (typeof value === "boolean") return value;
+  const fallback = defaultPtyEnabled(platform);
+  if (value !== undefined) {
+    const key = `${platform}:${JSON.stringify(value)}`;
+    if (!invalidPtyEnabledWarned.has(key)) {
+      invalidPtyEnabledWarned.add(key);
+      console.warn(`pty.enabled must be a boolean; using the platform default (${fallback})`);
+    }
+  }
+  return fallback;
+}
+
 function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Settings {
   const rawLevel = raw.security?.level;
   const level: SecurityLevel =
@@ -1228,7 +1263,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
           : 30_000,
     },
     pty: {
-      enabled: raw.pty?.enabled === true, // default false — opt-in (see DEFAULT_SETTINGS.pty)
+      enabled: resolvePtyEnabled(raw.pty?.enabled), // explicit boolean wins; else platform default (#550)
       idleReapMinutes:
         Number.isFinite(raw.pty?.idleReapMinutes) && Number(raw.pty.idleReapMinutes) > 0
           ? Number(raw.pty.idleReapMinutes)

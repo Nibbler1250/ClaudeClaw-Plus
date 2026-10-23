@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claudeExecutable } from "../runner/claude-executable.js";
+import { assertSessionSpawnable } from "../runner/pty-quarantine.js";
 import { cleanSpawnEnv } from "../runner/spawn-env.js";
 import type { OneShotRequest, OneShotResult } from "./engine.js";
 import { UNTRUSTED_CLAUDE_ARGS, trustedToolFlags, validateIsolation } from "./isolation.js";
@@ -74,6 +75,12 @@ export async function runPrint(req: OneShotRequest): Promise<OneShotResult> {
       : (req.cwd ?? process.cwd());
   try {
     return await new Promise<OneShotResult>((resolve, reject) => {
+      // #562 round 9: the synchronous final word, after every await above (the config and
+      // runner imports). No await between this check and the spawn on the next line. The
+      // untrusted route never resumes, so it has no session to check.
+      if (req.resumeSessionId !== undefined && req.isolation !== "untrusted") {
+        assertSessionSpawnable({ sessionId: req.resumeSessionId });
+      }
       const child = (overrides?.spawn ?? spawn)(claudeExecutable(), args, {
         stdio: [stdinPrompt ? "pipe" : "ignore", "pipe", "pipe"],
         env,
