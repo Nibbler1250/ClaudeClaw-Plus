@@ -212,3 +212,33 @@ describe("#572 trusted fallback dispatch", () => {
     expect(performance.now() - start).toBeLessThan(1500);
   });
 });
+
+describe("#572 oneShot view follows pty.enabled", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "oneshot-view-"));
+  });
+  afterEach(() => {
+    _setSettingsFileForTests(undefined);
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const viewWith = async (pty: boolean) => {
+    const file = join(dir, "settings.json");
+    writeFileSync(file, JSON.stringify({ pty: { enabled: pty } }));
+    _setSettingsFileForTests(file);
+    const { readOneShotView } = await import("./settings-store.js");
+    return readOneShotView();
+  };
+
+  it("pty on, default absent: resume routes show pty, the default shows print as implicit", async () => {
+    const view = await viewWith(true);
+    for (const route of RESUME_ROUTES) expect(view.effective[route]).toBe("pty");
+    expect(view.default).toBe("print");
+    expect(view.defaultImplicit).toBe(true);
+  });
+
+  it("pty off, default absent: resume routes show print", async () => {
+    const view = await viewWith(false);
+    for (const route of RESUME_ROUTES) expect(view.effective[route]).toBe("print");
+  });
+});
