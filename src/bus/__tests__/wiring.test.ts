@@ -258,8 +258,8 @@ describe("wireSlashCommands — real SessionManager + pty-stdin", () => {
     const bus = makeBus();
     wireSlashCommands(bus, sm);
 
-    const agent = mkAgent("wire-psj");
-    // origin=cron → defaultSupervisionFor → process-stream-json (Probe 0.6 Q5).
+    const agent = { ...mkAgent("wire-psj"), supervision: "process-stream-json" as const };
+    // Explicit override keeps the supported print path after #550.
     const proc = await sm.spawnAgent(agent, "cron");
     spawned.push(proc);
     expect(proc.supervision).toBe("process-stream-json");

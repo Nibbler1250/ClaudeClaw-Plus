@@ -1,7 +1,7 @@
 /**
  * The 60 s cron loop that runs jobs (moved out of `commands/start.ts`).
  *
- * Each due job runs as a one-shot `claude -p` through `run()`, with the job's
+ * Each due job runs through `run()` on the configured engine (PTY by default), with the job's
  * own model, timeout, retry/retryDelay and notify, and its result forwarded
  * to Telegram/Discord. Under `runtime: "bus"` it is still the only job runner:
  * `busSchedulerJobs()` keeps the jobs off the bus scheduler, so a job never runs
@@ -15,6 +15,11 @@ export interface JobRunResult {
   exitCode: number;
   stdout: string;
   stderr: string;
+  /**
+   * Set by the PTY path when the turn failed with an unknown outcome (#562). Such a turn may
+   * have completed and done its side effects, so the job's `retry` is not applied to it.
+   */
+  failureKind?: "uncertain" | "timeout";
 }
 
 export interface JobLoopDeps {
@@ -81,7 +86,7 @@ export function createJobLoop(deps: JobLoopDeps): JobLoop {
   /**
    * `job.agent` names a legacy agent (`agents/<name>/`): its persona and model
    * marker. A bus agent id (`settings.agents`) is not one, and this loop does
-   * not send jobs to bus agents, so such a job runs as a plain `claude -p` —
+   * not send jobs to bus agents, so such a job runs on the configured runner —
    * say so instead of dropping the routing silently.
    */
   async function warnIfBusOnlyAgent(job: Job, model: string | undefined): Promise<void> {
@@ -93,7 +98,7 @@ export function createJobLoop(deps: JobLoopDeps): JobLoop {
     warnedBusAgent.add(key);
     const modelText = model ? `model ${JSON.stringify(model)}` : "the default model";
     warn(
-      `[${ts()}] Job ${JSON.stringify(job.name)}: agent ${JSON.stringify(agent)} is a bus agent (settings.agents) with no legacy persona in agents/${agent}/. Jobs do not run in bus agent sessions; this one runs as a plain claude -p on ${modelText}. Set model: in the job's frontmatter to choose its model.`,
+      `[${ts()}] Job ${JSON.stringify(job.name)}: agent ${JSON.stringify(agent)} is a bus agent (settings.agents) with no legacy persona in agents/${agent}/. Jobs do not run in bus agent sessions; this one runs on the configured runner on ${modelText}. Set model: in the job's frontmatter to choose its model.`,
     );
   }
 
@@ -128,6 +133,13 @@ export function createJobLoop(deps: JobLoopDeps): JobLoop {
           });
           if (r.exitCode === 0) {
             retryState.delete(job.name);
+          } else if (r.failureKind) {
+            // The turn may have completed: a retry can repeat its side effects. The failure is
+            // still forwarded below, and a one-time job's schedule is cleared as if exhausted.
+            retryState.delete(job.name);
+            log(
+              `[${ts()}] Job ${job.name} not retried: PTY turn ${r.failureKind === "timeout" ? "timed out" : "uncertain"}, it may have completed`,
+            );
           } else if (job.retry && job.retry > 0) {
             // Preserve existing state so failCount accumulates correctly across retries.
             const state = retryState.get(job.name) ?? { failCount: 0, retryAt: 0 };

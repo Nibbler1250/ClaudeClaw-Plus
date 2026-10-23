@@ -6,6 +6,8 @@ import { homedir } from "os";
 import { extractErrorDetail } from "../messaging";
 import { join } from "path";
 import { fileURLToPath } from "url";
+import { logExecutionEngineSummary, ptyWithoutSharedMcpWarning } from "../execution-engines.js";
+import { beginStartupInitialization } from "../startup-initialization.js";
 import {
   run,
   runUserMessage,
@@ -842,6 +844,7 @@ export async function start(args: string[] = []) {
   process.on("SIGINT", shutdown);
 
   console.log("ClaudeClaw+ daemon started");
+  logExecutionEngineSummary(settings, console);
   console.log(`  PID: ${process.pid}`);
   // Probe and log the Claude CLI version so operators see which `claude`
   // the daemon is invoking. Mismatch against the parser's known-good list
@@ -1084,6 +1087,8 @@ export async function start(args: string[] = []) {
   // Activation rule (SPEC §6.3): only attempt to start when shared is
   // non-empty AND web.enabled is true. Otherwise the plugin would have
   // nothing to mount routes on.
+  let mcpMultiplexerActive = false;
+  let mcpMultiplexerStartFailed = false;
   if (settings.mcp.shared.length > 0 && settings.web.enabled) {
     try {
       const plugin = getMcpMultiplexerPlugin();
@@ -1128,6 +1133,7 @@ export async function start(args: string[] = []) {
             sharedServers: plugin.sharedServerNames(),
           });
         }
+        mcpMultiplexerActive = true;
         console.log("[mcp-multiplexer] started");
       } else {
         console.warn(
@@ -1135,6 +1141,7 @@ export async function start(args: string[] = []) {
         );
       }
     } catch (err) {
+      mcpMultiplexerStartFailed = true;
       // Don't crash the daemon — log clearly and fall back to per-PTY MCP
       // discovery (settings.mcp.shared becomes effectively dormant).
       const msg = err instanceof Error ? err.message : String(err);
@@ -1153,6 +1160,16 @@ export async function start(args: string[] = []) {
       `[mcp-multiplexer] settings.mcp.shared is set (${settings.mcp.shared.join(", ")}) but web.enabled is false — the multiplexer cannot mount its HTTP routes, so bus agents will spawn WITHOUT --mcp-config and these servers will be unreachable. Set web.enabled: true to use mcp.shared.`,
     );
   }
+  // PTY is the default engine (#550): say once, at startup, when it runs without the
+  // multiplexer, so the per-PTY MCP server footprint is not a surprise.
+  const sharingWarning = ptyWithoutSharedMcpWarning({
+    ptyEnabled: settings.pty.enabled,
+    sharedServerCount: settings.mcp.shared.length,
+    webEnabled: settings.web.enabled,
+    multiplexerActive: mcpMultiplexerActive,
+    startFailed: mcpMultiplexerStartFailed,
+  });
+  if (sharingWarning) console.warn(sharingWarning);
 
   // Issue #165: deferred bus agent spawn. The MCP multiplexer issuer is now
   // wired (or confirmed dormant) above, so spawning here means each agent's
@@ -1708,14 +1725,15 @@ export async function start(args: string[] = []) {
         `[${ts()}] Startup trigger failed (exit ${triggerResult.exitCode}). Daemon will continue running.`,
       );
     }
-  } else {
-    // Bootstrap the session first so system prompt is initial context
-    // and session.json is created immediately.
-    await bootstrap();
   }
 
-  // Install plugins without blocking daemon startup.
-  startPreflightInBackground(process.cwd());
+  // Bootstrap reserves its global queue slot before preflight/job wiring,
+  // but a model turn must never hold up the rest of daemon startup.
+  await beginStartupInitialization({
+    bootstrap: hasTriggerFlag ? undefined : bootstrap,
+    next: () => startPreflightInBackground(process.cwd()),
+    logger: console,
+  });
 
   // Sprint 5.2c: when the Bus runtime is mounted, the legacy heartbeat
   // tick is skipped — `wireBusScheduler` already registered the

@@ -1,5 +1,5 @@
-import { describe, test, expect } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { afterAll, describe, test, expect } from "bun:test";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -9,9 +9,18 @@ import {
   PtyClosedError,
   type PtyProcessOptions,
 } from "../runner/index";
-import { __buildClaudeArgsForTests } from "../runner/pty-process";
+import {
+  __buildClaudeArgsForTests,
+  collectSecretValues,
+  redactSecretsInTail,
+} from "../runner/pty-process";
+import {
+  neutralizeLeadingReplCommand,
+  preparePtyPromptForWrite,
+} from "../runner/pty-prompt-sanitizer";
 import { _setClaudeExecutableForTests } from "../runner";
 import type { SecurityConfig } from "../config";
+import { append, assistantLine, fakeTurn, userLine } from "./fixtures/fake-claude-tui";
 
 // ─── Shared test helpers ────────────────────────────────────────────────────
 
@@ -31,10 +40,27 @@ function baseOpts(over: Partial<PtyProcessOptions>): PtyProcessOptions {
     agentName: "test",
     _skipReadySettle: true,
     _skipClaudeArgs: true,
+    transcriptPath: TX_PATH,
     cols: 80,
     rows: 24,
     ...over,
   };
+}
+
+/**
+ * Every PtyProcess below is handed this transcript path: a turn resolves only on the
+ * session transcript (#562 round 2), and a process with none is refused. Tests that care
+ * what the transcript says write their own (`pty-false-completion.test.ts`); the ones here
+ * only need a turn to be able to run. A turn "completes" when the fake TUI appends the
+ * user and assistant entries, never because of what it paints.
+ */
+const TX_DIR = mkdtempSync(join(tmpdir(), "pty-process-tx-"));
+const TX_PATH = join(TX_DIR, "session.jsonl");
+afterAll(() => rmSync(TX_DIR, { recursive: true, force: true }));
+
+/** A fake TUI that takes `prompt`, records it, answers with `prompt` itself, then `cat`s. */
+function tuiScript(prompt: string): string {
+  return `${fakeTurn({ tx: TX_PATH, prompt, answer: prompt })}; exec cat`;
 }
 
 // ─── Lifecycle: spawn → dispose ──────────────────────────────────────────────
@@ -230,6 +256,140 @@ describe("PtyProcess — lifecycle", () => {
     // The redaction marker should appear.
     expect(info.tail).toContain("<redacted>");
     await proc.dispose();
+  });
+
+  test("exitInfo().tail redacts the exact credential values in the child env, whatever their shape (#562 security review)", async () => {
+    // A z.ai GLM `id.secret` token or a Kimi key has no `sk-` prefix, so the prefix patterns
+    // miss it. Values are obviously fake and built at runtime.
+    const glmShaped = `${"a".repeat(32)}.${"b".repeat(16)}`;
+    const kimiShaped = `test-token-${"0".repeat(24)}`;
+    const authShaped = `fake_auth_${"1".repeat(24)}`;
+    const innocent = "plainword";
+    const proc = await spawnPty(
+      baseOpts({
+        env: {
+          ...(process.env as Record<string, string>),
+          ANTHROPIC_AUTH_TOKEN: authShaped,
+          KIMI_API_KEY: kimiShaped,
+          CUSTOM_SERVICE_TOKEN: glmShaped.replace(/\./g, "-"),
+          SHORT_TOKEN: "abc",
+          UNRELATED_NAME: innocent,
+        },
+        _commandOverride: "/bin/sh",
+        _argsOverride: [
+          "-c",
+          [
+            `echo 'auth: ${authShaped}'`,
+            `echo 'kimi: ${kimiShaped}'`,
+            `echo 'custom: ${glmShaped.replace(/\./g, "-")}'`,
+            `echo 'glm: ${glmShaped}'`,
+            `echo 'short: abc and ${innocent}'`,
+            "exit 9",
+          ].join("; "),
+        ],
+      }),
+    );
+    await new Promise<void>((r) => setTimeout(r, 200));
+    const info = proc.exitInfo();
+    if (!info) throw new Error("type narrowing");
+    expect(info.tail).not.toContain(authShaped);
+    expect(info.tail).not.toContain(kimiShaped);
+    expect(info.tail).not.toContain(glmShaped.replace(/\./g, "-"));
+    expect(info.tail).not.toContain(glmShaped);
+    // A short value and an unrelated env value are left alone.
+    expect(info.tail).toContain("short: abc and plainword");
+    await proc.dispose();
+  });
+
+  test("collectSecretValues picks credential env names and skips short or unrelated values", () => {
+    const values = collectSecretValues({
+      ANTHROPIC_AUTH_TOKEN: "x".repeat(12),
+      ANTHROPIC_API_KEY: "y".repeat(10),
+      CLAUDE_CODE_OAUTH_TOKEN: "z".repeat(9),
+      FOO_API_KEY: "f".repeat(8),
+      BAR_TOKEN: "short",
+      PATH: "/usr/bin:/bin:/usr/local/bin",
+      EMPTY_TOKEN: "",
+    });
+    expect(values).toEqual(["x".repeat(12), "y".repeat(10), "z".repeat(9), "f".repeat(8)]);
+  });
+
+  test("a credential the TUI hard-wrapped across lines is still redacted (#562 security re-review)", () => {
+    const token = `fake${"0123456789abcdef".repeat(2)}ZZ`; // 38 chars, fake
+    expect(token.length).toBe(38);
+    const a = token.slice(0, 19);
+    const b = token.slice(19);
+    for (const sep of ["\n", "\r\n", "\n    ", "\r\n  \t "]) {
+      const out = redactSecretsInTail(`auth failed for key ${a}${sep}${b} — retry`, [token]);
+      expect(out).not.toContain(a);
+      expect(out).not.toContain(b);
+      expect(out).toContain("auth failed for key <redacted> — retry");
+    }
+    // Wrapped more than once.
+    const thrice = `${token.slice(0, 10)}\n  ${token.slice(10, 30)}\n  ${token.slice(30)}`;
+    expect(redactSecretsInTail(`x ${thrice} y`, [token])).toBe("x <redacted> y");
+  });
+
+  test("redaction of a wrapped secret stays linear on a full 8 KiB tail", () => {
+    const token = `fake${"x".repeat(36)}`;
+    const adversarial = "f".repeat(8 * 1024); // many partial matches: every char starts a run
+    const start = performance.now();
+    redactSecretsInTail(adversarial, [token, `${"f".repeat(30)}end`]);
+    expect(performance.now() - start).toBeLessThan(50);
+  });
+
+  test("a secret containing whitespace is still redacted exactly, and an unrelated line is untouched", () => {
+    const spaced = "test token with spaces 000";
+    expect(redactSecretsInTail(`say ${spaced} now\nother line`, [spaced])).toBe(
+      "say <redacted> now\nother line",
+    );
+  });
+
+  test("exitInfo().tail redacts a credential that wrapped at the TTY width", async () => {
+    const token = `test-token-wrapped-${"7".repeat(21)}`;
+    const half = Math.floor(token.length / 2);
+    const proc = await spawnPty(
+      baseOpts({
+        env: { ...(process.env as Record<string, string>), ANTHROPIC_AUTH_TOKEN: token },
+        _commandOverride: "/bin/sh",
+        _argsOverride: [
+          "-c",
+          `printf 'banner %s\\n    %s trailing\\n' '${token.slice(0, half)}' '${token.slice(half)}'; exit 9`,
+        ],
+      }),
+    );
+    await new Promise<void>((r) => setTimeout(r, 250));
+    const info = proc.exitInfo();
+    if (!info) throw new Error("type narrowing");
+    expect(info.tail).not.toContain(token.slice(0, half));
+    expect(info.tail).not.toContain(token.slice(half));
+    expect(info.tail).toContain("banner <redacted> trailing");
+    await proc.dispose();
+  });
+
+  test("collectSecretValues covers the wider name suffixes and URL passwords (L4)", () => {
+    const values = collectSecretValues({
+      DB_PASSWORD: "p".repeat(10),
+      SSH_PASSPHRASE: "q".repeat(11),
+      GCP_CREDENTIAL: "c".repeat(12),
+      AWS_CREDENTIALS: "d".repeat(13),
+      SOME_Key: "k".repeat(14),
+      DATABASE_URL: `postgres://app:${"u".repeat(15)}@db.internal:5432/main`,
+      REDIS_DSN: `redis://:${"v".repeat(16)}@cache:6379`,
+      PLAIN_URL: "https://example.com/path",
+      SHORT_PW_URL: "postgres://app:short@db/x",
+      PATH: "/usr/bin:/bin",
+      HOME: "/home/someone",
+    });
+    expect(values).toEqual([
+      "v".repeat(16),
+      "u".repeat(15),
+      "k".repeat(14),
+      "d".repeat(13),
+      "c".repeat(12),
+      "q".repeat(11),
+      "p".repeat(10),
+    ]);
   });
 
   test("'PTY exited before TUI settled' error includes exitCode + tail (#176)", async () => {
@@ -475,28 +635,30 @@ describe("PtyProcess — _waitForReadySettle two-phase (issue #84)", () => {
 
 // Words are separated by CHA cursor moves (`ESC[<n>G`), as the real CLI
 // renders them, so a matcher that only strips escapes sees "Yes,Iaccept".
-const FAKE_BYPASS_DIALOG_CLI = [
-  "printf 'WARNING: Claude\\033[13GCode\\033[18Grunning\\033[26Gin\\033[29GBypass\\033[36GPermissions\\033[48Gmode\\r\\n'",
-  "printf '\\342\\235\\257 No,\\033[7Gexit\\r\\n  Yes,\\033[8GI\\033[10Gaccept\\r\\n\\r\\nEnter to confirm \\302\\267 Esc to cancel\\r\\n'",
-  "IFS= read -r key",
-  'case "$key" in "$(printf "\\033[B")") ;; *) exit 1 ;; esac',
-  "printf 'bypass\\033[8Gpermissions\\033[20Gon\\033[23G(shift+tab\\033[34Gto\\033[37Gcycle)\\r\\n'",
-  "exec cat",
-].join("; ");
+function fakeBypassDialogCli(prompt: string): string {
+  return [
+    "printf 'WARNING: Claude\\033[13GCode\\033[18Grunning\\033[26Gin\\033[29GBypass\\033[36GPermissions\\033[48Gmode\\r\\n'",
+    "printf '\\342\\235\\257 No,\\033[7Gexit\\r\\n  Yes,\\033[8GI\\033[10Gaccept\\r\\n\\r\\nEnter to confirm \\302\\267 Esc to cancel\\r\\n'",
+    "IFS= read -r key",
+    'case "$key" in "$(printf "\\033[B")") ;; *) exit 1 ;; esac',
+    "printf 'bypass\\033[8Gpermissions\\033[20Gon\\033[23G(shift+tab\\033[34Gto\\033[37Gcycle)\\r\\n'",
+    tuiScript(prompt),
+  ].join("; ");
+}
 
 describe("PtyProcess — Bypass Permissions boot dialog (issue #460)", () => {
   test("accepts the dialog during settle so the first turn reaches the REPL", async () => {
     const proc = await spawnPty(
       baseOpts({
         _commandOverride: "/bin/sh",
-        _argsOverride: ["-c", FAKE_BYPASS_DIALOG_CLI],
+        _argsOverride: ["-c", fakeBypassDialogCli("after-dialog")],
         _skipReadySettle: false,
         quietWindowMs: 200,
         sentinelMaxWaitMs: 5000,
       }),
     );
     expect(proc.isAlive()).toBe(true);
-    const result = await proc.runTurn("✻ after-dialog shift+tab to cycle", { timeoutMs: 5000 });
+    const result = await proc.runTurn("after-dialog", { timeoutMs: 5000 });
     expect(proc.isAlive()).toBe(true);
     expect(result.text).toContain("after-dialog");
     await proc.dispose();
@@ -506,11 +668,11 @@ describe("PtyProcess — Bypass Permissions boot dialog (issue #460)", () => {
     // The REPL paints 600ms after the answer — three quiet windows later.
     // Resolving on that gap would hand the first prompt to a TUI that is
     // still switching screens.
-    const slowRepl = FAKE_BYPASS_DIALOG_CLI.replace(
+    const slowRepl = fakeBypassDialogCli("unused").replace(
       "; printf 'bypass",
       "; sleep 0.6; printf 'bypass",
     );
-    expect(slowRepl).not.toBe(FAKE_BYPASS_DIALOG_CLI);
+    expect(slowRepl).not.toBe(fakeBypassDialogCli("unused"));
     const t0 = Date.now();
     const proc = await spawnPty(
       baseOpts({
@@ -549,7 +711,12 @@ describe("PtyProcess — Bypass Permissions boot dialog (issue #460)", () => {
 // Echo stays off until the next screen paints: a prompt typed too early
 // must not come back as the reply.
 
-function fakeMcpDialogCli(dialog: string, gapAfterAnswer = "", beforeRead = ""): string {
+function fakeMcpDialogCli(
+  dialog: string,
+  prompt: string,
+  gapAfterAnswer = "",
+  beforeRead = "",
+): string {
   return [
     // perl, not `date +%s%N`: macOS's date has no %N.
     "now() { perl -MTime::HiRes=time -e 'printf q(%d), time * 1000'; }",
@@ -563,7 +730,7 @@ function fakeMcpDialogCli(dialog: string, gapAfterAnswer = "", beforeRead = ""):
     '[ "$key" = "$(printf "\\033")" ] || exit 1',
     gapAfterAnswer,
     "stty echo",
-    FAKE_BYPASS_DIALOG_CLI,
+    fakeBypassDialogCli(prompt),
   ]
     .filter(Boolean)
     .join("; ");
@@ -588,14 +755,14 @@ describe("PtyProcess — project MCP server approval dialog (issue #469)", () =>
       const proc = await spawnPty(
         baseOpts({
           _commandOverride: "/bin/sh",
-          _argsOverride: ["-c", fakeMcpDialogCli(dialog)],
+          _argsOverride: ["-c", fakeMcpDialogCli(dialog, "after-mcp-dialog")],
           _skipReadySettle: false,
           quietWindowMs: 200,
           sentinelMaxWaitMs: 5000,
         }),
       );
       expect(proc.isAlive()).toBe(true);
-      const result = await proc.runTurn("✻ after-mcp-dialog shift+tab to cycle", {
+      const result = await proc.runTurn("after-mcp-dialog", {
         timeoutMs: 5000,
       });
       expect(proc.isAlive()).toBe(true);
@@ -612,13 +779,13 @@ describe("PtyProcess — project MCP server approval dialog (issue #469)", () =>
     const proc = await spawnPty(
       baseOpts({
         _commandOverride: "/bin/sh",
-        _argsOverride: ["-c", fakeMcpDialogCli(MCP_DIALOG_SINGLE, "", "sleep 0.7")],
+        _argsOverride: ["-c", fakeMcpDialogCli(MCP_DIALOG_SINGLE, "slow-read", "", "sleep 0.7")],
         _skipReadySettle: false,
         quietWindowMs: 200,
         sentinelMaxWaitMs: 5000,
       }),
     );
-    const result = await proc.runTurn("✻ slow-read shift+tab to cycle", { timeoutMs: 5000 });
+    const result = await proc.runTurn("slow-read", { timeoutMs: 5000 });
     expect(proc.isAlive()).toBe(true);
     expect(result.text).toContain("slow-read");
     await proc.dispose();
@@ -630,13 +797,13 @@ describe("PtyProcess — project MCP server approval dialog (issue #469)", () =>
     const proc = await spawnPty(
       baseOpts({
         _commandOverride: "/bin/sh",
-        _argsOverride: ["-c", fakeMcpDialogCli(MCP_DIALOG_SINGLE, "sleep 0.6")],
+        _argsOverride: ["-c", fakeMcpDialogCli(MCP_DIALOG_SINGLE, "slow-next-screen", "sleep 0.6")],
         _skipReadySettle: false,
         quietWindowMs: 200,
         sentinelMaxWaitMs: 5000,
       }),
     );
-    const result = await proc.runTurn("✻ slow-next-screen shift+tab to cycle", {
+    const result = await proc.runTurn("slow-next-screen", {
       timeoutMs: 5000,
     });
     expect(proc.isAlive()).toBe(true);
@@ -651,7 +818,7 @@ describe("PtyProcess — project MCP server approval dialog (issue #469)", () =>
     // the first prompt lands in the bypass dialog.
     const lateDialog =
       "i=0; while [ $i -lt 25 ]; do printf .; sleep 0.1; i=$((i+1)); done; " +
-      fakeMcpDialogCli(MCP_DIALOG_SINGLE, "sleep 1");
+      fakeMcpDialogCli(MCP_DIALOG_SINGLE, "late-dialog", "sleep 1");
     const proc = await spawnPty(
       baseOpts({
         _commandOverride: "/bin/sh",
@@ -661,7 +828,7 @@ describe("PtyProcess — project MCP server approval dialog (issue #469)", () =>
         sentinelMaxWaitMs: 5000,
       }),
     );
-    const result = await proc.runTurn("✻ late-dialog shift+tab to cycle", { timeoutMs: 5000 });
+    const result = await proc.runTurn("late-dialog", { timeoutMs: 5000 });
     expect(proc.isAlive()).toBe(true);
     expect(result.text).toContain("late-dialog");
     await proc.dispose();
@@ -719,149 +886,50 @@ describe("PtyProcess — project MCP server approval dialog (issue #469)", () =>
 // the echo the parser scans for. Each test below proves a specific aspect of
 // the new flow without invoking real claude.
 
-describe("PtyProcess — runTurn sentinel-echo (clean boundary)", () => {
-  // NOTE: prompts include `✻` (U+273B, a claude spinner glyph)
-  // because the parser's activity-indicator gate (added in
-  // fix/pty-premature-sentinel) refuses to fire `quiet` until a
-  // spinner glyph has been seen. Marker glyphs (`●`/`⏺`) were dropped
-  // from the gate per Codex P1 on PR #124 — they appear in the TUI
-  // status-box row and in resumed scrollback. Real claude emits
-  // spinners while generating; `/bin/cat` doesn't, so we slip one
-  // into the prompt and let cat echo it back to satisfy the gate.
-  // The prompts ALSO carry the idle REPL footer "to cycle" (issue #316):
-  // the parser only treats quiet as turn-completion once claude has returned
-  // to the idle prompt. `/bin/cat` echoes it back, standing in for the footer
-  // real claude paints when a turn finishes.
-
-  test("cat echoes the sentinel back → cleanBoundary=true", async () => {
+describe("PtyProcess — runTurn resolves on the transcript", () => {
+  // The fake TUI records the user and assistant entries itself (`tuiScript`) and paints
+  // its own chrome; the prompts carry none of it, so none of these turns can be
+  // "accepted" by the echo of the prompt (#562 round 2, finding 6).
+  async function turnOn(
+    prompt: string,
+    over: Partial<PtyProcessOptions> = {},
+    onChunk?: (s: string) => void,
+  ) {
     const proc = await spawnPty(
       baseOpts({
-        _commandOverride: "/bin/cat",
-        _argsOverride: [],
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", tuiScript(prompt)],
         quietWindowMs: 100,
-        sentinelMaxWaitMs: 5000,
+        ...over,
       }),
     );
-    const result = await proc.runTurn("✻ hello world shift+tab to cycle", { timeoutMs: 5000 });
+    try {
+      const result = await proc.runTurn(prompt, { timeoutMs: 5000, onChunk });
+      return { result, ended: proc.lastTurnEndedAt() };
+    } finally {
+      await proc.dispose();
+    }
+  }
+
+  test("a turn the transcript shows complete resolves with the transcript's answer", async () => {
+    const { result, ended } = await turnOn("hello world");
     expect(result.cleanBoundary).toBe(true);
-    // cat echoes the prompt; the response should contain it.
-    expect(result.text.toLowerCase()).toContain("hello world");
-    expect(result.bytesCaptured).toBeGreaterThan(0);
-    expect(proc.lastTurnEndedAt()).toBeGreaterThan(0);
-    await proc.dispose();
+    expect(result.text).toBe("hello world");
+    expect(result.bytesCaptured).toBe(Buffer.byteLength("hello world"));
+    expect(ended).toBeGreaterThan(0);
   });
 
   test("long prompts are captured in full", async () => {
-    const proc = await spawnPty(
-      baseOpts({
-        _commandOverride: "/bin/cat",
-        _argsOverride: [],
-        quietWindowMs: 100,
-        sentinelMaxWaitMs: 5000,
-      }),
-    );
-    const longPrompt = `✻ ${"x".repeat(500)} shift+tab to cycle`;
-    const result = await proc.runTurn(longPrompt, { timeoutMs: 5000 });
-    expect(result.cleanBoundary).toBe(true);
-    expect(result.text).toContain("x".repeat(20));
-    await proc.dispose();
+    const longPrompt = "x".repeat(500);
+    const { result } = await turnOn(longPrompt);
+    expect(result.text).toBe(longPrompt);
   });
 
-  test("onChunk fires for streaming deltas", async () => {
-    const proc = await spawnPty(
-      baseOpts({
-        _commandOverride: "/bin/cat",
-        _argsOverride: [],
-        quietWindowMs: 100,
-        sentinelMaxWaitMs: 5000,
-      }),
-    );
-    let chunkBytes = 0;
-    const result = await proc.runTurn("✻ streaming-test-payload shift+tab to cycle", {
-      timeoutMs: 5000,
-      onChunk: (s) => {
-        chunkBytes += s.length;
-      },
-    });
-    expect(result.cleanBoundary).toBe(true);
-    expect(chunkBytes).toBeGreaterThan(0);
-    await proc.dispose();
-  });
-});
-
-describe("PtyProcess — runTurn sentinel max-wait fallback", () => {
-  test("when the echo never comes, completes with cleanBoundary=false", async () => {
-    // We need a PTY target that produces output but does NOT echo our writes
-    // back. Pure `sleep` does this — emits nothing, ignores stdin entirely.
-    // The parser stays in `accumulating` (no bytes ever arrive), the quiet
-    // timer fires, the supervisor writes the sentinel, but `sleep` never
-    // echoes it. sentinelMaxWaitMs elapses → cleanBoundary=false.
-    //
-    // The PTY's kernel cooked-mode echo would still echo our writes, so we
-    // disable it via `stty -echo` first.
-    // `\xe2\x9c\xbb` = `✻` (U+273B) — one of claude's spinner glyphs,
-    // the only signal the parser's activity-indicator gate accepts
-    // (Codex P1 on PR #124 — markers were dropped from the gate
-    // because they appear in TUI status-box rows + scrollback). Without
-    // it, quiet would never fire and the test would time out at the
-    // hard timeoutMs instead of exercising the sentinel-max-wait path.
-    const proc = await spawnPty(
-      baseOpts({
-        _commandOverride: "/bin/sh",
-        // #304: two reasons this used to time out. The output must arrive
-        // DURING the turn — the parser's quiet gate ignores bytes seen before
-        // `runTurn` (#87) — so the shell waits for our prompt line (`read`)
-        // before painting. And `/bin/sh` is dash on Debian/Ubuntu (CI too),
-        // whose `printf` has no `\xHH` escapes — the spinner glyph the
-        // activity gate looks for never appeared; octal is portable.
-        _argsOverride: [
-          "-c",
-          "stty -echo; read _; printf '\\342\\234\\273 shift+tab to cycle'; sleep 5",
-        ],
-        quietWindowMs: 50,
-        sentinelMaxWaitMs: 250,
-      }),
-    );
-    const result = await proc.runTurn("anything", { timeoutMs: 5000 });
-    expect(result.cleanBoundary).toBe(false);
-    await proc.dispose();
-  });
-
-  // Codex PR #82 P1 regression — when the sentinel max-wait expires, the
-  // fallback must use the ABSOLUTE end-of-stream offset, not the relative
-  // buffer length. Pre-fix, `_completeTurn` was passed `_turnBufLen`
-  // (relative); paired with the slice math that subtracts
-  // `parser.totalBytes - allBytes.length`, any pre-turn bytes (like
-  // claude's startup banner) would push `responseEndOffset` below
-  // `sliceStart` and the response would clamp to empty. Production
-  // symptom: `(empty response)` on every sentinel-echo failure.
-  test("sentinel-timeout fallback returns captured bytes even after pre-turn banner", async () => {
-    // BANNER emits BEFORE we send our prompt — advances parser.totalBytes
-    // without contributing to the turn buffer (turn hasn't started). Then
-    // stty -echo disables kernel cooked-mode echo (so our prompt + sentinel
-    // writes don't trivially come back). `printf 'response-bytes'` emits
-    // bytes that the parser accumulates AFTER the turn starts. Then sleep
-    // burns time until sentinelMaxWaitMs fires.
-    // `\xe2\x9c\xbb` = `✻` (U+273B) — spinner glyph the parser's
-    // activity-indicator gate scans for. Markers (`●`/`⏺`) were
-    // dropped from the gate per Codex P1 on PR #124.
-    const proc = await spawnPty(
-      baseOpts({
-        _commandOverride: "/bin/sh",
-        _argsOverride: [
-          "-c",
-          "echo BANNER_BANNER_BANNER_PRETURN; stty -echo; read _; printf '\\342\\234\\273 response-bytes-during-turn shift+tab to cycle'; sleep 5",
-        ],
-        quietWindowMs: 100,
-        sentinelMaxWaitMs: 400,
-      }),
-    );
-    const result = await proc.runTurn("trigger", { timeoutMs: 5000 });
-    expect(result.cleanBoundary).toBe(false);
-    // Without the absolute-offset fix, result.text would be empty (slice
-    // clamped to zero). With the fix, the captured bytes survive.
-    expect(result.text).toContain("response-bytes-during-turn");
-    await proc.dispose();
+  test("onChunk streams the assistant text", async () => {
+    const chunks: string[] = [];
+    const { result } = await turnOn("streaming-test-payload", {}, (s) => chunks.push(s));
+    expect(result.text).toBe("streaming-test-payload");
+    expect(chunks.join("")).toBe("streaming-test-payload");
   });
 });
 
@@ -891,47 +959,23 @@ describe("PtyProcess — runTurn hard timeout", () => {
   });
 });
 
-// ─── runTurn: sentinel UUID override (test-hook contract) ───────────────────
-
-describe("PtyProcess — sentinel UUID override hook", () => {
-  test("_sentinelUuidOverride pins the sentinel string written into the PTY", async () => {
-    // cat echoes the sentinel back; we don't observe the wire bytes here,
-    // but we DO observe that runTurn completes cleanly, proving the override
-    // produced a valid sentinel the parser found.
-    const proc = await spawnPty(
-      baseOpts({
-        _commandOverride: "/bin/cat",
-        _argsOverride: [],
-        quietWindowMs: 100,
-        sentinelMaxWaitMs: 5000,
-        _sentinelUuidOverride: () => "pinned-uuid-1234",
-      }),
-    );
-    const result = await proc.runTurn("✻ hi shift+tab to cycle", { timeoutMs: 5000 });
-    expect(result.cleanBoundary).toBe(true);
-    await proc.dispose();
-  });
-});
-
 // ─── runTurn: concurrency guard ─────────────────────────────────────────────
 
 describe("PtyProcess — concurrency", () => {
   test("concurrent runTurn rejects the second call", async () => {
     const proc = await spawnPty(
       baseOpts({
-        _commandOverride: "/bin/cat",
-        _argsOverride: [],
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", tuiScript("first")],
         turnIdleTimeoutMs: 300,
       }),
     );
-    // `✻` so cat's echo trips the activity-indicator gate (spinner-only
-    // per Codex P1 on PR #124); without it the first turn never
-    // completes and the test times out instead of exercising the
-    // concurrency rejection.
-    const t1 = proc.runTurn("✻ first shift+tab to cycle", { timeoutMs: 5000 });
+    const t1 = proc.runTurn("first", {
+      timeoutMs: 5000,
+    });
     let err: unknown;
     try {
-      await proc.runTurn("✻ second", { timeoutMs: 5000 });
+      await proc.runTurn("second", { timeoutMs: 5000 });
     } catch (e) {
       err = e;
     }
@@ -1180,6 +1224,12 @@ describe("sanitizePtyPromptText (issue #65 item 3)", () => {
     expect(sanitizePtyPromptText("")).toBe("");
   });
 
+  test("strips C1 controls U+0080 to U+009F, which some terminals read as escape sequences", () => {
+    expect(sanitizePtyPromptText("a\u009bb\u0080c\u009fd\u0085e")).toBe("abcde");
+    // Printable Latin-1 just above the C1 range survives.
+    expect(sanitizePtyPromptText("caf\u00e9 \u00a0x")).toBe("caf\u00e9 \u00a0x");
+  });
+
   test("strips NUL bytes that would truncate the C-string PTY write", () => {
     expect(sanitizePtyPromptText("hello\x00world")).toBe("helloworld");
   });
@@ -1194,6 +1244,83 @@ describe("sanitizePtyPromptText (issue #65 item 3)", () => {
 
   test("preserves printable Unicode and multi-byte UTF-8", () => {
     expect(sanitizePtyPromptText("héllo 🪶 wörld")).toBe("héllo 🪶 wörld");
+  });
+});
+
+// ─── What reaches the child: neutralize AFTER sanitize (#562 security re-review) ─────────────
+
+/** Bytes the child process actually receives for `prompt`, via a real PTY writing to a file. */
+async function wireFor(prompt: string, allowReplCommand?: boolean): Promise<string> {
+  const dir = mkdtempSync(join(tmpdir(), "pty-wire-"));
+  const file = join(dir, "wire.bin");
+  try {
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", `cat > '${file}'`],
+      }),
+    );
+    // The turn never completes (cat prints no sentinel); we only want the write.
+    await proc
+      .runTurn(prompt, { timeoutMs: 350, ...(allowReplCommand ? { allowReplCommand } : {}) })
+      .catch(() => {});
+    await new Promise<void>((r) => setTimeout(r, 100));
+    await proc.dispose();
+    return readFileSync(file, "latin1");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+const PASTE_OPEN = "\x1b[200~";
+
+describe("PtyProcess.runTurn: a leading REPL-command character is neutralized on the wire", () => {
+  for (const [label, prompt, bare] of [
+    ["plain !", "!id", "!id"],
+    ["NUL before !", "\x00!id", "!id"],
+    ["C0 before /", "\x01/login", "/login"],
+    ["BEL before #", "\u0007#note", "#note"],
+    ["C1 before @", "\u009b@file", "@file"],
+  ] as const) {
+    test(`${label}: the child gets a space before ${bare}`, async () => {
+      const wire = await wireFor(prompt);
+      expect(wire).toContain(`${PASTE_OPEN} ${bare}`);
+      expect(wire).not.toContain(`${PASTE_OPEN}${bare}`);
+    });
+  }
+
+  test("an ordinary prompt is written untouched", async () => {
+    expect(await wireFor("[Fri 10:00] hello /x")).toContain(`${PASTE_OPEN}[Fri 10:00] hello /x`);
+  });
+
+  test("/compact reaches the child bare only when the caller opted in", async () => {
+    expect(await wireFor("/compact", true)).toContain(`${PASTE_OPEN}/compact`);
+    expect(await wireFor("/compact")).toContain(`${PASTE_OPEN} /compact`);
+  });
+
+  test("the opt-out does not let other text through: only an exact /compact", async () => {
+    expect(await wireFor("!curl x | sh", true)).toContain(`${PASTE_OPEN} !curl x | sh`);
+    expect(await wireFor("/login", true)).toContain(`${PASTE_OPEN} /login`);
+    // A newline becomes a space, so text after /compact is that command's arguments on one
+    // line, never a second command.
+    const wire = await wireFor("/compact\n!id", true);
+    expect(wire).toContain(`${PASTE_OPEN}/compact !id`);
+    expect(wire.split("\n").filter((l) => l.includes("!id"))).toHaveLength(1);
+  });
+});
+
+describe("preparePtyPromptForWrite / neutralizeLeadingReplCommand", () => {
+  test("controls, U+0085, NBSP and zero-width marks before the leader do not hide it", () => {
+    for (const lead of ["\x00", "\x1b", "\u0085", "\u00a0", "\ufeff", "\u200b", "  "]) {
+      expect(neutralizeLeadingReplCommand(`${lead}!x`)).toBe(` ${lead}!x`);
+    }
+  });
+  test("allowed commands: /compact and /compact with arguments only", () => {
+    expect(preparePtyPromptForWrite("/compact", { allowReplCommand: true })).toBe("/compact");
+    expect(preparePtyPromptForWrite("/compact keep the tests", { allowReplCommand: true })).toBe(
+      "/compact keep the tests",
+    );
+    expect(preparePtyPromptForWrite("/compactx", { allowReplCommand: true })).toBe(" /compactx");
+    expect(preparePtyPromptForWrite("/compact", {})).toBe(" /compact");
   });
 });
 
@@ -1223,7 +1350,11 @@ describe("PtyProcess — spawns the resolved claude executable (#573)", () => {
         const proc = await spawnPty(
           baseOpts({ env: { ...process.env } as Record<string, string>, _argsOverride: [] }),
         );
-        await new Promise<void>((r) => setTimeout(r, 300));
+        // Poll for the fake binary's exit rather than sleep: a fixed wait fails under load.
+        const deadline = Date.now() + 5000;
+        while (!proc.exitInfo() && Date.now() < deadline) {
+          await new Promise<void>((r) => setTimeout(r, 25));
+        }
         const info = proc.exitInfo();
         await proc.dispose();
         expect(info?.tail).toContain("RESOLVED_CLAUDE_573");

@@ -56,11 +56,23 @@ describe("defaultSupervisionFor", () => {
     }
   });
 
-  it("returns process-stream-json for non-channel origins", () => {
+  it("returns pty-stdin for non-channel origins", () => {
     const nonChannel: BusOrigin[] = ["cron", "heartbeat", "cli", "rest"];
     for (const origin of nonChannel) {
-      expect(defaultSupervisionFor(origin)).toBe("process-stream-json");
+      expect(defaultSupervisionFor(origin)).toBe("pty-stdin");
     }
+  });
+
+  it("win32: non-channel origins keep their pre-#550 process-stream-json (no evidence the PTY path runs there)", () => {
+    for (const origin of ["cron", "heartbeat", "cli", "rest"] as BusOrigin[]) {
+      expect(defaultSupervisionFor(origin, "win32")).toBe("process-stream-json");
+    }
+    // channel origins were already pty-stdin before #550, and need the REPL
+    for (const origin of ["discord", "telegram", "slack", "webui"] as BusOrigin[]) {
+      expect(defaultSupervisionFor(origin, "win32")).toBe("pty-stdin");
+    }
+    expect(defaultSupervisionFor("cron", "linux")).toBe("pty-stdin");
+    expect(defaultSupervisionFor("cron", "darwin")).toBe("pty-stdin");
   });
 });
 
@@ -203,6 +215,12 @@ describe("pty-stdin supervision", () => {
     expect(proc.supervision).toBe("pty-stdin");
     expect(proc.pid).toBeGreaterThan(0);
   });
+  it("spawnAgent selects PTY for cron without declared supervision", async () => {
+    const proc = await mgr.spawnAgent(mkAgent({ id: "cron-default" }), "cron");
+    spawned.push(proc);
+    expect(proc.supervision).toBe("pty-stdin");
+    expect(proc.pid).toBeGreaterThan(0);
+  });
 
   it("propagates CCAW_AGENT_ID and CCAW_BUS_SOCK via the env", async () => {
     // We can't introspect a foreign process's env directly, but we can
@@ -302,8 +320,8 @@ describe("process-stream-json supervision", () => {
     spawned.length = 0;
   });
 
-  it("defaults to process-stream-json for cron origin", async () => {
-    const agent = mkAgent({ id: "psj-default" });
+  it("keeps explicit process-stream-json for cron origin", async () => {
+    const agent = mkAgent({ id: "psj-default", supervision: "process-stream-json" });
     const proc = await mgr.spawnAgent(agent, "cron");
     spawned.push(proc);
     expect(proc.supervision).toBe("process-stream-json");
@@ -319,7 +337,7 @@ describe("process-stream-json supervision", () => {
       .map((l) => JSON.parse(l) as { type: string; message: { role: string; content: string } });
 
   it("send_prompt_stream writes the prompt as one stream-json user message", async () => {
-    const agent = mkAgent({ id: "psj-stream" });
+    const agent = mkAgent({ id: "psj-stream", supervision: "process-stream-json" });
     const proc = await mgr.spawnAgent(agent, "cron");
     spawned.push(proc);
     let captured = "";
@@ -343,7 +361,10 @@ describe("process-stream-json supervision", () => {
       bus,
     });
     bus.setStreamPromptHandler(createPromptStreamHandler((id) => busMgr.getAgent(id)));
-    const proc = await busMgr.spawnAgent(mkAgent({ id: "psj-bus" }), "cron");
+    const proc = await busMgr.spawnAgent(
+      mkAgent({ id: "psj-bus", supervision: "process-stream-json" }),
+      "cron",
+    );
     try {
       let captured = "";
       proc.onData((chunk) => {
@@ -370,7 +391,7 @@ describe("process-stream-json supervision", () => {
   });
 
   it("slash commands are written to stdin (Probe 0.6 Q5)", async () => {
-    const agent = mkAgent({ id: "psj-slash" });
+    const agent = mkAgent({ id: "psj-slash", supervision: "process-stream-json" });
     const proc = await mgr.spawnAgent(agent, "cron");
     spawned.push(proc);
     let captured = "";
@@ -386,7 +407,7 @@ describe("process-stream-json supervision", () => {
 
   it("stop() ends the agent through /quit, not the 2 s SIGTERM fallback", async () => {
     // `-p` refuses "/quit" and keeps running; /bin/cat, like the CLI, exits on EOF.
-    const agent = mkAgent({ id: "psj-quit" });
+    const agent = mkAgent({ id: "psj-quit", supervision: "process-stream-json" });
     const proc = await mgr.spawnAgent(agent, "cron");
     spawned.push(proc);
     let exitCode: number | undefined;
@@ -409,7 +430,7 @@ describe("process-stream-json supervision", () => {
       argsOverride: ["-c", "read x; /usr/bin/env"],
       busSocketPath: "/tmp/test-bus-env.sock",
     });
-    const agent = mkAgent({ id: "psj-env-prop" });
+    const agent = mkAgent({ id: "psj-env-prop", supervision: "process-stream-json" });
     const proc = await localMgr.spawnAgent(agent, "cron");
     let captured = "";
     proc.onData((chunk) => {
@@ -423,7 +444,7 @@ describe("process-stream-json supervision", () => {
   });
 
   it("stop() emits onExit AFTER process exit, not before (Spike 0.5)", async () => {
-    const agent = mkAgent({ id: "psj-stop-order" });
+    const agent = mkAgent({ id: "psj-stop-order", supervision: "process-stream-json" });
     const proc = await mgr.spawnAgent(agent, "cron");
     spawned.push(proc);
 
@@ -1350,7 +1371,12 @@ describe("spawns the resolved claude executable (#573)", () => {
     ["process-stream-json", "cron"],
   ] as const) {
     it(`${mode} spawns claudeExecutable() when no commandOverride is given`, async () => {
-      const proc = await mgr.spawnAgent(mkAgent({ id: `exe-573-${origin}` }), origin);
+      // Declared, not defaulted: PTY is the default for every origin here, so cron would
+      // otherwise land on pty-stdin and never reach the process-stream-json spawn.
+      const proc = await mgr.spawnAgent(
+        mkAgent({ id: `exe-573-${origin}`, supervision: mode }),
+        origin,
+      );
       spawned.push(proc);
       expect(proc.supervision).toBe(mode);
       let received = "";

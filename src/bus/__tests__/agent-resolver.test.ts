@@ -100,6 +100,14 @@ describe("resolveBusAgentConfig — defaults", () => {
     expect(out.supervision).toBe("tmux");
   });
 
+  it("keeps the explicit process-stream-json opt-out", async () => {
+    const out = await resolveBusAgentConfig(
+      { id: "reporter", supervision: "process-stream-json" },
+      { resolveSessionId: async () => "fixed" },
+    );
+    expect(out.supervision).toBe("process-stream-json");
+  });
+
   it("forwards explicit permission_mode override", async () => {
     const out = await resolveBusAgentConfig(
       { id: "triage", permission_mode: "bypassPermissions" },

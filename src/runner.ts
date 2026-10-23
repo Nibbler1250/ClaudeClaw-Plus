@@ -77,12 +77,23 @@ import {
   killAllPtys,
   supervisorEntryCount,
   retirePtySession,
+  liveSessionKeys,
   type PtySessionStore,
+  type PtyUnsafeReplayKind,
   runEphemeralWithDeadline,
 } from "./runner/pty-supervisor";
+import {
+  assertSessionSpawnable,
+  assertSessionWritable,
+  PtyQuarantinedError,
+} from "./runner/pty-quarantine";
 import { encodeCwdForProjectsDir } from "./bus/jsonl-line-types";
 import { PTY_OUTPUT_FORMAT_CONSTRAINT } from "./runner/pty-output-format";
 import { SPAWN_ENV_STRIP_KEYS, cleanSpawnEnv, shouldStripSpawnEnvKey } from "./runner/spawn-env";
+import {
+  endsInRenderedSignatureError,
+  signatureErrorWarrantsReset,
+} from "./runner/signature-error";
 import {
   CLAUDE_EXECUTABLE,
   _setClaudeExecutableForTests,
@@ -153,7 +164,11 @@ export async function probeClaudeCliVersion(): Promise<{ version: string | null;
 /**
  * Compact configuration.
  * COMPACT_WARN_THRESHOLD: notify user that context is getting large.
- * COMPACT_TIMEOUT_ENABLED: whether to auto-compact on timeout (exit 124).
+ * COMPACT_TIMEOUT_ENABLED: whether to auto-compact on timeout (exit 124). This applies
+ * to the print (`claude -p`) path only. A PTY turn timeout is also exit 124 (so the
+ * watchdog and the timeout messages see it), and the supervisor retires the PTY, but the
+ * runner neither compacts nor re-runs it: it is usually a turn-detection miss on a
+ * healthy session, and the interactive REPL compacts its own context.
  */
 const COMPACT_WARN_THRESHOLD = 25;
 const COMPACT_TIMEOUT_ENABLED = true;
@@ -360,11 +375,19 @@ export interface RunResult {
    */
   sessionId?: string;
   /**
-   * #546: set when the response came from the rate-limit fallback. The
-   * fallback turn runs without onChunk, so a caller that streamed the
-   * primary's output must still deliver this stdout.
+   * #546: set when the response came from the rate-limit fallback. Primary
+   * text may only be a rate-limit notice; fallback delivery is tracked separately.
    */
   usedFallback?: true;
+  /** Whether the final fallback attempt delivered nonempty text via onChunk. */
+  fallbackStreamedText?: boolean;
+  /**
+   * #562: set only when a PTY turn failed with an unknown outcome (no turn boundary,
+   * ambiguous attribution, timeout): it may have completed and done its side effects, so a
+   * caller must not replay it. Absent on a success, on a definite failure and on every
+   * non-PTY engine, which keep their old behaviour.
+   */
+  failureKind?: PtyUnsafeReplayKind;
 }
 
 export interface AgentStreamEvent {
@@ -376,7 +399,10 @@ export interface AgentStreamEvent {
 
 const RATE_LIMIT_PATTERN = /you(?:'|')ve hit your limit|out of extra usage/i;
 const RATE_LIMIT_RESET_PATTERN = /resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*\(?\s*UTC\s*\)?/i;
-const SIGNATURE_ERROR = /Invalid.*signature.*thinking block/i;
+// Signature-error detection lives in `./runner/signature-error`: bounded, linear matching
+// of attacker-influenced text, and a transcript check before a PTY-rendered error resets a
+// session (#562 security review).
+export { endsInRenderedSignatureError };
 
 // Claude Code prints this when --resume references a session it no longer
 // has on disk (cleared, expired, compacted away, or moved to another machine).
@@ -707,15 +733,17 @@ export interface RunOptions {
  * Which engine runs an agent turn (#546). The single decision the agent-turn
  * call sites go through — primary turn, rate-limit fallback, dashboard chat,
  * fork, agent job — so a new call site cannot quietly skip `pty.enabled`.
- * The recovery retries (stale session, corrupted primary session, post-compact)
- * stay on `claude -p` by SPEC §5.3 and do not consult it.
+ * Bootstrap and recovery retries also follow this setting (#550).
  *
- *   - `name === "bootstrap"` → legacy `claude -p` (SPEC §7.1).
  *   - `settings.pty.enabled === false` → legacy `claude -p` (SPEC §5.2).
  *   - otherwise → the PTY supervisor.
+ *
+ * `pty.enabled` defaults to true except on win32, where it defaults to false: nothing
+ * in the codebase shows the PTY path working there (`claude` is a `.cmd` wrapper,
+ * spec §5.3 names `process` as the Windows fallback). An explicit `pty.enabled: true`
+ * still opts in. See `defaultPtyEnabled` in `src/config.ts`.
  */
 export function resolveAgentTurnRoute(name?: string): "legacy" | "pty" {
-  if (name === "bootstrap") return "legacy";
   return getSettings().pty.enabled ? "pty" : "legacy";
 }
 
@@ -733,10 +761,38 @@ let _claudeSpawnForTests: ClaudeSpawn | null = null;
 export function _setClaudeSpawnForTests(fn: ClaudeSpawn | null): void {
   _claudeSpawnForTests = fn;
 }
-function spawnClaude(
+/**
+ * #562 round 8: a legacy `claude -p --resume <id>` passes the same gate as every other start
+ * on a session. A transcript whose previous process the OS has not confirmed gone is not
+ * resumed beside it.
+ */
+async function gateResume(args: string[]): Promise<void> {
+  const id = resumeIdOf(args);
+  if (id) await assertSessionWritable({ sessionId: id });
+}
+
+function resumeIdOf(args: string[]): string | undefined {
+  const i = args.indexOf("--resume");
+  return i >= 0 ? args[i + 1] : undefined;
+}
+
+/**
+ * #562 round 9: the synchronous final word, run on the line before the process is created.
+ * `gateResume` is async, so a retirement that fails after it passed would quarantine a session
+ * the spawn then goes ahead on.
+ */
+function assertResumeSpawnable(args: string[]): void {
+  const id = resumeIdOf(args);
+  if (id) assertSessionSpawnable({ sessionId: id });
+}
+
+async function spawnClaude(
   args: string[],
   opts: { env: Record<string, string>; cwd?: string },
-): ClaudeProc {
+): Promise<ClaudeProc> {
+  await gateResume(args);
+  // Synchronous check; no await between it and the spawn below (#562 round 9).
+  assertResumeSpawnable(args);
   if (_claudeSpawnForTests) return _claudeSpawnForTests(args, opts);
   return Bun.spawn(args, {
     stdin: "ignore",
@@ -745,6 +801,21 @@ function spawnClaude(
     env: opts.env,
     ...(opts.cwd ? { cwd: opts.cwd } : {}),
   });
+}
+
+/**
+ * #562 connector P1: `pty.enabled` can flip to false while a PTY still owns a session key, and
+ * the next turn then resumes that session on print. Two processes would write one transcript
+ * (or the CLI refuses with "Session ID ... is already in use"). Retire the live PTY on each of
+ * `keys` BEFORE the legacy spawn. `retirePtySession` applies the round 8/9 fence and rejects
+ * with `PtyQuarantinedError` when the exit is unconfirmed, so the turn fails instead of
+ * resuming beside a process that may still be writing. A print-only install has no live key
+ * and pays one empty-array check.
+ */
+async function retireLivePtysBeforePrint(keys: string[]): Promise<void> {
+  const live = liveSessionKeys();
+  if (live.length === 0) return;
+  for (const key of keys) if (live.includes(key)) await retirePtySession(key);
 }
 
 /** A one-shot agent turn on its own PTY (#546); see `runEphemeralWithDeadline`. */
@@ -778,7 +849,7 @@ export async function runClaudeOnce(
   if (model.trim() && normalizedModel !== "glm" && normalizedModel !== "kimi-k2p6")
     args.push("--model", model.trim());
 
-  const proc = spawnClaude(args, { env: buildChildEnv(baseEnv, model, api), cwd });
+  const proc = await spawnClaude(args, { env: buildChildEnv(baseEnv, model, api), cwd });
 
   mainActiveProcs.add(proc);
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -860,7 +931,7 @@ export function buildAgentJobArgs(input: {
 
 /**
  * Run a named agent as a one-shot headless job (for the bus AgentJobRunner). Loads
- * the agent's persona (IDENTITY/SOUL/CLAUDE.md), runs `claude -p <prompt>` in the
+ * the agent's persona (IDENTITY/SOUL/CLAUDE.md), runs on the configured engine in the
  * agent's dir with plain-text output, and returns the final text. Honours the
  * AbortSignal (cancel → kill) and the timeout via `runClaudeOnce`. This is the
  * supported replacement for the hand-rolled `/tmp` fire-scripts that caused #295.
@@ -960,7 +1031,7 @@ async function runClaudeStream(
   const normalizedModel = model.trim().toLowerCase();
   if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
 
-  const proc = spawnClaude(args, { env: buildChildEnv(baseEnv, model, api), cwd });
+  const proc = await spawnClaude(args, { env: buildChildEnv(baseEnv, model, api), cwd });
 
   mainActiveProcs.add(proc);
   let sessionId: string | undefined;
@@ -1138,6 +1209,9 @@ async function runClaudeStreaming(
   const normalizedModel = model.trim().toLowerCase();
   if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
 
+  await gateResume(args);
+  // Synchronous check; no await between it and the spawn below (#562 round 9).
+  assertResumeSpawnable(args);
   const proc = Bun.spawn(args, {
     stdout: "pipe",
     stderr: "pipe",
@@ -1709,9 +1783,21 @@ export interface PrimaryExecCall {
   timeoutMs: number;
   route: "legacy" | "pty";
 }
-type PrimaryExec = (
-  call: PrimaryExecCall,
-) => Promise<{ rawStdout: string; stderr: string; exitCode: number; sessionId?: string }>;
+type PrimaryExec = (call: PrimaryExecCall) => Promise<{
+  rawStdout: string;
+  stderr: string;
+  exitCode: number;
+  sessionId?: string;
+  failureKind?: PtyUnsafeReplayKind;
+}>;
+/** What one exec (print or PTY) hands back; `failureKind` is set only by the PTY path. */
+type ExecOutcome = {
+  rawStdout: string;
+  stderr: string;
+  exitCode: number;
+  sessionId?: string;
+  failureKind?: PtyUnsafeReplayKind;
+};
 let _primaryExecForTests: PrimaryExec | null = null;
 export function _setPrimaryExecForTests(fn: PrimaryExec | null): void {
   _primaryExecForTests = fn;
@@ -1967,19 +2053,9 @@ async function execClaude(
     } catch {}
 
     // ──────────────────────────────────────────────────────────────────────────
-    // PTY routing decision (SPEC §5.2 + §7.1).
-    //
-    // Order of precedence:
-    //   1. `name === "bootstrap"` → ALWAYS legacy `runClaudeStream` (§7.1).
-    //      The bootstrap call seeds a fresh global session and is low-volume;
-    //      keeping it on the legacy path simplifies the supervisor.
-    //   2. `settings.pty.enabled === false` → legacy `runClaudeStream` (§5.2).
-    //   3. Otherwise → `runOnPty(sessionKey, …)` against the supervisor.
-    //
-    // Downstream logic (rate-limit fallback, corruption recovery, stale-session
-    // recovery) is unchanged — it consumes `exec` with the same shape regardless.
-    // Per §5.3 the stale-session retry path explicitly uses runClaudeStream
-    // directly, so we don't compound supervisor recovery with downstream recovery.
+    // #550: every agent turn, including bootstrap and recovery, follows the
+    // configured engine. Recovery retires the old PTY before retrying so a
+    // reset store or compacted transcript is actually loaded by a fresh CLI.
     const useLegacyPath = resolveAgentTurnRoute(name) === "legacy";
     const ptySessionKey = threadId
       ? `thread:${threadId}`
@@ -1987,7 +2063,13 @@ async function execClaude(
         ? `agent:${agentName}`
         : "global";
     const appendSystemPrompt = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
-    let exec: { rawStdout: string; stderr: string; exitCode: number; sessionId?: string };
+    // A flip to print leaves the PTY of this turn's key alive; retire it before the primary
+    // legacy spawn can resume its session. The fallback key is retired only where the
+    // fallback is about to run (below): a quarantined fallback must not fail a healthy primary.
+    if (useLegacyPath) {
+      await retireLivePtysBeforePrint([ptySessionKey]);
+    }
+    let exec: ExecOutcome;
     if (_primaryExecForTests) {
       exec = await _primaryExecForTests({
         name,
@@ -2025,6 +2107,7 @@ async function execClaude(
       // Kimi configuration silently drop on the PTY path.
       exec = await runOnPty(ptySessionKey, prompt, {
         timeoutMs,
+        retry: name !== "bootstrap",
         threadId,
         agentName,
         modelOverride: primaryConfig.model || (modelOverride ?? undefined),
@@ -2035,13 +2118,62 @@ async function execClaude(
         onToolEvent,
       });
     }
+    let fallbackStreamedText = false;
+    const onFallbackChunk = onChunk
+      ? (text: string) => {
+          if (text.length > 0) fallbackStreamedText = true;
+          onChunk(text);
+        }
+      : undefined;
+    const execRecovery = async (
+      legacyArgs: string[],
+      config: ModelConfig,
+      fallback = false,
+    ): Promise<ExecOutcome> => {
+      if (useLegacyPath) {
+        return runClaudeStream(legacyArgs, config.model, config.api, baseEnv, timeoutMs, spawnCwd);
+      }
+      const key = fallback ? `fallback:${ptySessionKey}` : ptySessionKey;
+      await retirePtySession(key);
+      if (fallback) fallbackStreamedText = false;
+      // One attempt: no supervisor turn/respawn retries on a recovery call. The PTY
+      // migration (§5.3) does not compound supervisor recovery with downstream
+      // recovery, and this IS the downstream one. With `pty.maxRetries` 5 a persistent
+      // timeout would cost ~6 x timeoutMs here while holding the global queue.
+      return runOnPty(key, prompt, {
+        timeoutMs,
+        retry: false,
+        threadId,
+        agentName,
+        modelOverride: config.model || modelOverride,
+        api: config.api,
+        securityArgs,
+        appendSystemPrompt,
+        onChunk: fallback ? onFallbackChunk : onChunk,
+        onToolEvent,
+        ...(fallback
+          ? {
+              sessionStore: {
+                load: async () => (await getFallbackSession(agentName, threadId))?.sessionId,
+                save: (id: string) => createFallbackSession(id, agentName, threadId),
+              },
+            }
+          : {}),
+      });
+    };
     const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
     let usedFallback = false;
     // The fallback session the response came from, when the stream carried no
     // id of its own (CodeRabbit on #376): resumed, so the CLI may omit it.
     let fallbackSessionId: string | undefined;
 
+    // Not for bootstrap, on either route: its job is to create the PRIMARY session, and a
+    // fallback run cannot (it persists to the separate fallback session store, never
+    // `createSession`, see `!usedFallback` below). It would only spend a second full turn
+    // holding the global queue that startup chat waits behind. The print opt-out gets
+    // the same rule: a "live" log line for a session that does not exist helps nobody.
     if (
+      name !== "bootstrap" &&
       primaryRateLimit &&
       hasModelConfig(fallbackConfig) &&
       !sameModelConfig(primaryConfig, fallbackConfig)
@@ -2074,8 +2206,12 @@ async function execClaude(
         load: async () => (await getFallbackSession(agentName, threadId))?.sessionId,
         save: (id) => createFallbackSession(id, agentName, threadId),
       };
-      const execFallback = (legacyArgs: string[]) =>
-        useLegacyPath
+      // `recovery` marks the fallback's own corruption retry: one supervisor attempt, like
+      // `execRecovery`, so recovery does not compound with the supervisor's retries. The
+      // first fallback attempt keeps the normal envelope. The print path is unchanged.
+      const execFallback = (legacyArgs: string[], { recovery = false } = {}) => {
+        fallbackStreamedText = false;
+        return useLegacyPath
           ? runClaudeStream(
               legacyArgs,
               fallbackConfig.model,
@@ -2086,6 +2222,7 @@ async function execClaude(
             )
           : runOnPty(fallbackPtyKey, prompt, {
               timeoutMs,
+              ...(recovery ? { retry: false } : {}),
               threadId,
               agentName,
               modelOverride: fallbackConfig.model,
@@ -2093,18 +2230,44 @@ async function execClaude(
               securityArgs,
               appendSystemPrompt,
               sessionStore: fallbackStore,
+              onChunk: onFallbackChunk,
+              onToolEvent,
             });
-      exec = await execFallback(fallbackArgs);
+      };
+      // The fallback resumes its own session, which a flip to print can leave with a live
+      // PTY: retire it immediately before use. A fallback session that cannot be retired
+      // (quarantined) fails this fallback attempt only; the primary has already run.
+      let fallbackRefused: PtyQuarantinedError | undefined;
+      if (useLegacyPath) {
+        try {
+          await retireLivePtysBeforePrint([fallbackPtyKey]);
+        } catch (err) {
+          if (!(err instanceof PtyQuarantinedError)) throw err;
+          fallbackRefused = err;
+        }
+      }
+      exec = fallbackRefused
+        ? { rawStdout: "", stderr: fallbackRefused.message, exitCode: 1 }
+        : await execFallback(fallbackArgs);
       usedFallback = true;
       let fallbackRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
 
-      // If the fallback resumed a corrupted session, reset it and retry fresh.
-      if (
+      // If the fallback resumed a corrupted session, reset it and retry fresh. On the print
+      // path a non-zero exit with the phrase is the CLI's own verdict. On a PTY the output is
+      // rendered text the model can also write, so whatever the exit code the transcript must
+      // confirm it (`signatureErrorWarrantsReset`).
+      const fallbackSignatureError =
         !fallbackRateLimit &&
-        fallbackSession &&
-        exec.exitCode !== 0 &&
-        SIGNATURE_ERROR.test(exec.rawStdout + exec.stderr)
-      ) {
+        !!fallbackSession &&
+        (await signatureErrorWarrantsReset({
+          useLegacyPath,
+          exitCode: exec.exitCode,
+          output: exec.rawStdout,
+          stderr: exec.stderr,
+          sessionId: exec.sessionId ?? fallbackSession.sessionId,
+          cwd: spawnCwd ?? process.cwd(),
+        }));
+      if (fallbackSession && fallbackSignatureError) {
         await resetFallbackSession(agentName, threadId);
         const flabel = threadId
           ? ` (thread ${threadId.slice(0, 8)})`
@@ -2120,7 +2283,7 @@ async function execClaude(
         // The PTY on the fallback key still holds the corrupted session; drop
         // it so the retry spawns fresh from the store just reset.
         if (!useLegacyPath) await retirePtySession(fallbackPtyKey);
-        exec = await execFallback(freshFallbackArgs);
+        exec = await execFallback(freshFallbackArgs, { recovery: true });
         fallbackRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
         if (!fallbackRateLimit && exec.sessionId) {
           await createFallbackSession(exec.sessionId, agentName, threadId);
@@ -2153,7 +2316,22 @@ async function execClaude(
 
     // Auto-detect corrupted primary session from thinking block signature mismatch.
     // Gated on !usedFallback — fallback corruption is handled inside the fallback block above.
-    if (exitCode !== 0 && !isNew && !usedFallback && SIGNATURE_ERROR.test(rawStdout + stderr)) {
+    // The interactive REPL may render an API error and return to its input prompt without
+    // exiting, and its output is text the model can also write. On a PTY the reset needs the
+    // rendered tail AND the session transcript's own API-error entry, whatever the exit code;
+    // the print path keeps its non-zero-exit rule (`signatureErrorWarrantsReset`).
+    const primarySignatureError =
+      !isNew &&
+      !usedFallback &&
+      (await signatureErrorWarrantsReset({
+        useLegacyPath,
+        exitCode,
+        output: rawStdout,
+        stderr,
+        sessionId: exec.sessionId ?? existing?.sessionId,
+        cwd: spawnCwd ?? process.cwd(),
+      }));
+    if (primarySignatureError) {
       if (threadId) {
         await removeThreadSession(threadId);
       } else if (agentName) {
@@ -2172,14 +2350,7 @@ async function execClaude(
       const freshArgs = args.filter((a) => a !== "--resume" && a !== existing?.sessionId);
       const fmtIdx = freshArgs.indexOf("--output-format");
       if (fmtIdx !== -1 && fmtIdx + 1 < freshArgs.length) freshArgs[fmtIdx + 1] = "stream-json";
-      exec = await runClaudeStream(
-        freshArgs,
-        primaryConfig.model,
-        primaryConfig.api,
-        baseEnv,
-        timeoutMs,
-        spawnCwd,
-      );
+      exec = await execRecovery(freshArgs, primaryConfig);
       rawStdout = exec.rawStdout;
       stderr = exec.stderr;
       exitCode = exec.exitCode;
@@ -2228,14 +2399,7 @@ async function execClaude(
 
       const retryArgs = withOutputFormat(stripResume(args), "stream-json");
       const retryConfig = usedFallback ? fallbackConfig : primaryConfig;
-      exec = await runClaudeStream(
-        retryArgs,
-        retryConfig.model,
-        retryConfig.api,
-        baseEnv,
-        timeoutMs,
-        spawnCwd,
-      );
+      exec = await execRecovery(retryArgs, retryConfig, usedFallback);
 
       rawStdout = exec.rawStdout;
       stderr = exec.stderr;
@@ -2303,7 +2467,9 @@ async function execClaude(
         const reported = usedFallback ? (exec.sessionId ?? fallbackSessionId) : sessionId;
         return reported && reported !== "unknown" ? { sessionId: reported } : {};
       })(),
-      ...(usedFallback ? { usedFallback: true as const } : {}),
+      ...(usedFallback ? { usedFallback: true as const, fallbackStreamedText } : {}),
+      // From the exec that produced THIS result, and only while it is a failure.
+      ...(exitCode !== 0 && exec.failureKind ? { failureKind: exec.failureKind } : {}),
     };
 
     // Record successful completion WITH the real token usage + cost so the
@@ -2454,12 +2620,25 @@ async function execClaude(
       }
     }
 
-    // --- Auto-compact on timeout (exit 124) ---
-    if (COMPACT_TIMEOUT_ENABLED && exitCode === 124 && !isNew && existing && !recoveredFromStale) {
-      // Save memory before compact wipes context. The turn timed out, so the
-      // session is wedged: skip the live path and resume it one-shot (#549). The
-      // compact below skips it too, whether or not the save got as far as retiring it
-      // (a memory path `memoryFileGrant` cannot scope returns before it does).
+    // --- Auto-compact on timeout (exit 124): PRINT PATH ONLY ---
+    // Print-era recovery for a wedged `claude -p`. A PTY turn timeout is also exit 124
+    // (so the watchdog and the "timed out" messages see it), but the supervisor has
+    // already retired that PTY, and the runner does nothing more on it: no memory save,
+    // no /compact, no re-run. PTY timeouts are often turn-detection misses on a healthy
+    // session (#369, #316/#317); re-running would repeat tool side effects, and the
+    // interactive REPL compacts its own context. The next turn on the key respawns and
+    // resumes the stored session id.
+    if (
+      useLegacyPath &&
+      COMPACT_TIMEOUT_ENABLED &&
+      exitCode === 124 &&
+      !isNew &&
+      existing &&
+      !recoveredFromStale
+    ) {
+      // No `sessionKey` below: the print opt-out has no supervisor session, so the
+      // utility calls resume one-shot without touching the PTY machinery at all.
+      // Save memory before compact wipes context.
       try {
         const memPath = getMemoryPath(agentName);
         console.log(
@@ -2468,7 +2647,6 @@ async function execClaude(
         const saved = await saveMemoryBeforeCompact({
           memPath,
           prompt: `Session is about to compact. Save your current memory to ${memPath} now. Include: current status, what was accomplished, key context for next session. Keep it concise.`,
-          sessionKey: ptySessionKey,
           sessionId: existing.sessionId,
           skipLive: exitCode === 124,
           model: primaryConfig.model,
@@ -2487,7 +2665,6 @@ async function execClaude(
       emitCompactEvent({ type: "auto-compact-start" });
       const compactOk = await runCompact({
         sessionId: existing.sessionId,
-        sessionKey: ptySessionKey,
         skipLive: true,
         model: primaryConfig.model,
         timeoutMs,
@@ -2498,20 +2675,16 @@ async function execClaude(
 
       if (compactOk) {
         console.log(`[${new Date().toLocaleTimeString()}] Retrying ${name} after compact...`);
-        const retryExec = await runClaudeStream(
-          args,
-          primaryConfig.model,
-          primaryConfig.api,
-          baseEnv,
-          timeoutMs,
-          spawnCwd,
-        );
+        const retryExec = await execRecovery(args, primaryConfig);
         const retryResult: RunResult = {
           stdout: retryExec.rawStdout,
           stderr: retryExec.stderr,
           exitCode: retryExec.exitCode,
           ...(retryExec.sessionId || existing?.sessionId
             ? { sessionId: retryExec.sessionId || existing?.sessionId }
+            : {}),
+          ...(retryExec.exitCode !== 0 && retryExec.failureKind
+            ? { failureKind: retryExec.failureKind }
             : {}),
         };
         emitCompactEvent({
@@ -2669,9 +2842,10 @@ async function streamClaude(
         },
         () => unblock(),
       );
-      // The fallback turn streams nothing: what the primary streamed (the
-      // rate-limit notice) is not the answer, so deliver the fallback's stdout.
-      if ((!textEmitted || result.usedFallback) && result.stdout) onChunk(result.stdout);
+      // A primary rate-limit notice says nothing about fallback delivery.
+      // Emit buffered stdout only if this response's engine streamed no text.
+      const needsFinalText = result.usedFallback ? !result.fallbackStreamedText : !textEmitted;
+      if (needsFinalText && result.stdout) onChunk(result.stdout);
     } finally {
       unblock();
     }
@@ -2745,7 +2919,9 @@ async function streamClaude(
     `[${new Date().toLocaleTimeString()}] Running: ${name} (stream-json, session: ${existing?.sessionId?.slice(0, 8) ?? "new"})`,
   );
 
-  const proc = spawnClaude(args, { env: childEnv });
+  // The dashboard chat resumes the global session on print; retire its PTY first (see above).
+  await retireLivePtysBeforePrint(["global"]);
+  const proc = await spawnClaude(args, { env: childEnv });
 
   // Collect stderr in the background so it doesn't back-pressure the process.
   // We need it after proc.exited for stale session detection.
@@ -3032,7 +3208,7 @@ export async function runFork(prompt: string): Promise<RunResult> {
     FORK_SYSTEM_PROMPT,
   ];
 
-  const proc = spawnClaude(args, { env: buildChildEnv(baseEnv, FORK_MODEL, api) });
+  const proc = await spawnClaude(args, { env: buildChildEnv(baseEnv, FORK_MODEL, api) });
 
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
   const timeoutPromise = new Promise<never>((_, reject) => {
@@ -3076,21 +3252,57 @@ export async function runFork(prompt: string): Promise<RunResult> {
 }
 
 /**
+ * The timeout handed to a PTY bootstrap's single `runOnPty` attempt. Issue #369 measured a
+ * 38.7 s real PTY cold start (spawn, MCP fleet, first turn), so 30 s failed a healthy boot;
+ * 120 s is ~3x that, and far under the 5 min `timeouts.default`, because bootstrap holds
+ * the serial queue a first channel message waits behind. It is a per-stage bound, not a
+ * total: `runOnPty` bounds four stages separately by `timeoutMs` (admission, lock wait,
+ * spawn, turn; 88cc310f), so the worst case a bootstrap holds the queue is up to 4x this
+ * value. About 3x on first boot, because nothing else holds the `global` lock yet. It
+ * never blocks startup itself: the daemon runs it in the background.
+ */
+export const BOOTSTRAP_PTY_MAX_MS = 120_000;
+
+/**
+ * The bootstrap's one-attempt timeout. The PTY route is capped at `BOOTSTRAP_PTY_MAX_MS`
+ * (a smaller configured `timeouts.default` still wins); the explicit print opt-out keeps
+ * `timeouts.default`, as the old bootstrap did.
+ */
+export function resolveBootstrapTimeoutMs(route: "pty" | "legacy", configuredMs: number): number {
+  return route === "pty" ? Math.min(configuredMs, BOOTSTRAP_PTY_MAX_MS) : configuredMs;
+}
+
+/**
  * Bootstrap the session: fires Claude with the system prompt so the
  * session is created immediately. No-op if a session already exists.
  */
 export async function bootstrap(): Promise<void> {
-  const existing = await getSession();
-  if (existing) return;
+  // Reserve the same serial queue used by global chat before doing any I/O.
+  // A channel turn arriving during startup waits behind this one attempt;
+  // a session already created by an earlier turn makes bootstrap a no-op.
+  return enqueue(async () => {
+    const existing = await getSession();
+    if (existing) return;
 
-  console.log(`[${new Date().toLocaleTimeString()}] Bootstrapping new session...`);
-  const { session: sessionConfig } = getSettings();
-  const summary = sessionConfig.summaryPath
-    ? await loadLatestSummary(sessionConfig.summaryPath)
-    : null;
-  const wakeupPrompt = summary
-    ? `Wakeup, my friend!\n\nContext from the previous session:\n\n${summary}`
-    : "Wakeup, my friend!";
-  await execClaude("bootstrap", wakeupPrompt);
-  console.log(`[${new Date().toLocaleTimeString()}] Bootstrap complete — session is live.`);
+    console.log(`[${new Date().toLocaleTimeString()}] Bootstrapping new session...`);
+    const { session: sessionConfig } = getSettings();
+    const summary = sessionConfig.summaryPath
+      ? await loadLatestSummary(sessionConfig.summaryPath)
+      : null;
+    const wakeupPrompt = summary
+      ? `Wakeup, my friend!\n\nContext from the previous session:\n\n${summary}`
+      : "Wakeup, my friend!";
+    const result = await execClaude(
+      "bootstrap",
+      wakeupPrompt,
+      undefined,
+      undefined,
+      resolveBootstrapTimeoutMs(resolveAgentTurnRoute("bootstrap"), resolveTimeoutMs("bootstrap")),
+    );
+    if (result.exitCode !== 0) {
+      if (resolveAgentTurnRoute("bootstrap") === "pty") await retirePtySession("global");
+      throw new Error(`Bootstrap exited ${result.exitCode}`);
+    }
+    console.log(`[${new Date().toLocaleTimeString()}] Bootstrap complete — session is live.`);
+  });
 }

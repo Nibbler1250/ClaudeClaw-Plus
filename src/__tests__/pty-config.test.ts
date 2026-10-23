@@ -6,12 +6,18 @@
  * already exists in this worktree from a previous test run / init step,
  * so we mutate it for each scenario and call reloadSettings().
  */
-import { describe, it, expect, beforeAll, afterAll } from "bun:test";
+import { describe, it, expect, beforeAll, afterAll, spyOn } from "bun:test";
 import { join } from "path";
 import { mkdir, copyFile, unlink } from "fs/promises";
 import { existsSync } from "fs";
 
-import { loadSettings, reloadSettings, getSettings } from "../config";
+import {
+  loadSettings,
+  reloadSettings,
+  getSettings,
+  defaultPtyEnabled,
+  resolvePtyEnabled,
+} from "../config";
 
 const SETTINGS_DIR = join(process.cwd(), ".claude", "claudeclaw");
 const SETTINGS_FILE = join(SETTINGS_DIR, "settings.json");
@@ -45,11 +51,30 @@ afterAll(async () => {
 });
 
 describe("parseSettings — pty defaults", () => {
+  it("warns once per distinct invalid enabled value across reloads", async () => {
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const value of [
+        "review-550-invalid-a",
+        "review-550-invalid-a",
+        "review-550-invalid-b",
+        "review-550-invalid-a",
+      ]) {
+        await writeRawSettings({ pty: { enabled: value } });
+        await reloadSettings();
+      }
+      expect(
+        warning.mock.calls.filter(([line]) => String(line).includes("pty.enabled")),
+      ).toHaveLength(2);
+    } finally {
+      warning.mockRestore();
+    }
+  });
   it("applies all defaults when pty block is missing", async () => {
     await writeRawSettings({});
     await reloadSettings();
     const { pty } = getSettings();
-    expect(pty.enabled).toBe(false); // opt-in default — operators must explicitly enable
+    expect(pty.enabled).toBe(true);
     expect(pty.idleReapMinutes).toBe(30);
     expect(pty.maxRetries).toBe(5);
     expect(pty.backoffMs).toEqual([1000, 2000, 4000, 8000, 16000]);
@@ -89,11 +114,27 @@ describe("parseSettings — pty defaults", () => {
     expect(getSettings().pty.enabled).toBe(false);
   });
 
-  it("treats a missing pty.enabled (object present, key absent) as false", async () => {
+  it("treats a missing pty.enabled (object present, key absent) as true", async () => {
     await writeRawSettings({ pty: { idleReapMinutes: 7 } });
     await reloadSettings();
-    expect(getSettings().pty.enabled).toBe(false);
+    expect(getSettings().pty.enabled).toBe(true);
   });
+
+  for (const value of ["false", 0, null, {}, []]) {
+    it(`warns and uses the default for invalid enabled=${JSON.stringify(value)}`, async () => {
+      const warning = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        await writeRawSettings({ pty: { enabled: value } });
+        await reloadSettings();
+        expect(getSettings().pty.enabled).toBe(true);
+        expect(
+          warning.mock.calls.some(([line]) => /pty.enabled.*boolean.*true/.test(String(line))),
+        ).toBe(true);
+      } finally {
+        warning.mockRestore();
+      }
+    });
+  }
 
   it("honours user-supplied numeric values", async () => {
     await writeRawSettings({
@@ -612,5 +653,58 @@ describe("parseSettings — mcp.audit (#232)", () => {
     await writeRawSettings({ mcp: { audit: "enforced" } });
     await reloadSettings();
     expect(getSettings().mcp.audit).toBe("enforce");
+  });
+});
+
+describe("pty.enabled platform default (#550, #562)", () => {
+  it("win32 + absent → false (print stays the Windows default)", () => {
+    expect(resolvePtyEnabled(undefined, "win32")).toBe(false);
+    expect(defaultPtyEnabled("win32")).toBe(false);
+  });
+
+  it("win32 + explicit true → true (opt-in)", () => {
+    expect(resolvePtyEnabled(true, "win32")).toBe(true);
+  });
+
+  it("win32 + explicit false → false", () => {
+    expect(resolvePtyEnabled(false, "win32")).toBe(false);
+  });
+
+  it("linux + absent → true", () => {
+    expect(resolvePtyEnabled(undefined, "linux")).toBe(true);
+  });
+
+  it("darwin + absent → true", () => {
+    expect(resolvePtyEnabled(undefined, "darwin")).toBe(true);
+  });
+
+  it("linux + explicit false → false", () => {
+    expect(resolvePtyEnabled(false, "linux")).toBe(false);
+  });
+
+  it("win32 + non-boolean → false, warning names the platform default", () => {
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(resolvePtyEnabled("562-win32-not-a-boolean", "win32")).toBe(false);
+      const lines = warning.mock.calls.map(([line]) => String(line));
+      expect(lines.some((l) => /pty\.enabled.*boolean.*platform default \(false\)/.test(l))).toBe(
+        true,
+      );
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it("linux + non-boolean → true, warning names the platform default", () => {
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(resolvePtyEnabled("562-linux-not-a-boolean", "linux")).toBe(true);
+      const lines = warning.mock.calls.map(([line]) => String(line));
+      expect(lines.some((l) => /pty\.enabled.*boolean.*platform default \(true\)/.test(l))).toBe(
+        true,
+      );
+    } finally {
+      warning.mockRestore();
+    }
   });
 });
