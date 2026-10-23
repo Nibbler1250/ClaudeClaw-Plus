@@ -8,8 +8,11 @@ import {
   procStartMs,
   processStartMs,
   readBootId,
+  readPidIdentity,
   recordedOnAnotherBoot,
+  sameIdentity,
   sameStart,
+  startMsFromIdentity,
   TEST_BOOT_ID,
 } from "./pty-proc-identity.js";
 import { withPlatform } from "./pty-test-platform.js";
@@ -58,35 +61,179 @@ describe.skipIf(process.platform !== "linux")("processStartMs on Linux", () => {
   });
 });
 
-/** #570 r14e (H1): a `/proc` start time is exact, so any window only lets a recycled pid read as the same. */
+/**
+ * #570 r14e (H1), #581 cp2: a start time is compared exactly on every platform. A window only
+ * lets a recycled pid read as the same process, and a comparison that authorises a signal gets none.
+ */
 describe("sameStart", () => {
   it("compares Linux /proc start times exactly: the next tick is another process", () => {
-    expect(sameStart(10_000, 10_000, "linux")).toBe(true);
-    // Went red (true) with `<= 10` put back on the Linux path.
-    expect(sameStart(10_000, 10_010, "linux")).toBe(false);
-    expect(sameStart(10_010, 10_000, "linux")).toBe(false);
-    expect(sameStart(10_000, 11_000, "linux")).toBe(false);
+    expect(sameStart(10_000, 10_000)).toBe(true);
+    expect(sameStart(10_000, 10_010)).toBe(false);
+    expect(sameStart(10_010, 10_000)).toBe(false);
+    expect(sameStart(10_000, 11_000)).toBe(false);
   });
 
-  it("keeps 2 s for `ps -o lstart=`, which has one-second resolution", () => {
-    expect(sameStart(10_000, 11_000, "darwin")).toBe(true);
-    expect(sameStart(10_000, 12_001, "darwin")).toBe(false);
-  });
-
-  it("takes the platform from the process by default", () => {
-    expect(withPlatform("linux", () => sameStart(10_000, 11_000))).toBe(false);
-    expect(withPlatform("darwin", () => sameStart(10_000, 11_000))).toBe(true);
+  it("compares `ps -o lstart=` start times exactly too: one or two seconds later is another process", () => {
+    expect(sameStart(1_760_000_000_000, 1_760_000_000_000)).toBe(true);
+    expect(sameStart(1_760_000_000_000, 1_760_000_001_000)).toBe(false);
+    expect(sameStart(1_760_000_000_000, 1_760_000_002_000)).toBe(false);
+    expect(sameStart(1_760_000_002_000, 1_760_000_000_000)).toBe(false);
   });
 });
 
-describe("pidIdentity on Linux", () => {
+describe("pidIdentity (the numeric projection) is exact on every platform", () => {
   const exists = () => true;
-  it("calls a pid whose start moved by one second recycled", () => {
-    const read = () => 11_000;
-    expect(withPlatform("linux", () => pidIdentity(4242, 10_000, { exists, read }))).toBe(
-      "recycled",
+  const readAt = (ms: number) => () => ms;
+
+  it("calls a pid whose start moved by one tick, one second or two seconds recycled", () => {
+    for (const platform of ["linux", "darwin"] as const) {
+      for (const moved of [10, 1_000, 2_000]) {
+        expect(
+          withPlatform(platform, () =>
+            pidIdentity(4242, 10_000, { exists, read: readAt(10_000 + moved) }),
+          ),
+        ).toBe("recycled");
+      }
+      expect(
+        withPlatform(platform, () => pidIdentity(4242, 10_000, { exists, read: readAt(10_000) })),
+      ).toBe("same");
+    }
+  });
+
+  it("cannot tell a stranger from the leader when either start time is unknown", () => {
+    expect(pidIdentity(4242, null, { exists, read: readAt(10_000) })).toBe("unknown");
+    expect(pidIdentity(4242, 10_000, { exists, read: () => null })).toBe("unknown");
+    expect(pidIdentity(4242, 10_000, { exists: () => false, read: readAt(10_000) })).toBe("gone");
+  });
+});
+
+/**
+ * #581 cp2: `readPidIdentity` is the one OS reader. These pin what it reads (the raw value, not a
+ * derived one), that two reads of one process are identical, and that a process born one tick
+ * (Linux) or one second (macOS) later is a different identity.
+ */
+describe("readPidIdentity (the one reader)", () => {
+  let proc: string;
+  beforeEach(() => {
+    proc = mkdtempSync(join(tmpdir(), "fake-proc-"));
+  });
+  afterEach(() => rmSync(proc, { recursive: true, force: true }));
+
+  const statWithTicks = (pid: number, ticks: string, comm = "sleep"): void => {
+    mkdirSync(join(proc, String(pid)), { recursive: true });
+    writeFileSync(
+      join(proc, String(pid), "stat"),
+      `${pid} (${comm}) S 1 ${pid} ${pid} 0 -1 4194304 100 0 0 0 5 6 0 0 20 0 1 0 ${ticks} 99999 8888\n`,
     );
-    expect(withPlatform("darwin", () => pidIdentity(4242, 10_000, { exists, read }))).toBe("same");
+  };
+  const linux = (): { platform: string; procDir: string } => ({ platform: "linux", procDir: proc });
+
+  it("Linux: the raw start ticks, as read, not milliseconds", () => {
+    statWithTicks(123, "12345");
+    expect(readPidIdentity(123, linux())).toBe("12345");
+    expect(readPidIdentity(123, linux())).toBe("12345"); // steady across reads
+  });
+
+  it("Linux: a command name with spaces and parentheses does not move the field", () => {
+    statWithTicks(124, "12345", "a) b) (c d");
+    expect(readPidIdentity(124, linux())).toBe("12345");
+  });
+
+  it("Linux: a process born in the next tick is a different identity, and so is its numeric start", () => {
+    statWithTicks(200, "500000");
+    statWithTicks(201, "500001"); // the same second, 10 ms later
+    const a = readPidIdentity(200, linux());
+    const b = readPidIdentity(201, linux());
+    expect(sameIdentity(a, a)).toBe(true);
+    expect(sameIdentity(a, b)).toBe(false);
+    const aMs = startMsFromIdentity(a, "linux");
+    const bMs = startMsFromIdentity(b, "linux");
+    expect(aMs).toBe(5_000_000);
+    expect(bMs).toBe(5_000_010);
+    expect(sameStart(aMs as number, bMs as number)).toBe(false);
+  });
+
+  it("Linux: nothing is read from a gone pid, a short stat, a non-numeric field, or a pid that names no process", () => {
+    expect(readPidIdentity(999, linux())).toBeNull();
+    mkdirSync(join(proc, "125"));
+    writeFileSync(join(proc, "125", "stat"), "125 (x) S 1\n");
+    expect(readPidIdentity(125, linux())).toBeNull();
+    statWithTicks(126, "12x45");
+    expect(readPidIdentity(126, linux())).toBeNull();
+    statWithTicks(127, "");
+    expect(readPidIdentity(127, linux())).toBeNull();
+    for (const bad of [0, -1, 1.5, Number.NaN]) expect(readPidIdentity(bad, linux())).toBeNull();
+  });
+
+  it("macOS: the C-locale `lstart` text exactly as `ps` printed it", () => {
+    const ps = (pid: number): string | null => (pid === 42 ? "Fri Oct 23 10:00:00 2026" : null);
+    expect(readPidIdentity(42, { platform: "darwin", ps })).toBe("Fri Oct 23 10:00:00 2026");
+    expect(readPidIdentity(43, { platform: "darwin", ps })).toBeNull();
+  });
+
+  it("macOS: a process born one second later is a different identity, and so is its numeric start", () => {
+    const text: Record<number, string> = {
+      1: "Fri Oct 23 10:00:00 2026",
+      2: "Fri Oct 23 10:00:01 2026",
+    };
+    const ps = (pid: number): string | null => text[pid] ?? null;
+    const a = readPidIdentity(1, { platform: "darwin", ps });
+    const b = readPidIdentity(2, { platform: "darwin", ps });
+    expect(sameIdentity(a, b)).toBe(false);
+    const aMs = startMsFromIdentity(a, "darwin");
+    const bMs = startMsFromIdentity(b, "darwin");
+    expect(aMs).not.toBeNull();
+    expect((bMs as number) - (aMs as number)).toBe(1_000);
+    expect(sameStart(aMs as number, bMs as number)).toBe(false);
+  });
+
+  it("Windows reads nothing", () => {
+    expect(readPidIdentity(42, { platform: "win32", ps: () => "x" })).toBeNull();
+  });
+
+  it("an identity that cannot be read is the same as nothing", () => {
+    expect(sameIdentity(null, null)).toBe(false);
+    expect(sameIdentity("12345", null)).toBe(false);
+    expect(sameIdentity(null, "12345")).toBe(false);
+    expect(sameIdentity("12345", "12345")).toBe(true);
+  });
+
+  it("the numeric start is only a projection of the raw identity", () => {
+    expect(startMsFromIdentity("12345", "linux")).toBe(123_450);
+    expect(startMsFromIdentity("not-ticks", "linux")).toBeNull();
+    expect(startMsFromIdentity(null, "linux")).toBeNull();
+    expect(startMsFromIdentity("Fri Oct 23 10:00:00 2026", "win32")).toBeNull();
+    expect(startMsFromIdentity("not a date", "darwin")).toBeNull();
+  });
+
+  it("procStartMs and processStartMs read through it", () => {
+    statWithTicks(300, "12345");
+    expect(procStartMs(300, proc)).toBe(123_450);
+    expect(processStartMs(300, linux())).toBe(123_450);
+  });
+
+  it.skipIf(process.platform !== "darwin")(
+    "macOS, real `ps`: steady across reads and unaffected by the caller's locale",
+    () => {
+      const first = readPidIdentity(process.pid);
+      expect(first).not.toBeNull();
+      expect(readPidIdentity(process.pid)).toBe(first);
+      expect(first).toMatch(/^[A-Z][a-z]{2} [A-Z][a-z]{2} [ 0-9]\d \d\d:\d\d:\d\d \d{4}$/);
+      const saved = process.env.LC_ALL;
+      process.env.LC_ALL = "fr_FR.UTF-8";
+      try {
+        expect(readPidIdentity(process.pid)).toBe(first);
+      } finally {
+        if (saved === undefined) delete process.env.LC_ALL;
+        else process.env.LC_ALL = saved;
+      }
+    },
+  );
+
+  it.skipIf(process.platform !== "linux")("Linux, real /proc: steady across reads", () => {
+    const first = readPidIdentity(process.pid);
+    expect(first).toMatch(/^\d+$/);
+    expect(readPidIdentity(process.pid)).toBe(first);
   });
 });
 

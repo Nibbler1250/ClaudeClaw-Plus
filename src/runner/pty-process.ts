@@ -70,45 +70,14 @@ import {
 // #581 cp3: group termination is wired into dispose() there; the types are kept so the
 // supervisor's isolation hooks (onGroupSurvived/reapEscapees) still type-check meanwhile.
 import type { GroupTerminationOptions, SurvivorCause } from "./pty-group-kill";
-// #581 cp2: `processStartMs` and the inline reader below become one identity module.
-import { processStartMs } from "./pty-proc-identity";
+// The one OS identity reader (#581 cp2). The leader's numeric start time is a projection of the
+// same reading, not a second read.
+import { readPidIdentity, sameIdentity, startMsFromIdentity } from "./pty-proc-identity";
 // Screen is used for readiness and dialogs only (`_awaitReplReady`), never for a turn outcome.
 import { Screen } from "./pty-screen";
 
 export { TranscriptReplacedError };
-import { spawnSync } from "node:child_process";
-import { appendFileSync, readFileSync } from "node:fs";
-
-// #581 cp2: this inline reader moves into `pty-proc-identity.ts` (one OS read implementation);
-// B's exact comparison semantics are kept until then.
-/**
- * A process's birth identity: something a reused pid cannot share with the process that held
- * it before. Linux: field 22 of `/proc/<pid>/stat` (start time in clock ticks since boot, read
- * with a plain file read). macOS/BSD: `ps -o lstart=` (the start time to the second; one
- * `ps` spawn, about 10-20 ms, paid once at spawn and once per signal, never per poll).
- * Reuse inside the same second would need the pid counter to wrap in that second. `null`:
- * the pid is gone or the identity cannot be read (Windows, no `ps`).
- */
-export function readPidIdentity(pid: number): string | null {
-  try {
-    if (process.platform === "win32") return null;
-    if (process.platform === "linux") {
-      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-      // `comm` (field 2) may hold spaces and parens: split after the LAST ")".
-      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-      return fields[19] || null; // field 22 = index 19 once fields 1-2 are cut
-    }
-    const r = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
-      encoding: "utf8",
-      env: { ...process.env, LC_ALL: "C" },
-      timeout: 2000,
-    });
-    const out = (r.stdout ?? "").trim();
-    return r.status === 0 && out ? out : null;
-  } catch {
-    return null;
-  }
-}
+import { appendFileSync } from "node:fs";
 
 /**
  * Raw PTY trace, off unless `CLAUDECLAW_PTY_DUMP=<file>` is set. Every chunk
@@ -890,7 +859,6 @@ class PtyProcessImpl implements PtyProcess {
     this._onGroupSurvived = opts.onGroupSurvived;
     this._reapEscapees = opts.reapEscapees;
     this._groupTermination = opts._groupTermination;
-    this._leaderStartMs = this._terminateGroup ? processStartMs(pty.pid) : null;
     this._screen = new Screen(opts.cols ?? DEFAULT_COLS, opts.rows ?? DEFAULT_ROWS);
     this.label = `${opts.agentName ?? "pty"}:${pty.pid}`;
     this._quietWindowMs = opts.quietWindowMs ?? DEFAULT_QUIET_WINDOW_MS;
@@ -909,6 +877,7 @@ class PtyProcessImpl implements PtyProcess {
     this._signalPid = opts._signalPid ?? ((pid, signal) => void process.kill(pid, signal));
     this._readIdentity = opts._readPidIdentity ?? (opts._signalPid ? () => null : readPidIdentity);
     this._identity = this._readIdentity(pty.pid);
+    this._leaderStartMs = this._terminateGroup ? startMsFromIdentity(this._identity) : null;
     this._exitGraceMs = opts._exitGraceMs ?? DEFAULT_EXIT_GRACE_MS;
     this._exitCapMs = opts._exitCapMs ?? DEFAULT_EXIT_CAP_MS;
     this._setTimeout = opts._setTimeout ?? ((cb, ms) => setTimeout(cb, ms));
@@ -1578,7 +1547,7 @@ class PtyProcessImpl implements PtyProcess {
     if (this._identity === null) return "unknown";
     const now = this._readIdentity(pid);
     if (now === null) return "unknown";
-    return now === this._identity ? "same" : "replaced";
+    return sameIdentity(now, this._identity) ? "same" : "replaced";
   }
 
   private _originalGone(pid: number): boolean {

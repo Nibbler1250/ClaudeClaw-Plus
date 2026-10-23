@@ -1,76 +1,130 @@
 /**
  * Is this pid still the process we recorded? A pid is reused once its process has been reaped,
- * so a signal sent to a remembered pid can hit a stranger. Everything that signals an untrusted
- * claude (pty-group-kill, the escapee scan, the sweeper's survivor retry) checks the start time
- * recorded at spawn first (#570 r13, B), and again immediately before each signal (r14, B).
+ * so a signal sent to a remembered pid can hit a stranger. Everything that signals a claude
+ * (the runner's retirement, pty-group-kill, the escapee scan, the sweeper's survivor retry)
+ * checks the identity recorded at spawn first (#570 r13), and again immediately before each
+ * signal (r14).
  *
  * This narrows pid reuse to a very small window; it cannot close it. Between the check and the
  * `kill()` the process can still exit and its pid be reused, and only a native process handle
  * (a pidfd) would make "check and signal" one step. Node and Bun offer none, and none is built
  * here.
+ *
+ * #581 cp2: `readPidIdentity` below is the ONLY place that asks the OS who a pid is. The numeric
+ * start time (`processStartMs`, `procStartMs`) is a projection of that one reading, not a second
+ * reader, and every comparison is exact: no window is allowed to widen "the same process".
  */
 
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 
-/** `ps -o lstart=` has 1 s resolution, so two readings of one process can differ by a second. */
-export const START_TIME_TOLERANCE_MS = 2000;
-
+/** A numeric start time: ms since boot on Linux, epoch ms elsewhere. Null when unreadable. */
 export type StartMsReader = (pid: number) => number | null;
+
+/** A raw birth identity (see `readPidIdentity`). Opaque: compare it, do not interpret it. */
+export type PidIdentityReader = (pid: number) => string | null;
 
 /** Clock ticks per second of `/proc/<pid>/stat` times. 100 on every Linux build in use. */
 const LINUX_CLOCK_TICKS_PER_SECOND = 100;
 
-/**
- * Do two start times, read by `processStartMs`, belong to one process? On Linux they come from
- * `/proc` (ticks * 10 ms), so two reads of one process are identical and a different process in
- * the next tick differs by 10: they compare exactly, and any window only lets a recycled pid read
- * as the same process (#570 r14e, H1). Elsewhere they come from `ps -o lstart=`, which has 1 s
- * resolution, and the window is `START_TIME_TOLERANCE_MS`. Every comparison of a recorded start
- * time with a fresh reading goes through here.
- */
-export function sameStart(a: number, b: number, platform: string = process.platform): boolean {
-  if (platform === "linux") return a === b;
-  return Math.abs(a - b) <= START_TIME_TOLERANCE_MS;
+/** Seams for the one reader. Production passes nothing; tests name a platform, a fake `/proc` or `ps`. */
+export interface IdentityReadDeps {
+  platform?: string;
+  /** `/proc`; replaced by a fake tree in tests. Linux only. */
+  procDir?: string;
+  /** Prints `lstart` for a pid in the C locale, or null when `ps` cannot say. Replaced in tests. */
+  ps?: (pid: number) => string | null;
+}
+
+function psLstart(pid: number): string | null {
+  const r = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+    encoding: "utf8",
+    // The C locale fixes the text of the month and weekday names: the same process reads the same
+    // string in every environment the daemon is started from.
+    env: { ...process.env, LC_ALL: "C" },
+    timeout: 2000,
+  });
+  const out = (r.stdout ?? "").trim();
+  return r.status === 0 && out ? out : null;
 }
 
 /**
- * Linux: the start time from field 22 of `/proc/<pid>/stat` (ticks since boot), in ms since boot.
- * A wall-clock step moves `ps -o lstart=` but not this. The value restarts from zero at every
- * boot, so it is only comparable with another read on the same boot. A recorded start time that
- * outlives the daemon (an owner file, `survivor.json`) can be read again after a reboot, so it
- * is stored with the boot id and compared only when that matches (`recordedOnAnotherBoot`,
- * #570 r15, A1). Null when the stat cannot be read or parsed. `comm` (field 2) may hold spaces
- * and parens, so fields are split after the last `)`, where field 3 is the first.
+ * A process's birth identity: something a reused pid cannot share with the process that held
+ * it before. THE one OS reader.
+ *   Linux     field 22 of `/proc/<pid>/stat`, start time in clock ticks since boot, as the raw
+ *             digits (a plain file read). Only comparable with a reading from the same boot; a
+ *             copy that outlives the daemon is stored with the boot id (`recordedOnAnotherBoot`).
+ *   macOS/BSD `ps -o lstart=` in the C locale, the start time to the second (one `ps` spawn, about
+ *             10-20 ms, paid once at spawn and once per signal, never per poll). Reuse inside the
+ *             same second would need the pid counter to wrap in that second; that is the limit
+ *             of this platform and no tolerance is added to it.
+ *   null      the pid is gone, the identity cannot be read or parsed (Windows, no `ps`, a
+ *             malformed stat), or the pid is not one that names a process.
+ * `comm` (field 2 of the stat) may hold spaces and parens, so fields are split after the last
+ * `)`, where field 3 is the first.
  */
+export function readPidIdentity(pid: number, deps: IdentityReadDeps = {}): string | null {
+  const { platform = process.platform, procDir = "/proc", ps = psLstart } = deps;
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    if (platform === "win32") return null;
+    if (platform === "linux") {
+      const stat = readFileSync(`${procDir}/${pid}/stat`, "utf8");
+      const ticks = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]; // field 22
+      return ticks !== undefined && /^\d+$/.test(ticks) ? ticks : null;
+    }
+    return ps(pid);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The numeric start time a raw identity stands for, for the places that compare ages (a leader
+ * against the processes born after it) and for records that persist a number. Linux: ticks * 10
+ * ms since boot (exact, so equal ticks give equal ms). Elsewhere: the epoch ms of the C-locale
+ * `lstart` text. Null for a null or unparseable identity.
+ */
+export function startMsFromIdentity(
+  identity: string | null,
+  platform: string = process.platform,
+): number | null {
+  if (identity === null || platform === "win32") return null;
+  if (platform === "linux") {
+    return /^\d+$/.test(identity) ? (Number(identity) * 1000) / LINUX_CLOCK_TICKS_PER_SECOND : null;
+  }
+  const ms = Date.parse(identity);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/**
+ * Do two raw identities name one process? Exact, and only when both were read: an unreadable
+ * identity is not the same as anything.
+ */
+export function sameIdentity(a: string | null, b: string | null): boolean {
+  return a !== null && b !== null && a === b;
+}
+
+/**
+ * Do two start times, read by `processStartMs`, belong to one process? Exactly equal, on every
+ * platform. On Linux two reads of one process are identical and a different process in the next
+ * tick differs by 10 ms. On macOS two reads of one process come from the same `lstart` text and
+ * are identical, and a process born one second later differs by 1000 ms: a window of any size
+ * would only let a recycled pid read as the same process (#570 r14e, H1; #581 cp2). A comparison
+ * that authorises a signal must not be given a tolerance.
+ */
+export function sameStart(a: number, b: number): boolean {
+  return a === b;
+}
+
+/** Start time of `pid` (see `startMsFromIdentity`), or null when it cannot be read. */
+export function processStartMs(pid: number, deps: IdentityReadDeps = {}): number | null {
+  return startMsFromIdentity(readPidIdentity(pid, deps), deps.platform);
+}
+
+/** `processStartMs` read from a `/proc` tree: the escape scan reads fake trees in its tests. */
 export function procStartMs(pid: number, procDir = "/proc"): number | null {
-  try {
-    const stat = readFileSync(`${procDir}/${pid}/stat`, "utf8");
-    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-    const ticks = Number(fields[19]); // field 22 is index 19 after field 3
-    return Number.isFinite(ticks) ? (ticks * 1000) / LINUX_CLOCK_TICKS_PER_SECOND : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Start time of `pid`, or null when it cannot be read. Linux: `/proc` (monotonic, 10 ms
- * resolution). Elsewhere: `ps -o lstart=` (1 s resolution).
- */
-export function processStartMs(pid: number): number | null {
-  if (process.platform === "linux") return procStartMs(pid);
-  try {
-    const out = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
-      encoding: "utf8",
-      timeout: 2000,
-    });
-    if (out.status !== 0) return null;
-    const ms = Date.parse(out.stdout.trim());
-    return Number.isNaN(ms) ? null : ms;
-  } catch {
-    return null;
-  }
+  return processStartMs(pid, { platform: "linux", procDir });
 }
 
 export type BootIdReader = () => string | null;

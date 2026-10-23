@@ -905,23 +905,36 @@ describe("unknown holds (r14b)", () => {
   });
 });
 
-// #570 r14d (H1): on Linux a recorded start time is exact, so a one-second move is another process.
-describe("start-time comparison by platform (r14d, H1)", () => {
+// #570 r14d (H1), #581 cp2: a recorded start time is compared exactly on every platform, so a
+// process that started one or two seconds after the recorded one is another process, under `ps`
+// as under `/proc`. The 2000 ms window #570 kept for `ps` is gone.
+describe("start-time comparison on every platform (r14d, H1; #581 cp2)", () => {
   const alive = () => {};
-  it("a held process whose /proc start moved by one second is gone; under ps it is the same", () => {
+  const platforms: Array<"linux" | "darwin"> = ["linux", "darwin"];
+
+  it("a held process whose start moved by one or two seconds is gone, on every platform", () => {
     const held = { pid: 4242, startMs: 10_000 };
-    const deps = { kill: alive, startMs: () => 11_000 };
-    // Went red (true) with the 2000 ms window on the Linux path of heldProcAlive.
-    expect(withPlatform("linux", () => heldProcAlive(held, deps))).toBe(false);
-    expect(withPlatform("darwin", () => heldProcAlive(held, deps))).toBe(true);
+    for (const platform of platforms) {
+      for (const now of [11_000, 12_000]) {
+        const deps = { kill: alive, startMs: () => now };
+        expect(withPlatform(platform, () => heldProcAlive(held, deps))).toBe(false);
+      }
+      // The twin: the recorded start time itself is still the held process.
+      const same = { kill: alive, startMs: () => 10_000 };
+      expect(withPlatform(platform, () => heldProcAlive(held, same))).toBe(true);
+    }
   });
 
-  it("an owner whose /proc start moved by one second is dead; under ps it is still the owner", () => {
+  it("an owner whose start moved by one or two seconds is dead, on every platform", () => {
     const owner = live({ pid: 4242, startMs: 10_000, instance: "an-earlier-daemon" });
-    const deps = { kill: alive, startMs: () => 11_000 };
-    // Went red (false) with the 2000 ms window on the Linux path of isOwnerDead.
-    expect(withPlatform("linux", () => isOwnerDead(owner, deps))).toBe(true);
-    expect(withPlatform("darwin", () => isOwnerDead(owner, deps))).toBe(false);
+    for (const platform of platforms) {
+      for (const now of [11_000, 12_000]) {
+        const deps = { kill: alive, startMs: () => now, anotherBoot: () => false };
+        expect(withPlatform(platform, () => isOwnerDead(owner, deps))).toBe(true);
+      }
+      const same = { kill: alive, startMs: () => 10_000, anotherBoot: () => false };
+      expect(withPlatform(platform, () => isOwnerDead(owner, same))).toBe(false);
+    }
   });
 });
 
@@ -1025,6 +1038,94 @@ describe("a persisted record from another boot is gone", () => {
     } finally {
       for (const log of logs) log.mockRestore();
     }
+  });
+
+  // #581 cp2: a record written before the boot id existed has no `bootId` KEY at all (not null).
+  // It stays readable, and on Linux it never authorises a probe or a signal: with no boot id there
+  // is no way to know its start time was read on this boot.
+  function persistedLegacy(): string {
+    const root = leftover(
+      `${ONESHOT_CONFIG_PREFIX}survivor-legacy`,
+      OLD,
+      live({ pid: deadPid(), instance: "the-daemon-before-the-restart" }),
+    );
+    const { bootId: _owner, ...legacyOwner } = live({
+      pid: deadPid(),
+      instance: "the-daemon-before-the-restart",
+    });
+    writeFileSync(join(root, ONESHOT_OWNER_FILE), JSON.stringify(legacyOwner));
+    writeFileSync(
+      join(root, ONESHOT_SURVIVOR_FILE),
+      JSON.stringify({
+        pid: 4242,
+        startMs: selfStart,
+        cwds: [],
+        unknown: [{ pid: 4343, startMs: selfStart }],
+      }),
+    );
+    expect("bootId" in JSON.parse(readFileSync(join(root, ONESHOT_SURVIVOR_FILE), "utf8"))).toBe(
+      false,
+    );
+    utimesSync(root, OLD, OLD);
+    return root;
+  }
+
+  it("legacy survivor.json with no bootId key: stays readable, but on Linux nothing is probed, signalled or held", () => {
+    const root = persistedLegacy();
+    const groupGone = spyOn({ f: (_r: unknown) => true }, "f");
+    const scan = spyOn({ f: (_t: unknown) => ({ pids: [], unknown: [] }) as EscapeScan }, "f");
+    const heldAlive = spyOn({ f: (_p: unknown) => true }, "f");
+    const logs = quiet();
+    try {
+      restart();
+      expect(
+        sweep({
+          anotherBoot: onBoot("boot-B"),
+          groupGone: groupGone as never,
+          scan: scan as never,
+          heldAlive: heldAlive as never,
+        }),
+      ).toBe(1);
+      expect(groupGone).not.toHaveBeenCalled();
+      expect(scan).not.toHaveBeenCalled();
+      expect(heldAlive).not.toHaveBeenCalled();
+      expect(groupSurvivorOf(root)).toBeUndefined();
+      expect(unknownHoldCount()).toBe(0);
+      expect(existsSync(root)).toBe(false);
+    } finally {
+      for (const log of logs) log.mockRestore();
+    }
+  });
+
+  it("legacy survivor.json off Linux (no boot id exists to compare) is still a survivor, probed with its recorded start time", () => {
+    const root = persistedLegacy();
+    const logs = quiet();
+    try {
+      restart();
+      const asked: Array<{ pid: number; startMs: number | null }> = [];
+      expect(
+        sweep({
+          anotherBoot: (recorded) =>
+            recordedOnAnotherBoot(recorded, { platform: "darwin", bootId: () => "boot-B" }),
+          groupGone: (r) => {
+            asked.push({ pid: r.pid, startMs: r.startMs });
+            return false;
+          },
+          scan: () => ({ pids: [], unknown: [] }) as EscapeScan,
+          heldAlive: () => true,
+        }),
+      ).toBe(0);
+      expect(asked).toEqual([{ pid: 4242, startMs: selfStart }]);
+      expect(groupSurvivorOf(root)).toBe(4242);
+    } finally {
+      for (const log of logs) log.mockRestore();
+    }
+  });
+
+  it("a legacy owner file with no bootId key is a dead owner on Linux, however live its pid", () => {
+    const { bootId: _dropped, ...legacy } = live();
+    const owner = { ...legacy, bootId: undefined } as OwnerRecord;
+    expect(isOwnerDead(owner, { anotherBoot: onBoot("boot-B") })).toBe(true);
   });
 
   it("writes the boot id into the owner file and into survivor.json", () => {

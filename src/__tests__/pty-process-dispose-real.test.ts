@@ -7,7 +7,8 @@
  * tests use the real library and a child that traps TERM and HUP, and read death from the OS.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { PtyExitUnconfirmedError, readPidIdentity, spawnPty } from "../runner/pty-process";
+import { readPidIdentity } from "../runner/pty-proc-identity";
+import { PtyExitUnconfirmedError, spawnPty } from "../runner/pty-process";
 
 const alive = (pid: number): boolean => {
   try {

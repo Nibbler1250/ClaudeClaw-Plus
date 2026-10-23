@@ -184,6 +184,47 @@ describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () =
     expect(child?.kills).toEqual([]);
   });
 
+  test("a pid reused one tick after the child was born (a raw Linux start time one higher) is never signalled", async () => {
+    // The identity is compared exactly as read: a window of one tick (10 ms) or one second would
+    // call the stranger the child.
+    const os = makeOs();
+    os.identity = "500000";
+    const proc = await spawnWith(os);
+    os.identity = "500001";
+
+    await proc.dispose();
+
+    expect(os.log.filter((e) => e.endsWith(":SIGKILL"))).toEqual([]);
+    expect(os.alive).toBe(true);
+    expect(child?.kills).toEqual([]);
+  });
+
+  test("the identity is read again immediately before each SIGKILL: a pid reused after the last wait check is left alone", async () => {
+    // Every earlier look says "same". The pid is handed over after the wait's last check and
+    // before the signal, so only a read made right before the signal sees the stranger.
+    const os = makeOs();
+    const grace = 200;
+    let flipped = false;
+    let t0 = Number.POSITIVE_INFINITY;
+    os.identity = null; // the reader below answers instead
+    const proc = await spawnWith(os, {
+      _exitGraceMs: grace,
+      _exitCapMs: 800,
+      _readPidIdentity: () => {
+        if (flipped) return "boot-2";
+        if (Date.now() >= t0 + grace) flipped = true; // this read is the wait's last check: still "same"
+        return "boot-1";
+      },
+    });
+    t0 = Date.now();
+
+    await proc.dispose();
+
+    expect(flipped).toBe(true);
+    expect(os.log.filter((e) => e.endsWith(":SIGKILL"))).toEqual([]);
+    expect(os.alive).toBe(true); // the stranger is untouched
+  });
+
   test("a later confirmation whose identity cannot be read sends no signal and stays unconfirmed", async () => {
     // Fault (site: `_maySignal`, treat "unknown" as signalable on any retirement): the later
     // confirmation SIGKILLs a pid it cannot vouch for. Predicted result: a second pair of
