@@ -1709,3 +1709,211 @@ What this shows: slot accounting did not regress any live row. It does not exerc
 
 - Holds were already persisted and adopted; no persistence was added. A hold adopted at restart now reserves a slot, which it did not before.
 - A hold whose process the daemon can never confirm gone (an identity it cannot read) keeps its slot until restart. That is the fail-closed choice, same as an unsettled retirement.
+
+## #581 checkpoint 6: spawn audit, internal key carried to the native spawn, final assertion at every spawn
+
+Branch `feat/570-shared-pty`, from `9443134b` (cp5). Commits: `958ada11` (assertions and late-fence tests), `51c52985` (streaming-helper test), `24b52395` (pre-allocated id test), `257ca8ae` (tmux order, polling controls).
+
+### 1. Re-enumeration of native spawns
+
+Searched `src` (production only, tests excluded) for `spawn(`, `Bun.spawn`, `Bun.spawnSync`, `_ptySpawn`, `bunPty.spawn`, `nodeSpawnChildProcess`, `spawnPty`, `spawnSync`, `execFile`, `execSync`, `fork(`, `Bun.$`, and for every use of `claudeExecutable()` / `CLAUDE_EXECUTABLE` / `claudeBin`. Every `CLAUDE_EXECUTABLE` argv array in `runner.ts` (1046, 2048, 2307, 3000, 3319) is only built there and consumed by `spawnClaude`, so it is covered by site 9. Not Claude writers on a session, and so without a session fence: `runner.ts:148` and `bus/schema-probe.ts:167` (`claude --version`), `commands/plugin-cli.ts:60` (`claude plugin ...`, no session), the identity and group `ps`/`lsof` helpers, `memory.ts`, `whisper.ts`, `preflight.ts`, `tuner/*`, `skills-tuner/core/llm.ts` (goes through `runOneShot`), HTTP engines.
+
+| # | Site | Final assertion (target) | Native call |
+|---|---|---|---|
+| 1 | Supervisor first spawn, `pty-supervisor.ts:2674` | key + `sessionId \|\| newSessionId` | `:2675` |
+| 2 | Supervisor respawn, `pty-supervisor.ts:2848` | key + `sessionId \|\| newSessionId` | `:2849` |
+| 3 | Runner native PTY, `pty-process.ts:1951` (inside the `withCleanProcessEnv` callback) | `opts.sessionKey` + `sessionId \|\| newSessionId`, unconditional | `:1955` |
+| 4 | Untrusted one-shot native PTY: the same line as 3 (the ephemeral key is `opts.sessionKey`) | key only, no CLI id | `:1955` |
+| 5 | Bus PTY, `bus/session-manager.ts:1146` (moved inside the callback) | `session_id` | `:1147` |
+| 6 | Bus child, `bus/session-manager.ts:1172` | `session_id` | `:1177` |
+| 7 | Bus tmux, `bus/session-manager.ts:1217` (now after the argv is prepared) | `session_id` | `:1218` |
+| 8 | Bus schema probe, `bus/schema-probe-runner.ts:102` (NEW, inside the callback) | key `schema-probe:<id>` + generated id | `:103` |
+| 9 | Print engine, `oneshot/print.ts:84` | trusted resume id; untrusted creates none | `:86` |
+| 10 | Legacy `spawnClaude`, `runner.ts:915` | resume id from argv | `:917` (test seam `:916`) |
+| 11 | Legacy `runClaudeStreaming`, `runner.ts:1341` | resume id from argv | `:1342` |
+
+No await sits between any assertion and its native call (checked by reading each; for 3, 5, 8 the call and the assertion are two statements of one synchronous callback).
+
+### 2. Decisions and findings
+
+- **Key carried.** `PtyProcessOptions.sessionKey` already travelled from `buildSpawnOptions`; it is now read by the native assertion. The supervisor and the native site use the effective id `sessionId || newSessionId` (the id the argv names).
+- **A fenced session is not a spawn failure.** `spawnPty`'s catch wraps errors into `Failed to spawn PTY`; `PtyQuarantinedError` is now rejected as itself, so the supervisor maps it as before.
+- **Bus assertions mirror their gate, on purpose.** The bus quarantines under key `agent_id` but its async gate and final assertions use only `session_id` (the id rotates on a collision respawn). Adding the key to the final assertion alone would refuse a spawn the gate would have released (a quarantine under a rotated-away id would never be confirmed). Left as in #562; adding the key to both is a behaviour change for Terry to rule on (for cp7).
+- **`runClaudeStreaming` has no production caller** (`rg` finds only its definition). Its assertion is kept and now reachable for a test through `_runClaudeStreamingForTests`; whether to delete the function is left to Terry.
+- **No default changed**: route, platform, version, environment masking and #575 precedence are untouched. The only production-behaviour changes are the stricter checks above.
+- **Independent of the injection harness**: `tests/integration/untrusted-pty-isolation.test.ts` (CI only) reads the spawn's cwd and environ after `spawnPty` returns. Nothing it reads changed; a fenced spawn now rejects, which only happens on a fenced key.
+
+### 3. Late-fence tests
+
+`src/__tests__/pty-final-spawn-assertions.test.ts` (12: native trusted by id, by key, by new id, by quarantine record; untrusted by ephemeral key; fences that land during argv preparation, trusted and untrusted; a fence that lands while the exact environment policy is applied, plus restore of PATH; positive control; supervisor respawn after the gate passed; first spawn by key; first spawn by pre-allocated id), `pty-spawn-fence.test.ts` (+1, streaming helper), `bus/__tests__/session-manager-quarantine.test.ts` (+4: child, tmux, two positive controls), `bus/__tests__/schema-probe-spawn-fence.test.ts` (3, new).
+
+### 4. One-site fault injections (`git archive` copy per injection, restored by deleting the copy)
+
+Every injection went RED, each independently. The RED lines below are verbatim from `bun test`.
+
+#### 6a-supervisor-first-spawn (on 24b52395)
+
+- fault: remove the final assertion before `spawn(spawnOpts)` in spawnEntry
+- result: pass=21 fail=3
+- RED lines:
+  - `(fail) the retirement fence > refuses a first spawn that would resume the session of a key whose retirement is in flight [5016.02ms]`
+  - `(fail) the supervisor's spawns > a first spawn on a fresh session does not go ahead when the id it pre-allocates is fenced [0.87ms]`
+  - `(fail) the supervisor's spawns > a first spawn does not go ahead on a fenced KEY, though the session it names is free [0.70ms]`
+
+#### 6b-supervisor-respawn (on 24b52395)
+
+- fault: remove the final assertion before `spawn(opts)` in respawnEntry
+- result: pass=23 fail=1
+- RED lines:
+  - `(fail) the supervisor's spawns > the respawn does not spawn on a key fenced after its gate passed [2.65ms]`
+
+#### 6c-native-pty-removed (on 24b52395)
+
+- fault: remove the final assertion in spawnPty's environment callback
+- result: pass=4 fail=8
+- RED lines:
+  - `(fail) spawnPty: the assertion directly before the native call > a trusted resume of a fenced session id does not spawn [0.95ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > a trusted spawn on a fenced KEY does not spawn, whatever session it names [0.33ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > a pre-allocated new session id is checked too [0.73ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > an untrusted one-shot names no session id: its ephemeral KEY is fenced, and it does not spawn [1.05ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > a quarantine record stops a native spawn the same way a fence does [1.01ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > a fence that lands while the argv is being prepared still stops the spawn (trusted) [0.23ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > a fence that lands while the argv is being prepared still stops the spawn (untrusted) [0.78ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > an untrusted fence that lands while the exact environment policy is applied is seen, and the environment is restored [0.47ms]`
+
+#### 6d-native-untrusted-conditional (on 24b52395)
+
+- fault: assert only when the options name a session id (the pre-cp6 shape): an untrusted one-shot names none
+- result: pass=7 fail=5
+- RED lines:
+  - `(fail) spawnPty: the assertion directly before the native call > a trusted spawn on a fenced KEY does not spawn, whatever session it names [0.44ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > a pre-allocated new session id is checked too [0.31ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > an untrusted one-shot names no session id: its ephemeral KEY is fenced, and it does not spawn [0.50ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > a fence that lands while the argv is being prepared still stops the spawn (untrusted) [0.77ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > an untrusted fence that lands while the exact environment policy is applied is seen, and the environment is restored [0.49ms]`
+
+#### 6e-native-key-dropped (on 24b52395)
+
+- fault: drop `sessionKey` from the native assertion's target
+- result: pass=6 fail=6
+- RED lines:
+  - `(fail) spawnPty: the assertion directly before the native call > a trusted spawn on a fenced KEY does not spawn, whatever session it names [0.37ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > an untrusted one-shot names no session id: its ephemeral KEY is fenced, and it does not spawn [0.46ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > a quarantine record stops a native spawn the same way a fence does [0.27ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > a fence that lands while the argv is being prepared still stops the spawn (trusted) [0.18ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > a fence that lands while the argv is being prepared still stops the spawn (untrusted) [0.46ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > an untrusted fence that lands while the exact environment policy is applied is seen, and the environment is restored [0.45ms]`
+
+#### 6f1-native-outside-callback (on 24b52395)
+
+- fault: move the native assertion out of the withCleanProcessEnv callback, to the line above it
+- result: pass=11 fail=1
+- RED lines:
+  - `(fail) spawnPty: the assertion directly before the native call > an untrusted fence that lands while the exact environment policy is applied is seen, and the environment is restored [0.54ms]`
+
+#### 6f2-native-top-of-spawnPty (on 24b52395)
+
+- fault: move the native assertion to the top of spawnPty, before argv preparation
+- result: pass=9 fail=3
+- RED lines:
+  - `(fail) spawnPty: the assertion directly before the native call > a fence that lands while the argv is being prepared still stops the spawn (trusted) [0.33ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > a fence that lands while the argv is being prepared still stops the spawn (untrusted) [0.46ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > an untrusted fence that lands while the exact environment policy is applied is seen, and the environment is restored [0.54ms]`
+
+#### 6g-bus-pty (on 257ca8ae)
+
+- fault: remove the assertion before ptySpawn in the bus PTY spawn
+- result: pass=5 fail=1
+- RED lines:
+  - `(fail) SessionManager.spawnAgent and the quarantine gate > does not start claude on a session whose retirement began after the async gate passed [2432.30ms]`
+
+#### 6h-bus-child (on 257ca8ae)
+
+- fault: remove the assertion before the node spawn in spawnChild
+- result: pass=5 fail=1
+- RED lines:
+  - `(fail) SessionManager.spawnAgent and the quarantine gate > does not start the child process on a session whose retirement began after the async gate passed [296.20ms]`
+
+#### 6i-bus-tmux (on 257ca8ae)
+
+- fault: remove the assertion before the node spawn in spawnTmux
+- result: pass=5 fail=1
+- RED lines:
+  - `(fail) SessionManager.spawnAgent and the quarantine gate > tmux > does not start tmux on a session whose retirement began after the async gate passed [600.19ms]`
+
+#### 6j-schema-probe (on 257ca8ae)
+
+- fault: remove the assertion before bunPty.spawn in the schema probe runner
+- result: pass=1 fail=2
+- RED lines:
+  - `(fail) defaultPtyRunnerFactory and the spawn gate > does not start claude on a probe key fenced after the factory's awaits [219.40ms]`
+  - `(fail) defaultPtyRunnerFactory and the spawn gate > does not start claude on a probe session id whose process is quarantined [220.07ms]`
+
+#### 6k-print-engine (on 24b52395)
+
+- fault: remove the trusted resume-session assertion before the print spawn
+- result: pass=11 fail=1
+- RED lines:
+  - `(fail) a session quarantined during the awaited gap before a spawn > the print engine does not spawn after its config and runner imports (print.ts) [4.29ms]`
+
+#### 6l-legacy-spawnClaude (on 24b52395)
+
+- fault: remove assertResumeSpawnable before the legacy spawn in spawnClaude
+- result: pass=11 fail=1
+- RED lines:
+  - `(fail) a session quarantined during the awaited gap before a spawn > the legacy `claude -p --resume` does not spawn (runner spawnClaude) [3.06ms]`
+
+#### 6m-legacy-streaming (on 24b52395)
+
+- fault: remove assertResumeSpawnable before Bun.spawn in runClaudeStreaming
+- result: pass=11 fail=1
+- RED lines:
+  - `(fail) a session quarantined during the awaited gap before a spawn > the legacy streaming helper does not spawn (runner runClaudeStreaming) [331.36ms]`
+
+#### 6n-supervisor-first-spawn-new-id (on 24b52395)
+
+- fault: leave newSessionId out of spawnEntry's effective session id
+- result: pass=11 fail=1
+- RED lines:
+  - `(fail) the supervisor's spawns > a first spawn on a fresh session does not go ahead when the id it pre-allocates is fenced [1.21ms]`
+
+#### 12a-native-env-isolation (on 24b52395)
+
+- fault: an untrusted spawn no longer passes its exact environment as the native policy
+- result: pass=41 fail=1
+- RED lines:
+  - `(fail) untrusted native PTY inheritance excludes even native-only variables and restores the parent [21.80ms]`
+
+#### 12b-isolation-argv-flag (on 24b52395)
+
+- fault: an untrusted PTY argv loses --disable-slash-commands
+- result: pass=7 fail=1
+- RED lines:
+  - `(fail) the actual untrusted PTY spawn preserves every interactive isolation argument [14.30ms]`
+
+#### 12c-file-mention-neutralising (on 24b52395)
+
+- fault: an untrusted PTY prompt keeps its @ file mentions
+- result: pass=53 fail=2
+- RED lines:
+  - `(fail) the exact bytes written > a user record with the neutralised text is this prompt [539.40ms]`
+  - `(fail) the exact bytes written > a user record with the pre-neutralisation text is not [122.74ms]`
+
+#### 12d-containment-marketplace-env (on 24b52395)
+
+- fault: an untrusted child loses CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL
+- result: pass=7 fail=1
+- RED lines:
+  - `(fail) untrusted PTY spawn uses the exact same caller environment policy as print [11.23ms]`
+
+### 5. Gates (HEAD `257ca8ae`)
+
+- Gate files run one per process (a single combined process shows cross-file pollution: 870 tests, 5 failures that pass alone). 870 tests in 35 files, all pass per file: spawn-fence (12+12+5+11+5), bus (6+3+7+27), native environment (runner 34, pty-isolation 8, libc-fallthrough 6), routing (21+8+38+61), argv (5+11), and the #562 safety files (transcript 93, false-completion 46, turn-evidence-guard 31, process 71, supervisor 111, send-to-live 34, boot-dialog 16, trust-prompt 18, hot-switch-to-print 9, dispose 9, dispose-real 5), plus the isolated-turn, reply, slot, late-retire and untrusted-state files.
+- `pty-supervisor.test.ts` has one failure only when `ANTHROPIC_BASE_URL` is set in the shell (the local proxy sets it); identical on `9443134b`. With it unset: 111 pass, 0 fail on both.
+- tsc ratchet: 149 (baseline 149). `bun run lint`: exit 0, 0 errors.
+
+### 6. Not done / left for cp7
+
+- Full-suite integration run, security and code review of the whole delta, CI isolation twins.
+- The bus key question above; the dead `runClaudeStreaming`.
+- Respawn's `newSessionId` leg of the effective id has no dedicated test (a respawn resumes the stored id); the first-spawn leg does.
