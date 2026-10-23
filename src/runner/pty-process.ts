@@ -1615,12 +1615,10 @@ class PtyProcessImpl implements PtyProcess {
       deadlineAt,
       termGraceMs: this._exitGraceMs,
     });
-    // Continuity is fresh evidence only: a group found absent revokes it (see retireProcessGroup).
-    if (outcome.groupAbsentSeen) this._groupContinuity = false;
-    else if (outcome.groupSeen) {
-      this._groupContinuity = true;
-      this._groupContinuityAt = Date.now();
-    }
+    // Continuity is fresh evidence only: it is what the retirement ended holding, never a group
+    // that was merely seen (a withheld signal means nothing vouched for it).
+    this._groupContinuity = outcome.continuityHeld;
+    if (outcome.continuityHeld) this._groupContinuityAt = Date.now();
     let scanCause: SurvivorCause | null = null;
     if (this._reapEscapees) {
       try {

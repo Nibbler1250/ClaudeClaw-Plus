@@ -262,6 +262,19 @@ describe("natural leader exit before dispose", () => {
     expect(os.log).toEqual([`-${proc.pid}:SIGTERM`, `-${proc.pid}:SIGKILL`]);
   });
 
+  test("a group seen while a signal was withheld does not become continuity for the retry", async () => {
+    // Fault (site: `retireProcessGroup`, continuityHeld = "the group was seen"): the unvouched
+    // group is renewed as ours and the retry KILLs it. Predicted result: `-pid:SIGKILL` in the log.
+    const os = makeOs({ leader: false, members: 0 });
+    const proc = await spawnOver(os, { _groupConfirm: "enforce" });
+    (native as FakeNative).fireExit(); // no group behind the leader at its exit
+    os.members = 3; // a stranger's group appears on the pgid
+    await expect(proc.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
+    await expect(proc.confirmExit?.()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
+    expect(os.log).toEqual([]);
+    expect(os.members).toBe(3); // untouched
+  });
+
   test("an exit that left no group behind signals nothing, even if something answers on the pgid later", async () => {
     // The exit event finds no group (continuity not established); a stranger's group then
     // appears on that pgid. Without evidence it is ours, nothing is sent.

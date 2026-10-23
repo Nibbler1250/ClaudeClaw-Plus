@@ -205,13 +205,44 @@ describe("retireProcessGroup", () => {
     expect(out.groupGone).toBe(true);
   });
 
-  it("a probe that finds the group absent says so, so the caller revokes the continuity it held", async () => {
+  it("a group seen while a signal is withheld never becomes continuity", async () => {
+    // Leader gone, a stranger's group answers, no evidence it is ours: nothing is sent, and the
+    // outcome must not hand the caller "continuity" to use on the next confirmation (security
+    // review of cp3: a withheld outcome used to renew it).
+    const w = world({ leader: false, members: 2, immuneMembers: true });
+    const out = await retireProcessGroup(
+      input(w, { initial: false, leaderSeenAlive: false, groupContinuity: false, sendTerm: false }),
+    );
+    // Went red (true) with continuity renewed from "the group was seen".
+    expect(w.log).toEqual([]);
+    expect(out.reason).toBe("unknown-identity");
+    expect(out.continuityHeld).toBe(false);
+  });
+
+  it("continuity held at the start is held at the end while the group stays, and the initial retirement of a live leader holds it", async () => {
+    const stays = world({ leader: false, members: 2, immuneMembers: true });
+    const held = await retireProcessGroup(
+      input(stays, {
+        initial: false,
+        leaderSeenAlive: false,
+        groupContinuity: true,
+        sendTerm: false,
+      }),
+    );
+    expect(held).toMatchObject({ groupGone: false, continuityHeld: true });
+
+    const live = world({ members: 1, immuneMembers: true });
+    const initial = await retireProcessGroup(input(live));
+    expect(initial).toMatchObject({ leaderGone: true, groupGone: false, continuityHeld: true });
+  });
+
+  it("a probe that finds the group absent revokes the continuity it held", async () => {
     const w = world({ leader: false, members: 0 });
     const out = await retireProcessGroup(
       input(w, { initial: false, leaderSeenAlive: false, groupContinuity: true, sendTerm: false }),
     );
-    // Went red (false) with the report removed: a stale `true` would outlive the group it vouched for.
-    expect(out.groupAbsentSeen).toBe(true);
+    // Went red (true) with the revocation removed: a stale `true` would outlive the group it vouched for.
+    expect(out.continuityHeld).toBe(false);
     expect(out.groupGone).toBe(true);
     expect(w.log).toEqual([]);
   });

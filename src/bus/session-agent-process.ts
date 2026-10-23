@@ -1411,11 +1411,10 @@ export class PtyAgentProcess implements AgentProcess {
       deadlineAt,
       termGraceMs: seams.exitGraceMs ?? 2000,
     });
-    if (outcome.groupAbsentSeen) this._groupContinuity = false;
-    else if (outcome.groupSeen) {
-      this._groupContinuity = true;
-      this._groupContinuityAt = Date.now();
-    }
+    // Continuity is fresh evidence only: it is what the retirement ended holding, never a group
+    // that was merely seen (a withheld signal means nothing vouched for it).
+    this._groupContinuity = outcome.continuityHeld;
+    if (outcome.continuityHeld) this._groupContinuityAt = Date.now();
     const verdict = judgeGroupOutcome(outcome, {
       untrusted: false,
       mode: seams.groupConfirm,

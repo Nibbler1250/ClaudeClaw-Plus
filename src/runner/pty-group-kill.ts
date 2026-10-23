@@ -441,10 +441,13 @@ export interface RetireGroupOutcome {
   survivors: number | undefined;
   /** Executable basenames of the members left. */
   comm: string[];
-  /** Whether the group was seen with members: the continuity a later confirmation may rely on. */
-  groupSeen: boolean;
-  /** Whether a probe found the group absent: that revokes any continuity (see above). */
-  groupAbsentSeen: boolean;
+  /**
+   * The continuity a later confirmation may rely on, as this call left it: true only when the
+   * call began holding valid evidence (or the leader was alive at its start) and no probe has
+   * found the group absent since. Never set because a group was merely SEEN: a group seen while
+   * a signal was withheld is exactly one nothing vouched for (security review of cp3).
+   */
+  continuityHeld: boolean;
 }
 
 /** How often a SIGTERM that could not be sent yet is tried again, inside the TERM grace. */
@@ -532,8 +535,7 @@ export async function retireProcessGroup(input: RetireGroupInput): Promise<Retir
     reason: null,
     survivors: undefined,
     comm: [],
-    groupSeen: false,
-    groupAbsentSeen: false,
+    continuityHeld: false,
   };
   if (!isSignalablePid(pid)) return unknown;
   const target = new GroupTarget(pid, signal, liveMembers, {
@@ -548,14 +550,9 @@ export async function retireProcessGroup(input: RetireGroupInput): Promise<Retir
   // that is seen again after that is not the one that was seen before (a stranger's, on a
   // recycled pid). Security review of cp3.
   let continuity = input.groupContinuity || (input.initial && input.leaderSeenAlive);
-  let groupSeen = false;
-  let groupAbsentSeen = false;
   const look = (withIdentity: boolean): GroupProbe => {
     const probe = target.probe(withIdentity);
-    if (probe.groupGone) {
-      groupAbsentSeen = true;
-      continuity = false;
-    } else if (probe.live === undefined || probe.live > 0) groupSeen = true;
+    if (probe.groupGone) continuity = false; // nothing is left that evidence could vouch for
     return probe;
   };
   // Identity is read on the first and the last check of a wait only (a `ps` spawn on macOS).
@@ -586,17 +583,10 @@ export async function retireProcessGroup(input: RetireGroupInput): Promise<Retir
     probe = await waitGone(input.deadlineAt);
   }
   if (probe.groupGone) {
-    return {
-      ...unknown,
-      leaderGone: true,
-      groupGone: true,
-      survivors: 0,
-      groupSeen,
-      groupAbsentSeen,
-    };
+    return { ...unknown, leaderGone: true, groupGone: true, survivors: 0, continuityHeld: false };
   }
   if (!probe.leaderGone) {
-    return { ...unknown, leaderGone: false, survivors: probe.live, groupSeen, groupAbsentSeen };
+    return { ...unknown, leaderGone: false, survivors: probe.live, continuityHeld: continuity };
   }
   const described = describe(pid);
   const reason: GroupReason = probe.eperm
@@ -612,7 +602,6 @@ export async function retireProcessGroup(input: RetireGroupInput): Promise<Retir
     reason,
     survivors: described.count ?? probe.live,
     comm: described.comm,
-    groupSeen: true,
-    groupAbsentSeen,
+    continuityHeld: continuity,
   };
 }
