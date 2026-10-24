@@ -176,6 +176,27 @@ function commandNameOf(text: string): string | null {
   return /<command-name>\s*([^<]*?)\s*<\/command-name>/.exec(text)?.[1] ?? null;
 }
 
+/** The `<command-args>` the CLI recorded beside a slash command; empty when there are none. */
+function commandArgsOf(text: string): string {
+  return /<command-args>([\s\S]*?)<\/command-args>/.exec(text)?.[1]?.trim() ?? "";
+}
+
+/**
+ * A prompt that is a custom slash command (`/name args`) is NOT recorded as the typed text:
+ * the CLI writes `<command-message>..</command-message><command-name>/name</command-name>
+ * <command-args>args</command-args>` and then the expansion as an `isMeta` entry (which the
+ * turn skips). So the typed text can never equal the entry, and without this the prompt would
+ * never be seen as accepted (CI integration, `command FLAG alone` twin, exit 1). It matches
+ * only on the command name AND its exact arguments, so `/a b` is not `/a c` and not `/a`.
+ */
+function recordedCommandMatches(entryText: string, want: string): boolean {
+  if (!want.startsWith("/")) return false;
+  const name = commandNameOf(entryText);
+  if (name === null) return false;
+  const first = want.split(/\s+/)[0];
+  return name === first && commandArgsOf(entryText) === want.slice(first.length).trim();
+}
+
 /**
  * Whether the transcript's `entryText` IS the prompt we wrote: the whole payload, after the
  * CLI's paste wrapper and the whitespace around it are taken off, compared for equality.
@@ -195,6 +216,7 @@ export function promptMatches(entryText: string, written: string, replCommand: b
   }
   const want = written.normalize("NFC").trim();
   if (want === "") return false;
+  if (recordedCommandMatches(entryText, want)) return true;
   const tabbed = want.includes("\t")
     ? new RegExp(`^${want.split("\t").map(escapeRegExp).join(" *")}$`, "u")
     : null;

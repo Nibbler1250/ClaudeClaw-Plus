@@ -423,8 +423,10 @@ describe("M2: one absolute deadline end to end", () => {
         startMs: () => 1,
         sleep: async (ms: number) => sleep(ms * 4),
         pollMs: 20,
-        termGraceMs: 100,
-        killGraceMs: 100,
+        // Grace budgets that EXCEED the deadline: a scan that honours only its own budgets
+        // runs for over two seconds here, one that honours the deadline stops at about 150 ms.
+        termGraceMs: 1000,
+        killGraceMs: 1000,
         deadlineAt: started + 150, // read by the fix only
       },
     ).catch(() => [5001]);

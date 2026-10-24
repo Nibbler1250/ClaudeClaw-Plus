@@ -504,6 +504,44 @@ describe("survivor.json", () => {
     expect(statSync(file).mode & 0o777).toBe(0o600);
   });
 
+  it("carries the identity, group id and identified members across a restart into the retry (#581 cp8, H1)", async () => {
+    const root = leftover(`${ONESHOT_CONFIG_PREFIX}members`, OLD, own());
+    const members = [
+      { pid: 4243, identity: "m-1" },
+      { pid: 4244, identity: "m-2" },
+    ];
+    markGroupSurvivor(root, 4242, {
+      startMs: 7,
+      identity: "id-4242",
+      groupId: 4242,
+      members,
+      cwds: [],
+    });
+    // Went red (members [] in the file) with the members left out of the persisted record.
+    expect(JSON.parse(readFileSync(join(root, ONESHOT_SURVIVOR_FILE), "utf8"))).toMatchObject({
+      identity: "id-4242",
+      groupId: 4242,
+      members,
+    });
+    utimesSync(root, OLD, OLD);
+    restart();
+    const error = errorSpy();
+    try {
+      expect(sweep({ groupGone: () => false })).toBe(0); // adopts it back, removes nothing
+    } finally {
+      error.mockRestore();
+    }
+    const seen: Array<{ identity: string | null; groupId: number | null; members: unknown }> = [];
+    await retrySurvivingGroups({
+      retire: async (input) => {
+        seen.push({ identity: input.identity, groupId: input.groupId, members: input.members });
+        return retireOutcome(false);
+      },
+      reap: async () => [],
+    });
+    expect(seen).toEqual([{ identity: "id-4242", groupId: 4242, members }]);
+  });
+
   it("does not make recording the survivor throw when it cannot be written, and says so", () => {
     const error = errorSpy();
     try {
