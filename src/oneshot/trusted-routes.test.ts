@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, rmdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -30,6 +30,7 @@ import {
   resetSession,
   createFallbackSession,
   getFallbackSession,
+  resetFallbackSession,
 } from "../sessions.js";
 import { saveGlobalMemoryOneShot } from "../shutdown-memory-save.js";
 
@@ -134,6 +135,11 @@ describe("#572 trusted fallback dispatch", () => {
     injectOneShotTrustForTests(null);
     _setSettingsFileForTests();
     await resetSession();
+    // The compact test stores a fallback session for agent "suzy" under <cwd>/agents/suzy. Left
+    // behind, that directory makes the later `validateAgentName("suzy")` test fail (#581 cp8).
+    await resetFallbackSession("suzy");
+    const suzyDir = join(process.cwd(), "agents", "suzy");
+    if (existsSync(suzyDir) && readdirSync(suzyDir).length === 0) rmdirSync(suzyDir);
     rmSync(dir, { recursive: true, force: true });
   });
   it("reload changes implicit dispatch without re-parsing an explicit default", async () => {
