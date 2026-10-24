@@ -1531,8 +1531,13 @@ export function discordStatusText(
   quarantine?: QuarantineInfo[],
   now?: number,
 ): string {
+  // The observed-group counter is the soak's measure and moves with bus and cron retirements,
+  // not with this chat, so it is shown whether or not there is an active session (#581 cp8, L2).
+  const unconfirmed = `PTY groups unconfirmed (observed): ${groupUnconfirmedObservedCount()}`;
   if (!session) {
-    return ["📊 No active session.", ...formatQuarantineStatus(quarantine, now)].join("\n");
+    return ["📊 No active session.", unconfirmed, ...formatQuarantineStatus(quarantine, now)].join(
+      "\n",
+    );
   }
   const lines = [
     "📊 **Session Status**",
@@ -1543,7 +1548,7 @@ export function discordStatusText(
     `Created: ${session.createdAt}`,
     `Last used: ${session.lastUsedAt}`,
     `Compact warned: ${session.compactWarned ? "yes" : "no"}`,
-    `PTY groups unconfirmed (observed): ${groupUnconfirmedObservedCount()}`,
+    unconfirmed,
   ];
   if (threadSessions.length > 0) {
     lines.push("", `**Thread Sessions:** ${threadSessions.length}`);

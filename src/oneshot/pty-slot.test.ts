@@ -21,6 +21,7 @@ import {
   unknownHoldCount,
   untrustedOneShotsInFlight,
 } from "./pty-cleanup.js";
+import { retireFake, retireOutcome } from "../runner/pty-retire-fakes.js";
 
 /**
  * #570 r15e/r15f: a concurrency slot is held while a process of its call may still be alive (a
@@ -85,7 +86,7 @@ function granted(n: number): number {
 const retry = (gone: number[], heldGone: number[] = []): Promise<number> => {
   for (const pid of heldGone) exited.add(pid);
   return retrySurvivingGroups({
-    terminate: async (pid) => gone.includes(pid),
+    retire: retireFake((input) => gone.includes(input.pid)),
     reap: async () => [],
   });
 };
@@ -303,7 +304,7 @@ describe("an unknown hold keeps the slot as a survivor does (r15f)", () => {
     let cleared: number;
     try {
       cleared = await retrySurvivingGroups({
-        terminate: async (pid) => pid === 101,
+        retire: retireFake((input) => input.pid === 101),
         reap: async (target) => {
           if (target.root === "/root/a") markUnknownProcs("/root/a", LEADER, [unreadable(301)]);
           return [];

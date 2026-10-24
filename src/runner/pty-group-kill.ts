@@ -17,13 +17,19 @@ import { spawnSync } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
 import { basename } from "node:path";
 import {
+  type GroupMember,
+  type GroupMembersReader,
   type PidIdentity,
+  type PgidReader,
   type PidIdentityReader,
   type StartMsReader,
   pidIdentity,
   processStartMs,
+  readGroupMembers,
+  readPgid,
   readPidIdentity,
   sameIdentity,
+  sameMember,
 } from "./pty-proc-identity.js";
 
 export type SignalFn = (pid: number, signal: NodeJS.Signals | 0) => void;
@@ -35,15 +41,13 @@ export type SignalFn = (pid: number, signal: NodeJS.Signals | 0) => void;
  */
 export type SurvivorCause = "group" | "escapee" | "scan-unknown" | "dispose-rejected";
 
-export interface GroupTerminationOptions {
+/**
+ * What an observation of a group (`groupGoneNow`) needs: no signal is ever sent through it.
+ * The signalling algorithm is `retireProcessGroup` below, and there is no other (#581 cp8, H1).
+ */
+export interface GroupObservationOptions {
   /** `process.kill`. Replaced in tests. */
   signal?: SignalFn;
-  sleep?: (ms: number) => Promise<void>;
-  /** How long after SIGTERM the group may take to disappear before SIGKILL. */
-  termGraceMs?: number;
-  /** How long after SIGKILL the group may take to disappear before the call fails. */
-  killGraceMs?: number;
-  pollMs?: number;
   /**
    * Live (non-zombie) members of the group; 0 only on positive evidence that every member is a
    * zombie; undefined when this platform cannot say or cannot see every member.
@@ -53,41 +57,6 @@ export interface GroupTerminationOptions {
   leaderStartMs?: number | null;
   /** Reads a pid's start time. Replaced in tests. */
   startMs?: StartMsReader;
-  /**
-   * Whether the PTY still owns the leader (it has not exited and been reaped), so its pid cannot
-   * have been reused. Default false: once the child is gone only `-pid` is signalled, and only
-   * while the group still has a member.
-   */
-  leaderAlive?: () => boolean;
-  /**
-   * This is the first termination of a call, run while the call disposes its own PTY: the leader
-   * was spawned moments ago, so a group that has a member is ours even when no start time could
-   * be recorded for it. Only then may `-pid` be signalled for an unrecorded start time. A retry
-   * of a survivor minutes later, or the sweeper, leaves it unset: by then group membership no
-   * longer proves the group is ours, and nothing is signalled without a recorded start time
-   * (#570 r14d, H2). Passed by the caller; never inferred from timing here.
-   */
-  firstTermination?: boolean;
-  /**
-   * #581 cp3, the common retirement (`retireProcessGroup`): what the leader is now, judged
-   * against the raw identity recorded at spawn, in place of the numeric start-time comparison.
-   */
-  identityState?: () => PidIdentity;
-  /**
-   * Whether an identity was recorded for the leader at all (default: `leaderStartMs` is set).
-   * Only with `retire` below.
-   */
-  identityRecorded?: boolean;
-  /**
-   * Switches the signal authority to the retirement rules (#581 cp3, plan "Signal authority"):
-   *  - a leader that is absent leaves the group ours only when `absentLeaderGroupIsOurs`: the
-   *    retirement began while the leader was alive or just exited, or the group was seen alive
-   *    with it. A saved start time alone never says so;
-   *  - an unreadable identity authorises a signal only for an unrecorded one, in the initial
-   *    window (`firstTermination`), and never because the PTY "still owns" the pid;
-   *  - the bare leader pid is signalled only when its identity matches.
-   */
-  retire?: { absentLeaderGroupIsOurs: () => boolean };
 }
 
 const defaultSleep = (ms: number): Promise<void> =>
@@ -96,6 +65,27 @@ const defaultSleep = (ms: number): Promise<void> =>
 /** A pid that can be signalled as `-pid` without reaching init, our own group or every process. */
 export function isSignalablePid(pid: number): boolean {
   return Number.isInteger(pid) && pid > 1 && pid !== process.pid;
+}
+
+/**
+ * Is `-pid` a target this process may ever signal? Only an ISOLATED group: the child was seen to
+ * lead a group of its own (`groupId === pid`, read together with its identity at spawn) and that
+ * group is not the daemon's (`daemonGroupId`). A child that shares another group is signalled by
+ * its pid alone; a group whose id could not be read, or the daemon's own, is never a target
+ * (#581 cp8, L1).
+ */
+export function isolatedGroupTarget(
+  pid: number,
+  groupId: number | null | undefined,
+  daemonGroupId: number | null | undefined,
+): boolean {
+  return (
+    isSignalablePid(pid) &&
+    groupId === pid &&
+    typeof daemonGroupId === "number" &&
+    daemonGroupId > 1 &&
+    daemonGroupId !== groupId
+  );
 }
 
 /** `kill(target, 0)`: ESRCH is the only proof of absence. EPERM means it exists. */
@@ -183,23 +173,35 @@ export function processGroupGone(
   return liveMembers(pid) === 0;
 }
 
+/** What `GroupTarget` is given for one retirement. */
+interface GroupTargetDeps {
+  /** What the leader is now against the identity recorded at spawn. */
+  identityState: () => PidIdentity;
+  /** Whether an identity was recorded for the leader at all. */
+  identityRecorded: boolean;
+  /** An unrecorded identity may be signalled (the initial window only). */
+  firstTermination: boolean;
+  /** `-pid` is an isolated group target (see `isolatedGroupTarget`). Asked at every signal. */
+  isolated: () => boolean;
+  /**
+   * Fresh evidence that a group answering on this pgid beside an ABSENT leader is ours: a member
+   * identified earlier is still in it, with the identity it had. Read now, every time it is asked.
+   */
+  absentLeaderGroupIsOurs: () => boolean;
+  /** No more signals once this says so (the retirement's absolute deadline). */
+  expired: () => boolean;
+}
+
 /**
  * `kill(2)` with the zero-signal answers made safe against pid reuse. Everything here reads the
- * leader's identity first (#570 r13, B): a pid that now belongs to a process with another start
- * time is a stranger, and neither it nor `-pid` is touched (a process group id cannot be
+ * leader's identity first (#570 r13, B): a pid that now belongs to a process with another birth
+ * identity is a stranger, and neither it nor `-pid` is touched (a process group id cannot be
  * reused while the group has a member, so a recycled leader means the group is long gone).
  * The identity is read again immediately before every signal (r14, B). That narrows pid reuse to
  * the instant between the read and the `kill()`; it cannot close it without a native process
  * handle, which is not built here (see pty-proc-identity).
  */
 class GroupTarget {
-  private readonly leaderStartMs: number | null;
-  private readonly read: StartMsReader;
-  private readonly owned: () => boolean;
-  private readonly firstTermination: boolean;
-  private readonly recorded: boolean;
-  private readonly retire: GroupTerminationOptions["retire"];
-  private readonly identityState: GroupTerminationOptions["identityState"];
   private loggedUnreadable = false;
   /** A signal was withheld for lack of proof that the group is ours (reported as a reason). */
   withheld = false;
@@ -210,30 +212,18 @@ class GroupTarget {
     private readonly pid: number,
     private readonly signal: SignalFn,
     private readonly liveMembers: (pid: number) => number | undefined,
-    opts: GroupTerminationOptions,
-  ) {
-    this.leaderStartMs = opts.leaderStartMs ?? null;
-    this.read = opts.startMs ?? processStartMs;
-    this.owned = opts.leaderAlive ?? (() => false);
-    this.firstTermination = opts.firstTermination === true;
-    this.retire = opts.retire;
-    this.identityState = opts.identityState;
-    this.recorded = opts.identityRecorded ?? this.leaderStartMs !== null;
-  }
+    private readonly deps: GroupTargetDeps,
+  ) {}
 
   identity(): PidIdentity {
-    if (this.identityState) return this.identityState();
-    return pidIdentity(this.pid, this.leaderStartMs, {
-      exists: (p) => exists(this.signal, p),
-      read: this.read,
-    });
+    return this.deps.identityState();
   }
 
   /**
-   * One look at the leader and its group, by the same rules as `gone()` but telling the two
-   * apart: the leader (pid absent, or a different process now, or every member a zombie) and then
-   * every other member of the group. `withIdentity` also re-reads the leader's identity (a `ps`
-   * spawn on macOS), which the retirement does on its first and last check only.
+   * One look at the leader and its group, telling the two apart: the leader (pid absent, or a
+   * different process now, or every member a zombie) and then every other member of the group.
+   * `withIdentity` also re-reads the leader's identity (a `ps` spawn on macOS), which the
+   * retirement does on its first and last check only.
    */
   probe(withIdentity: boolean): GroupProbe {
     const leaderExists = exists(this.signal, this.pid);
@@ -254,9 +244,9 @@ class GroupTarget {
   private polls = 0;
 
   /**
-   * Both the leader and its group are gone, or the pid is no longer ours to ask about. The start
-   * time is read on the first poll and then every tenth, not every one: it costs a `ps` spawn,
-   * and a pid is not reused within 20 ms of being asked about.
+   * Both the leader and its group are gone, or the pid is no longer ours to ask about. The
+   * identity is read on the first poll and then every tenth, not every one: it costs a `ps`
+   * spawn, and a pid is not reused within 20 ms of being asked about.
    */
   gone(): boolean {
     if (this.polls++ % 10 === 0 && this.identity() === "recycled") return true;
@@ -267,41 +257,38 @@ class GroupTarget {
    * Signal what is provably ours, the group first. Once the group has been signalled the bare pid
    * is not: the leader is a member of its own group, so a second signal adds nothing and would be
    * one more chance to hit a reused pid. The bare pid is signalled only when the group could not
-   * be (a leader that moved itself out of its group), while the PTY still owns it.
+   * be, and only to a leader whose identity matches.
    */
   send(name: NodeJS.Signals): boolean {
+    if (this.deps.expired()) return false; // past the deadline there is no more signalling work
     if (this.sendGroup(name)) return true;
     return this.sendBare(name);
   }
 
   /** `-pid`, while the group has a member and the leader is not a stranger. True when it was sent. */
   private sendGroup(name: NodeJS.Signals): boolean {
+    if (!this.deps.isolated()) return false; // not a group that was proven to be ours alone
     const identity = this.identity(); // read now, not earlier: this is the last look before kill()
     if (identity === "recycled") return false;
     // A start time that was never recorded cannot tell a stranger from the leader. During the
     // first termination of a call the leader was spawned moments ago, and a process group id
     // cannot be reused while the group has a member, so `-pid` is ours while `kill(-pid, 0)`
     // shows one (#570 r14, B). A later retry has no such proof and signals nothing (r14d, H2).
-    const unrecordedOk = !this.recorded && this.firstTermination;
+    const unrecordedOk = !this.deps.identityRecorded && this.deps.firstTermination;
     if (identity === "unknown" && unrecordedOk && !this.loggedUnreadable) {
       this.loggedUnreadable = true;
       console.warn(
-        `[pty-group-kill] start time of pid ${this.pid} was not recorded; signalling its group on group membership alone`,
+        `[pty-group-kill] identity of pid ${this.pid} was not recorded; signalling its group on group membership alone`,
       );
     }
-    // `gone` is read before the recorded start time is looked at, so it says only that the leader
-    // pid is absent. A live `-pid` group beside an absent leader is ours only if we recorded the
-    // leader, or this is the first termination (r14e, H2). The retirement narrows that further:
-    // a saved start time alone proves nothing about a group whose leader is gone (#581 cp3).
-    const absentOk = this.retire
-      ? this.retire.absentLeaderGroupIsOurs()
-      : this.recorded || unrecordedOk;
-    const unknownOk = this.retire ? unrecordedOk : this.owned() || unrecordedOk;
+    if (!exists(this.signal, -this.pid)) return false;
+    // An absent leader leaves the group ours only on fresh member evidence (cp8, H2): a member
+    // that was identified earlier is still in it. A saved birth time, a flag, or the time since
+    // the last look never says so.
     const known =
       identity === "same" ||
-      (identity === "gone" && absentOk) ||
-      (identity === "unknown" && unknownOk);
-    if (!exists(this.signal, -this.pid)) return false;
+      (identity === "gone" && this.deps.absentLeaderGroupIsOurs()) ||
+      (identity === "unknown" && unrecordedOk);
     if (!known) {
       this.withheld = true;
       return false;
@@ -317,11 +304,9 @@ class GroupTarget {
 
   private sendBare(name: NodeJS.Signals): boolean {
     const identity = this.identity();
-    if (this.retire) {
-      // The retirement: only a leader whose identity matches, or an unrecorded one in the initial window.
-      const unrecordedOk = !this.recorded && this.firstTermination;
-      if (identity !== "same" && !(identity === "unknown" && unrecordedOk)) return false;
-    } else if (!this.owned() || (identity !== "same" && identity !== "unknown")) return false;
+    // Only a leader whose identity matches, or an unrecorded one in the initial window.
+    const unrecordedOk = !this.deps.identityRecorded && this.deps.firstTermination;
+    if (identity !== "same" && !(identity === "unknown" && unrecordedOk)) return false;
     try {
       this.signal(this.pid, name);
       return true;
@@ -333,50 +318,22 @@ class GroupTarget {
 
 /**
  * Whether the group of `pid` (and its leader) is gone right now, by the same rules as the
- * termination: a recycled leader means the group is long gone, a group made only of zombies is
+ * retirement: a recycled leader means the group is long gone, a group made only of zombies is
  * gone. For a caller that has to decide on a recorded survivor without signalling it (the sweep).
  */
-export function groupGoneNow(pid: number, opts: GroupTerminationOptions = {}): boolean {
+export function groupGoneNow(pid: number, opts: GroupObservationOptions = {}): boolean {
   const { signal = process.kill, liveMembers = procLiveMembers } = opts;
   if (!isSignalablePid(pid)) return false; // not a pid to reason about: not proof of absence
-  return new GroupTarget(pid, signal, liveMembers, opts).gone();
-}
-
-/**
- * SIGTERM the group, wait for the leader and the group to disappear, escalate to SIGKILL after
- * `termGraceMs`, wait again for up to `killGraceMs`. Resolves true only when both `kill(pid, 0)`
- * and `kill(-pid, 0)` have answered ESRCH (or the pid was reused, so the group is gone). Resolves
- * false when something outlived SIGKILL, or when the pid is not one that may be signalled.
- * Before every signal, the escalation included, the leader's start time is checked against
- * `leaderStartMs`, so a pid that was reaped and reused in the meantime is never signalled.
- */
-export async function terminateProcessGroup(
-  pid: number,
-  opts: GroupTerminationOptions = {},
-): Promise<boolean> {
-  const {
-    signal = process.kill,
-    sleep = defaultSleep,
-    termGraceMs = 2000,
-    killGraceMs = 2000,
-    pollMs = 20,
-    liveMembers = procLiveMembers,
-  } = opts;
-  if (!isSignalablePid(pid)) return false;
-  const target = new GroupTarget(pid, signal, liveMembers, opts);
-
-  const waitGone = async (budgetMs: number): Promise<boolean> => {
-    for (let waited = 0; ; waited += pollMs) {
-      if (target.gone()) return true;
-      if (waited >= budgetMs) return false;
-      await sleep(pollMs);
-    }
-  };
-
-  target.send("SIGTERM");
-  if (await waitGone(termGraceMs)) return true;
-  target.send("SIGKILL");
-  return waitGone(killGraceMs);
+  const read = opts.startMs ?? processStartMs;
+  return new GroupTarget(pid, signal, liveMembers, {
+    identityState: () =>
+      pidIdentity(pid, opts.leaderStartMs ?? null, { exists: (p) => exists(signal, p), read }),
+    identityRecorded: (opts.leaderStartMs ?? null) !== null,
+    firstTermination: false,
+    isolated: () => false,
+    absentLeaderGroupIsOurs: () => false,
+    expired: () => false,
+  }).gone();
 }
 
 // ─── The common retirement (#581 cp3) ───────────────────────────────────────
@@ -400,28 +357,49 @@ export interface RetireGroupInput {
   pid: number;
   /** Raw birth identity captured at spawn; null when it could not be read. */
   identity: string | null;
-  /** Reads a pid's birth identity now. Replaced in tests. */
+  /**
+   * The leader's process group id as last read while the leader was the recorded process (see
+   * `RetireGroupOutcome.groupId`); null when it never was. It is read again at the start of
+   * every call that finds the leader still there, and the fresh reading wins: a reading taken
+   * the instant after the fork can predate the child's `setsid()`. Negative targets are used
+   * only when it equals `pid` and differs from `daemonGroupId` (`isolatedGroupTarget`).
+   */
+  groupId: number | null;
+  /**
+   * The daemon's own process group id; null when it cannot be read. Omitted: read now through
+   * `readGroupId`, inside the deadline.
+   */
+  daemonGroupId?: number | null;
+  /**
+   * Members of the group identified positively (pid and birth identity) by an earlier
+   * retirement. They are evidence, never authority: each is read again before it counts.
+   */
+  members: readonly GroupMember[];
+  /** Lists a group's members with their identities. Replaced in tests: a fake never reaches a real pid. */
+  readMembers?: GroupMembersReader;
+  /** Reads the leader's process group id. Replaced in tests. */
+  readGroupId?: PgidReader;
+  /**
+   * Reads a pid's birth identity now. Replaced in tests. The default is bounded by what is left
+   * of `deadlineAt`, so a `ps` it starts cannot outlast the retirement.
+   */
   readIdentity?: PidIdentityReader;
   /** `process.kill`. Replaced in tests: a fake never reaches a real pid. */
   signal?: SignalFn;
-  /** Live members of the group; see `GroupTerminationOptions.liveMembers`. */
+  /** Live members of the group; see `GroupObservationOptions.liveMembers`. */
   liveMembers?: (pid: number) => number | undefined;
   /** Names the members left, for the report only. Replaced in tests. */
-  describe?: (pid: number) => GroupDescription;
+  describe?: (pid: number, deadlineAt: number) => GroupDescription;
   /** The first retirement of this process. A delayed confirmation has no such privilege. */
   initial: boolean;
-  /** The leader was alive when this retirement began (not an exit that happened earlier). */
-  leaderSeenAlive: boolean;
-  /**
-   * The group was seen alive together with its leader or when the leader went (or an earlier
-   * retirement found survivors), so an absent leader does not make `-pid` a stranger's.
-   */
-  groupContinuity: boolean;
   /** Whether an unrecorded identity may be signalled in the initial window (false: never). */
   allowUnrecordedInitial: boolean;
   /** SIGTERM the group first (the initial retirement). */
   sendTerm: boolean;
-  /** ONE absolute wall-clock deadline for the whole retirement, scans included. */
+  /**
+   * ONE absolute wall-clock deadline for the whole retirement, scans included. Past it nothing
+   * is signalled, listed or described; what is unresolved stays unresolved.
+   */
   deadlineAt: number;
   /** How long SIGTERM gets before SIGKILL, counted from the call and never past `deadlineAt`. */
   termGraceMs: number;
@@ -442,19 +420,36 @@ export interface RetireGroupOutcome {
   /** Executable basenames of the members left. */
   comm: string[];
   /**
-   * The continuity a later confirmation may rely on, as this call left it: true only when the
-   * call began holding valid evidence (or the leader was alive at its start) and no probe has
-   * found the group absent since. Never set because a group was merely SEEN: a group seen while
-   * a signal was withheld is exactly one nothing vouched for (security review of cp3).
+   * The leader's process group id as read in this call while the leader was the recorded
+   * process, else what the call was given. Carried to the next call like `members`.
    */
-  continuityHeld: boolean;
+  groupId: number | null;
+  /**
+   * The group members positively identified as of this call: what a later confirmation, or a
+   * sweeper retry, carries into `RetireGroupInput.members`. Empty when the group is gone or
+   * when nothing vouched for it. The carrier re-reads each before it grants any authority.
+   */
+  members: GroupMember[];
 }
 
 /** How often a SIGTERM that could not be sent yet is tried again, inside the TERM grace. */
 const TERM_RETRY_MS = 100;
 
-/** Group members by name, for the report: Linux from `/proc`, elsewhere one bounded `ps`. */
-export function describeGroup(pid: number, procDir = "/proc"): GroupDescription {
+/**
+ * The report (who is left, and which members to carry on) is taken this long before the
+ * deadline, while time remains: after the deadline nothing is listed or described.
+ */
+const REPORT_MARGIN_MS = 250;
+
+/**
+ * Group members by name, for the report: Linux from `/proc`, elsewhere one `ps` bounded by what
+ * is left of `deadlineAt` (none left: not counted, no subprocess).
+ */
+export function describeGroup(
+  pid: number,
+  deadlineAt: number = Number.POSITIVE_INFINITY,
+  procDir = "/proc",
+): GroupDescription {
   const names = new Set<string>();
   let count = 0;
   try {
@@ -476,7 +471,12 @@ export function describeGroup(pid: number, procDir = "/proc"): GroupDescription 
         names.add(stat.slice(open + 1, close));
       }
     } else {
-      const r = spawnSync("ps", ["-axo", "pgid=,stat=,comm="], { encoding: "utf8", timeout: 2000 });
+      const left = deadlineAt - Date.now();
+      if (!(left > 0)) return { count: undefined, comm: [] };
+      const r = spawnSync("ps", ["-axo", "pgid=,stat=,comm="], {
+        encoding: "utf8",
+        timeout: Math.min(2000, left),
+      });
       if (r.status !== 0) return { count: undefined, comm: [] };
       for (const line of (r.stdout ?? "").split("\n")) {
         const m = /^\s*(\d+)\s+(\S+)\s+(.+)$/.exec(line);
@@ -504,70 +504,188 @@ function rawIdentityState(
   return sameIdentity(now, recorded) ? "same" : "recycled";
 }
 
+/** Add the members of `fresh` that are not in `into` yet. */
+function mergeMembers(into: readonly GroupMember[], fresh: readonly GroupMember[]): GroupMember[] {
+  const out = [...into];
+  for (const m of fresh) if (!out.some((x) => sameMember(x, m))) out.push(m);
+  return out;
+}
+
+export interface NoteMembersInput {
+  pid: number;
+  identity: string | null;
+  groupId: number | null;
+  /** Members remembered so far; the result adds to them. */
+  members: readonly GroupMember[];
+  signal?: SignalFn;
+  readIdentity?: PidIdentityReader;
+  readMembers?: GroupMembersReader;
+  readGroupId?: PgidReader;
+  /** The daemon's own group id; omitted: read now. */
+  daemonGroupId?: number | null;
+  /** How long this look may take (default 1000 ms). */
+  budgetMs?: number;
+  /**
+   * Whether a leader that is already absent still counts as proof the group is ours. Only at the
+   * instant its exit is first seen (the exit callback): a group listed at any later time may be a
+   * stranger's, so every other caller passes false and learns members only from a live leader.
+   */
+  leaderJustExited?: boolean;
+}
+
 /**
- * THE termination and confirmation of a PTY child and its process group: SIGTERM the group,
- * wait for the leader AND every other member to be gone, SIGKILL after `termGraceMs`, wait again,
- * all inside one absolute `deadlineAt` that the caller owns. It holds no config root, slot,
- * quarantine or turn state: it reports what the OS shows (`RetireGroupOutcome`), and the caller
- * decides what that means (`PtyProcess` retirement, the bus adapter, the schema probe).
+ * Remember who is in a child's process group while that group is provably ours, so that a later
+ * retirement has evidence once the leader is gone (#581 cp8, H2). Called before anything is
+ * signalled and when the leader's exit is first seen. A group is taken as ours only when the
+ * leader is the recorded process (`same`) or, only at the instant its exit is first seen
+ * (`leaderJustExited`: while a group has a member its id cannot be reused, so whoever is in it
+ * at the moment its leader goes is ours), is absent. Never when the pid belongs to another
+ * process or cannot be read, and never for an absent leader at any later time. It needs an isolated group
+ * (`isolatedGroupTarget`). Nothing is signalled. A listing that fails changes nothing.
+ */
+export function noteGroupMembers(input: NoteMembersInput): {
+  members: GroupMember[];
+  groupId: number | null;
+} {
+  const unchanged = { members: [...input.members], groupId: input.groupId };
+  const { pid, identity } = input;
+  if (process.platform === "win32" || !isSignalablePid(pid) || identity === null) return unchanged;
+  const deadlineAt = Date.now() + (input.budgetMs ?? 1000);
+  const signal = input.signal ?? process.kill;
+  const readIdentity: PidIdentityReader = input.readIdentity ?? ((p) => readPidIdentity(p));
+  const readGroupId: PgidReader = input.readGroupId ?? ((p) => readPgid(p));
+  const state = rawIdentityState(pid, identity, signal, readIdentity);
+  if (state === "recycled" || state === "unknown") return unchanged;
+  if (state === "gone" && input.leaderJustExited !== true) return unchanged;
+  let groupId = input.groupId;
+  if (state === "same") {
+    const fresh = readGroupId(pid);
+    if (fresh !== null) groupId = fresh;
+  }
+  const daemon = input.daemonGroupId !== undefined ? input.daemonGroupId : readGroupId(process.pid);
+  if (!isolatedGroupTarget(pid, groupId, daemon)) return { members: unchanged.members, groupId };
+  try {
+    const reading = (input.readMembers ?? ((g, at) => readGroupMembers(g, at)))(pid, deadlineAt);
+    return { members: mergeMembers(input.members, reading.members), groupId };
+  } catch {
+    return { members: unchanged.members, groupId };
+  }
+}
+
+/**
+ * THE termination and confirmation of a PTY child and its process group, and the only one:
+ * SIGTERM the group, wait for the leader AND every other member to be gone, SIGKILL after
+ * `termGraceMs`, wait again, all inside one absolute `deadlineAt` that the caller owns. It holds
+ * no config root, slot, quarantine or turn state: it reports what the OS shows
+ * (`RetireGroupOutcome`), and the caller decides what that means (`PtyProcess` retirement, the
+ * bus adapter, the schema probe, the sweeper's survivor retry).
  *
- * Signal authority: the leader's identity is read again immediately before every signal, and a
- * recycled leader is never signalled. Only a group that is provably ours is signalled with
- * `-pid` (see `GroupTerminationOptions.retire`); when it cannot be proved, nothing is sent and
- * the outcome says `unknown-identity`. ESRCH proves absence; EPERM and an unreadable
- * enumeration do not. Never infers death from an exit event.
+ * Signal authority (plan "Signal authority", cp8 H1/H2/L1):
+ *  - the leader's identity is read again immediately before every signal, and a recycled leader
+ *    is never signalled;
+ *  - `-pid` is a target only for an isolated group (`isolatedGroupTarget`);
+ *  - while the leader is the process we recorded the group is ours. Once the leader is absent
+ *    it is ours only if a member identified EARLIER (pid and birth identity, from the initial
+ *    retirement or a previous call) is read again now, in that group, with the same identity.
+ *    No flag and no elapsed time grants that;
+ *  - without such evidence nothing is sent and the outcome says `unknown-identity`.
+ * ESRCH proves absence; EPERM and an unreadable enumeration do not. An exit event never
+ * proves death. Past `deadlineAt` nothing is signalled, listed, described or spawned.
  */
 export async function retireProcessGroup(input: RetireGroupInput): Promise<RetireGroupOutcome> {
   const {
     pid,
     identity,
-    readIdentity = readPidIdentity,
     signal = process.kill,
     liveMembers = procLiveMembers,
-    describe = (p) => describeGroup(p),
     pollMs = 20,
     now = Date.now,
     sleep = defaultSleep,
   } = input;
+  const left = (): number => input.deadlineAt - now();
+  const readIdentity: PidIdentityReader =
+    input.readIdentity ?? ((p) => readPidIdentity(p, { psTimeoutMs: Math.max(0, left()) }));
+  const readMembers: GroupMembersReader =
+    input.readMembers ?? ((pgid, deadlineAt) => readGroupMembers(pgid, deadlineAt, { now }));
+  const readGroupId: PgidReader =
+    input.readGroupId ?? ((p) => readPgid(p, { psTimeoutMs: Math.max(0, left()) }));
+  const describe = input.describe ?? ((p, at) => describeGroup(p, at));
   const unknown: RetireGroupOutcome = {
     leaderGone: false,
     groupGone: false,
     reason: null,
     survivors: undefined,
     comm: [],
-    continuityHeld: false,
+    groupId: input.groupId,
+    members: [],
   };
   if (!isSignalablePid(pid)) return unknown;
+  let groupId = input.groupId;
+  const daemonGroupId =
+    input.daemonGroupId !== undefined ? input.daemonGroupId : readGroupId(process.pid);
+  const isolated = (): boolean => isolatedGroupTarget(pid, groupId, daemonGroupId);
+
+  // Members identified so far: evidence only, merged from every positive reading.
+  let known: GroupMember[] = [...input.members];
+  const read = (): { members: GroupMember[]; complete: boolean } | null => {
+    if (!isolated() || left() <= 0) return null; // no group to list, or no time to list it
+    return readMembers(pid, input.deadlineAt);
+  };
+  const list = (): GroupMember[] | null => read()?.members ?? null;
   const target = new GroupTarget(pid, signal, liveMembers, {
     identityState: () => rawIdentityState(pid, identity, signal, readIdentity),
     identityRecorded: identity !== null,
     firstTermination: input.initial && input.allowUnrecordedInitial,
-    retire: { absentLeaderGroupIsOurs: () => continuity },
+    isolated,
+    expired: () => left() <= 0,
+    absentLeaderGroupIsOurs: () => {
+      // Fresh evidence only, asked at the moment a signal would be sent: is a member identified
+      // earlier still in the group, with the identity it had?
+      const fresh = list();
+      if (fresh === null || !fresh.some((f) => known.some((k) => sameMember(k, f)))) return false;
+      known = mergeMembers(
+        known.filter((k) => fresh.some((f) => sameMember(k, f))),
+        fresh,
+      );
+      return true;
+    },
   });
 
-  // Evidence that a group answering on this pgid, beside an absent leader, is ours. It is fresh
-  // evidence only: the moment any probe finds the group ABSENT it is revoked, because a group
-  // that is seen again after that is not the one that was seen before (a stranger's, on a
-  // recycled pid). Security review of cp3.
-  let continuity = input.groupContinuity || (input.initial && input.leaderSeenAlive);
-  const look = (withIdentity: boolean): GroupProbe => {
-    const probe = target.probe(withIdentity);
-    if (probe.groupGone) continuity = false; // nothing is left that evidence could vouch for
-    return probe;
-  };
+  // While the leader is the process we recorded its group is ours: remember who is in it, so a
+  // later retirement can still prove the group is the same one after the leader is gone.
+  if (target.identity() === "same") {
+    // The leader is the recorded process, so what its group id is NOW is its group id for good (a
+    // session leader cannot move itself out of its group). The reading at spawn can predate setsid().
+    const fresh = readGroupId(pid);
+    if (fresh !== null) groupId = fresh;
+    const members = list();
+    if (members !== null) known = mergeMembers(known, members);
+  }
+
+  const look = (withIdentity: boolean): GroupProbe => target.probe(withIdentity);
   // Identity is read on the first and the last check of a wait only (a `ps` spawn on macOS).
   // A SIGTERM that could not be sent yet is tried again every TERM_RETRY_MS inside the grace: a
   // leader that is dying can read as "identity unknown" for a moment, and waiting out the whole
   // grace for a signal that was merely early would turn a prompt exit into a SIGKILL.
   let termPending = input.sendTerm;
   let lastTry = now();
-  const waitGone = async (untilMs: number): Promise<GroupProbe> => {
+  // Taken once, near the end of the final wait, only if the group is still there by then.
+  let report: {
+    described: GroupDescription;
+    fresh: { members: GroupMember[]; complete: boolean } | null;
+  } | null = null;
+  const takeReport = (): void => {
+    if (report !== null || left() <= 0) return;
+    report = { described: describe(pid, input.deadlineAt), fresh: read() };
+  };
+  const waitGone = async (untilMs: number, final = false): Promise<GroupProbe> => {
     let probe = look(true);
     for (;;) {
       if (probe.groupGone) return probe;
-      const left = untilMs - now();
-      if (left <= 0) return probe;
-      await sleep(Math.min(pollMs, left));
+      const remaining = Math.min(untilMs, input.deadlineAt) - now();
+      if (final && remaining <= REPORT_MARGIN_MS && probe.leaderGone) takeReport();
+      if (remaining <= 0) return probe;
+      await sleep(Math.min(pollMs, remaining));
       if (termPending && now() - lastTry >= TERM_RETRY_MS) {
         lastTry = now();
         termPending = !target.send("SIGTERM");
@@ -580,15 +698,32 @@ export async function retireProcessGroup(input: RetireGroupInput): Promise<Retir
   let probe = await waitGone(Math.min(input.deadlineAt, now() + input.termGraceMs));
   if (!probe.groupGone) {
     target.send("SIGKILL");
-    probe = await waitGone(input.deadlineAt);
+    probe = await waitGone(input.deadlineAt, true);
   }
   if (probe.groupGone) {
-    return { ...unknown, leaderGone: true, groupGone: true, survivors: 0, continuityHeld: false };
+    return { ...unknown, leaderGone: true, groupGone: true, survivors: 0, groupId };
   }
   if (!probe.leaderGone) {
-    return { ...unknown, leaderGone: false, survivors: probe.live, continuityHeld: continuity };
+    return { ...unknown, leaderGone: false, survivors: probe.live, groupId, members: known };
   }
-  const described = describe(pid);
+  // Leader gone, group not: record who is left, but only what was read in a group that is ours.
+  // Leader gone, group not: carry on what was positively identified. A fresh listing that shows
+  // none of the members known is a group nothing vouches for; with no listing (no time left)
+  // the members known stay as the evidence they are, to be read again when they are used.
+  takeReport(); // a no-op once taken, and when no time remains
+  const taken = report as {
+    described: GroupDescription;
+    fresh: { members: GroupMember[]; complete: boolean } | null;
+  } | null;
+  let carried: GroupMember[] = known;
+  if (taken?.fresh) {
+    const { members: fresh, complete } = taken.fresh;
+    // A complete listing that shows none of the members known is positive absence: nothing
+    // vouches for what is there. An incomplete one cannot say, so the evidence is kept.
+    if (fresh.some((f) => known.some((k) => sameMember(k, f)))) carried = fresh;
+    else if (complete) carried = [];
+  }
+  const described = taken?.described ?? { count: undefined, comm: [] };
   const reason: GroupReason = probe.eperm
     ? "eperm"
     : target.withheld
@@ -602,6 +737,7 @@ export async function retireProcessGroup(input: RetireGroupInput): Promise<Retir
     reason,
     survivors: described.count ?? probe.live,
     comm: described.comm,
-    continuityHeld: continuity,
+    groupId,
+    members: carried,
   };
 }

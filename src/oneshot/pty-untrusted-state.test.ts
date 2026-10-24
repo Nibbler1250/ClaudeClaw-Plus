@@ -40,6 +40,7 @@ import { resolveOneShotEngine } from "./config.js";
 import * as cleanup from "./pty-cleanup.js";
 import { withPrintRuntime } from "./print.js";
 import { engines } from "./registry.js";
+import { retireFake, retireOutcome } from "../runner/pty-retire-fakes.js";
 
 /** #570 r11: what an untrusted PTY one-shot writes, where, and what it leaves behind. */
 
@@ -583,16 +584,16 @@ describe("r13 A/G: a survivor keeps the call failed, the root in place, and is s
         expect(existsSync(tempCwd)).toBe(true);
 
         // 4. each sweeper tick terminates the survivor again, with the recorded identity.
-        const attempts: Array<{ pid: number; start: number | null | undefined }> = [];
+        const attempts: Array<{ pid: number; identity: string | null }> = [];
         let groupGone = false;
         let tick: (() => void) | undefined;
         cleanup.startOneShotSweeper({
           sweep: () => cleanup.sweepStaleOneShotDirs(tmpdir(), Date.now()),
           retrySurvivors: () =>
             cleanup.retrySurvivingGroups({
-              terminate: async (pid, opts) => {
-                attempts.push({ pid, start: opts.leaderStartMs });
-                return groupGone;
+              retire: async (input) => {
+                attempts.push({ pid: input.pid, identity: input.identity });
+                return retireOutcome(groupGone);
               },
               reap: async () => [],
             }),
@@ -606,7 +607,7 @@ describe("r13 A/G: a survivor keeps the call failed, the root in place, and is s
         tick?.();
         await new Promise((r) => setTimeout(r, 20));
         expect(attempts.map((a) => a.pid)).toEqual([shellPid, shellPid]);
-        expect(attempts[0]!.start).not.toBeNull();
+        expect(attempts[0]!.identity).not.toBeNull();
         expect(existsSync(root)).toBe(true); // alive: still protected after two ticks
 
         // 5. once the group is gone the entry is dropped, and the next pass sweeps the root.
@@ -857,7 +858,12 @@ describe("r14b: an unreadable process is a hold on the root, not a failure", () 
         return [];
       },
     );
-    const left = await options.reapEscapees!({ pid: 4242, startMs: 98_760, remainingMs: 7000 });
+    const left = await options.reapEscapees!({
+      pid: 4242,
+      startMs: 98_760,
+      remainingMs: 7000,
+      deadlineAt: Date.now() + 7000,
+    });
     expect(left).toEqual([]);
     // Went red (undefined) with the leader's start time not handed to the scan.
     expect((seen[0]!.target as { leaderStartMs?: number }).leaderStartMs).toBe(98_760);
@@ -1430,7 +1436,7 @@ describe("r15 A4: concurrent untrusted PTY one-shots are capped", () => {
 
     // The sweeper confirms one survivor gone: exactly one slot comes back.
     const gone = await cleanup.retrySurvivingGroups({
-      terminate: async (pid) => pid === 4001,
+      retire: retireFake((input) => input.pid === 4001),
       reap: async () => [],
     });
     expect(gone).toBe(1);

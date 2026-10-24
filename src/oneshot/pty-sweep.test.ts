@@ -14,7 +14,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EscapeScan } from "../runner/pty-escape-scan.js";
-import { terminateProcessGroup } from "../runner/pty-group-kill.js";
+import { retireProcessGroup } from "../runner/pty-group-kill.js";
+import { retireFake, retireOutcome } from "../runner/pty-retire-fakes.js";
 import { currentBootId, recordedOnAnotherBoot } from "../runner/pty-proc-identity.js";
 import { withPlatform } from "../runner/pty-test-platform.js";
 import {
@@ -361,7 +362,7 @@ describe("group survivors", () => {
     markGroupSurvivor(root, 4242, { startMs: 1 });
     utimesSync(root, OLD, OLD); // recording the survivor wrote survivor.json into it
     expect(sweep()).toBe(0);
-    await retrySurvivingGroups({ terminate: async () => true, reap: async () => [] });
+    await retrySurvivingGroups({ retire: retireFake(() => true), reap: async () => [] });
     expect(groupSurvivorCount()).toBe(0);
     expect(sweep()).toBe(1);
     expect(existsSync(root)).toBe(false);
@@ -369,15 +370,36 @@ describe("group survivors", () => {
 });
 
 describe("retrySurvivingGroups", () => {
-  it("terminates each recorded survivor again, with the identity recorded at spawn and no claim on the leader", async () => {
-    markGroupSurvivor("/tmp/root-a", 4242, { startMs: 1_700_000_000_000, cwds: ["/tmp/cwd-a"] });
-    const seen: Array<{ pid: number; start: number | null | undefined; owned: boolean }> = [];
+  it("retires each recorded survivor again, with the identity, group id and members recorded at spawn and no first-termination privilege", async () => {
+    const members = [{ pid: 4243, identity: "m-1" }];
+    markGroupSurvivor("/tmp/root-a", 4242, {
+      startMs: 1_700_000_000_000,
+      cwds: ["/tmp/cwd-a"],
+      identity: "id-4242",
+      groupId: 4242,
+      members,
+    });
+    const seen: Array<{
+      pid: number;
+      identity: string | null;
+      groupId: number | null;
+      members: unknown;
+      initial: boolean;
+      allowUnrecordedInitial: boolean;
+    }> = [];
     const reaped: Array<{ root: string | null; cwds: string[]; leaderStartMs?: number | null }> =
       [];
     const cleared = await retrySurvivingGroups({
-      terminate: async (pid, opts) => {
-        seen.push({ pid, start: opts.leaderStartMs, owned: opts.leaderAlive?.() ?? true });
-        return true;
+      retire: async (input) => {
+        seen.push({
+          pid: input.pid,
+          identity: input.identity,
+          groupId: input.groupId,
+          members: input.members,
+          initial: input.initial,
+          allowUnrecordedInitial: input.allowUnrecordedInitial,
+        });
+        return retireOutcome(true);
       },
       reap: async (target) => {
         reaped.push(target);
@@ -385,7 +407,18 @@ describe("retrySurvivingGroups", () => {
       },
     });
     expect(cleared).toBe(1);
-    expect(seen).toEqual([{ pid: 4242, start: 1_700_000_000_000, owned: false }]);
+    // Went red (initial true) with the retry given the first-termination privilege; went red
+    // (members []) with the recorded members no longer handed to the retirement.
+    expect(seen).toEqual([
+      {
+        pid: 4242,
+        identity: "id-4242",
+        groupId: 4242,
+        members,
+        initial: false,
+        allowUnrecordedInitial: false,
+      },
+    ]);
     expect(reaped).toEqual([
       // Went red (no leaderStartMs) with the survivor's start time no longer handed to the scan.
       { root: "/tmp/root-a", cwds: ["/tmp/cwd-a"], leaderStartMs: 1_700_000_000_000 },
@@ -399,7 +432,7 @@ describe("retrySurvivingGroups", () => {
     const error = spyOn(console, "error").mockImplementation(() => {});
     try {
       const cleared = await retrySurvivingGroups({
-        terminate: async (pid) => pid === 4343, // 4242's group survives again
+        retire: retireFake((input) => input.pid === 4343), // 4242's group survives again
         reap: async (target) => (target.root.endsWith("-b") ? [999] : []),
       });
       expect(cleared).toBe(0);
@@ -419,9 +452,9 @@ describe("retrySurvivingGroups", () => {
     const error = spyOn(console, "error").mockImplementation(() => {});
     try {
       const cleared = await retrySurvivingGroups({
-        terminate: async (pid) => {
-          if (pid === 4242) throw new Error("boom");
-          return true;
+        retire: async (input) => {
+          if (input.pid === 4242) throw new Error("boom");
+          return retireOutcome(true);
         },
         reap: async () => [],
       });
@@ -665,31 +698,35 @@ describe("quarantine (#570 r14, M4)", () => {
   });
 });
 
-describe("retrySurvivingGroups with no recorded start time (r14d, H2)", () => {
-  it("is not told it is the first termination, keeps the root registered, and says so once with metadata only", async () => {
+describe("retrySurvivingGroups with no recorded identity or members (r14d, H2; #581 cp8, H1)", () => {
+  it("is never told it is the first termination, keeps the root registered, and says so once with metadata only", async () => {
     markGroupSurvivor("/tmp/secret-root-x", 4242, { startMs: null, cwds: ["/tmp/secret-cwd"] });
-    const told: Array<boolean | undefined> = [];
+    const told: Array<[boolean, boolean]> = [];
     const warn = spyOn(console, "warn").mockImplementation(() => {});
     const error = spyOn(console, "error").mockImplementation(() => {});
     try {
       for (let pass = 0; pass < 3; pass++) {
         const cleared = await retrySurvivingGroups({
-          terminate: async (_pid, opts) => {
-            told.push(opts.firstTermination);
-            return false; // the group is alive and was not signalled
+          retire: async (input) => {
+            told.push([input.initial, input.allowUnrecordedInitial]);
+            return retireOutcome(false); // the group is alive and was not signalled
           },
           reap: async () => [],
         });
         expect(cleared).toBe(0);
       }
-      // Went red ([true, true, true]) with `firstTermination: true` added to the retry.
-      expect(told).toEqual([undefined, undefined, undefined]);
+      // Went red ([true, true] x3) with the first-termination privilege added to the retry.
+      expect(told).toEqual([
+        [false, false],
+        [false, false],
+        [false, false],
+      ]);
       expect(groupSurvivorOf("/tmp/secret-root-x")).toBe(4242);
       const logged = warn.mock.calls.map((call: unknown[]) => String(call[0]));
       // Went red (3 lines) with the once-per-root set removed.
       expect(logged.length).toBe(1);
       expect(logged[0]).toContain("pid 4242");
-      expect(logged[0]).toContain("start time not recorded");
+      expect(logged[0]).toContain("no recorded identity or members");
       expect(logged[0]).toContain("secret-root-x");
       expect(logged[0]).not.toContain("/tmp/");
       expect(logged[0]).not.toContain("secret-cwd");
@@ -699,28 +736,38 @@ describe("retrySurvivingGroups with no recorded start time (r14d, H2)", () => {
     }
   });
 
-  it("sends no signal at all to a live group with the real termination", async () => {
-    markGroupSurvivor("/tmp/root-null", 4242, { startMs: null, cwds: [] });
+  // #581 cp8, H1: a LEGACY record (a historical group id and the leader's birth time, no identity,
+  // no members) once signalled a group whose leader was long gone: the group id may be a stranger's.
+  it("sends no signal at all to a live group whose leader is absent, with the real retirement", async () => {
+    markGroupSurvivor("/tmp/root-null", 4242, { startMs: 1_700_000_000_000, cwds: [] });
     const sent: Array<[number, NodeJS.Signals | 0]> = [];
     const kernel = (target: number, name: NodeJS.Signals | 0): void => {
-      sent.push([target, name]); // every kill(.., 0) answers: the group is there
+      sent.push([target, name]);
+      // The leader is gone (ESRCH); the group id answers: someone else's group is there.
+      if (name === 0 && target === 4242) throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
     };
     const warn = spyOn(console, "warn").mockImplementation(() => {});
     const error = spyOn(console, "error").mockImplementation(() => {});
     try {
       const cleared = await retrySurvivingGroups({
-        terminate: (pid, opts) =>
-          terminateProcessGroup(pid, {
-            ...opts,
+        retire: (input) =>
+          retireProcessGroup({
+            ...input,
             signal: kernel,
-            startMs: () => null,
+            readIdentity: () => null,
+            readMembers: () => ({ members: [{ pid: 9001, identity: "stranger" }], complete: true }),
+            readGroupId: (pid) => pid,
+            daemonGroupId: 1000,
             sleep: async () => {},
             liveMembers: () => undefined,
+            describe: () => ({ count: undefined, comm: [] }),
           }),
         reap: async () => [],
+        capMs: 50,
       });
       expect(cleared).toBe(0);
-      // Went red (SIGTERM then SIGKILL to -4242 sent) with the first-termination check dropped.
+      // Went red (SIGTERM then SIGKILL to -4242 sent) with the old rule restored: a recorded
+      // leader birth time authorising a group signal for a leader that is absent.
       expect(sent.filter(([, name]) => name !== 0)).toEqual([]);
       expect(groupSurvivorOf("/tmp/root-null")).toBe(4242);
     } finally {
@@ -730,9 +777,15 @@ describe("retrySurvivingGroups with no recorded start time (r14d, H2)", () => {
   });
 });
 
-describe("retrySurvivingGroups with the real termination (#570 r14, B and E)", () => {
-  it("signals the group of the recorded leader with a recording kernel, and no cached start time", async () => {
-    markGroupSurvivor("/tmp/root-real", 4242, { startMs: 1_700_000_000_000, cwds: [] });
+describe("retrySurvivingGroups with the real retirement (#570 r14, B and E; #581 cp8, H1)", () => {
+  it("signals the group of the recorded leader with a recording kernel, and carries the members on", async () => {
+    markGroupSurvivor("/tmp/root-real", 4242, {
+      startMs: 1_700_000_000_000,
+      cwds: [],
+      identity: "id-4242",
+      groupId: 4242,
+      members: [{ pid: 4243, identity: "m-1" }],
+    });
     const sent: Array<[number, NodeJS.Signals]> = [];
     let alive = true;
     const kernel = (target: number, name: NodeJS.Signals | 0): void => {
@@ -743,25 +796,82 @@ describe("retrySurvivingGroups with the real termination (#570 r14, B and E)", (
       sent.push([target, name]);
       alive = false;
     };
-    const readers: unknown[] = [];
     const cleared = await retrySurvivingGroups({
-      terminate: (pid, opts) => {
-        readers.push(opts.startMs);
-        return terminateProcessGroup(pid, {
-          ...opts,
+      retire: (input) =>
+        retireProcessGroup({
+          ...input,
           signal: kernel,
-          startMs: () => 1_700_000_000_000, // the leader is the one recorded
+          readIdentity: () => "id-4242", // the leader is the one recorded
+          readMembers: () => ({ members: [{ pid: 4243, identity: "m-1" }], complete: true }),
+          readGroupId: (pid) => pid,
+          daemonGroupId: 1000,
           sleep: async () => {},
           liveMembers: () => undefined,
-        });
-      },
+        }),
       reap: async () => [],
     });
     // Went red (cleared 0, expected 1) with the `-pid` send deleted from GroupTarget.send.
     expect(cleared).toBe(1);
     expect(sent).toEqual([[-4242, "SIGTERM"]]);
-    // Went red (a reader function) with the pass's cached reader passed to the termination again.
-    expect(readers).toEqual([undefined]);
+  });
+
+  it("signals a group whose leader is gone only while a recorded member is still in it", async () => {
+    const record = (): void =>
+      markGroupSurvivor("/tmp/root-member", 4242, {
+        startMs: 1_700_000_000_000,
+        cwds: [],
+        identity: "id-4242",
+        groupId: 4242,
+        members: [{ pid: 4243, identity: "m-1" }],
+      });
+    const sent: Array<[number, NodeJS.Signals]> = [];
+    let alive = true;
+    let memberIdentity = "m-1";
+    const kernel = (target: number, name: NodeJS.Signals | 0): void => {
+      if (target === 4242 && name === 0) throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+      if (name === 0) {
+        if (!alive) throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+        return;
+      }
+      sent.push([target, name]);
+      alive = false;
+    };
+    const run = (): Promise<number> =>
+      retrySurvivingGroups({
+        retire: (input) =>
+          retireProcessGroup({
+            ...input,
+            signal: kernel,
+            readIdentity: () => null,
+            readMembers: () => ({
+              members: [{ pid: 4243, identity: memberIdentity }],
+              complete: true,
+            }),
+            readGroupId: (pid) => pid,
+            daemonGroupId: 1000,
+            sleep: async () => {},
+            liveMembers: () => undefined,
+            describe: () => ({ count: 1, comm: [] }),
+          }),
+        reap: async () => [],
+        capMs: 50,
+      });
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // The group id was reused: pid 4243 is another process now. Nothing vouches for the group.
+      record();
+      memberIdentity = "someone-else";
+      expect(await run()).toBe(0);
+      // Went red ([[-4242, "SIGTERM"]]) with the members no longer read again before the signal.
+      expect(sent).toEqual([]);
+      // The recorded member is still there with its identity: the group is ours.
+      record();
+      memberIdentity = "m-1";
+      expect(await run()).toBe(1);
+      expect(sent).toEqual([[-4242, "SIGTERM"]]);
+    } finally {
+      error.mockRestore();
+    }
   });
 });
 

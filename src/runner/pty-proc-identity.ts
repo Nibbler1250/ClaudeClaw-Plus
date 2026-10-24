@@ -16,7 +16,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 
 /** A numeric start time: ms since boot on Linux, epoch ms elsewhere. Null when unreadable. */
 export type StartMsReader = (pid: number) => number | null;
@@ -34,18 +34,35 @@ export interface IdentityReadDeps {
   procDir?: string;
   /** Prints `lstart` for a pid in the C locale, or null when `ps` cannot say. Replaced in tests. */
   ps?: (pid: number) => string | null;
+  /** Prints `pgid lstart` for one pid (the snapshot's `ps`). Replaced in tests. */
+  psSnapshot?: (pid: number) => string | null;
+  /** Prints `pid pgid stat lstart` for every process (the member listing's `ps`). Replaced in tests. */
+  psAll?: (timeoutMs: number) => string | null;
+  /**
+   * Upper bound on any `ps` this call may start, in ms (default 2000). A caller that owns an
+   * absolute deadline passes what is left of it; zero or less starts nothing and reads as null.
+   */
+  psTimeoutMs?: number;
 }
 
-function psLstart(pid: number): string | null {
-  const r = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+const PS_TIMEOUT_MS = 2000;
+
+/** One bounded `ps` in the C locale: the same process reads the same text in every environment. */
+function runPs(args: string[], timeoutMs: number): string | null {
+  if (!(timeoutMs > 0)) return null; // no time left: do not start a subprocess
+  const r = spawnSync("ps", args, {
     encoding: "utf8",
     // The C locale fixes the text of the month and weekday names: the same process reads the same
     // string in every environment the daemon is started from.
     env: { ...process.env, LC_ALL: "C" },
-    timeout: 2000,
+    timeout: Math.min(PS_TIMEOUT_MS, timeoutMs),
   });
-  const out = (r.stdout ?? "").trim();
-  return r.status === 0 && out ? out : null;
+  return r.status === 0 ? (r.stdout ?? "") : null;
+}
+
+function psLstart(pid: number, timeoutMs = PS_TIMEOUT_MS): string | null {
+  const out = (runPs(["-o", "lstart=", "-p", String(pid)], timeoutMs) ?? "").trim();
+  return out || null;
 }
 
 /**
@@ -64,19 +81,148 @@ function psLstart(pid: number): string | null {
  * `)`, where field 3 is the first.
  */
 export function readPidIdentity(pid: number, deps: IdentityReadDeps = {}): string | null {
-  const { platform = process.platform, procDir = "/proc", ps = psLstart } = deps;
+  const { platform = process.platform, procDir = "/proc", psTimeoutMs = PS_TIMEOUT_MS } = deps;
+  const ps = deps.ps ?? ((p: number) => psLstart(p, psTimeoutMs));
   if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
     if (platform === "win32") return null;
-    if (platform === "linux") {
-      const stat = readFileSync(`${procDir}/${pid}/stat`, "utf8");
-      const ticks = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]; // field 22
-      return ticks !== undefined && /^\d+$/.test(ticks) ? ticks : null;
-    }
+    if (platform === "linux")
+      return parseLinuxStat(readFileSync(`${procDir}/${pid}/stat`, "utf8"))?.identity ?? null;
     return ps(pid);
   } catch {
     return null;
   }
+}
+
+/** What one reading of a process says: who it is (its birth) and which group it is in. */
+export interface PidSnapshot {
+  identity: string;
+  pgid: number;
+}
+
+/** A reader of a pid's process group id. Replaced in tests. */
+export type PgidReader = (pid: number) => number | null;
+
+interface LinuxStat {
+  state: string;
+  pgid: number;
+  identity: string;
+}
+
+/** Fields of a `/proc/<pid>/stat` line; `comm` may hold spaces and parens, so split after the last `)`. */
+function parseLinuxStat(stat: string): LinuxStat | null {
+  const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+  const state = fields[0];
+  const pgid = Number(fields[2]);
+  const ticks = fields[19]; // field 22
+  if (!state || !Number.isInteger(pgid) || ticks === undefined || !/^\d+$/.test(ticks)) return null;
+  return { state, pgid, identity: ticks };
+}
+
+/**
+ * A process's identity AND its process group id from ONE reading, so the two cannot belong to
+ * different processes (#581 cp8, L1). The identity is the one `readPidIdentity` reports: Linux
+ * reads one `/proc/<pid>/stat`; macOS runs one bounded `ps -o pgid=,lstart=`.
+ */
+export function readPidSnapshot(pid: number, deps: IdentityReadDeps = {}): PidSnapshot | null {
+  const { platform = process.platform, procDir = "/proc", psTimeoutMs = PS_TIMEOUT_MS } = deps;
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    if (platform === "win32") return null;
+    if (platform === "linux") {
+      const parsed = parseLinuxStat(readFileSync(`${procDir}/${pid}/stat`, "utf8"));
+      return parsed ? { identity: parsed.identity, pgid: parsed.pgid } : null;
+    }
+    const out =
+      deps.psSnapshot?.(pid) ?? runPs(["-o", "pgid=,lstart=", "-p", String(pid)], psTimeoutMs);
+    const m = /^\s*(\d+)\s+(.+?)\s*$/.exec(out ?? "");
+    return m?.[1] && m[2] ? { identity: m[2], pgid: Number(m[1]) } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The process group id of `pid` now, or null when it cannot be read. */
+export function readPgid(pid: number, deps: IdentityReadDeps = {}): number | null {
+  return readPidSnapshot(pid, deps)?.pgid ?? null;
+}
+
+/** A process that was positively identified (by its birth) as a member of a process group. */
+export interface GroupMember {
+  pid: number;
+  /** Raw birth identity, as `readPidIdentity` reports it. */
+  identity: string;
+}
+
+/** What one listing of a group saw. `complete` is false when part of the table could not be read. */
+export interface GroupMembersReading {
+  members: GroupMember[];
+  complete: boolean;
+}
+
+/** Lists the live members of process group `pgid`, inside the absolute `deadlineAt`. Replaced in tests. */
+export type GroupMembersReader = (pgid: number, deadlineAt: number) => GroupMembersReading;
+
+/**
+ * The live (non-zombie) members of process group `pgid`, each with the birth identity read in the
+ * SAME reading that showed its group, so a member is never a stranger that took a dead member's
+ * pid between two reads. Bounded by `deadlineAt`: Linux checks it as it walks `/proc`, and macOS
+ * gives its one `ps` what is left of it. A table that cannot be read (or the deadline) returns
+ * what was seen with `complete: false`; the caller treats it as positive evidence only.
+ */
+export function readGroupMembers(
+  pgid: number,
+  deadlineAt: number,
+  deps: IdentityReadDeps & { now?: () => number } = {},
+): GroupMembersReading {
+  const { platform = process.platform, procDir = "/proc", now = Date.now } = deps;
+  const members: GroupMember[] = [];
+  if (!Number.isInteger(pgid) || pgid <= 1 || platform === "win32") {
+    return { members, complete: false };
+  }
+  if (platform === "linux") {
+    let names: string[];
+    try {
+      names = readdirSync(procDir);
+    } catch {
+      return { members, complete: false };
+    }
+    let complete = true;
+    let walked = 0;
+    for (const name of names) {
+      if (!/^\d+$/.test(name)) continue;
+      if (++walked % 64 === 0 && now() >= deadlineAt) return { members, complete: false };
+      let stat: LinuxStat | null;
+      try {
+        stat = parseLinuxStat(readFileSync(`${procDir}/${name}/stat`, "utf8"));
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ESRCH") complete = false;
+        continue;
+      }
+      if (stat === null) {
+        complete = false;
+        continue;
+      }
+      if (stat.pgid !== pgid || stat.state === "Z" || stat.state === "X") continue;
+      members.push({ pid: Number(name), identity: stat.identity });
+    }
+    return { members, complete };
+  }
+  const left = deadlineAt - now();
+  const out = deps.psAll?.(left) ?? runPs(["-axo", "pid=,pgid=,stat=,lstart="], left);
+  if (out === null) return { members, complete: false };
+  for (const line of out.split("\n")) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.+?)\s*$/.exec(line);
+    if (!m || Number(m[2]) !== pgid || m[3]?.startsWith("Z")) continue;
+    members.push({ pid: Number(m[1]), identity: m[4] ?? "" });
+  }
+  return { members, complete: true };
+}
+
+/** Do two member lists name the same process? Exact on both pid and raw identity. */
+export function sameMember(a: GroupMember, b: GroupMember): boolean {
+  return a.pid === b.pid && sameIdentity(a.identity, b.identity);
 }
 
 /**

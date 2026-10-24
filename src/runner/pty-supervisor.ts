@@ -1987,8 +1987,17 @@ function untrustedGroupOptions(
 ): Pick<PtyProcessOptions, "onGroupSurvived" | "reapEscapees"> {
   const cwds = untrustedCleanup.untrustedCwdForms(tempCwd);
   return {
-    onGroupSurvived: (pid, startMs, cause) =>
-      untrustedCleanup.markGroupSurvivor(root, pid, { startMs, tempCwd, cwds, cause }),
+    onGroupSurvived: (pid, startMs, cause, evidence) =>
+      untrustedCleanup.markGroupSurvivor(root, pid, {
+        startMs,
+        tempCwd,
+        cwds,
+        cause,
+        // No evidence (a caller that has none): the retry then signals nothing and holds the root.
+        identity: evidence?.identity ?? null,
+        groupId: evidence?.groupId ?? null,
+        members: evidence?.members ?? [],
+      }),
     // Processes the scan could not read are kept as a hold on the root, not as a failure: the
     // reply was already obtained, and the only risk is removing a directory under a live writer.
     // The scan gets what is left of the retirement's one deadline, split TERM then KILL: it has
@@ -1997,6 +2006,8 @@ function untrustedGroupOptions(
       reap(
         { root, cwds, leaderStartMs: leader.startMs },
         {
+          // One deadline for the whole retirement: the scan is bounded by it, not by a budget of its own.
+          deadlineAt: leader.deadlineAt,
           termGraceMs: Math.floor(leader.remainingMs / 2),
           killGraceMs: Math.ceil(leader.remainingMs / 2),
           onUnknown: (unknown) =>
@@ -2032,6 +2043,7 @@ function keepRootAfterFailedDispose(
       tempCwd: entry.spawnOpts?.cwd,
       cwds: entry.spawnOpts ? untrustedCleanup.untrustedCwdForms(entry.spawnOpts.cwd) : [],
       cause: "dispose-rejected",
+      ...pty.survivorEvidence?.(),
     });
   }
 }

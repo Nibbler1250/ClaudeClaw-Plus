@@ -188,6 +188,15 @@ export interface EscapeKillOptions extends EscapeScanOptions {
   killGraceMs?: number;
   pollMs?: number;
   /**
+   * The retirement's ONE absolute deadline (`Date.now()` ms). Every wait is bounded by it in
+   * wall-clock time, not by the sleeps requested, and past it nothing is scanned or signalled:
+   * no scan has been made before it means `EscapeScanDeadlineError` (not an empty answer), and a
+   * scan cut short returns what it last saw, so the caller keeps what is unresolved held.
+   */
+  deadlineAt?: number;
+  /** Wall clock. Replaced in tests. */
+  now?: () => number;
+  /**
    * Told, once, about the processes the final scan could not read (see `UnknownProc`). They are
    * not a failure of this call: the caller keeps the root while they live.
    */
@@ -196,6 +205,14 @@ export interface EscapeKillOptions extends EscapeScanOptions {
 
 const defaultSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
+
+/** The deadline passed before the escape scan could look: "nothing found" is not an answer. */
+export class EscapeScanDeadlineError extends Error {
+  constructor() {
+    super("the retirement deadline passed before the escape scan could run");
+    this.name = "EscapeScanDeadlineError";
+  }
+}
 
 /**
  * Stop every escapee of `target`: SIGTERM, then SIGKILL after `termGraceMs`, polling until the
@@ -217,11 +234,15 @@ export async function terminateEscapees(
     killGraceMs = 2000,
     pollMs = 20,
     onUnknown,
+    now = Date.now,
   } = opts;
+  const deadlineAt = opts.deadlineAt ?? Number.POSITIVE_INFINITY;
+  const expired = (): boolean => now() >= deadlineAt;
   const finish = (scan: EscapeScan): number[] => {
     if (scan.unknown.length > 0) onUnknown?.(scan.unknown);
     return scan.pids;
   };
+  if (expired()) throw new EscapeScanDeadlineError();
   const first = findEscapees(target, opts);
   if (first.pids.length === 0) return finish(first);
 
@@ -233,6 +254,7 @@ export async function terminateEscapees(
     return then !== null && now !== null && sameStart(now, then);
   };
   const send = (name: NodeJS.Signals): void => {
+    if (expired()) return; // past the deadline there is no more scanning or signalling
     for (const pid of findEscapees(target, opts).pids) {
       // A pid first seen now has no recorded identity: it is recorded, and signalled next round.
       if (!born.has(pid)) {
@@ -247,17 +269,22 @@ export async function terminateEscapees(
       }
     }
   };
-  const remaining = async (budgetMs: number): Promise<EscapeScan> => {
-    for (let waited = 0; ; waited += pollMs) {
-      const left = findEscapees(target, opts);
-      if (left.pids.length === 0 || waited >= budgetMs) return left;
-      await sleep(pollMs);
+  // Waits are measured on the wall clock: the sleeps requested are a lower bound on the time
+  // spent, since every pass over /proc and every signal adds to it.
+  const remaining = async (budgetMs: number, last: EscapeScan): Promise<EscapeScan> => {
+    const until = Math.min(deadlineAt, now() + budgetMs);
+    let seen = last;
+    for (;;) {
+      if (now() >= until) return seen; // out of time: the last scan stands, nothing new is started
+      seen = findEscapees(target, opts);
+      if (seen.pids.length === 0 || now() >= until) return seen;
+      await sleep(Math.min(pollMs, Math.max(0, until - now())));
     }
   };
 
   send("SIGTERM");
-  const afterTerm = await remaining(termGraceMs);
+  const afterTerm = await remaining(termGraceMs, first);
   if (afterTerm.pids.length === 0) return finish(afterTerm);
   send("SIGKILL");
-  return finish(await remaining(killGraceMs));
+  return finish(await remaining(killGraceMs, afterTerm));
 }

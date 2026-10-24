@@ -15,6 +15,7 @@ import {
 import * as cleanup from "./pty-cleanup.js";
 import { withPrintRuntime } from "./print.js";
 import { engines } from "./registry.js";
+import { retireFake, retireOutcome } from "../runner/pty-retire-fakes.js";
 
 /**
  * #581 cp5: an isolated one-shot whose claude lands AFTER the call handed back. The root is
@@ -184,11 +185,11 @@ describe("a late PTY whose disposal fails keeps the root and the slot", () => {
     const root = rootOf();
     expect(cleanup.groupSurvivorOf(root)).toBe(LATE_PID);
     // A retry with a termination that cannot prove the group gone leaves it held.
-    const terminate = async (): Promise<boolean> => false;
-    expect(await cleanup.retrySurvivingGroups({ terminate, reap: async () => [] })).toBe(0);
+    const retire = retireFake(() => false);
+    expect(await cleanup.retrySurvivingGroups({ retire, reap: async () => [] })).toBe(0);
     expect(existsSync(root)).toBe(true);
     expect(cleanup.untrustedOneShotsInFlight()).toBe(1);
-    expect(warned.join("\n")).toContain("start time not recorded");
+    expect(warned.join("\n")).toContain("no recorded identity or members");
   });
 });
 
@@ -232,7 +233,7 @@ describe("a late confirmation that succeeds releases once", () => {
     await sleep(80);
     expect(cleanup.untrustedOneShotsInFlight()).toBe(1);
     const cleared = await cleanup.retrySurvivingGroups({
-      terminate: async () => true,
+      retire: retireFake(() => true),
       reap: async () => [],
     });
     expect(cleared).toBe(1);

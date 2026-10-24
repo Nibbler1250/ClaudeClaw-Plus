@@ -21,13 +21,15 @@ import {
   terminateEscapees,
 } from "../runner/pty-escape-scan.js";
 import {
-  type GroupTerminationOptions,
+  type RetireGroupInput,
+  type RetireGroupOutcome,
   type SurvivorCause,
   groupGoneNow,
   isSignalablePid,
-  terminateProcessGroup,
+  retireProcessGroup,
 } from "../runner/pty-group-kill.js";
 import {
+  type GroupMember,
   type StartMsReader,
   cachedStartMs,
   currentBootId,
@@ -340,6 +342,20 @@ export interface GroupSurvivor {
   retries: number;
   /** Why it is recorded: what the failed call reports. */
   cause: SurvivorCause;
+  /**
+   * The leader's raw birth identity at spawn. Null (a legacy record, or one that could not be
+   * read): the leader can never be shown to be the process that was recorded.
+   */
+  identity: string | null;
+  /** The leader's process group id at spawn; null: the group was never proven isolated. */
+  groupId: number | null;
+  /**
+   * Members of the group identified positively (pid and birth identity) when it was last seen.
+   * Evidence only: the retry reads each again before it signals. None (a legacy record): once
+   * the leader is gone nothing proves the group is still ours, so nothing is signalled and the
+   * root and slot stay held.
+   */
+  members: GroupMember[];
 }
 
 /** Written into a survivor's config root, so a daemon restart still knows what to keep and stop. */
@@ -355,6 +371,12 @@ interface SurvivorFileRecord {
   /** The PTY leader. Its group is checked (with `startMs`) when a restart reads this. */
   pid: number;
   startMs: number | null;
+  /** Raw birth identity of the leader (same boot as `bootId`); absent in a legacy record. */
+  identity?: string | null;
+  /** Process group id of the leader at spawn; absent in a legacy record. */
+  groupId?: number | null;
+  /** Group members identified when the record was written; absent in a legacy record. */
+  members?: GroupMember[];
   /**
    * The Linux boot id every start time in this record was read on. A restart that finds another
    * one (or none) treats every process named here as gone and signals none (#570 r15, A1).
@@ -411,6 +433,9 @@ function writeSurvivorFile(root: string): void {
     ? {
         pid: survivor.pid,
         startMs: survivor.startMs,
+        identity: survivor.identity,
+        groupId: survivor.groupId,
+        members: survivor.members,
         cwds: survivor.cwds,
         tempCwd: survivor.tempCwd,
       }
@@ -444,6 +469,9 @@ export function markGroupSurvivor(
     tempCwd?: string;
     cwds?: string[];
     cause?: SurvivorCause;
+    identity?: string | null;
+    groupId?: number | null;
+    members?: GroupMember[];
   } = {},
 ): void {
   const survivor: GroupSurvivor = {
@@ -453,6 +481,9 @@ export function markGroupSurvivor(
     cwds: extra.cwds ?? [],
     retries: survivingGroups.get(root)?.retries ?? 0,
     cause: extra.cause ?? "group",
+    identity: extra.identity ?? null,
+    groupId: extra.groupId ?? null,
+    members: extra.members ?? [],
   };
   survivingGroups.set(root, survivor);
   writeSurvivorFile(root);
@@ -646,10 +677,19 @@ function readSurvivorFile(root: string): SurvivorFileRecord | "missing" | "unrea
             u.pid > 1 &&
             (u.startMs === null || typeof u.startMs === "number"),
         ));
-    if (!isSignalablePid(parsed.pid) || !cwdsOk || !unknownOk) return "unreadable";
+    const membersOk =
+      parsed.members === undefined ||
+      (Array.isArray(parsed.members) &&
+        parsed.members.every(
+          (m) => Number.isInteger(m?.pid) && m.pid > 1 && typeof m.identity === "string",
+        ));
+    if (!isSignalablePid(parsed.pid) || !cwdsOk || !unknownOk || !membersOk) return "unreadable";
     return {
       pid: parsed.pid,
       startMs: typeof parsed.startMs === "number" ? parsed.startMs : null,
+      identity: typeof parsed.identity === "string" ? parsed.identity : null,
+      groupId: Number.isInteger(parsed.groupId) ? (parsed.groupId as number) : null,
+      members: (parsed.members ?? []).map((m) => ({ pid: m.pid, identity: m.identity })),
       bootId: typeof parsed.bootId === "string" ? parsed.bootId : null,
       cwds: parsed.cwds,
       tempCwd: typeof parsed.tempCwd === "string" ? parsed.tempCwd : undefined,
@@ -662,41 +702,65 @@ function readSurvivorFile(root: string): SurvivorFileRecord | "missing" | "unrea
   }
 }
 
+/** One retry gets the same cap a disposal does, as one absolute deadline. */
+const SURVIVOR_RETRY_CAP_MS = 7000;
+
 export interface SurvivorRetryDeps {
-  terminate?: (pid: number, opts: GroupTerminationOptions) => Promise<boolean>;
-  reap?: (target: EscapeScanTarget) => Promise<number[]>;
-  startMs?: StartMsReader;
+  /** The common retirement. Replaced in tests: a fake never reaches a real pid. */
+  retire?: (input: RetireGroupInput) => Promise<RetireGroupOutcome>;
+  reap?: (target: EscapeScanTarget, deadlineAt: number) => Promise<number[]>;
+  /** Fields of `RetireGroupInput` a test replaces (signals, probes, member listing, clock). */
+  retireInput?: Partial<RetireGroupInput>;
+  /** The retry's cap (default 7000 ms, as a disposal's). */
+  capMs?: number;
 }
 
 /**
- * Signal every recorded survivor again. Each is checked against the start time recorded at
- * spawn immediately before every signal, so a pid that was reused is not touched (narrowed to
- * the instant between the check and the kill, which only a native process handle could close); the leader is no longer
- * ours, so only its group is signalled. An entry is dropped once the group and everything that
- * left it are gone. A retry that fails is logged as metadata (pid, retry count, how many
- * processes), never paths or environment. Returns how many entries were cleared.
+ * Stop a recorded survivor again, through THE common retirement (`retireProcessGroup`), the
+ * same algorithm a disposal uses (#581 cp8, H1). It holds no authority of its own: the leader's
+ * identity is read before every signal, `-pid` is a target only for the isolated group that
+ * was recorded at spawn, and once the leader is gone the group is signalled only if a member
+ * identified when it was last seen (pid and birth identity) is read again, in that group, with
+ * the same identity. A historical group id plus the leader's birth time is NOT that. A record
+ * with no members (a legacy one, or none identified) therefore signals nothing once its leader
+ * is gone, and its root and slot stay held. The members found are carried to the next retry.
+ * An entry is dropped once the group and everything that left it are gone. A retry that fails is
+ * logged as metadata (pid, retry count, how many processes), never paths or environment. Returns
+ * how many entries were cleared.
  */
 export async function retrySurvivingGroups(deps: SurvivorRetryDeps = {}): Promise<number> {
-  const terminate = deps.terminate ?? terminateProcessGroup;
+  const retire = deps.retire ?? retireProcessGroup;
   let cleared = 0;
   for (const [root, survivor] of [...survivingGroups]) {
     survivor.retries++;
-    // Without a recorded start time nothing is signalled (the termination below is not told it is
-    // the first): the root stays registered, and this says so once, as metadata only.
-    if (survivor.startMs === null && !loggedUnrecorded.has(root)) {
+    // Without a recorded identity or any member nothing is signalled once the leader is gone:
+    // the root stays registered, and this says so once, as metadata only.
+    if (
+      (survivor.identity === null || survivor.members.length === 0) &&
+      !loggedUnrecorded.has(root)
+    ) {
       loggedUnrecorded.add(root);
       console.warn(
-        `[oneshot] survivor of pid ${survivor.pid} not signalled again: start time not recorded (${basename(root)}); root kept`,
+        `[oneshot] survivor of pid ${survivor.pid} has no recorded identity or members; it is not signalled unless its leader is still the recorded process (${basename(root)}); root kept`,
       );
     }
     try {
-      // The start time is read fresh before every signal, not from the sweep pass's cache: this
-      // runs seconds after the pass began, and a cached reading is how a reused pid is signalled.
-      const groupGone = await terminate(survivor.pid, {
-        leaderStartMs: survivor.startMs,
-        startMs: deps.startMs,
-        leaderAlive: () => false,
+      const deadlineAt = Date.now() + (deps.capMs ?? SURVIVOR_RETRY_CAP_MS);
+      const outcome = await retire({
+        pid: survivor.pid,
+        identity: survivor.identity,
+        groupId: survivor.groupId,
+        members: survivor.members,
+        initial: false, // a delayed retry has no first-termination privilege
+        allowUnrecordedInitial: false,
+        sendTerm: true,
+        deadlineAt,
+        termGraceMs: 2000,
+        ...deps.retireInput,
       });
+      survivor.members = outcome.members;
+      writeSurvivorFile(root);
+      const groupGone = outcome.leaderGone && outcome.groupGone;
       const target: EscapeScanTarget = {
         root,
         cwds: survivor.cwds,
@@ -705,15 +769,16 @@ export async function retrySurvivingGroups(deps: SurvivorRetryDeps = {}): Promis
       // Unreadable processes are not a failure here either: they become a hold on the root.
       const escapees = await (
         deps.reap ??
-        ((t: EscapeScanTarget) =>
+        ((t: EscapeScanTarget, at: number) =>
           terminateEscapees(t, {
+            deadlineAt: at,
             onUnknown: (unknown) =>
               markUnknownProcs(root, { pid: survivor.pid, startMs: survivor.startMs }, unknown, {
                 tempCwd: survivor.tempCwd,
                 cwds: survivor.cwds,
               }),
           }))
-      )(target);
+      )(target, deadlineAt);
       if (groupGone && escapees.length === 0) {
         survivingGroups.delete(root);
         releaseIfClear(root); // an unknown hold the reap just recorded keeps the slot
@@ -948,6 +1013,10 @@ function adoptPersistedSurvivors(
           cwds: record.cwds,
           retries: 0,
           cause: "group",
+          // A legacy record has none of these: the retry then signals nothing and holds the root.
+          identity: record.identity ?? null,
+          groupId: record.groupId ?? null,
+          members: record.members ?? [],
         });
         reserveSurvivorSlot(path);
         console.error(

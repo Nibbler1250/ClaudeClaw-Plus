@@ -68,8 +68,20 @@ interface FakeOs {
   members: number;
   immuneLeader: boolean;
   immuneMembers: boolean;
+  /** Changes the identity of every member: the group id was reused by a stranger's group. */
+  salt: string;
+  /** SIGTERM takes the leader and the members (default: only SIGKILL does). */
+  termKills: boolean;
   log: string[];
   signalPid: (pid: number, sig: NodeJS.Signals | 0) => void;
+}
+
+/** The members the fake OS lists for the group right now, with the identities they carry. */
+function roster(os: FakeOs): Array<{ pid: number; identity: string }> {
+  return Array.from({ length: os.members }, (_, i) => ({
+    pid: 9000 + i,
+    identity: `member-${i}${os.salt}`,
+  }));
 }
 
 function makeOs(init: Partial<FakeOs> = {}): FakeOs {
@@ -78,6 +90,8 @@ function makeOs(init: Partial<FakeOs> = {}): FakeOs {
     members: 0,
     immuneLeader: false,
     immuneMembers: false,
+    salt: "",
+    termKills: false,
     log: [],
     signalPid(pid, sig) {
       const esrch = Object.assign(new Error("ESRCH"), { code: "ESRCH" });
@@ -86,7 +100,7 @@ function makeOs(init: Partial<FakeOs> = {}): FakeOs {
         return;
       }
       os.log.push(`${pid}:${sig}`);
-      if (sig !== "SIGKILL") return;
+      if (sig !== "SIGKILL" && !os.termKills) return;
       if (!os.immuneLeader) os.leader = false;
       if (pid < 0 && !os.immuneMembers) os.members = 0;
     },
@@ -109,6 +123,7 @@ function spawnOver(os: FakeOs, extra: Partial<PtyProcessOptions> = {}): Promise<
     _ptySpawn: fakePtySpawn as never,
     _signalPid: os.signalPid,
     _readPidIdentity: () => "boot-1",
+    _readMembers: () => ({ members: roster(os), complete: true }),
     _liveMembers: () => (os.leader ? 1 : 0) + os.members,
     _describeGroup: () => ({ count: os.members, comm: ["mcp-server", "git"] }),
     _exitGraceMs: 80,
@@ -242,22 +257,25 @@ describe("natural leader exit before dispose", () => {
     expect(groupUnconfirmedObservedCount()).toBe(0);
   });
 
-  test("exit-time evidence goes stale: a late dispose signals nothing on a group it cannot vouch for", async () => {
-    // Fault (site: `_confirmGone`, drop the freshness bound): the late dispose KILLs `-pid`, which
-    // by now may be a stranger's. Predicted result: `-pid:SIGKILL` in the log.
+  test("a group id reused by a stranger's group is not ours: the members seen at the exit are gone", async () => {
+    // Fault (site: `retireProcessGroup`, drop the fresh read of the earlier members): the late
+    // dispose KILLs `-pid`, which by now is a stranger's. Predicted result: `-pid:SIGKILL` in the log.
     const os = makeOs({ leader: false, members: 2, immuneMembers: true });
-    const proc = await spawnOver(os, { _groupContinuityMaxAgeMs: 20 });
-    (native as FakeNative).fireExit(); // the group was alive when the leader went
-    await new Promise((r) => setTimeout(r, 60));
+    const proc = await spawnOver(os);
+    (native as FakeNative).fireExit(); // the group was alive, with these members, when the leader went
+    os.salt = "-stranger"; // the group id is reused: other processes answer on it
     await proc.dispose();
     expect(os.log).toEqual([]);
     expect(groupUnconfirmedObservedCount()).toBe(1); // reported (reason unknown-identity), not signalled
   });
 
-  test("within the window the same dispose does signal the group it saw", async () => {
+  test("the members identified at the exit keep their authority however long the dispose is delayed: no clock decides", async () => {
+    // Fault (site: `_confirmGone`, authority from a flag plus a freshness window): after 60 ms the
+    // window has passed and the group is not signalled. Predicted result: an empty log.
     const os = makeOs({ leader: false, members: 2 });
-    const proc = await spawnOver(os, { _groupContinuityMaxAgeMs: 5000 });
+    const proc = await spawnOver(os);
     (native as FakeNative).fireExit();
+    await new Promise((r) => setTimeout(r, 60));
     await proc.dispose();
     expect(os.log).toEqual([`-${proc.pid}:SIGTERM`, `-${proc.pid}:SIGKILL`]);
   });
@@ -318,23 +336,49 @@ describe("joined, retryable confirmExit after a native exit event", () => {
 });
 
 describe("one deadline", () => {
-  test("the escape scan gets what is left of the cap, not a budget of its own", async () => {
-    const os = makeOs({ members: 1, immuneMembers: true, immuneLeader: true });
+  test("the escape scan gets what is left of the cap, not a budget of its own, and spends it", async () => {
+    // The group takes SIGKILL at the end of the TERM grace (200 ms of the 300 ms cap) and is gone
+    // a poll later, so about 80 ms is left. The scan stand-in uses everything it is given.
+    const os = makeOs({ members: 1 });
     const seen: number[] = [];
     const started = Date.now();
     const proc = await spawnOver(os, {
       isolation: "untrusted",
+      _exitGraceMs: 200,
+      _exitCapMs: 300,
+      reapEscapees: async (leader) => {
+        seen.push(leader.remainingMs);
+        await new Promise((r) => setTimeout(r, leader.remainingMs));
+        return [];
+      },
+    });
+    await proc.dispose();
+    expect(seen).toHaveLength(1);
+    // Went red (300) with the scan given a fresh full budget (`remainingMs: this._exitCapMs`),
+    // and again in the elapsed time below, because the scan then spends all of it.
+    expect(seen[0]).toBeGreaterThanOrEqual(0);
+    expect(seen[0]).toBeLessThanOrEqual(120);
+    // The retirement spent the cap, not the cap plus a scan budget.
+    expect(Date.now() - started).toBeLessThan(300 + 100);
+  });
+
+  test("no scan, signal or listing is started once the cap has been spent: the root stays held", async () => {
+    const os = makeOs({ members: 1, immuneMembers: true, immuneLeader: true });
+    const seen: number[] = [];
+    const survivors: string[] = [];
+    const proc = await spawnOver(os, {
+      isolation: "untrusted",
       _exitGraceMs: 80,
       _exitCapMs: 300,
+      onGroupSurvived: (_pid, _start, cause) => survivors.push(cause),
       reapEscapees: async (leader) => {
         seen.push(leader.remainingMs);
         return [];
       },
     });
     await expect(proc.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
-    expect(seen).toHaveLength(1);
-    expect(seen[0]).toBeLessThanOrEqual(300);
-    // The retirement spent the cap, not the cap plus a scan budget.
-    expect(Date.now() - started).toBeLessThan(300 + 250);
+    // Went red (one call) with the scan started on a spent cap.
+    expect(seen).toEqual([]);
+    expect(survivors).toEqual(["group"]);
   });
 });

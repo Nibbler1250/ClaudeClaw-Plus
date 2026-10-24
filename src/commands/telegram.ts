@@ -1135,6 +1135,9 @@ export function telegramStatusText(
   quarantine?: QuarantineInfo[],
   now?: number,
 ): string {
+  // The observed-group counter is the soak's measure and moves with bus and cron retirements,
+  // not with this chat, so it is shown whether or not there is an active session (#581 cp8, L2).
+  const unconfirmed = `PTY groups unconfirmed (observed): ${groupUnconfirmedObservedCount()}`;
   const lines = session
     ? [
         "📊 **Session Status**",
@@ -1145,9 +1148,9 @@ export function telegramStatusText(
         `Created: ${session.createdAt}`,
         `Last used: ${session.lastUsedAt}`,
         `Compact warned: ${(session as any).compactWarned ? "yes" : "no"}`,
-        `PTY groups unconfirmed (observed): ${groupUnconfirmedObservedCount()}`,
+        unconfirmed,
       ]
-    : ["📊 No active session."];
+    : ["📊 No active session.", unconfirmed];
   lines.push(...formatQuarantineStatus(quarantine, now));
   return lines.join("\n");
 }

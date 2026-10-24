@@ -79,12 +79,23 @@ import {
   type GroupDescription,
   type RetireGroupOutcome,
   type SurvivorCause,
+  noteGroupMembers,
   retireProcessGroup,
 } from "./pty-group-kill";
 import { type GroupConfirmMode, judgeGroupOutcome } from "./pty-group-confirm";
 // The one OS identity reader (#581 cp2). The leader's numeric start time is a projection of the
 // same reading, not a second read.
-import { readPidIdentity, sameIdentity, startMsFromIdentity } from "./pty-proc-identity";
+import {
+  type GroupMember,
+  type GroupMembersReader,
+  type PgidReader,
+  readGroupMembers,
+  readPgid,
+  readPidIdentity,
+  readPidSnapshot,
+  sameIdentity,
+  startMsFromIdentity,
+} from "./pty-proc-identity";
 // Screen is used for readiness and dialogs only (`_awaitReplReady`), never for a turn outcome.
 import { Screen } from "./pty-screen";
 
@@ -113,6 +124,17 @@ export { sanitizePtyPromptText };
 
 // ─── Public types (FROZEN per SPEC §3.1) ────────────────────────────────────
 
+/**
+ * What a later, independent retry needs to keep its signal authority when a retirement could not
+ * finish (#581 cp8, H1): the leader's raw birth identity and process group id as read at spawn, and
+ * the group members identified positively. A retry re-reads each before it signals anything.
+ */
+export interface GroupSurvivorEvidence {
+  identity: string | null;
+  groupId: number | null;
+  members: GroupMember[];
+}
+
 export interface PtyProcessOptions {
   /** One-shot isolation overrides every persona, resume and permission flag. */
   isolation?: "untrusted" | "trusted-session";
@@ -130,9 +152,19 @@ export interface PtyProcessOptions {
   /** INTERNAL TEST HOOK: live (non-zombie) members of the group; see `retireProcessGroup`. */
   _liveMembers?: (pid: number) => number | undefined;
   /** INTERNAL TEST HOOK: names the members left in a group that would not go. */
-  _describeGroup?: (pid: number) => GroupDescription;
-  /** INTERNAL TEST HOOK: how long group continuity evidence stays fresh (default 30 s). */
-  _groupContinuityMaxAgeMs?: number;
+  _describeGroup?: (pid: number, deadlineAt: number) => GroupDescription;
+  /**
+   * INTERNAL TEST HOOK: lists a process group's members with their birth identities. The default
+   * reads the OS. A test that stands in for the OS with `_signalPid` or `_readPidIdentity` gets
+   * an empty listing unless it names a reader: a made-up group has no members to identify.
+   */
+  _readMembers?: GroupMembersReader;
+  /**
+   * INTERNAL TEST HOOK: reads a process group id (the child's at spawn, the daemon's at
+   * retirement). A test that stands in for the OS gets a fake in which every pid leads its own
+   * group; a real one reads the OS (`readPidSnapshot`).
+   */
+  _readPgid?: PgidReader;
   /** Test seam: how long an untrusted spawn waits for the REPL footer. Default 20 s. */
   _replReadyBudgetMs?: number;
   /**
@@ -143,7 +175,12 @@ export interface PtyProcessOptions {
    * and nothing it does, an exception included, can change that outcome. If it throws, the error
    * is logged and `dispose()` rejects all the same.
    */
-  onGroupSurvived?: (pid: number, startMs: number | null, cause: SurvivorCause) => void;
+  onGroupSurvived?: (
+    pid: number,
+    startMs: number | null,
+    cause: SurvivorCause,
+    evidence?: GroupSurvivorEvidence,
+  ) => void;
   /**
    * Called once the group is gone: stop descendants that left it (Linux, see pty-escape-scan),
    * given the leader's pid and the start time recorded at spawn (a process older than that
@@ -155,6 +192,8 @@ export interface PtyProcessOptions {
     startMs: number | null;
     /** Time left in the retirement's one deadline; the scan must not start a budget of its own. */
     remainingMs: number;
+    /** The retirement's one absolute deadline (`Date.now()` ms): the scan is bounded by it. */
+    deadlineAt: number;
   }) => Promise<number[]>;
   /** Existing Claude Code session ID to resume via `claude --resume <id>`.
    *  Empty string means "no resume". */
@@ -317,6 +356,8 @@ export interface PtyProcess {
   readonly pid: number;
   /** The leader's start time recorded at spawn (untrusted children only); null when not read. */
   readonly leaderStartMs?: number | null;
+  /** Identity, group id and identified members, for a retry that must keep its signal authority. */
+  survivorEvidence?(): GroupSurvivorEvidence;
   readonly sessionId: string;
   readonly cwd: string;
   isAlive(): boolean;
@@ -528,15 +569,10 @@ const DEFAULT_SUBMIT_CONFIRM_MS = 3000;
 const DEFAULT_POLL_MS = 50;
 /** Retirement: how long SIGTERM gets before SIGKILL, and the total wait for the OS to agree. */
 const DEFAULT_EXIT_GRACE_MS = 2000;
+/** When the child's group id is read again after spawn (see `PtyProcess._refreshGroupId`). */
+const GROUP_ID_REFRESH_MS = [25, 250] as const;
 const DEFAULT_EXIT_CAP_MS = 7000;
 const EXIT_PROBE_MS = 20;
-/**
- * How long evidence that a group was seen alive (at the leader's exit, or by an earlier
- * retirement) may authorise `-pid` for a leader that is absent. Past it nothing is signalled
- * without fresh evidence: between the exit and a late dispose a stranger can take the pid and
- * leave a group on it (security review of cp3). Not an authority by itself: age only narrows.
- */
-const GROUP_CONTINUITY_MAX_AGE_MS = 30_000;
 const DEFAULT_COLS = 100;
 const DEFAULT_ROWS = 30;
 const DEFAULT_PERMISSION_MODE_ARGS = ["--dangerously-skip-permissions"];
@@ -805,6 +841,8 @@ class PtyProcessImpl implements PtyProcess {
   private _disposal: Promise<void> | null = null;
   private readonly _signalPid: (pid: number, signal: NodeJS.Signals | 0) => void;
   private readonly _readIdentity: (pid: number) => string | null;
+  /** A test's identity reader; undefined: the retirement uses the OS reader bounded by its deadline. */
+  private readonly _injectedIdentity: ((pid: number) => string | null) | undefined;
   /** The child's birth identity, read at spawn; null when it could not be read. */
   private readonly _identity: string | null;
   private readonly _exitGraceMs: number;
@@ -838,26 +876,31 @@ class PtyProcessImpl implements PtyProcess {
   private readonly _sessionKey: string;
   private readonly _groupConfirm?: GroupConfirmMode;
   private readonly _liveMembers?: (pid: number) => number | undefined;
-  private readonly _describeGroup?: (pid: number) => GroupDescription;
+  private readonly _describeGroup?: (pid: number, deadlineAt: number) => GroupDescription;
+  private readonly _readMembers: GroupMembersReader;
+  private readonly _readPgid: PgidReader;
+  /** A test's (or the fake OS's) group id reader; undefined: the retirement reads the OS, bounded by its deadline. */
+  private readonly _injectedPgid: PgidReader | undefined;
+  /** The leader's process group id, read with its identity at spawn; null when unreadable. */
+  private _groupId: number | null;
   private readonly _onGroupSurvived?: (
     pid: number,
     startMs: number | null,
     cause: SurvivorCause,
+    evidence?: GroupSurvivorEvidence,
   ) => void;
   private readonly _reapEscapees?: (leader: {
     pid: number;
     startMs: number | null;
     remainingMs: number;
+    deadlineAt: number;
   }) => Promise<number[]>;
   /**
-   * The group had members when the leader went, or a retirement found survivors in it. Only then
-   * may a later retirement signal `-pid` of a leader that is absent: a saved start time says
-   * nothing about a group whose leader is gone (plan "Signal authority", point 2).
+   * Group members identified positively (pid and birth identity) by a retirement, carried to the
+   * next one. Evidence only: each is read again before it grants any authority, and nothing here
+   * expires or renews by itself (#581 cp8, H2).
    */
-  private _groupContinuity = false;
-  /** Wall-clock ms when `_groupContinuity` was last established by a probe. */
-  private _groupContinuityAt = 0;
-  private readonly _groupContinuityMaxAgeMs: number;
+  private _groupMembers: GroupMember[] = [];
   /** The leader's start time at spawn: every later signal checks that the pid still has it. */
   private readonly _leaderStartMs: number | null;
   /**
@@ -912,7 +955,6 @@ class PtyProcessImpl implements PtyProcess {
     this._groupConfirm = opts._groupConfirm;
     this._liveMembers = opts._liveMembers;
     this._describeGroup = opts._describeGroup;
-    this._groupContinuityMaxAgeMs = opts._groupContinuityMaxAgeMs ?? GROUP_CONTINUITY_MAX_AGE_MS;
     this._readyGate = opts.isolation === "untrusted" && !opts._skipReadySettle;
     this._replReadyBudgetMs = opts._replReadyBudgetMs ?? UNTRUSTED_REPL_READY_MS;
     this._onGroupSurvived = opts.onGroupSurvived;
@@ -933,8 +975,28 @@ class PtyProcessImpl implements PtyProcess {
     this._submitConfirmMs = opts.submitConfirmMs ?? DEFAULT_SUBMIT_CONFIRM_MS;
     this._now = opts._now ?? (() => Date.now());
     this._signalPid = opts._signalPid ?? ((pid, signal) => void process.kill(pid, signal));
-    this._readIdentity = opts._readPidIdentity ?? (opts._signalPid ? () => null : readPidIdentity);
-    this._identity = this._readIdentity(pty.pid);
+    // A test that stands in for the OS (a made-up pid with `_signalPid` or `_readPidIdentity`) gets
+    // a fake one: every pid leads its own group and has no members; the real reader is the default.
+    const fakeOs = Boolean(opts._signalPid || opts._readPidIdentity || opts._readPgid);
+    this._injectedPgid = opts._readPgid ?? (fakeOs ? (pid) => pid : undefined);
+    this._readPgid = this._injectedPgid ?? ((pid) => readPgid(pid));
+    this._readMembers =
+      opts._readMembers ??
+      (fakeOs
+        ? () => ({ members: [], complete: true })
+        : (pgid, deadlineAt) => readGroupMembers(pgid, deadlineAt));
+    this._injectedIdentity = opts._readPidIdentity ?? (opts._signalPid ? () => null : undefined);
+    this._readIdentity = this._injectedIdentity ?? readPidIdentity;
+    // The child's identity and its group id come from ONE reading, taken while it is certainly
+    // the process we spawned (#581 cp8, L1).
+    if (this._injectedIdentity || opts._readPgid) {
+      this._identity = this._readIdentity(pty.pid);
+      this._groupId = this._readPgid(pty.pid);
+    } else {
+      const snapshot = readPidSnapshot(pty.pid);
+      this._identity = snapshot?.identity ?? null;
+      this._groupId = snapshot?.pgid ?? null;
+    }
     this._leaderStartMs = startMsFromIdentity(this._identity);
     this._exitGraceMs = opts._exitGraceMs ?? DEFAULT_EXIT_GRACE_MS;
     this._exitCapMs = opts._exitCapMs ?? DEFAULT_EXIT_CAP_MS;
@@ -946,6 +1008,13 @@ class PtyProcessImpl implements PtyProcess {
 
     this._onDataDisposable = pty.onData((data) => this._handleData(data));
     this._onExitDisposable = pty.onExit((info) => this._handleExit(info));
+    // The reading above can predate the child's `setsid()`, and a child that prints nothing never
+    // triggers the first-data refresh. Real timers on purpose, like the retirement's: a frozen
+    // turn clock must not keep the group id wrong.
+    for (const ms of GROUP_ID_REFRESH_MS) {
+      const timer = setTimeout(() => this._refreshGroupId(), ms);
+      timer.unref?.();
+    }
   }
 
   get pid(): number {
@@ -954,6 +1023,18 @@ class PtyProcessImpl implements PtyProcess {
   /** The leader's start time recorded at spawn, for a group that outlives it. Null: not read. */
   get leaderStartMs(): number | null {
     return this._leaderStartMs;
+  }
+  /**
+   * What a later retry needs to keep its signal authority over this child's group (see
+   * `GroupSurvivorEvidence`): the identity and group id recorded at spawn and the members a
+   * retirement has identified so far.
+   */
+  survivorEvidence(): GroupSurvivorEvidence {
+    return {
+      identity: this._identity,
+      groupId: this._groupId,
+      members: [...this._groupMembers],
+    };
   }
   get sessionId(): string {
     return this._sessionId;
@@ -1043,7 +1124,10 @@ class PtyProcessImpl implements PtyProcess {
     const bytes = new TextEncoder().encode(data);
     const now = this._now();
     this._trace(`<< pid=${this._pid} turn=${this._turnInProgress} n=${bytes.length}`, data);
-    if (this._firstDataAt === 0) this._firstDataAt = now;
+    if (this._firstDataAt === 0) {
+      this._firstDataAt = now;
+      this._refreshGroupId();
+    }
     // Liveness only: when did the TUI last paint. A finished reply waits for this to go
     // quiet before the next prompt is accepted (readiness); it never decides the outcome.
     this._lastDataAt = now;
@@ -1145,9 +1229,45 @@ class PtyProcessImpl implements PtyProcess {
     }
   }
 
+  /**
+   * The group id read at construction can predate the child's `setsid()`; the first output proves
+   * the child has run. Re-read it, but only while the pid still has the identity recorded at spawn.
+   */
+  private _refreshGroupId(): void {
+    if (this._identity === null) return;
+    if (this._injectedPgid) {
+      this._groupId = this._injectedPgid(this._pid);
+      return;
+    }
+    const snapshot = readPidSnapshot(this._pid);
+    if (snapshot !== null && sameIdentity(snapshot.identity, this._identity)) {
+      this._groupId = snapshot.pgid;
+    }
+  }
+
+  /**
+   * Remember who is in the group while it is provably ours (see `noteGroupMembers`): once the
+   * leader is gone nothing else can say the survivors are ours. Evidence only.
+   */
+  private _noteGroupMembers(leaderJustExited = false): void {
+    const noted = noteGroupMembers({
+      leaderJustExited,
+      pid: this._pid,
+      identity: this._identity,
+      groupId: this._groupId,
+      members: this._groupMembers,
+      signal: this._signalPid,
+      readIdentity: this._injectedIdentity,
+      readMembers: this._readMembers,
+      readGroupId: this._injectedPgid,
+    });
+    this._groupMembers = noted.members;
+    this._groupId = noted.groupId;
+  }
+
   private _handleExit(info: { exitCode: number; signal?: number | string }): void {
     this._alive = false;
-    this._noteGroupAtExit();
+    this._noteGroupMembers(true); // the leader just went: whoever is in its group now is ours
     // Issue #176: capture a diagnostic snapshot the moment the PTY exits.
     // Reading the tail ring buffer now is cheap and avoids the
     // _onDataDisposable race (data events still flush before exit on
@@ -1467,12 +1587,20 @@ class PtyProcessImpl implements PtyProcess {
    */
   dispose(): Promise<void> {
     if (!this._disposal) {
-      const run = this._retire();
-      this._disposal = run;
-      // A rejected retirement is retried by the next `dispose()` / `confirmExit()`.
-      run.catch(() => {
-        if (this._disposal === run) this._disposal = null;
+      // The joined promise is published BEFORE the retirement starts: `_retire()` runs
+      // synchronously up to its first await, and the native `kill()` in it fires bun-pty's exit
+      // callbacks right there. A callback that calls `dispose()` / `confirmExit()` must find this
+      // retirement and join it, not start a second one with its own deadline (#581 cp8, M3).
+      let settle!: { resolve: () => void; reject: (reason: unknown) => void };
+      const joined = new Promise<void>((resolve, reject) => {
+        settle = { resolve, reject };
       });
+      this._disposal = joined;
+      // A rejected retirement is retried by the next `dispose()` / `confirmExit()`.
+      joined.catch(() => {
+        if (this._disposal === joined) this._disposal = null;
+      });
+      this._retire().then(settle.resolve, settle.reject);
     }
     return this._disposal;
   }
@@ -1486,6 +1614,9 @@ class PtyProcessImpl implements PtyProcess {
     this._disposed = true;
     // Read before kill(): bun-pty's own exit event flips this synchronously.
     const wasAlive = this._alive;
+    // Before anything is signalled: the native kill below can take the leader down at once, and
+    // after that only members identified now can show the group is still ours.
+    if (firstRun) this._noteGroupMembers();
 
     if (firstRun && this._turnInProgress) {
       this._rejectTurn(new PtyClosedError(this.label, null, "SIGTERM", true));
@@ -1513,7 +1644,7 @@ class PtyProcessImpl implements PtyProcess {
 
     // Always, whether or not the leader was alive: a leader that exited on its own can leave a
     // group behind, and bun-pty's exit event proves neither the leader's death nor the group's.
-    if (probeable) await this._confirmGone(firstRun, wasAlive);
+    if (probeable) await this._confirmGone(firstRun);
 
     try {
       this._onDataDisposable?.dispose();
@@ -1633,41 +1764,48 @@ class PtyProcessImpl implements PtyProcess {
    * probes are `retireProcessGroup`; the escape scan of an isolated one-shot gets only what is
    * left of the same deadline. Throws `PtyExitUnconfirmedError` through `_mapGroupOutcome`.
    */
-  private async _confirmGone(initial: boolean, wasAlive: boolean): Promise<void> {
+  private async _confirmGone(initial: boolean): Promise<void> {
     const pid = this._pid;
     const deadlineAt = Date.now() + this._exitCapMs;
     const outcome = await retireProcessGroup({
       pid,
       identity: this._identity,
-      readIdentity: this._readIdentity,
+      groupId: this._groupId,
+      members: this._groupMembers,
+      readMembers: this._readMembers,
+      readGroupId: this._injectedPgid,
+      readIdentity: this._injectedIdentity,
       signal: this._signalPid,
       liveMembers: this._liveMembers,
       describe: this._describeGroup,
       initial,
-      leaderSeenAlive: wasAlive,
-      groupContinuity:
-        this._groupContinuity &&
-        Date.now() - this._groupContinuityAt <= this._groupContinuityMaxAgeMs,
       allowUnrecordedInitial: true,
       sendTerm: initial,
       deadlineAt,
       termGraceMs: this._exitGraceMs,
     });
-    // Continuity is fresh evidence only: it is what the retirement ended holding, never a group
-    // that was merely seen (a withheld signal means nothing vouched for it).
-    this._groupContinuity = outcome.continuityHeld;
-    if (outcome.continuityHeld) this._groupContinuityAt = Date.now();
+    // What the OS vouched for in this call replaces what an earlier one carried: members that
+    // were not seen again are not remembered, and nothing about time or a flag survives.
+    this._groupMembers = outcome.members;
+    this._groupId = outcome.groupId;
     let scanCause: SurvivorCause | null = null;
     if (this._reapEscapees) {
-      try {
-        const left = await this._reapEscapees({
-          pid,
-          startMs: this._leaderStartMs,
-          remainingMs: Math.max(0, deadlineAt - Date.now()),
-        });
-        if (left.length > 0) scanCause = "escapee";
-      } catch {
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 0) {
+        // Out of time: not looking is not the same as finding nothing. The root stays held.
         scanCause = "scan-unknown";
+      } else {
+        try {
+          const left = await this._reapEscapees({
+            pid,
+            startMs: this._leaderStartMs,
+            remainingMs,
+            deadlineAt,
+          });
+          if (left.length > 0) scanCause = "escapee";
+        } catch {
+          scanCause = "scan-unknown";
+        }
       }
     }
     this._mapGroupOutcome(outcome, scanCause);
@@ -1688,7 +1826,11 @@ class PtyProcessImpl implements PtyProcess {
     if (!verdict.fatal) return;
     if (this._onGroupSurvived) {
       try {
-        this._onGroupSurvived(this._pid, this._leaderStartMs, verdict.cause);
+        this._onGroupSurvived(this._pid, this._leaderStartMs, verdict.cause, {
+          identity: this._identity,
+          groupId: this._groupId,
+          members: this._groupMembers,
+        });
       } catch (err) {
         console.error(
           `[pty-process] ${this.label}: survivor hook threw (${(err as Error)?.message ?? "error"}); the retirement is rejected all the same`,
@@ -1696,24 +1838,6 @@ class PtyProcessImpl implements PtyProcess {
       }
     }
     throw new PtyExitUnconfirmedError(this.label, this._pid);
-  }
-
-  /**
-   * The leader just exited: remember whether its group still has members. That is the evidence
-   * that a later retirement may signal `-pid` of an absent leader (see `_groupContinuity`).
-   */
-  private _noteGroupAtExit(): void {
-    if (process.platform === "win32" || !Number.isInteger(this._pid) || this._pid <= 1) return;
-    try {
-      this._signalPid(-this._pid, 0);
-      this._groupContinuity = true;
-      this._groupContinuityAt = Date.now();
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "EPERM") {
-        this._groupContinuity = true;
-        this._groupContinuityAt = Date.now();
-      }
-    }
   }
 
   /** The pre-probe behaviour, for platforms that cannot probe a pid. */

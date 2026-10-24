@@ -28,6 +28,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import ts from "typescript";
+import { PtyAgentProcess, type PtyHandle } from "../bus/session-agent-process";
 
 /** Modules that decide whether a turn succeeded or build the answer it returns. */
 const SUCCESS_DECIDING_MODULES = [
@@ -550,5 +551,100 @@ describe("one answer observer: no second transcript reply scanner in production 
     }
     // Fault: restore `awaitLastAssistantReply` (or the module) and use it after a turn.
     expect(offenders).toEqual([]);
+  });
+});
+
+// ─── The bus route (#581 cp8, M1) ────────────────────────────────────────────
+
+/**
+ * The rule holds on EVERY route, the bus included: a bus delivery is accepted only when the
+ * transcript shows the CLI ingesting the prompt. These run the real `PtyAgentProcess` over a
+ * fake PTY that only ever paints the screen; no JSONL record and no tailer callback exists in any
+ * of them, and none may end `turn-started`.
+ */
+describe("bus acceptance is the transcript's word, never the screen's", () => {
+  const busFake = () => {
+    const writes: string[] = [];
+    const data: Array<(chunk: string) => void> = [];
+    const handle: PtyHandle = {
+      pid: 4242,
+      onData: (cb) => {
+        data.push(cb);
+        return { dispose() {} };
+      },
+      onExit: () => ({ dispose() {} }),
+      write: (s: string) => {
+        writes.push(s);
+      },
+      kill: () => {},
+    };
+    return {
+      handle,
+      writes,
+      emit: (chunk: string) => {
+        for (const cb of data) cb(chunk);
+      },
+    };
+  };
+
+  test("a repaint of an old conversation, with no transcript line at all, is not an accepted turn", async () => {
+    // Codex's reproduction: 8917ca95 returned `turn-started` here.
+    const { handle, emit } = busFake();
+    const proc = new PtyAgentProcess("evidence", handle, {
+      bootDialogMaxMs: 1,
+      submitConfirmMs: 10,
+      maxSubmitNudges: 1,
+      transcriptGraceMs: 30,
+    });
+    const timer = setInterval(() => emit("old assistant repaint"), 2);
+    try {
+      expect(await proc.send_prompt_stream("new prompt")).not.toBe("turn-started");
+    } finally {
+      clearInterval(timer);
+    }
+  });
+
+  test("streaming output on the screen, with a tailer that has spoken but not about this prompt, is not accepted", async () => {
+    const { handle, emit } = busFake();
+    const proc = new PtyAgentProcess("evidence", handle, {
+      bootDialogMaxMs: 1,
+      submitConfirmMs: 10,
+      maxSubmitNudges: 1,
+      transcriptGraceMs: 30,
+    });
+    proc.enableTranscriptConfirmation();
+    proc.noteTranscriptActivity(); // some earlier line
+    const timer = setInterval(() => emit("assistant is streaming a response chunk"), 2);
+    try {
+      expect(await proc.send_prompt_stream("new prompt")).toBe("unconfirmed-live");
+    } finally {
+      clearInterval(timer);
+    }
+  });
+
+  test("positive control: the transcript recording this exact prompt is what accepts it", async () => {
+    const { handle, emit } = busFake();
+    const proc = new PtyAgentProcess("evidence", handle, {
+      bootDialogMaxMs: 1,
+      submitConfirmMs: 10,
+      maxSubmitNudges: 1,
+      transcriptGraceMs: 30,
+    });
+    const timer = setInterval(() => emit("old assistant repaint"), 2);
+    setTimeout(
+      () =>
+        proc.notePromptIngested({
+          text: "new prompt",
+          source: "user",
+          promptId: "evidence-1",
+          ingestedAtMs: Date.now(),
+        }),
+      15,
+    );
+    try {
+      expect(await proc.send_prompt_stream("new prompt")).toBe("turn-started");
+    } finally {
+      clearInterval(timer);
+    }
   });
 });

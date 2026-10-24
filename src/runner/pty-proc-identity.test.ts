@@ -8,13 +8,16 @@ import {
   procStartMs,
   processStartMs,
   readBootId,
+  readGroupMembers,
   readPidIdentity,
+  readPidSnapshot,
   recordedOnAnotherBoot,
   sameIdentity,
   sameStart,
   startMsFromIdentity,
   TEST_BOOT_ID,
 } from "./pty-proc-identity.js";
+import { noteGroupMembers } from "./pty-group-kill.js";
 import { withPlatform } from "./pty-test-platform.js";
 
 /** #570 r14 (E): on Linux the start time comes from `/proc/<pid>/stat` field 22, not from `ps`. */
@@ -336,5 +339,189 @@ describe("the test-only Linux switch", () => {
     process.env.NODE_ENV = "production";
     expect(readBootId()).not.toBe(TEST_BOOT_ID);
     expect(currentBootId()).not.toBe(TEST_BOOT_ID);
+  });
+});
+
+// ─── #581 cp8: identity and group id from one reading; the members of a group ──────────
+
+describe("readPidSnapshot and readGroupMembers (#581 cp8)", () => {
+  let proc: string;
+  beforeEach(() => {
+    proc = mkdtempSync(join(tmpdir(), "fake-proc-"));
+  });
+  afterEach(() => rmSync(proc, { recursive: true, force: true }));
+
+  // Fields after the command: state, ppid, pgrp, ... starttime is the 20th (field 22 overall).
+  const stat = (pid: number, state: string, pgrp: number, ticks: number): void => {
+    mkdirSync(join(proc, String(pid)));
+    writeFileSync(
+      join(proc, String(pid), "stat"),
+      `${pid} (a b) ${state} 1 ${pgrp} ${pgrp} 0 -1 4194304 100 0 0 0 5 6 0 0 20 0 1 0 ${ticks} 99999 8888\n`,
+    );
+  };
+  const linux = { platform: "linux", procDir: "" };
+
+  it("reads the identity and the group id from the same /proc/<pid>/stat", () => {
+    stat(123, "S", 77, 12345);
+    expect(readPidSnapshot(123, { ...linux, procDir: proc })).toEqual({
+      identity: "12345",
+      pgid: 77,
+    });
+    // The identity is the one readPidIdentity reports: one reading, one meaning.
+    expect(readPidIdentity(123, { ...linux, procDir: proc })).toBe("12345");
+  });
+
+  it("is null for a pid that is gone, a malformed stat, and platforms that cannot say", () => {
+    expect(readPidSnapshot(999, { ...linux, procDir: proc })).toBeNull();
+    mkdirSync(join(proc, "5"));
+    writeFileSync(join(proc, "5", "stat"), "5 (x) S garbage\n");
+    expect(readPidSnapshot(5, { ...linux, procDir: proc })).toBeNull();
+    expect(readPidSnapshot(123, { platform: "win32" })).toBeNull();
+    expect(readPidSnapshot(0, { ...linux, procDir: proc })).toBeNull();
+  });
+
+  it("reads `pgid lstart` from one ps elsewhere", () => {
+    const psSnapshot = () => "  4242 Sat Oct 24 01:37:34 2026\n";
+    expect(readPidSnapshot(4242, { platform: "darwin", psSnapshot })).toEqual({
+      identity: "Sat Oct 24 01:37:34 2026",
+      pgid: 4242,
+    });
+    expect(readPidSnapshot(4242, { platform: "darwin", psSnapshot: () => null })).toBeNull();
+  });
+
+  it("lists the live members of a group with their identities, not zombies or other groups", () => {
+    stat(100, "S", 100, 1000); // the leader
+    stat(101, "S", 100, 1010); // a member
+    stat(102, "Z", 100, 1020); // a zombie of the group
+    stat(103, "S", 200, 1030); // another group
+    const reading = readGroupMembers(100, Date.now() + 5000, { ...linux, procDir: proc });
+    expect(reading.complete).toBe(true);
+    expect(reading.members.sort((a, b) => a.pid - b.pid)).toEqual([
+      { pid: 100, identity: "1000" },
+      { pid: 101, identity: "1010" },
+    ]);
+  });
+
+  it("says the listing is incomplete when an entry cannot be read, and keeps what it saw", () => {
+    stat(100, "S", 100, 1000);
+    mkdirSync(join(proc, "104")); // no stat file: ENOENT, a process that went away
+    mkdirSync(join(proc, "105"));
+    writeFileSync(join(proc, "105", "stat"), "105 (x) S garbage\n"); // present but not understood
+    const reading = readGroupMembers(100, Date.now() + 5000, { ...linux, procDir: proc });
+    expect(reading.members).toEqual([{ pid: 100, identity: "1000" }]);
+    expect(reading.complete).toBe(false);
+  });
+
+  it("stops walking /proc once the deadline has passed", () => {
+    for (let pid = 200; pid < 330; pid++) stat(pid, "S", 100, pid);
+    const reading = readGroupMembers(100, 0, { ...linux, procDir: proc, now: () => 1 });
+    expect(reading.complete).toBe(false);
+    expect(reading.members.length).toBeLessThan(130);
+  });
+
+  it("starts no ps with no time left, and parses the one table elsewhere", () => {
+    expect(readGroupMembers(100, 0, { platform: "darwin", now: () => 5 })).toEqual({
+      members: [],
+      complete: false,
+    });
+    const psAll = () =>
+      [
+        "  100   100 Ss   Sat Oct 24 01:37:34 2026",
+        "  101   100 S    Sat Oct  4 01:37:35 2026",
+        "  102   100 Z    Sat Oct 24 01:37:36 2026",
+        "  103   300 S    Sat Oct 24 01:37:37 2026",
+      ].join("\n");
+    const reading = readGroupMembers(100, Date.now() + 5000, { platform: "darwin", psAll });
+    expect(reading.members).toEqual([
+      { pid: 100, identity: "Sat Oct 24 01:37:34 2026" },
+      { pid: 101, identity: "Sat Oct  4 01:37:35 2026" },
+    ]);
+  });
+});
+
+describe("noteGroupMembers (#581 cp8)", () => {
+  const base = {
+    pid: 5150,
+    identity: "id-1",
+    groupId: 5150,
+    members: [] as { pid: number; identity: string }[],
+    daemonGroupId: 4000,
+    readGroupId: () => 5150,
+    readMembers: () => ({ members: [{ pid: 9001, identity: "m1" }], complete: true }),
+  };
+  const alive = () => {};
+  const gone = () => {
+    throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+  };
+
+  it("learns the members of a group whose leader is the recorded process", () => {
+    const out = noteGroupMembers({ ...base, signal: alive, readIdentity: () => "id-1" });
+    expect(out.members).toEqual([{ pid: 9001, identity: "m1" }]);
+  });
+
+  it("learns nothing from an absent leader, unless this is the instant its exit was first seen", () => {
+    expect(noteGroupMembers({ ...base, signal: gone, readIdentity: () => null }).members).toEqual(
+      [],
+    );
+    // Went red (empty) with the exit-time case no longer honoured.
+    expect(
+      noteGroupMembers({
+        ...base,
+        signal: gone,
+        readIdentity: () => null,
+        leaderJustExited: true,
+      }).members,
+    ).toEqual([{ pid: 9001, identity: "m1" }]);
+  });
+
+  it("learns nothing when the pid is another process's or cannot be read", () => {
+    for (const read of [() => "other", () => null]) {
+      const out = noteGroupMembers({
+        ...base,
+        signal: alive,
+        readIdentity: read,
+        leaderJustExited: true,
+      });
+      expect(out.members).toEqual([]);
+    }
+  });
+
+  it("learns nothing from a group that is not isolated", () => {
+    const shared = noteGroupMembers({
+      ...base,
+      signal: alive,
+      readIdentity: () => "id-1",
+      readGroupId: () => 777,
+      groupId: 777,
+    });
+    expect(shared.members).toEqual([]);
+    const daemons = noteGroupMembers({
+      ...base,
+      signal: alive,
+      readIdentity: () => "id-1",
+      daemonGroupId: 5150,
+    });
+    expect(daemons.members).toEqual([]);
+  });
+
+  it("adds to what it already has, and a failing listing changes nothing", () => {
+    const had = [{ pid: 9000, identity: "m0" }];
+    const added = noteGroupMembers({
+      ...base,
+      members: had,
+      signal: alive,
+      readIdentity: () => "id-1",
+    });
+    expect(added.members).toEqual([...had, { pid: 9001, identity: "m1" }]);
+    const failed = noteGroupMembers({
+      ...base,
+      members: had,
+      signal: alive,
+      readIdentity: () => "id-1",
+      readMembers: () => {
+        throw new Error("boom");
+      },
+    });
+    expect(failed.members).toEqual(had);
   });
 });

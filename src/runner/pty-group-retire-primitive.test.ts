@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { type RetireGroupInput, retireProcessGroup } from "./pty-group-kill.js";
+import type { GroupMember } from "./pty-proc-identity.js";
 
 /**
  * #581 cp3: `retireProcessGroup`, the common termination and confirmation primitive, driven by a
@@ -20,9 +21,15 @@ interface World {
   log: string[];
   t: number;
   reads: number;
+  /** Changes the identity of every member: the group id was reused by a stranger's group. */
+  salt: string;
+  /** Times the member table / the group description was read. */
+  listings: number;
+  described: number;
 }
 
 const PID = 5150;
+const DAEMON_GROUP = 4000;
 
 function world(init: Partial<World> = {}): World {
   return {
@@ -35,8 +42,19 @@ function world(init: Partial<World> = {}): World {
     log: [],
     t: 0,
     reads: 0,
+    salt: "",
+    listings: 0,
+    described: 0,
     ...init,
   };
+}
+
+/** The members the fake OS lists for the group right now, with the identities they carry. */
+function roster(w: World): GroupMember[] {
+  return Array.from({ length: w.members }, (_, i) => ({
+    pid: 9000 + i,
+    identity: `m${i}${w.salt}`,
+  }));
 }
 
 const esrch = (): Error => Object.assign(new Error("ESRCH"), { code: "ESRCH" });
@@ -70,11 +88,20 @@ function input(w: World, over: Partial<RetireGroupInput> = {}): RetireGroupInput
       return "boot-1";
     },
     signal: kernel(w),
+    groupId: PID,
+    daemonGroupId: DAEMON_GROUP,
+    members: [],
+    readMembers: () => {
+      w.listings++;
+      return { members: roster(w), complete: true };
+    },
+    readGroupId: () => PID,
     liveMembers: () => (w.leader ? 1 : 0) + w.members,
-    describe: () => ({ count: w.members, comm: ["mcp-server"] }),
+    describe: () => {
+      w.described++;
+      return { count: w.members, comm: ["mcp-server"] };
+    },
     initial: true,
-    leaderSeenAlive: true,
-    groupContinuity: false,
     allowUnrecordedInitial: true,
     sendTerm: true,
     deadlineAt: 7000,
@@ -144,8 +171,9 @@ describe("retireProcessGroup", () => {
     const w = world({ members: 1, immuneMembers: true, immuneLeader: true });
     const out = await retireProcessGroup(input(w, { deadlineAt: 500, termGraceMs: 2000 }));
     expect(out.groupGone).toBe(false);
-    // The grace is capped by the deadline: KILL went out, and the clock never passed it.
-    expect(w.log).toEqual([`-${PID}:SIGTERM`, `-${PID}:SIGKILL`]);
+    // The grace is capped by the deadline, and past the deadline there is no KILL: the cap is the
+    // cap. The clock never passed it either.
+    expect(w.log).toEqual([`-${PID}:SIGTERM`]);
     expect(w.t).toBeLessThanOrEqual(500 + 20);
   });
 
@@ -188,63 +216,111 @@ describe("retireProcessGroup", () => {
   // Plan injection 4: a delayed confirmation has no first-termination privilege.
   it("a delayed confirmation never signals a group whose leader is absent, without evidence it is ours", async () => {
     const w = world({ leader: false, members: 3, immuneMembers: true });
-    const out = await retireProcessGroup(
-      input(w, { initial: false, leaderSeenAlive: false, groupContinuity: false, sendTerm: false }),
-    );
+    const out = await retireProcessGroup(input(w, { initial: false, sendTerm: false }));
     // Went red (KILL sent to a stranger's group) with "unknown may signal on a later confirmation".
     expect(w.log).toEqual([]);
     expect(out).toMatchObject({ leaderGone: true, groupGone: false, reason: "unknown-identity" });
+    expect(out.members).toEqual([]); // nothing vouched for it, so nothing is carried on
   });
 
-  it("the same delayed confirmation may signal once the group was seen alive with its leader", async () => {
+  it("the same delayed confirmation may signal once a member identified earlier is still in the group", async () => {
     const w = world({ leader: false, members: 3 });
+    const earlier = roster(w).slice(0, 1);
     const out = await retireProcessGroup(
-      input(w, { initial: false, leaderSeenAlive: false, groupContinuity: true, sendTerm: false }),
+      input(w, { initial: false, sendTerm: false, members: earlier }),
     );
     expect(w.log).toEqual([`-${PID}:SIGKILL`]);
     expect(out.groupGone).toBe(true);
   });
 
-  it("a group seen while a signal is withheld never becomes continuity", async () => {
-    // Leader gone, a stranger's group answers, no evidence it is ours: nothing is sent, and the
-    // outcome must not hand the caller "continuity" to use on the next confirmation (security
-    // review of cp3: a withheld outcome used to renew it).
+  // #581 cp8, H2: the group id was reused. Its new members are not the ones identified earlier.
+  it("a reused group id is not ours: the members seen earlier are gone and strangers answer", async () => {
     const w = world({ leader: false, members: 2, immuneMembers: true });
+    const earlier = roster(w);
+    w.salt = "-stranger"; // same pids' slots, other processes: the old members are gone
     const out = await retireProcessGroup(
-      input(w, { initial: false, leaderSeenAlive: false, groupContinuity: false, sendTerm: false }),
+      input(w, { initial: false, sendTerm: false, members: earlier }),
     );
-    // Went red (true) with continuity renewed from "the group was seen".
+    // Went red (-pid:SIGKILL logged) with the fresh read of the earlier members removed.
     expect(w.log).toEqual([]);
-    expect(out.reason).toBe("unknown-identity");
-    expect(out.continuityHeld).toBe(false);
+    expect(out).toMatchObject({ groupGone: false, reason: "unknown-identity" });
+    expect(out.members).toEqual([]);
   });
 
-  it("continuity held at the start is held at the end while the group stays, and the initial retirement of a live leader holds it", async () => {
+  it("the members of a group that stays are carried on, as identified by this call", async () => {
     const stays = world({ leader: false, members: 2, immuneMembers: true });
+    const earlier = roster(stays).slice(0, 1);
     const held = await retireProcessGroup(
-      input(stays, {
-        initial: false,
-        leaderSeenAlive: false,
-        groupContinuity: true,
-        sendTerm: false,
-      }),
+      input(stays, { initial: false, sendTerm: false, members: earlier }),
     );
-    expect(held).toMatchObject({ groupGone: false, continuityHeld: true });
+    expect(held.groupGone).toBe(false);
+    expect(held.members).toEqual(roster(stays));
 
+    // The initial retirement of a live leader identifies the group before it signals anything.
     const live = world({ members: 1, immuneMembers: true });
     const initial = await retireProcessGroup(input(live));
-    expect(initial).toMatchObject({ leaderGone: true, groupGone: false, continuityHeld: true });
+    expect(initial).toMatchObject({ leaderGone: true, groupGone: false });
+    expect(initial.members).toEqual(roster(live));
   });
 
-  it("a probe that finds the group absent revokes the continuity it held", async () => {
+  it("a group found absent hands nothing on", async () => {
     const w = world({ leader: false, members: 0 });
     const out = await retireProcessGroup(
-      input(w, { initial: false, leaderSeenAlive: false, groupContinuity: true, sendTerm: false }),
+      input(w, {
+        initial: false,
+        sendTerm: false,
+        members: [{ pid: 9000, identity: "m0" }],
+      }),
     );
-    // Went red (true) with the revocation removed: a stale `true` would outlive the group it vouched for.
-    expect(out.continuityHeld).toBe(false);
+    expect(out.members).toEqual([]);
     expect(out.groupGone).toBe(true);
     expect(w.log).toEqual([]);
+  });
+
+  // #581 cp8, L1: a negative target needs an isolated group that is not the daemon's.
+  it("never signals -pid unless the child led a group of its own that is not the daemon's", async () => {
+    const cases: Array<[string, Partial<RetireGroupInput>]> = [
+      ["the child shares another group", { groupId: 777 }],
+      ["the group id was unreadable", { groupId: null }],
+      ["the group is the daemon's own", { daemonGroupId: PID, readGroupId: () => PID }],
+      ["the daemon's group is unreadable", { daemonGroupId: null }],
+    ];
+    for (const [why, over] of cases) {
+      const w = world({ members: 1 });
+      await retireProcessGroup(
+        input(w, { readGroupId: () => (over.groupId as number) ?? null, ...over }),
+      );
+      // Went red (a -pid line) with the isolation check removed from the group send.
+      expect(
+        w.log.filter((l) => l.startsWith("-")),
+        why,
+      ).toEqual([]);
+      // The leader itself is still ours to signal: its identity matches.
+      expect(
+        w.log.some((l) => l.startsWith(`${PID}:`)),
+        why,
+      ).toBe(true);
+    }
+  });
+
+  it("reads the child's group id again while the leader is the recorded process: a reading taken before setsid() does not stick", async () => {
+    const w = world({ members: 1 });
+    const out = await retireProcessGroup(input(w, { groupId: 777, readGroupId: () => PID }));
+    expect(w.log[0]).toBe(`-${PID}:SIGTERM`);
+    expect(out.groupId).toBe(PID);
+  });
+
+  // #581 cp8, M2: one absolute deadline; past it nothing is signalled, listed or described.
+  it("does no TERM, KILL, listing or description once the deadline has passed", async () => {
+    const w = world({ leader: false, members: 2, immuneMembers: true });
+    w.t = 10_000; // already past deadlineAt (7000)
+    const out = await retireProcessGroup(
+      input(w, { initial: false, members: roster(w), sendTerm: true }),
+    );
+    expect(w.log).toEqual([]);
+    expect(w.listings).toBe(0);
+    expect(w.described).toBe(0);
+    expect(out).toMatchObject({ leaderGone: true, groupGone: false }); // unresolved stays held
   });
 
   it("an identity that cannot be read on a delayed confirmation signals nothing", async () => {
