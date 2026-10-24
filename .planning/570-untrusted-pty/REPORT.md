@@ -2098,3 +2098,149 @@ Each set of test files was first run un-injected and was green; pass plus fail w
 - **Bus final assertions** are keyed on `session_id` only, as their gate is; keying both on the agent id is a separate behaviour change.
 - **Pty untrusted routes are accepted at save** (the version gate runs after settings load) and refused at the call; a UI that offers pty for an untrusted route on an old claude will see the call fail closed to the classifier's null.
 - **Flaky under load**: the three tests named above pass alone; they are not changed here.
+
+
+## cp8: Codex review of 8917ca95 (4 HIGH, 3 MEDIUM, 2 LOW) and the CI integration row
+
+Commits on `feat/570-shared-pty`:
+
+- `ad052ce6` the first cp8 worker's draft. It stopped at a usage limit; it was reviewed against the brief and kept, not reset.
+- `905a91af` the CI row fix, plus two injections that had stayed green in the draft.
+- `1a38f732` the command record is matched as a whole entry, anchored (an automated review of `905a91af`).
+- the `trusted-routes` test cleanup (below).
+
+Version stays 2.2.358 (`povai/main` is 2.2.357).
+
+### How the draft was checked
+
+1. Every finding was re-read in the source at the fix sites listed below.
+2. The cp8 regression tests and the changed existing tests were run against a `git archive 8917ca95` copy. Result there: `pty-cp8-regressions` + `pty-transcript` 95 pass / 19 fail, the other changed files 148 pass / 25 fail. Every finding is RED on 8917ca95 (H1, H2, H3 x4, H4 x2 + 4 in the bus suites, M1 x3, M2 x4, M3, L1 x4, L2 x2, the CI row x2).
+3. Each fix got a one-site injection in a scratch copy of the head (revert that site, run the named files, restore). Two did NOT go red the first time: H1 persisted members (no test read the members back after a restart) and M2 escape-scan deadline (the test's grace budgets equalled the deadline, so it could not tell the two apart). Both tests were fixed so the injection goes RED. A third, M3, was a bad injection of mine (it removed the line instead of moving it); redone.
+4. The brief's M2 test point (`pty-group-confirm.test.ts:336`): the scan now consumes its allowance and the fresh-full-budget mutation (`remainingMs = this._exitCapMs`) goes RED in `pty-cp8-regressions` and `pty-group-confirm`.
+
+### Fix site, injection and RED line per finding
+
+**H1. Survivor retries use the common retirement; no historical-PGID authority**
+
+- Fix: `src/oneshot/pty-cleanup.ts:749`, `src/oneshot/pty-cleanup.ts:438`, `src/runner/pty-group-kill.ts:595`
+- Injection `H1/H2 authority`: exit=1 {'pass': '109', 'fail': '4'}
+  - `(fail) H2: nothing renews group authority from a flag or the time since the last look > a retry after the original survivors are gone and the pgid was reused signals nothing [72.66ms]`
+  - `(fail) retireProcessGroup > a delayed confirmation never signals a group whose leader is absent, without evidence it is ours [0.93ms]`
+- Injection `H1 persisted members`: exit=1 {'pass': '75', 'fail': '1'}
+  - `(fail) survivor.json > carries the identity, group id and identified members across a restart into the retry (#581 cp8, H1) [9.38ms]`
+
+**H2. No boolean or time-window continuity; identified members revalidated fresh**
+
+- Fix: `src/runner/pty-group-kill.ts:290`, `src/runner/pty-group-kill.ts:559`, `src/runner/pty-process.ts:1789`, `src/bus/session-agent-process.ts:1501`
+- Injection `H1/H2 authority`: exit=1 {'pass': '109', 'fail': '4'}
+  - `(fail) H2: nothing renews group authority from a flag or the time since the last look > a retry after the original survivors are gone and the pgid was reused signals nothing [72.66ms]`
+  - `(fail) retireProcessGroup > a delayed confirmation never signals a group whose leader is absent, without evidence it is ours [0.93ms]`
+- Injection `H2 exit-instant evidence`: exit=1 {'pass': '109', 'fail': '3'}
+  - `(fail) noteGroupMembers (#581 cp8) > learns nothing from an absent leader, unless this is the instant its exit was first seen [0.72ms]`
+  - `(fail) group authority after the leader is gone > a group id reused by a stranger's group after the exit is not signalled [327.74ms]`
+
+**H3. Bus session fenced synchronously; natural exits confirmed; cleanup bound to the captured record**
+
+- Fix: `src/bus/session-manager.ts:1369`, `src/bus/session-manager.ts:1390`, `src/bus/session-manager.ts:995`, `src/bus/session-manager.ts:1302`
+- Injection `H3 stop() fence`: exit=1 {'pass': '22', 'fail': '2'}
+  - `(fail) H3: bus retirement owns the session until the OS has spoken > stop(): the session is not spawnable while the leader is unconfirmed [209.10ms]`
+  - `(fail) H3: bus retirement owns the session until the OS has spoken > a natural exit goes through the same confirmation, and the session stays fenced [408.90ms]`
+- Injection `H3 natural-exit fence+confirm`: exit=1 {'pass': '16', 'fail': '2'}
+  - `(fail) H3: bus retirement owns the session until the OS has spoken > a natural exit goes through the same confirmation, and the session stays fenced [21.04ms]`
+  - `(fail) H3: bus retirement owns the session until the OS has spoken > a natural exit the OS confirms lifts the fence [3.21ms]`
+- Injection `H3 late finaliser bound to record`: exit=1 {'pass': '17', 'fail': '1'}
+  - `(fail) H3: bus retirement owns the session until the OS has spoken > a late finaliser does not delete a replacement agent that took the id [382.76ms]`
+
+**H4. Bus native kill needs target and identity proof, including the /quit fallback**
+
+- Fix: `src/bus/session-agent-process.ts:1420`, `src/bus/session-agent-process.ts:1438`
+- Injection `H4 native kill authority`: exit=1 {'pass': '25', 'fail': '8'}
+  - `(fail) H4: the bus native kill needs proof before it is made > a recorded identity that is now another process's gets no native kill [1.24ms]`
+  - `(fail) H4: the bus native kill needs proof before it is made > an unrecorded identity gets no native kill either [0.15ms]`
+
+**M1. The screen never confirms a bus delivery**
+
+- Fix: `src/bus/session-agent-process.ts:871`
+- Injection `M1 screen confirms bus turn`: exit=1 {'pass': '97', 'fail': '3'}
+  - `(fail) bus acceptance is the transcript's word, never the screen's > a repaint of an old conversation, with no transcript line at all, is not an accepted turn [214.93ms]`
+  - `(fail) PtyAgentProcess transcript-confirmed delivery (issue #362) > does not fall back to the screen for that same ordering when no transcript is live (#581 cp8, M1) [295.64ms]`
+
+**M2. One absolute deadline through scan, probe, listing and ps**
+
+- Fix: `src/runner/pty-escape-scan.ts:275`, `src/runner/pty-process.ts:1793`
+- Injection `M2 fresh full budget to scan`: exit=1 {'pass': '32', 'fail': '4'}
+  - `(fail) M2: one absolute deadline end to end > nothing is signalled, scanned or described once the cap is spent [122.98ms]`
+  - `(fail) M2: one absolute deadline end to end > a cap of zero starts nothing: no signal, no scan [3.69ms]`
+- Injection `M2 escape scan ignores deadline`: exit=1 {'pass': '17', 'fail': '1'}
+  - `(fail) M2: one absolute deadline end to end > the escape scan is bounded by the deadline on the wall clock, not by the sleeps it asked for [2091.60ms]`
+
+**M3. Runner disposal publishes its joined promise before a native exit callback can run**
+
+- Fix: `src/runner/pty-process.ts:1598`
+- Injection `M3 publish joined promise first`: exit=1 {'pass': '17', 'fail': '1'}
+  - `(fail) M3: a disposal re-entered from the native exit callback joins the initiating one > the callback's dispose() is the same promise [1.70ms]`
+
+**L1. Negative targets need pgid === pid and a group that is not the daemon's**
+
+- Fix: `src/runner/pty-group-kill.ts:77`, `src/runner/pty-proc-identity.ts:127`
+- Injection `L1 group id must equal pid`: exit=1 {'pass': '36', 'fail': '2'}
+  - `(fail) L1: a negative target needs an isolated group that is not the daemon's > a child that shares another group is never signalled as -pid [87.30ms]`
+  - `(fail) retireProcessGroup > never signals -pid unless the child led a group of its own that is not the daemon's [0.25ms]`
+- Injection `L1 not the daemon's group`: exit=1 {'pass': '36', 'fail': '2'}
+  - `(fail) L1: a negative target needs an isolated group that is not the daemon's > the daemon's own group is never a target, even when its id differs from the daemon pid [71.52ms]`
+  - `(fail) retireProcessGroup > never signals -pid unless the child led a group of its own that is not the daemon's [0.55ms]`
+
+**L2. /status shows the observed-group counter with no active session**
+
+- Fix: `src/commands/discord.ts:1536`, `src/commands/telegram.ts:1140`
+- Injection `L2 discord counter, no session`: exit=1 {'pass': '17', 'fail': '1'}
+  - `(fail) L2: /status shows the observed-group counter without an active session > discord [1.99ms]`
+- Injection `L2 telegram counter, no session`: exit=1 {'pass': '17', 'fail': '1'}
+  - `(fail) L2: /status shows the observed-group counter without an active session > telegram [0.23ms]`
+
+**CI. CI row `command FLAG alone ... CONTROL REMOVED`: slash-command prompt acceptance**
+
+- Fix: `src/runner/pty-transcript.ts:196`, `src/runner/pty-transcript.ts:223`
+- Injection `CI slash-command prompt match`: exit=1 {'pass': '95', 'fail': '2'}
+  - `(fail) a custom slash command is recorded as its command entry, not as the typed text (#581 cp8, CI 40043570190) > the command entry is the prompt; the isMeta expansion is skipped; the reply is the answer [1.56ms]`
+  - `(fail) a custom slash command is recorded as its command entry, not as the typed text (#581 cp8, CI 40043570190) > a different command name, or other arguments, is not this prompt [0.31ms]`
+- Injection `CI command record: leading anchor dropped`: exit=1 {'pass': '96', 'fail': '1'}
+  - `(fail) a custom slash command is recorded as its command entry, not as the typed text (#581 cp8, CI 40043570190) > an entry that only QUOTES the command tags inside other text is not a command record [4.82ms]`
+- Injection `CI command record: trailing anchor dropped`: exit=1 {'pass': '96', 'fail': '1'}
+  - `(fail) a custom slash command is recorded as its command entry, not as the typed text (#581 cp8, CI 40043570190) > an entry that only QUOTES the command tags inside other text is not a command record [0.23ms]`
+
+### CI integration row (run 40043570190, `command FLAG alone ... CONTROL REMOVED`)
+
+Diagnosed without auth. The twin removes `--disable-slash-commands` and sends the custom slash command `/isolation-probe`. The CLI does not record the typed text for a custom command: it writes a user entry `<command-message>..</command-message><command-name>/isolation-probe</command-name><command-args>..</command-args>`, then the expansion as an `isMeta` entry (checked on real transcripts in `~/.claude/projects`). The merged observer (cp4) accepts a prompt only on exact text, and understood the command-entry shape only under `allowReplCommand` (`/compact`). So the prompt was never seen as accepted: "not accepted" after the submit retry, exit 1 (`expect(result.exitCode).toBe(0)` at `tests/integration/untrusted-pty-isolation.test.ts:740`). The pre-cp4 reader did no prompt matching at all, which is why the row passed before.
+
+Fix: `promptMatches` also accepts the recorded command entry for a prompt that starts with `/`, when the command name and its exact arguments equal the typed ones, and the entry is nothing but that record (anchored both ends, so a prompt quoting the tags inside other text is not a command record). The row is untouched. This could not be run here (it needs authenticated claude); the coordinator runs the CI integration workflow.
+
+### M1 is inherited from main
+
+The bus's screen-only `turn-started` (and the "silent transcript: fall back to the screen" path) is on `povai/main` too, not introduced by the merge. The coordinator should file it against main. On this branch the bus now returns `unconfirmed-live` until the transcript speaks, and bus acceptance cases are in `pty-turn-evidence-guard.test.ts`. M3 (runner disposal re-entry) is likewise inherited from main.
+
+### Test pollution found and fixed on the way
+
+`src/oneshot/trusted-routes.test.ts` (new on this branch) stored a fallback session for agent `suzy` under `<cwd>/agents/suzy` and never removed it. In the full suite, `validateAgentName > accepts simple kebab-case names` then failed. Reproduced as a pair (`trusted-routes` then `agents.test.ts`: fail on HEAD, pass on main, pass after the cleanup).
+
+### Gates
+
+All on clean `git archive` copies of the head (never the working tree), `env -u ANTHROPIC_BASE_URL bun test`, output to a file.
+
+| Gate | Result |
+|---|---|
+| Nine #562 safety files (pty-process-dispose, -dispose-real, pty-quarantine, pty-quarantine-gate, pty-spawn-fence, pty-pending-spawn-retire, pty-false-completion, pty-turn-evidence-guard, pty-hot-switch-to-print) plus pty-cp8-regressions, group-confirm, group-kill, group-retire(-primitive), proc-identity, late-retire, slot, sweep, untrusted-state, bus pty-agent-retire, session-manager(-quarantine), session-agent-process, pty-transcript (24 files) | 651 pass, 2 skip (Linux-only), 0 fail |
+| Full `bun test src` on the final head archive | 5579 pass, 9 skip, 0 fail (298 files) |
+| Full `bun test src` on `povai/main` | 5236 pass, 5 skip, 0 fail (281 files) |
+| `bun run lint` | exit 0, 0 errors (1437 warnings, 323 infos, same as base) |
+| `bun run typecheck` (ratchet) | 149, baseline 149 |
+| Version | 2.2.358 (main 2.2.357) |
+
+Earlier full runs on the head showed `validateAgentName` failing (the `trusted-routes` leak above, fixed) and one load timeout in `pty-process.test.ts` (#469 dialog, 3.1 s; unchanged from main, passes 3/3 alone).
+
+**Flake to know about.** In 2 of 4 runs of the combined 24-file gate set, one real-shell test in `src/runner/pty-group-retire.test.ts` hit its 5 s timeout ("sweeps the descendants of a child that already exited on its own", then "still looks for descendants that left the group when the child exited long ago"). That file is unchanged from 8917ca95 and passes 15/15 on its own, 3 of 3 times on both head and base; the third and fourth combined runs were green. It looks like load, but I did not prove that the 8917ca95 file set flakes the same way in a combined run.
+
+### Not done here
+
+- The authenticated CI isolation matrix (including the fixed row) and the candidate MCP soak. The coordinator runs the CI integration workflow.
+- Linux-only paths (`/proc` member listing, escape scan) ran only through their fakes on this macOS host.
