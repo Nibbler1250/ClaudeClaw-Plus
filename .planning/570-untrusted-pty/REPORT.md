@@ -1917,3 +1917,184 @@ Every injection went RED, each independently. The RED lines below are verbatim f
 - Full-suite integration run, security and code review of the whole delta, CI isolation twins.
 - The bus key question above; the dead `runClaudeStreaming`.
 - Respawn's `newSessionId` leg of the effective id has no dedicated test (a respawn resumes the stored id); the first-spawn leg does.
+
+## Shared PTY merge (cp1-cp7)
+
+Branch `feat/570-shared-pty` (#581). cp1 merged #575 into #570 on top of #562's lifecycle; cp2 to cp6 folded the isolation work into one identity reader, one retirement, one turn observer and one spawn gate; cp7 (this section) merged main, validated the whole and fixed what the merge exposed. Plan: cp1 to cp7 of the #581 merge plan (section 6).
+
+### What changed for TRUSTED PTYs
+
+- **Group kill.** Retirement (`dispose()` and `confirmExit()`, every route: runner, cron, bus, live sessions) now terminates the proven process group, not only the leader: TERM, then SIGKILL to `-pid`, with a fresh identity read immediately before each signal, the #562 disposal cap (7000 ms) and a joined, retryable confirmation. A leader that exits first (naturally or on SIGTERM) still has its group confirmed. A recycled or unreadable identity sends nothing.
+- **Staged enforcement, observe by default.** `pty.groupConfirm` is `"observe"` unless set to `"enforce"` (`src/runner/pty-group-confirm.ts`, one predicate, `judgeGroupOutcome`). With a confirmed-gone LEADER and a group member that cannot be confirmed gone (a SIGKILL survivor, EPERM, unreadable enumeration, unknown identity), a trusted PTY is NOT quarantined. The daemon logs one line `[pty] group-unconfirmed mode=observe key=<k> reason=<code> survivors=<n> comm=<names>` (executable basenames only, no argv, no screen text) and increments a counter shown as `PTY groups unconfirmed (observed)` on `/status` (Telegram, Discord) and in the supervisor snapshot (`groupUnconfirmedObserved`). An unconfirmed LEADER quarantines exactly as in #562 in both modes.
+- **Turn evidence is unchanged in meaning.** Acceptance, completion and the answer come only from the session transcript on trusted routes too; the screen is used for readiness, dialogs and liveness only and cannot produce success.
+- **Merge with main.** Main carries #562 as a squash (`c19d5162`, tree-identical to the #562 tip `8d812a8f`) plus #591 (`/status` lists quarantined sessions; `/kill` reports confirmed exits) and the version bump. The branch merged the #562 tip first (it brought main's #594 in), then main as a no-conflict merge that keeps this branch's tree and applies the one real change on main since the squash, #591, as a three-way patch. Two `/status` builders (`discordStatusText`, `telegramStatusText`) now carry the #581 counter line beside #591's quarantine lines. The merged tree is a strict superset of `povai/main` (no main file is dropped).
+
+### What changed for UNTRUSTED one-shots
+
+- **JSONL-only observer.** Untrusted interactive calls use the same `TranscriptTurn` as trusted ones, reading the throwaway config root's physical project directory (never a user-controlled path). Before sending, the candidate JSONL files and offsets are snapshotted; the CLI-created session file is bound by inode; only records appended after the snapshot that match the exact, `@`-neutralised bytes written count. Several matching files, replacement, truncation, unreadability or a missing boundary fail closed. There is no sentinel, footer or screen success and no second post-turn answer scanner.
+- **Always enforce.** An unconfirmed group or an escapee found by the exact config-root/cwd/UID/age scan holds the root and the concurrency slot and quarantines the ephemeral key, whatever `pty.groupConfirm` says; the setting cannot weaken it.
+- **Holds.** The root and the slot follow the last live writer: a late-landing child, a failed or unknown disposal, an unknown-process hold or a pending spawn keeps both. The 60 s ceiling only logs once. Two untrusted slots; no default, route, platform, version or environment-masking behaviour changed.
+
+### Every spawn site and its check
+
+Each check is `assertSessionSpawnable` (synchronous, key and the id the argv names), on the line before the native call and after every await. `runClaudeStreaming` (the former eleventh site) had no production caller and is deleted in cp7 with its test seam (#576 deletes it on its own branch too).
+
+| # | Site | Target | Late-fence test |
+|---|---|---|---|
+| 1 | Supervisor first spawn, `pty-supervisor.ts:2686` | key + `sessionId \|\| newSessionId` | `pty-final-spawn-assertions` (by key, by pre-allocated id), `pty-spawn-fence` |
+| 2 | Supervisor respawn, `pty-supervisor.ts:2860` | key + `sessionId \|\| newSessionId` (cp7: dedicated test for the minted-id leg) | `pty-final-spawn-assertions` |
+| 3 | Runner native PTY, `pty-process.ts:1951` (inside `withCleanProcessEnv`) | key + id, unconditional | `pty-final-spawn-assertions` |
+| 4 | Untrusted one-shot native PTY (same line as 3) | ephemeral key | `pty-final-spawn-assertions` |
+| 5 | Bus PTY, `bus/session-manager.ts:1146` | `session_id` | `session-manager-quarantine` |
+| 6 | Bus child, `bus/session-manager.ts:1172` | `session_id` | `session-manager-quarantine` |
+| 7 | Bus tmux, `bus/session-manager.ts:1217` | `session_id` | `session-manager-quarantine` |
+| 8 | Bus schema probe, `bus/schema-probe-runner.ts:102` | `schema-probe:<id>` + generated id | `schema-probe-spawn-fence` |
+| 9 | Print engine, `oneshot/print.ts:84` | trusted resume id | `pty-spawn-fence` |
+| 10 | Legacy `spawnClaude`, `runner.ts:972` (`assertResumeSpawnable`) | resume id from argv | `pty-spawn-fence` |
+
+Not Claude writers on a session, so no fence: the `claude --version` probes, the identity and group `ps`/`lsof` helpers, `claude plugin ...`, HTTP engines. Bus final assertions stay keyed on `session_id` only, matching their async gate (ruling, cp7).
+
+### Staged enforcement and the release gate
+
+- **Setting:** `pty.groupConfirm` = `"observe"` (default). Untrusted is always `enforce`.
+- **Release gate:** the #581 candidate soak (bus and runner agents with real stdio MCP servers, at least one slow to exit; trusted turns, restart, `/kill`, compaction) reports the `/status` counter and the `[pty] group-unconfirmed` lines. Flip the default to `"enforce"` in a later PR only if that counter is about 0. Until then trusted PTYs keep #562's behaviour for the leader and only observe the group.
+
+### cp7 changes
+
+- Deleted `runClaudeStreaming` and `_runClaudeStreamingForTests`; its late-fence test went with it.
+- New test: the final respawn attempt (`dropResume`) mints a replacement session id; `pty-final-spawn-assertions.test.ts` asserts the spawn does not go ahead when that id is fenced, with a positive control. Injection: `newSessionId` left out of `respawnEntry`'s effective id.
+  - RED (verbatim): `(fail) the supervisor's spawns > the final respawn attempt does not go ahead when the replacement id it mints is fenced [5.92ms]` (13 pass, 1 fail; un-injected 14 pass).
+- Four tests inherited from main assumed the PTY isolation gate is OFF at load: #581's `scripts/test-preload.ts` turns it on, and `093da9d1` (in #581) made pty isolation a CALL-time check only, because the claude version gate runs after settings load. `engines-routes.test.ts` (`/api/oneshot/test` now pins isolation off, as its name says; the GET choices and the untrusted-route-on-pty save now expect pty to be accepted at save) and `oneshot-cli.test.ts` (setting the default to pty is accepted). The refusal itself is covered at the call: `pty-untrusted-state.test.ts:1091`, `claude-version.test.ts`. No production code changed for this.
+- Versions: plugin.json, marketplace `plugins[0]` and marketplace top-level are all **2.2.358** (main 2.2.356; #596 re-bumped to 2.2.357 per the coordinator).
+
+### Validation (final code)
+
+- **Full suite**, `env -u ANTHROPIC_BASE_URL bun test src` on a clean `git archive` of the merge (`15744fc7`, before the test fixes): 5527 pass, 9 skip, 7 fail over 297 files; clean `povai/main` (`396aa4aa`): 5033 pass, 5 skip, 1 fail over 272 files. Branch failures, each run alone on the branch archive:
+  - pass alone (order or load flakes): `validateAgentName accepts simple kebab-case names` (`agents.test.ts`); `PtyProcess project MCP server approval dialog (issue #469) dialog that paints late gets a fresh hard-timeout window` (`pty-process.test.ts`; timing); `#215 net and daemon injects normal Telegram turn without reply still goes through net` (`inject-turn-net.test.ts`; this one also fails alone on main).
+  - four real failures, fixed (see cp7 changes): the three `engines-routes` tests and the one `oneshot-cli` test. After the fix the two files pass alone (41 pass) and with `src/ui src/commands src/oneshot` together (525 pass, 0 fail).
+  - main only: `HTTP engines ollama 200 reply not JSON ...` (not on the branch in this run).
+- **#562 safety files**, exactly the nine, one process each: pty-process-dispose, pty-process-dispose-real, pty-quarantine, pty-quarantine-gate, pty-spawn-fence, pty-pending-spawn-retire, pty-false-completion, pty-turn-evidence-guard, pty-hot-switch-to-print: **132 pass, 0 fail**.
+- **Superset**, 57 PTY, spawn-fence, bus, oneshot, quarantine and engine files, one process each: **1391 pass, 0 fail** (the nine are included in it).
+- **tsc ratchet**: branch 149, `povai/main` baseline 149. **Lint**: `bun run lint` exit 0.
+
+### Fault injections on the final head (one site each, `git archive` copy, restored by deleting it)
+
+Each set of test files was first run un-injected and was green; pass plus fail with the fault equals that total, so every RED below is the fault.
+
+#### Injection 1
+
+- fault: group confirmation replaced by leader-only absence (`GroupTarget.probe`: `groupGone: !leaderExists`)
+- result: pass=65 fail=22 (the same files un-injected: all pass)
+- RED lines (first 6 of 22, verbatim):
+  - `(fail) retireProcessGroup > a leader that dies while a member survives is NOT a confirmed group: leader gone, group not, with a reason [8.49ms]`
+  - `(fail) retireProcessGroup > EPERM on the group is a reason of its own, never proof of absence [0.19ms]`
+  - `(fail) retireProcessGroup > a platform that cannot count live members says 'unreadable', not 'survivor' [0.16ms]`
+  - `(fail) retireProcessGroup > a delayed confirmation never signals a group whose leader is absent, without evidence it is ours [0.09ms]`
+  - `(fail) retireProcessGroup > the same delayed confirmation may signal once the group was seen alive with its leader [0.09ms]`
+  - `(fail) retireProcessGroup > a group seen while a signal is withheld never becomes continuity [0.14ms]`
+
+#### Injection 3a
+
+- fault: no fresh identity read before SIGTERM (`GroupTarget.sendGroup`)
+- result: pass=74 fail=13 (the same files un-injected: all pass)
+- RED lines (first 6 of 13, verbatim):
+  - `(fail) retireProcessGroup > a leader pid that belongs to another process before SIGTERM is never signalled [0.22ms]`
+  - `(fail) retireProcessGroup > a pid reused after the wait's last check is not KILLed: the identity is read again right before the signal [0.13ms]`
+  - `(fail) retireProcessGroup > an unrecorded identity may be signalled in the initial window only when the caller allows it [0.13ms]`
+  - `(fail) terminateProcessGroup > pid identity (#570 r13, B) > signals nothing when the pid now has a different start time [0.10ms]`
+  - `(fail) terminateProcessGroup > pid identity (#570 r13, B) > checks again before the SIGKILL: a pid reused after the SIGTERM is not killed [0.12ms]`
+  - `(fail) terminateProcessGroup > pid identity (#570 r13, B) > signals nothing for an unrecorded start time on a later retry, however live the group, and logs nothing [0.13ms]`
+
+#### Injection 3b
+
+- fault: no fresh identity read before SIGKILL (`GroupTarget.sendGroup`)
+- result: pass=72 fail=15 (the same files un-injected: all pass)
+- RED lines (first 6 of 15, verbatim):
+  - `(fail) retireProcessGroup > a pid reused after the wait's last check is not KILLed: the identity is read again right before the signal [0.25ms]`
+  - `(fail) retireProcessGroup > a delayed confirmation never signals a group whose leader is absent, without evidence it is ours [0.28ms]`
+  - `(fail) retireProcessGroup > a group seen while a signal is withheld never becomes continuity [0.26ms]`
+  - `(fail) retireProcessGroup > an identity that cannot be read on a delayed confirmation signals nothing [0.22ms]`
+  - `(fail) retireProcessGroup > an unrecorded identity may be signalled in the initial window only when the caller allows it [0.15ms]`
+  - `(fail) terminateProcessGroup > pid identity (#570 r13, B) > checks again before the SIGKILL: a pid reused after the SIGTERM is not killed [0.13ms]`
+
+#### Injection 6 (native PTY)
+
+- fault: final spawn assertion removed from `spawnPty`'s environment callback
+- result: pass=6 fail=8 (the same files un-injected: all pass)
+- RED lines (first 6 of 8, verbatim):
+  - `(fail) spawnPty: the assertion directly before the native call > a trusted resume of a fenced session id does not spawn [4.88ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > a trusted spawn on a fenced KEY does not spawn, whatever session it names [0.35ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > a pre-allocated new session id is checked too [0.17ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > an untrusted one-shot names no session id: its ephemeral KEY is fenced, and it does not spawn [2.92ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > a quarantine record stops a native spawn the same way a fence does [0.37ms]`
+  - `(fail) spawnPty: the assertion directly before the native call > a fence that lands while the argv is being prepared still stops the spawn (trusted) [0.17ms]`
+
+#### Injection 6 (schema probe)
+
+- fault: final spawn assertion removed before `bunPty.spawn` in `schema-probe-runner.ts`
+- result: pass=1 fail=2 (the same files un-injected: all pass)
+- RED lines (first 2 of 2, verbatim):
+  - `(fail) defaultPtyRunnerFactory and the spawn gate > does not start claude on a probe key fenced after the factory's awaits [227.01ms]`
+  - `(fail) defaultPtyRunnerFactory and the spawn gate > does not start claude on a probe session id whose process is quarantined [233.18ms]`
+
+#### Injection 8
+
+- fault: screen success re-enabled: a quiet screen with an answer-shaped line completes the turn (`PtyProcessImpl._tick`)
+- result: pass=72 fail=13 (the same files un-injected: all pass)
+- RED lines (first 6 of 13, verbatim):
+  - `(fail) the transcript decides, not the screen > a JSONL answer that differs from the screen is returned exactly [121.69ms]`
+  - `(fail) the transcript decides, not the screen > a plausible answer on the screen with no JSONL at all is a failure [117.07ms]`
+  - `(fail) the transcript decides, not the screen > a plausible answer on the screen over a transcript that only has the prompt is not a success [131.88ms]`
+  - `(fail) #562 — the screen is never evidence the prompt was accepted > a prompt and old assistant text containing "esc to interrupt": the turn is NOT done [121.54ms]`
+  - `(fail) #562 — the screen is never evidence the prompt was accepted > a prompt and old assistant text containing "esc cancel": the turn is NOT done [138.60ms]`
+  - `(fail) #562 — the screen is never evidence the prompt was accepted > a prompt and old assistant text containing "Compacting conversation": the turn is NOT done [128.08ms]`
+
+#### Injection 9a
+
+- fault: the pre-neutralisation prompt is what the transcript is matched against
+- result: pass=83 fail=2 (the same files un-injected: all pass)
+- RED lines (first 2 of 2, verbatim):
+  - `(fail) the exact bytes written > a user record with the neutralised text is this prompt [548.91ms]`
+  - `(fail) the exact bytes written > a user record with the pre-neutralisation text is not [128.47ms]`
+
+#### Injection 9b
+
+- fault: the discovery offset is bound from the file as it is after the send
+- result: pass=64 fail=21 (the same files un-injected: all pass)
+- RED lines (first 6 of 21, verbatim):
+  - `(fail) the transcript decides, not the screen > a JSONL answer that differs from the screen is returned exactly [543.04ms]`
+  - `(fail) the transcript decides, not the screen > a plausible answer on the screen over a transcript that only has the prompt is not a success [536.37ms]`
+  - `(fail) the transcript decides, not the screen > a reply with no turn boundary after it is uncertain at the deadline, never a success [546.57ms]`
+  - `(fail) the exact bytes written > a user record with the neutralised text is this prompt [535.60ms]`
+  - `(fail) fail closed > two session files that record the prompt are ambiguous, with no answer [532.96ms]`
+  - `(fail) fail closed > an API error record fails the turn with the CLI's own text [536.30ms]`
+
+#### Injection 11a
+
+- fault: the config root is removed although a group survivor may still write into it
+- result: pass=24 fail=5 (the same files un-injected: all pass)
+- RED lines (first 5 of 5, verbatim):
+  - `(fail) a late PTY whose disposal fails keeps the root and the slot > spawn timeout, then a late PTY, then a failed disposal: root and slot held, session quarantined [404.13ms]`
+  - `(fail) a late PTY whose disposal fails keeps the root and the slot > an unknown identity is held: no start time recorded, nothing signalled, root and slot kept [294.97ms]`
+  - `(fail) the 60 s late-slot ceiling only logs > logs once past the ceiling and the root and slot are still held, also after a failed disposal [495.01ms]`
+  - `(fail) an abort during a late retirement > an abort that reaches the retirement while the spawn is pending still hands back the late retirement [493.71ms]`
+  - `(fail) the pending-spawn stand-in (pid 0) holds the root and the slot > hands the hold to the survivor when what the spawn produced cannot be confirmed gone [95.79ms]`
+
+#### Injection 11b
+
+- fault: the late slot is freed at the 60 s ceiling
+- result: pass=26 fail=3 (the same files un-injected: all pass)
+- RED lines (first 3 of 3, verbatim):
+  - `(fail) a late confirmation that succeeds releases once > removes the root and frees the slot exactly once when the late exit is confirmed [461.93ms]`
+  - `(fail) the 60 s late-slot ceiling only logs > logs once past the ceiling and the root and slot are still held, also after a failed disposal [305.97ms]`
+  - `(fail) the ceiling does not free a slot whose retirement is pending > keeps two late retirements counted past the ceiling, logs once each, and frees one when it settles [52.38ms]`
+
+### Residuals
+
+- **Trusted group confirmation is observe-only** until the candidate soak; a trusted MCP child that outlives its leader and keeps writing is logged and counted, not quarantined.
+- **macOS**: escaped descendants (setsid/setpgid children) are contained only by the group; the exact config-root/cwd scan that finds them is Linux-only. No stronger claim is made, and the macOS start-time comparison is exact, not widened.
+- **PID/PGID reuse on a delayed confirmation**: a historical PGID is signalled only on fresh evidence from the same retirement; otherwise the session stays quarantined until absence is confirmed.
+- **The CI-only isolation matrix** (`tests/integration/untrusted-pty-isolation.test.ts`, authenticated claude) was not run here; the coordinator runs the CI integration workflow.
+- **Bus final assertions** are keyed on `session_id` only, as their gate is; keying both on the agent id is a separate behaviour change.
+- **Pty untrusted routes are accepted at save** (the version gate runs after settings load) and refused at the call; a UI that offers pty for an untrusted route on an old claude will see the call fail closed to the classifier's null.
+- **Flaky under load**: the three tests named above pass alone; they are not changed here.
