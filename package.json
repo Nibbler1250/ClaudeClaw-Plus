@@ -23,12 +23,23 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.40.0",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "bun-pty": "0.4.9",
     "commander": "^14.0.3",
-    "js-yaml": "^4.1.0",
+    "js-yaml": "^4.3.2",
     "ogg-opus-decoder": "^1.7.3",
-    "simple-git": "^3.27.0",
-    "zod": "^4.4.3"
+    "simple-git": "^4.0.2",
+    "zod": "^4.6.7"
+  },
+  "overrides": {
+    "@hono/node-server": "^1.19.17",
+    "@simple-git/argv-parser": "^2.0.1",
+    "body-parser": "^2.4.0",
+    "fast-uri": "^3.1.9",
+    "form-data": "^4.0.6",
+    "hono": "^4.13.13",
+    "ip-address": "^10.7.4",
+    "proxy-addr": "^2.0.8",
+    "qs": "^6.16.1"
   }
 }
