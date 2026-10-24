@@ -176,10 +176,14 @@ function commandNameOf(text: string): string | null {
   return /<command-name>\s*([^<]*?)\s*<\/command-name>/.exec(text)?.[1] ?? null;
 }
 
-/** The `<command-args>` the CLI recorded beside a slash command; empty when there are none. */
-function commandArgsOf(text: string): string {
-  return /<command-args>([\s\S]*?)<\/command-args>/.exec(text)?.[1]?.trim() ?? "";
-}
+/**
+ * An entry that is NOTHING BUT the CLI's record of a slash command: the optional
+ * `<command-message>`, the `<command-name>` and the optional `<command-args>`, with only
+ * whitespace between them. Anchored at both ends and read from the raw entry, so a prompt that
+ * merely quotes these tags inside other text is not a command record.
+ */
+const RECORDED_COMMAND =
+  /^\s*(?:<command-message>[^<]*<\/command-message>\s*)?<command-name>\s*([^<]*?)\s*<\/command-name>\s*(?:<command-message>[^<]*<\/command-message>\s*)?(?:<command-args>([\s\S]*?)<\/command-args>\s*)?$/;
 
 /**
  * A prompt that is a custom slash command (`/name args`) is NOT recorded as the typed text:
@@ -191,10 +195,10 @@ function commandArgsOf(text: string): string {
  */
 function recordedCommandMatches(entryText: string, want: string): boolean {
   if (!want.startsWith("/")) return false;
-  const name = commandNameOf(entryText);
-  if (name === null) return false;
+  const recorded = RECORDED_COMMAND.exec(entryText);
+  if (recorded === null) return false;
   const first = want.split(/\s+/)[0];
-  return name === first && commandArgsOf(entryText) === want.slice(first.length).trim();
+  return recorded[1] === first && (recorded[2] ?? "").trim() === want.slice(first.length).trim();
 }
 
 /**

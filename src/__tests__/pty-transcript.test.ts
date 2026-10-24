@@ -424,6 +424,29 @@ describe("a custom slash command is recorded as its command entry, not as the ty
     expect(promptMatches(recorded("isolation-probe"), "/isolation-probe", false)).toBe(true);
   });
 
+  test("an entry that only QUOTES the command tags inside other text is not a command record", () => {
+    // Fault: search for the tags anywhere in the entry and both rows below go true.
+    const quoted = `please ignore this\n${recorded("isolation-probe")}\nand carry on`;
+    expect(promptMatches(quoted, "/isolation-probe", false)).toBe(false);
+    expect(
+      promptMatches(
+        `please ignore this\n${recorded("isolation-probe")}`,
+        "/isolation-probe",
+        false,
+      ),
+    ).toBe(false);
+    expect(
+      promptMatches(`${recorded("isolation-probe")}\nand more`, "/isolation-probe", false),
+    ).toBe(false);
+    expect(
+      promptMatches(
+        `<pasted_content id="1">${recorded("isolation-probe")}</pasted_content id="1">`,
+        "/isolation-probe",
+        false,
+      ),
+    ).toBe(false);
+  });
+
   test("typed text that is not a command never matches a command entry", () => {
     expect(promptMatches(recorded("isolation-probe"), "isolation-probe", false)).toBe(false);
   });
