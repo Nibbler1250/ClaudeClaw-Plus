@@ -2244,3 +2244,75 @@ Earlier full runs on the head showed `validateAgentName` failing (the `trusted-r
 
 - The authenticated CI isolation matrix (including the fixed row) and the candidate MCP soak. The coordinator runs the CI integration workflow.
 - Linux-only paths (`/proc` member listing, escape scan) ran only through their fakes on this macOS host.
+
+## cp9: Codex re-review of b1f36287 (H2 and M2 still open, CI1 new)
+
+Commit on `feat/570-shared-pty`: `8458e303`. It finishes the unverified cp9 draft left in the worktree when its Orca pane exited (reviewed against the brief and kept, not reset), and adds option B for H2 (Terry, 26 Oct; below). Done off Orca, in one Claude Code session. Version stays 2.2.358.
+
+### How it was checked
+
+1. The draft was read hunk by hunk against `brief-581-cp9.md` and the re-review; every fix site below was confirmed in the source.
+2. Codex's four probes (`rereview-probes.test.ts`) became `src/__tests__/pty-cp9-regressions.test.ts`, asserting the FIXED behaviour, plus walk-deadline tests for `describeGroup` and `findEscapees`, two option-B tests and the CI1 positive control. On a `git archive b1f36287` copy: **3 pass / 8 fail**, each fail on the defect (foreign members recorded; `-424242` TERM and KILL from bus and runner; SIGTERM at t=20 past a 10 ms deadline; a native SIGTERM under a zero cap; describeGroup count 2 past the deadline; escapee 6001 reported past the deadline; `/wanted` accepted from a different command's isMeta expansion). The 3 passes are the two option-B cases (new behaviour, not regressions) and the genuine-command control. On the head: 11 pass.
+3. One-site injections in a scratch copy of the head (one site reverted, named files run, restored, copy diffed back to the worktree).
+
+### H2 option B (Terry, 26 Oct)
+
+Removing exit-callback admission also removed the only learning that happened after a leader's natural exit, so a crashed or self-exited CLI would have left its MCP servers unretired (trusted: observed and counted; untrusted: quarantined). Option B learns members while the leader is alive and positively identified, so a later natural exit is vouched for by members identified before it, case (b) of `noteGroupMembers`:
+
+- runner: the spawn hand-over (both spawn paths), each turn start, each clean turn end (`_noteLiveGroup`, guarded `_alive && !_disposed`);
+- bus: before each typed prompt and slash command (`noteLiveGroup`, guarded not exited and no retirement).
+
+Each look is evidence only and never signals.
+
+### Fix site, injection and RED line per finding
+
+**H2. No signal authority from an exit callback**
+
+- Fix: `src/runner/pty-group-kill.ts:576`, `:596` (absent leader: only a known member listed again with its identity vouches); `leaderJustExited` removed from `src/runner/pty-process.ts` `_handleExit` and `src/bus/session-agent-process.ts` exit callback; option B at `src/runner/pty-process.ts:1281`, `:1391`, `:1580`, `:2145`, `:2177` and `src/bus/session-agent-process.ts:606`, `:655`, `:1412`.
+- RED on b1f36287: `expect(noted.members).toEqual([])` received `[{"identity":"foreign-child","pid":424243}]`; bus and runner adapters each received `[[-424242,"SIGTERM"],[-424242,"SIGKILL"]]`.
+- Injection `vouch check` (`state === "gone" &&` → `false &&`, `:592`): exit=1, 50 pass / 1 fail
+  - `(fail) noteGroupMembers (#581 cp8) > learns nothing from an absent leader that nothing known vouches for [5.95ms]`
+- Injection `members.length === 0 early return` (`:576`): stays GREEN (51/51). It is a shortcut the vouch check already covers (no known member can be listed), not a separate guard.
+- Injection `turn start look`: exit=1, `(fail) natural leader exit before dispose > members that joined after the hand-over are learned when a turn starts`
+- Injection `turn end look`: exit=1, `(fail) H2 (option B) ... > runner: a server the turn started is learned when the turn ends cleanly`
+- Injection `spawn hand-over look`: exit=1, `(fail) natural leader exit before dispose > the group it left behind is still TERMed, KILLed and confirmed` and `... keep their authority however long the dispose is delayed: no clock decides`
+- Injection `bus look before send_slash`: exit=1, `(fail) H2 (option B) ... > bus: members seen before a typed command vouch for the group after the leader exits`
+
+**M2. One absolute deadline per retirement**
+
+- Fix: allocated before the snapshot and native kill (`src/runner/pty-process.ts:1641`, `src/bus/session-agent-process.ts:1497`) and shared by every look inside it; rechecked before the runner native kill (`:1672`), after the bus identity read (`session-agent-process.ts:1457`), before `sendGroup` and `sendBare` (`pty-group-kill.ts:298`, `:313`), before each escapee kill (`pty-escape-scan.ts:282`); walks stop at it (`pty-group-kill.ts:464` describeGroup, `pty-escape-scan.ts:153` findEscapees, `:262` an incomplete first scan is `EscapeScanDeadlineError`); `noteGroupMembers` takes the retirement's deadline and starts no budget inside one (`pty-group-kill.ts:564`).
+- RED on b1f36287: `{"at":20,"pid":-424242,"s":"SIGTERM"}`; native `["SIGTERM"]` under `exitCapMs: 0`; describeGroup `Received: 2`; findEscapees `[6001]`.
+- Injection `pre-signal recheck in sendGroup` (`:298`): exit=1, `(fail) M2: ... > a group signal is not sent when the identity read before it crossed the deadline [2.80ms]`
+
+**CI1. isMeta never establishes command acceptance**
+
+- Fix: `src/runner/pty-transcript.ts:661` (`ingestSeeking` returns on `isMeta` before any matching).
+- RED on b1f36287: `Expected: false, Received: true`.
+- Injection `isMeta exclusion while seeking`: exit=1, `(fail) CI1: ... > a different command's expansion holding an exact \`/wanted\` record does not accept \`/wanted\` [3.63ms]`
+
+### Tests changed, and why
+
+- `pty-cp8-regressions` M3: cap 0 → 50 ms. Under M2 a spent cap allows no native kill, and without it the exit callback the test re-enters through never fires.
+- `pty-group-confirm` natural-exit tests: members are now identified while the leader is alive (the hand-over), not first seen at the exit. New tests: late members learned at turn start; a leader never identified alive leaves no authority (observe: counted, not signalled).
+- `pty-proc-identity` noteGroupMembers: the exit-flag case becomes "learns from an absent leader only while a member identified earlier is still in the group".
+- `pty-group-retire` (**the cp8 flake, fixed**): `BG_THEN_EXIT` now waits for a `go` file, and `learnThenExit` makes a live look before releasing it. Root cause: the shell could exit before the spawn hand-over look, so nothing was learned and the retirement held to its 7 s deadline past the 5 s test timeout. Before: 2 of 4 standalone runs on cp9 failed (0 of 4 on b1f36287, where the exit flag still admitted). After: 6 of 6 green. Injection (drop the `go` wait): exit=1, both tests fail at 5 s again.
+
+### Gates
+
+All on a `git archive 8458e303` copy (never the working tree), `env -u ANTHROPIC_BASE_URL bun test`, output to a file.
+
+| Gate | Result |
+|---|---|
+| 26 files: the nine #562 safety files, pty-cp8- and pty-cp9-regressions, group-confirm, group-kill, group-retire(-primitive), proc-identity, escape-scan, late-retire, slot, sweep, untrusted-state, bus pty-agent-retire, session-manager(-quarantine), session-agent-process, pty-transcript | 690 pass, 4 skip, 0 fail (694 tests). A pre-commit run without the retire fix: 688 pass, 2 fail (the two flake tests) |
+| Full `bun test src` on the head archive | 5592 pass, 9 skip, 1 fail (299 files) |
+| `bun run lint` | exit 0, 0 errors (1437 warnings, 323 infos, same as base) |
+| `bun run typecheck` (ratchet) | 149, baseline 149 |
+| Version | 2.2.358 |
+
+The one full-suite fail is `session-manager.test.ts` "send_prompt_stream types the prompt into the pty (pty-stdin mode)" at 7336 ms. It is a slow test by nature (its `/bin/cat` stand-in never confirms, so the delivery loop runs to unconfirmed-idle): alone it takes 7.36-7.47 s on the head and 7.27-7.30 s on b1f36287, and the whole file passes 52/52 twice on each. A load-timing flake, not cp9; worth an issue alongside the others.
+
+### Not done here
+
+- Codex re-review of this delta (headless `codex exec`, Terry 26 Oct) and `/code-review:code-review` on the final head.
+- The CI integration workflow on the new head, and the candidate MCP soak.
+- Linux-only paths ran only through their fakes on this macOS host.
