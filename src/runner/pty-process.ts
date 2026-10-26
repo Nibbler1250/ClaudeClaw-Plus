@@ -257,8 +257,8 @@ export interface PtyProcessOptions {
   submitConfirmMs?: number;
   /**
    * Where the CLI writes this session's transcript. Derived from the session id, cwd
-   * and config dir when omitted; an untrusted one-shot (`--no-session-persistence`) and
-   * a process spawned through a test hook have none. With a transcript, acceptance, the
+   * and config dir when omitted; a process spawned through a test hook has none. An untrusted
+   * one-shot writes one inside its throwaway config root (`_isolatedProjectDir`). With a transcript, acceptance, the
    * answer and the end of the turn come from it, not from the screen (#562 round 2).
    */
   transcriptPath?: string;
@@ -572,7 +572,6 @@ const DEFAULT_EXIT_GRACE_MS = 2000;
 /** When the child's group id is read again after spawn (see `PtyProcess._refreshGroupId`). */
 const GROUP_ID_REFRESH_MS = [25, 250] as const;
 const DEFAULT_EXIT_CAP_MS = 7000;
-const EXIT_PROBE_MS = 20;
 const DEFAULT_COLS = 100;
 const DEFAULT_ROWS = 30;
 const DEFAULT_PERMISSION_MODE_ARGS = ["--dangerously-skip-permissions"];
@@ -619,9 +618,6 @@ export const BLOCKED_BOOT_SCREENS: ReadonlyArray<readonly [string, RegExp]> = [
  * has one) or the default mode's "? for shortcuts".
  */
 export const REPL_FOOTER = /tab\s*to\s*cycle|for\s*shortcuts/;
-
-/** A child that exited on its own is still swept for descendants for this long. */
-const GROUP_SWEEP_MAX_AGE_MS = 30_000;
 
 /**
  * Patterns redacted from `_readTailSnapshot()` before the tail is exposed
@@ -896,9 +892,10 @@ class PtyProcessImpl implements PtyProcess {
     deadlineAt: number;
   }) => Promise<number[]>;
   /**
-   * Group members identified positively (pid and birth identity) by a retirement, carried to the
-   * next one. Evidence only: each is read again before it grants any authority, and nothing here
-   * expires or renews by itself (#581 cp8, H2).
+   * Group members identified positively (pid and birth identity) by a live look, while the leader
+   * was the recorded process and before any retirement began (#581 cp10, option B). A retirement
+   * only narrows them. Evidence only: each is read again before it grants any authority, and
+   * nothing here expires or renews by itself (#581 cp8, H2).
    */
   private _groupMembers: GroupMember[] = [];
   /** The leader's start time at spawn: every later signal checks that the pid still has it. */

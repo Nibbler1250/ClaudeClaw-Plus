@@ -266,9 +266,10 @@ export class PtyAgentProcess implements AgentProcess {
   private groupId: number | null;
   private groupIdRefreshed = false;
   /**
-   * Group members identified positively (pid and birth identity) by a retirement, carried to the
-   * next one. Evidence only: each is read again before it grants any authority, and nothing here
-   * expires or renews by itself (#581 cp8, H2).
+   * Group members identified positively (pid and birth identity) by a live look, while the leader
+   * was the recorded process and before any retirement began (#581 cp10, option B). A retirement
+   * only narrows them. Evidence only: each is read again before it grants any authority, and
+   * nothing here expires or renews by itself (#581 cp8, H2).
    */
   private _groupMembers: GroupMember[] = [];
   /** Set with `_exited` (issue #393): the code a late `onExit` subscriber is

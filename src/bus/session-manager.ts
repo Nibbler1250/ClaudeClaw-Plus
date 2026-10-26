@@ -1354,8 +1354,11 @@ export class SessionManager {
             // The native kill is made only to a child proven to be ours (PtyAgentProcess._kill).
             // When it is not made, no exit event follows, so the OS is asked directly: the
             // retirement signals what it can prove and quarantines the session when it cannot.
+            // A plain child's SIGTERM is always sent and its exit event finalises it.
             record.proc._kill();
-            if (!record.proc._isExited()) confirmThenFinalise();
+            if (record.proc instanceof PtyAgentProcess && !record.proc._isExited()) {
+              confirmThenFinalise();
+            }
           }, 2000).unref?.();
         });
     });

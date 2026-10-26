@@ -89,7 +89,8 @@ const SYNTHETIC_MODEL = "<synthetic>";
 
 /**
  * Where the CLI writes the transcript of `sessionId` run in `cwd`, or null when it
- * cannot be known: no session id, or an untrusted one-shot (`--no-session-persistence`).
+ * cannot be known: no session id. (An untrusted one-shot has one, inside its throwaway config
+ * root; the caller passes that path.)
  * There is no switch to turn this off: without a transcript a turn cannot succeed.
  *
  * The cwd is realpath'd because the CLI encodes the physical directory it was started in

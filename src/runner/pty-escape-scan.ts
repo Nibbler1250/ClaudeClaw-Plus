@@ -30,7 +30,8 @@ export interface EscapeScanTarget {
   /** The throwaway cwd, in every form claude may see it (as given and resolved). */
   cwds: string[];
   /**
-   * The PTY leader's start time recorded at spawn (same units as `/proc/<pid>/stat` field 22).
+   * The PTY leader's start time recorded at spawn, in milliseconds as `startMsFromIdentity` and
+   * `procStartMs` give it (not raw `/proc/<pid>/stat` clock ticks).
    * A process that started before it cannot be ours and is skipped. Null/undefined: not known,
    * so nothing is skipped on age.
    */
