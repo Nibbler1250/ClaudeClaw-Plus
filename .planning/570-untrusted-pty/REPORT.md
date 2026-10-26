@@ -2383,3 +2383,19 @@ The three full-suite fails were `session-manager.test.ts` "send_prompt_stream ty
 - Codex re-review of `726f27c8..9569dd42` and `/code-review:code-review` on the final head.
 - The CI integration workflow on the new head, and the candidate MCP soak.
 - Linux-only paths ran only through their fakes on this macOS host.
+
+### cp10b: Codex re-review of 093b1524 (H2, H5 CLOSED; OB1 MEDIUM)
+
+Codex (headless `codex exec`, seat2, the default seat being out of credits) re-reviewed `726f27c8..093b1524`: **0 HIGH, 1 MEDIUM**. H2 and H5 CLOSED; M2, CI1 and the seven earlier findings stay CLOSED; no new permissive signal fallback. Report: `.claude/handoffs/581-artifacts/codex-581-rereview-cp10.md` (main checkout).
+
+**OB1. A failed bus retirement reopened the live member look.** `noteLiveGroup()` was gated on `_retirement === null`, which a rejected retirement clears so it can be retried. With the identity unreadable (no native kill, no exit callback) the retirement rejected, and a queued prompt or slash command then listed the group after retirement had begun.
+- Fix (`6dad35fc`): `retire()` sets `_retirementBegun` synchronously and nothing clears it; `noteLiveGroup()` gates on it (`src/bus/session-agent-process.ts`). The runner had no such gap: `_disposed` is set at retirement start and never cleared.
+- RED on 093b1524: `Expected: 0, Received: 1`. The first draft of the test passed on 093b1524 too (its identity was unreadable from spawn, so nothing was recorded to look with); fixed by recording it at spawn and losing it at retirement, as Codex's probe did.
+- Injection I7 (guard back on `_retirement === null`): 7 pass / 1 fail, `bus: a retirement that failed and was cleared for retry still closes the live look (OB1)`.
+
+| Gate (archive of `6dad35fc`) | Result |
+|---|---|
+| Focused set, 52 files (adds `session-agent-process*`) | 1339 pass, 4 skip, 0 fail |
+| Full `bun test src` | 5602 pass, 9 skip, 0 fail |
+| `bun run lint` | exit 0, 0 errors |
+| `bun run typecheck` (ratchet) | 149, baseline 149 |
