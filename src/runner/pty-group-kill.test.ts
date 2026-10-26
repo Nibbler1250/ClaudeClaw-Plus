@@ -131,8 +131,9 @@ describe("retireProcessGroup over a fake kernel", () => {
     it("checks again before the SIGKILL: a pid reused after the SIGTERM is not killed", async () => {
       const k = fakeKernel(null);
       let reads = 0;
-      // The first readings (before SIGTERM) are ours; every later one is a stranger's.
-      const readIdentity = () => (reads++ < 2 ? IDENT : "boot-2");
+      // The first readings (before SIGTERM) are ours; every later one is a stranger's. Three: the
+      // group-id refresh reads the identity before and after the group id (cp10, H2), then SIGTERM.
+      const readIdentity = () => (reads++ < 3 ? IDENT : "boot-2");
       // A short SIGTERM grace, so the escalation is reached before any poll can notice the reuse.
       const result = await retire(k.signal, { readIdentity, termGraceMs: 100 });
       // Went red (a SIGKILL among the signals) when the escalation reused the identity read

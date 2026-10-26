@@ -189,7 +189,7 @@ describe("group authority after the leader is gone", () => {
   test("members identified while the leader was alive keep the group signalable after it exits", async () => {
     const os = makeOs({ members: 2 });
     const { proc, handle } = make(os, { readMembers: rosterOf(os) });
-    proc.snapshotGroupMembers(); // what SessionManager.stop() does before the graceful quit
+    proc.noteLiveGroup(); // what SessionManager.stop() does before the graceful quit
     os.leader = false; // the quit ended the leader; its members stay
     handle.fireExit();
     await proc.retire();
@@ -202,7 +202,7 @@ describe("group authority after the leader is gone", () => {
   test("a group id reused by a stranger's group after the exit is not signalled", async () => {
     const os = Object.assign(makeOs({ members: 2, immuneMembers: true }), { salt: "" });
     const { proc, handle } = make(os, { readMembers: rosterOf(os) });
-    proc.snapshotGroupMembers();
+    proc.noteLiveGroup();
     os.leader = false;
     handle.fireExit();
     os.salt = "-stranger"; // other processes answer on the group id now

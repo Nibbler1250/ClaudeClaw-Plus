@@ -494,8 +494,10 @@ describe("M3: a disposal re-entered from the native exit callback joins the init
   test("the callback's dispose() is the same promise", async () => {
     const handle = fakeNative();
     const p = await spawnOver(handle, {
+      // The leader is there, with its recorded identity, until the native kill ends it: since
+      // cp10 (H5) only a positive identity match allows the native kill this test re-enters by.
       _signalPid: () => {
-        throw esrch();
+        if (handle.kills.length > 0) throw esrch();
       },
       _liveMembers: () => 0,
       _exitGraceMs: 0,

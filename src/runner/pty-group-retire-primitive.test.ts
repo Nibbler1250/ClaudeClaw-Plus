@@ -247,20 +247,22 @@ describe("retireProcessGroup", () => {
     expect(out.members).toEqual([]);
   });
 
-  it("the members of a group that stays are carried on, as identified by this call", async () => {
+  it("the members of a group that stays are carried on as known before it, never added to (cp10)", async () => {
     const stays = world({ leader: false, members: 2, immuneMembers: true });
     const earlier = roster(stays).slice(0, 1);
     const held = await retireProcessGroup(
       input(stays, { initial: false, sendTerm: false, members: earlier }),
     );
     expect(held.groupGone).toBe(false);
-    expect(held.members).toEqual(roster(stays));
+    // The second member was never identified while the leader lived: a listing made inside the
+    // retirement does not add it.
+    expect(held.members).toEqual(earlier);
 
-    // The initial retirement of a live leader identifies the group before it signals anything.
+    // Nor does the initial retirement of a live leader learn its group: it learns no member.
     const live = world({ members: 1, immuneMembers: true });
     const initial = await retireProcessGroup(input(live));
     expect(initial).toMatchObject({ leaderGone: true, groupGone: false });
-    expect(initial.members).toEqual(roster(live));
+    expect(initial.members).toEqual([]);
   });
 
   it("a group found absent hands nothing on", async () => {

@@ -542,16 +542,17 @@ export interface NoteMembersInput {
 
 /**
  * Remember who is in a child's process group while that group is provably ours, so that a later
- * retirement has evidence once the leader is gone (#581 cp8, H2; cp9, H2). Called before anything
- * is signalled and when the leader's exit is seen. A member list is learned in exactly two cases:
- *  (a) the leader is the recorded process, read now with its exact identity; or
- *  (b) the leader is absent, and a member identified EARLIER (pid and birth identity) is read
- *      again now in this very group with the identity it had: that member vouches for the group.
- * Nothing else grants it. In particular not an exit callback: it can be delivered after the group
- * has gone and its number been reused, so "the leader just exited" says nothing about whose group
- * this is. With neither (a) nor (b) nothing is recorded. It needs an isolated group
- * (`isolatedGroupTarget`) and nothing is signalled. A listing that fails, or any read that ends
- * past the deadline, changes nothing.
+ * retirement has evidence once the leader is gone (#581 cp8, H2; cp9, H2; cp10, H2). A member
+ * list is learned in exactly one case: the leader is the recorded process, read with its exact
+ * identity BEFORE the listing and again AFTER it. A process cannot lose its pid while it lives,
+ * and a live session leader cannot leave its group, so a group read between two such looks is
+ * the leader's own. An identity read before the listing alone vouches for nothing: the leader
+ * can exit and its group number be reused while the listing runs.
+ * Nothing else grants it: not an absent leader, not a member identified earlier, and not an exit
+ * callback, which can be delivered after the group has gone and its number been reused. Callers
+ * look only while the leader is alive and no retirement has begun (option B, strict). It needs
+ * an isolated group (`isolatedGroupTarget`) and nothing is signalled. A listing that fails, or
+ * any read that ends past the deadline, changes nothing.
  */
 export function noteGroupMembers(input: NoteMembersInput): {
   members: GroupMember[];
@@ -570,35 +571,28 @@ export function noteGroupMembers(input: NoteMembersInput): {
     ((p) => readPidIdentity(p, { psTimeoutMs: Math.max(0, deadlineAt - now()) }));
   const readGroupId: PgidReader =
     input.readGroupId ?? ((p) => readPgid(p, { psTimeoutMs: Math.max(0, deadlineAt - now()) }));
-  const state = rawIdentityState(pid, identity, signal, readIdentity);
-  if (expired() || state === "recycled" || state === "unknown") return unchanged;
-  // An absent leader has nothing to vouch for its group: only a member known from before can.
-  if (state === "gone" && input.members.length === 0) return unchanged;
-  let groupId = input.groupId;
-  if (state === "same") {
-    const fresh = readGroupId(pid);
-    if (expired()) return unchanged;
-    if (fresh !== null) groupId = fresh;
-  }
+  const leaderIsOurs = (): boolean =>
+    rawIdentityState(pid, identity, signal, readIdentity) === "same" && !expired();
+  if (!leaderIsOurs()) return unchanged;
+  const fresh = readGroupId(pid);
+  if (expired()) return unchanged;
+  const groupId = fresh ?? input.groupId;
   const daemon = input.daemonGroupId !== undefined ? input.daemonGroupId : readGroupId(process.pid);
   if (expired()) return unchanged;
-  if (!isolatedGroupTarget(pid, groupId, daemon)) return { members: unchanged.members, groupId };
+  // The group id alone is kept only if the leader is still ours once it has been read.
+  const groupOnly = (): { members: GroupMember[]; groupId: number | null } =>
+    leaderIsOurs() ? { members: unchanged.members, groupId } : unchanged;
+  if (!isolatedGroupTarget(pid, groupId, daemon)) return groupOnly();
+  let reading: { members: GroupMember[] };
   try {
-    const reading = (input.readMembers ?? ((g, at) => readGroupMembers(g, at, { now })))(
-      pid,
-      deadlineAt,
-    );
-    if (expired()) return unchanged; // a reading that outlasted the deadline is unresolved evidence
-    if (
-      state === "gone" &&
-      !reading.members.some((f) => input.members.some((k) => sameMember(k, f)))
-    ) {
-      return unchanged; // no known member is in it: nothing vouches for this group
-    }
-    return { members: mergeMembers(input.members, reading.members), groupId };
+    reading = (input.readMembers ?? ((g, at) => readGroupMembers(g, at, { now })))(pid, deadlineAt);
   } catch {
-    return { members: unchanged.members, groupId };
+    return groupOnly();
   }
+  // The leader must still be the recorded process now, after the listing (cp10, H2): only then
+  // was the group listed the leader's own for the whole of the read.
+  if (!leaderIsOurs()) return unchanged;
+  return { members: mergeMembers(input.members, reading.members), groupId };
 }
 
 /**
@@ -614,9 +608,11 @@ export function noteGroupMembers(input: NoteMembersInput): {
  *    is never signalled;
  *  - `-pid` is a target only for an isolated group (`isolatedGroupTarget`);
  *  - while the leader is the process we recorded the group is ours. Once the leader is absent
- *    it is ours only if a member identified EARLIER (pid and birth identity, from the initial
- *    retirement or a previous call) is read again now, in that group, with the same identity.
- *    No flag and no elapsed time grants that;
+ *    it is ours only if a member identified EARLIER (pid and birth identity, learned while the
+ *    leader was alive, before this retirement: `input.members`) is read again now, in that group,
+ *    with the same identity. No flag and no elapsed time grants that;
+ *  - a retirement learns no member (cp10, option B strict): a listing made here can only narrow
+ *    `input.members` to those still present, never add one;
  *  - without such evidence nothing is sent and the outcome says `unknown-identity`.
  * ESRCH proves absence; EPERM and an unreadable enumeration do not. An exit event never
  * proves death. Past `deadlineAt` nothing is signalled, listed, described or spawned.
@@ -654,8 +650,10 @@ export async function retireProcessGroup(input: RetireGroupInput): Promise<Retir
     input.daemonGroupId !== undefined ? input.daemonGroupId : readGroupId(process.pid);
   const isolated = (): boolean => isolatedGroupTarget(pid, groupId, daemonGroupId);
 
-  // Members identified so far: evidence only, merged from every positive reading.
+  // Members identified before this retirement: evidence only. Readings here narrow it, never add.
   let known: GroupMember[] = [...input.members];
+  const stillPresent = (fresh: readonly GroupMember[]): GroupMember[] =>
+    known.filter((k) => fresh.some((f) => sameMember(k, f)));
   const read = (): { members: GroupMember[]; complete: boolean } | null => {
     if (!isolated() || left() <= 0) return null; // no group to list, or no time to list it
     const reading = readMembers(pid, input.deadlineAt);
@@ -672,24 +670,20 @@ export async function retireProcessGroup(input: RetireGroupInput): Promise<Retir
       // Fresh evidence only, asked at the moment a signal would be sent: is a member identified
       // earlier still in the group, with the identity it had?
       const fresh = list();
-      if (fresh === null || !fresh.some((f) => known.some((k) => sameMember(k, f)))) return false;
-      known = mergeMembers(
-        known.filter((k) => fresh.some((f) => sameMember(k, f))),
-        fresh,
-      );
+      if (fresh === null) return false;
+      const present = stillPresent(fresh);
+      if (present.length === 0) return false;
+      known = present;
       return true;
     },
   });
 
-  // While the leader is the process we recorded its group is ours: remember who is in it, so a
-  // later retirement can still prove the group is the same one after the leader is gone.
+  // While the leader is the process we recorded, what its group id is NOW is its group id for
+  // good (a session leader cannot move itself out of its group); the reading at spawn can predate
+  // setsid(). Kept only if the leader is still that process after the read (cp10, H2).
   if (target.identity() === "same") {
-    // The leader is the recorded process, so what its group id is NOW is its group id for good (a
-    // session leader cannot move itself out of its group). The reading at spawn can predate setsid().
     const fresh = readGroupId(pid);
-    if (fresh !== null) groupId = fresh;
-    const members = list();
-    if (members !== null) known = mergeMembers(known, members);
+    if (fresh !== null && target.identity() === "same") groupId = fresh;
   }
 
   const look = (withIdentity: boolean): GroupProbe => target.probe(withIdentity);
@@ -736,10 +730,10 @@ export async function retireProcessGroup(input: RetireGroupInput): Promise<Retir
   if (!probe.leaderGone) {
     return { ...unknown, leaderGone: false, survivors: probe.live, groupId, members: known };
   }
-  // Leader gone, group not: record who is left, but only what was read in a group that is ours.
-  // Leader gone, group not: carry on what was positively identified. A fresh listing that shows
-  // none of the members known is a group nothing vouches for; with no listing (no time left)
-  // the members known stay as the evidence they are, to be read again when they are used.
+  // Leader gone, group not: carry on what was positively identified, and nothing more. A fresh
+  // listing narrows the members known to those still in it; one that shows none of them is a
+  // group nothing vouches for. With no listing (no time left) the members known stay as the
+  // evidence they are, to be read again when they are used.
   takeReport(); // a no-op once taken, and when no time remains
   const taken = report as {
     described: GroupDescription;
@@ -750,7 +744,8 @@ export async function retireProcessGroup(input: RetireGroupInput): Promise<Retir
     const { members: fresh, complete } = taken.fresh;
     // A complete listing that shows none of the members known is positive absence: nothing
     // vouches for what is there. An incomplete one cannot say, so the evidence is kept.
-    if (fresh.some((f) => known.some((k) => sameMember(k, f)))) carried = fresh;
+    const present = stillPresent(fresh);
+    if (present.length > 0) carried = present;
     else if (complete) carried = [];
   }
   const described = taken?.described ?? { count: undefined, comm: [] };

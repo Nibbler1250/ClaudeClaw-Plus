@@ -575,9 +575,8 @@ export class PtyAgentProcess implements AgentProcess {
     }
     pty.onExit((e) => {
       this._exited = true;
-      // The exit callback proves nothing about whose group this is (it can be delivered late): it
-      // adds members only where a recorded leader or an already-identified member vouches.
-      this.snapshotGroupMembers();
+      // No member look here: the exit callback proves nothing about whose group this is (it can
+      // be delivered late). Members are learned only while the leader is alive (cp10, option B).
       // A process that exited is not "stuck at boot": the exit log line
       // (session-manager, issue #393) is the one that speaks for it.
       this.endBootDialogPhase();
@@ -1379,14 +1378,12 @@ export class PtyAgentProcess implements AgentProcess {
   /**
    * Remember who is in the child's process group while it is provably ours (see
    * `noteGroupMembers`): once the leader is gone nothing else can say its survivors are ours.
-   * Called before the graceful quit, before any kill and when the exit is seen. Evidence
-   * only; nothing is signalled.
+   * Reached only through `noteLiveGroup`. Evidence only; nothing is signalled.
    */
-  snapshotGroupMembers(): void {
+  private snapshotGroupMembers(): void {
     const seams = this.retireSeams;
+    // Only ever outside a retirement (`noteLiveGroup`), so the look has its own short budget.
     const noted = noteGroupMembers({
-      // Inside a retirement the look shares its deadline; outside one it has its own short budget.
-      deadlineAt: this.retireDeadlineAt ?? undefined,
       pid: this.pid,
       identity: this.identity,
       groupId: this.groupId,
@@ -1405,9 +1402,9 @@ export class PtyAgentProcess implements AgentProcess {
   /**
    * Learn the group while the leader is alive and no retirement has begun: before each prompt or
    * slash command is typed, when the servers started at boot or by earlier turns are in it
-   * (#581 cp9, H2). A leader that later exits on its own then leaves behind members identified
-   * before it went, which can vouch for its group; nothing learned at the exit itself can (see
-   * `noteGroupMembers`). Evidence only.
+   * (#581 cp9, H2), and before a stop's graceful quit. These are the ONLY looks (cp10, option B):
+   * none at the exit and none inside a retirement. A leader that later exits on its own leaves
+   * behind members identified before it went, which can vouch for its group. Evidence only.
    */
   noteLiveGroup(): void {
     if (!this._exited && this._retirement === null) this.snapshotGroupMembers();
@@ -1511,7 +1508,8 @@ export class PtyAgentProcess implements AgentProcess {
     this._retiredOnce = true;
     const seams = this.retireSeams;
     const wasAlive = !this._exited;
-    if (initial) this.snapshotGroupMembers(); // before the native kill can take the leader down
+    // No member look here: a retirement learns no member (cp10, option B). The evidence is what
+    // `noteLiveGroup` learned while the leader was alive and before the retirement began.
     if (initial && wasAlive) this._kill("SIGTERM");
     if (process.platform === "win32" || !isSignalablePid(this.pid)) return; // no probe to make
     const outcome = await retireProcessGroup({

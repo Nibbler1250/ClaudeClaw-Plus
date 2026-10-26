@@ -470,7 +470,7 @@ describe("noteGroupMembers (#581 cp8)", () => {
     ).toEqual(had);
   });
 
-  it("learns from an absent leader only while a member identified earlier is still in the group (cp9, H2)", () => {
+  it("learns nothing from an absent leader, even while a member identified earlier is still in the group (cp10)", () => {
     const had = [{ pid: 9001, identity: "m1" }];
     const out = noteGroupMembers({
       ...base,
@@ -485,10 +485,19 @@ describe("noteGroupMembers (#581 cp8)", () => {
         complete: true,
       }),
     });
-    expect(out.members).toEqual([
-      { pid: 9001, identity: "m1" },
-      { pid: 9002, identity: "m2" },
-    ]);
+    // Option B, strict: members are learned only while the leader is the recorded process.
+    expect(out.members).toEqual(had);
+  });
+
+  it("learns nothing when the leader is no longer the recorded process after the listing (cp10, H2)", () => {
+    let reads = 0;
+    const out = noteGroupMembers({
+      ...base,
+      signal: alive,
+      // Ours before the listing, a stranger's after it: the leader exited and its pid was reused.
+      readIdentity: () => (reads++ === 0 ? "id-1" : "other"),
+    });
+    expect(out.members).toEqual([]);
   });
 
   it("learns nothing when the pid is another process's or cannot be read", () => {

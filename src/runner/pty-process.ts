@@ -901,12 +901,6 @@ class PtyProcessImpl implements PtyProcess {
    * expires or renews by itself (#581 cp8, H2).
    */
   private _groupMembers: GroupMember[] = [];
-  /**
-   * The absolute deadline of the retirement in progress, allocated before its first read or
-   * signal. Every look and signal made inside it, the native kill's exit callback included,
-   * shares it; null when no retirement is running (#581 cp9, M2).
-   */
-  private _retireDeadlineAt: number | null = null;
   /** The leader's start time at spawn: every later signal checks that the pid still has it. */
   private readonly _leaderStartMs: number | null;
   /**
@@ -1253,12 +1247,12 @@ class PtyProcessImpl implements PtyProcess {
 
   /**
    * Remember who is in the group while it is provably ours (see `noteGroupMembers`): once the
-   * leader is gone nothing else can say the survivors are ours. Evidence only.
+   * leader is gone nothing else can say the survivors are ours. Evidence only. Reached only
+   * through `_noteLiveGroup`.
    */
   private _noteGroupMembers(): void {
+    // Only ever outside a retirement (`_noteLiveGroup`), so the look has its own short budget.
     const noted = noteGroupMembers({
-      // A look made inside a retirement shares its deadline; outside one it has its own short budget.
-      deadlineAt: this._retireDeadlineAt ?? undefined,
       pid: this._pid,
       identity: this._identity,
       groupId: this._groupId,
@@ -1274,9 +1268,10 @@ class PtyProcessImpl implements PtyProcess {
 
   /**
    * Learn the group while the leader is alive and no retirement has begun: at the hand-over from
-   * spawn, when a turn starts and when one ends cleanly (#581 cp9, H2). A leader that later exits
-   * on its own then leaves behind members identified before it went, which can vouch for its
-   * group; nothing learned at the exit itself can (see `noteGroupMembers`). Evidence only.
+   * spawn, when a turn starts and when one ends cleanly (#581 cp9, H2). These are the ONLY looks
+   * (cp10, option B): none at the exit and none inside a retirement. A leader that later exits
+   * on its own leaves behind members identified before it went, which can vouch for its group.
+   * Evidence only.
    */
   _noteLiveGroup(): void {
     if (this._alive && !this._disposed) this._noteGroupMembers();
@@ -1284,9 +1279,8 @@ class PtyProcessImpl implements PtyProcess {
 
   private _handleExit(info: { exitCode: number; signal?: number | string }): void {
     this._alive = false;
-    // The exit callback proves nothing about whose group this is (it can be delivered late): it
-    // adds members only where a recorded leader or an already-identified member vouches (cp9, H2).
-    this._noteGroupMembers();
+    // No member look here: the exit callback proves nothing about whose group this is (it can be
+    // delivered late). Members are learned only while the leader is alive (cp10, option B).
     // Issue #176: capture a diagnostic snapshot the moment the PTY exits.
     // Reading the tail ring buffer now is cheap and avoids the
     // _onDataDisposable race (data events still flush before exit on
@@ -1636,15 +1630,9 @@ class PtyProcessImpl implements PtyProcess {
   }
 
   private async _retire(): Promise<void> {
-    // ONE absolute deadline for the whole retirement, allocated before the member snapshot and
-    // before any native kill, so no read or signal below can start a budget of its own (cp9, M2).
-    const deadlineAt = Date.now() + this._exitCapMs;
-    this._retireDeadlineAt = deadlineAt;
-    try {
-      await this._retireWithin(deadlineAt);
-    } finally {
-      this._retireDeadlineAt = null;
-    }
+    // ONE absolute deadline for the whole retirement, allocated before any read and before the
+    // native kill, so no read or signal below can start a budget of its own (cp9, M2).
+    await this._retireWithin(Date.now() + this._exitCapMs);
   }
 
   private async _retireWithin(deadlineAt: number): Promise<void> {
@@ -1652,9 +1640,8 @@ class PtyProcessImpl implements PtyProcess {
     this._disposed = true;
     // Read before kill(): bun-pty's own exit event flips this synchronously.
     const wasAlive = this._alive;
-    // Before anything is signalled: the native kill below can take the leader down at once, and
-    // after that only members identified now can show the group is still ours.
-    if (firstRun) this._noteGroupMembers();
+    // No member look here: a retirement learns no member (cp10, option B). The evidence is what
+    // `_noteLiveGroup` learned while the leader was alive and before the retirement began.
 
     if (firstRun && this._turnInProgress) {
       this._rejectTurn(new PtyClosedError(this.label, null, "SIGTERM", true));
@@ -1667,9 +1654,10 @@ class PtyProcessImpl implements PtyProcess {
 
     if (firstRun && wasAlive) {
       if (probeable) {
-        // Not through bun-pty if the pid now belongs to someone else, nor past the deadline: the
-        // identity read takes time and the native kill is a signal like any other.
-        if (this._pidState(this._pid) !== "replaced" && Date.now() < deadlineAt) {
+        // Through bun-pty only on a fresh positive identity match, and not past the deadline: the
+        // identity read takes time and the native kill is a signal like any other. Unknown, gone
+        // and replaced all withhold it (cp10, H5), as the bus adapter's native kill does.
+        if (this._pidState(this._pid) === "same" && Date.now() < deadlineAt) {
           try {
             this._pty.kill("SIGTERM");
           } catch {

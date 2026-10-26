@@ -1290,7 +1290,7 @@ export class SessionManager {
     this.fenceForRetirement(record);
     // While the process is certainly alive, remember who is in its group: if the graceful quit
     // ends it, that is the only evidence the survivors are still ours (#581 cp8, H2).
-    if (record.proc instanceof PtyAgentProcess) record.proc.snapshotGroupMembers();
+    if (record.proc instanceof PtyAgentProcess) record.proc.noteLiveGroup();
     return new Promise<void>((resolve) => {
       const finalise = (): void => {
         // Issue #215: tear down the session tailer.
