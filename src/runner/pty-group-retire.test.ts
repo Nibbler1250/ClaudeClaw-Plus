@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PtyExitUnconfirmedError, type PtyProcessOptions, spawnPty } from "./pty-process.js";
@@ -71,9 +71,27 @@ const HUP_PROOF_BG = "(trap '' HUP; exec sleep 60) & echo $! > $BG; sleep 60";
 // A shell that exits at once, leaving a HUP-proof background child. The shell does not exit until
 // the child has installed its trap and said so: the pid file is written at the fork, before the
 // trap, and a hangup that arrives first (the shell is a session leader) kills the child, which
-// flaked these tests about 1 run in 8.
+// flaked these tests about 1 run in 8. Nor does it exit until told to (`$BG.go`, see
+// `learnThenExit`).
 const BG_THEN_EXIT =
-  "(trap '' HUP; : > $BG.ready; exec sleep 60) & echo $! > $BG; while [ ! -e $BG.ready ]; do sleep 0.02; done";
+  "(trap '' HUP; : > $BG.ready; exec sleep 60) & echo $! > $BG; while [ ! -e $BG.ready ] || [ ! -e $BG.go ]; do sleep 0.02; done";
+
+/**
+ * Let the child of `BG_THEN_EXIT` exit on its own, after a live look has identified its group.
+ * Since #581 cp9 (H2) only members identified while the leader lived vouch for its group once it
+ * is gone; the exit event does not. Holding the shell until `go` keeps its leader alive through
+ * the spawn hand-over look: without it the shell could exit first, nothing was ever learned, and
+ * the retirement held to its 7 s deadline (the cp9 flake). The hand-over usually lists the
+ * background child already; the explicit look (a turn's start and end make it in production)
+ * covers a hand-over that ran before the fork. Removing it alone stays green for that reason.
+ */
+async function learnThenExit(child: Awaited<ReturnType<typeof spawnPty>>): Promise<void> {
+  const ready = join(dir, "bg.pid.ready");
+  await until(() => existsSync(ready));
+  (child as unknown as { _noteLiveGroup(): void })._noteLiveGroup();
+  writeFileSync(join(dir, "bg.pid.go"), "");
+  await until(() => !child.isAlive());
+}
 
 describe("retiring a PTY child", () => {
   it("is the leader of its own process group (pgid equals pid)", async () => {
@@ -122,7 +140,7 @@ describe("retiring a PTY child", () => {
 
   it("sweeps the descendants of a child that already exited on its own", async () => {
     const { child, bg } = await spawnShell(BG_THEN_EXIT);
-    await until(() => !child.isAlive());
+    await learnThenExit(child);
     expect(alive(bg)).toBe(true); // the leader is gone, its background child is not
     await child.dispose();
     expect(alive(bg)).toBe(false);
@@ -198,7 +216,7 @@ describe("retiring a PTY child", () => {
         return [];
       },
     });
-    await until(() => !child.isAlive());
+    await learnThenExit(child);
     await child.dispose();
     // The scan ran once, and it was handed what is left of the one 7000 ms deadline.
     expect(budgets.length).toBe(1);

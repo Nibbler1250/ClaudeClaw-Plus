@@ -293,6 +293,9 @@ class GroupTarget {
       this.withheld = true;
       return false;
     }
+    // The reads above (identity, member listing) may have used up what was left: the deadline is
+    // looked at again as the last step before kill(), not only when send() was entered (cp9, M2).
+    if (this.deps.expired()) return false;
     try {
       this.signal(-this.pid, name);
       this.withheld = false;
@@ -307,6 +310,7 @@ class GroupTarget {
     // Only a leader whose identity matches, or an unrecorded one in the initial window.
     const unrecordedOk = !this.deps.identityRecorded && this.deps.firstTermination;
     if (identity !== "same" && !(identity === "unknown" && unrecordedOk)) return false;
+    if (this.deps.expired()) return false; // see sendGroup: the identity read above takes time
     try {
       this.signal(this.pid, name);
       return true;
@@ -456,6 +460,8 @@ export function describeGroup(
     if (process.platform === "linux" || procDir !== "/proc") {
       for (const entry of readdirSync(procDir)) {
         if (!/^\d+$/.test(entry)) continue;
+        // Past the deadline the walk stops and says it did not finish: a partial count is no count.
+        if (Date.now() >= deadlineAt) return { count: undefined, comm: [] };
         let stat: string;
         try {
           stat = readFileSync(`${procDir}/${entry}/stat`, "utf8");
@@ -523,25 +529,29 @@ export interface NoteMembersInput {
   readGroupId?: PgidReader;
   /** The daemon's own group id; omitted: read now. */
   daemonGroupId?: number | null;
-  /** How long this look may take (default 1000 ms). */
-  budgetMs?: number;
   /**
-   * Whether a leader that is already absent still counts as proof the group is ours. Only at the
-   * instant its exit is first seen (the exit callback): a group listed at any later time may be a
-   * stranger's, so every other caller passes false and learns members only from a live leader.
+   * The absolute wall-clock deadline of the retirement this look belongs to (#581 cp9, M2). A look
+   * made inside a retirement shares ITS deadline and never starts a budget of its own.
    */
-  leaderJustExited?: boolean;
+  deadlineAt?: number;
+  /** How long a look made outside any retirement may take (default 1000 ms). Ignored beside `deadlineAt`. */
+  budgetMs?: number;
+  /** Wall clock. Replaced in tests. */
+  now?: () => number;
 }
 
 /**
  * Remember who is in a child's process group while that group is provably ours, so that a later
- * retirement has evidence once the leader is gone (#581 cp8, H2). Called before anything is
- * signalled and when the leader's exit is first seen. A group is taken as ours only when the
- * leader is the recorded process (`same`) or, only at the instant its exit is first seen
- * (`leaderJustExited`: while a group has a member its id cannot be reused, so whoever is in it
- * at the moment its leader goes is ours), is absent. Never when the pid belongs to another
- * process or cannot be read, and never for an absent leader at any later time. It needs an isolated group
- * (`isolatedGroupTarget`). Nothing is signalled. A listing that fails changes nothing.
+ * retirement has evidence once the leader is gone (#581 cp8, H2; cp9, H2). Called before anything
+ * is signalled and when the leader's exit is seen. A member list is learned in exactly two cases:
+ *  (a) the leader is the recorded process, read now with its exact identity; or
+ *  (b) the leader is absent, and a member identified EARLIER (pid and birth identity) is read
+ *      again now in this very group with the identity it had: that member vouches for the group.
+ * Nothing else grants it. In particular not an exit callback: it can be delivered after the group
+ * has gone and its number been reused, so "the leader just exited" says nothing about whose group
+ * this is. With neither (a) nor (b) nothing is recorded. It needs an isolated group
+ * (`isolatedGroupTarget`) and nothing is signalled. A listing that fails, or any read that ends
+ * past the deadline, changes nothing.
  */
 export function noteGroupMembers(input: NoteMembersInput): {
   members: GroupMember[];
@@ -550,22 +560,41 @@ export function noteGroupMembers(input: NoteMembersInput): {
   const unchanged = { members: [...input.members], groupId: input.groupId };
   const { pid, identity } = input;
   if (process.platform === "win32" || !isSignalablePid(pid) || identity === null) return unchanged;
-  const deadlineAt = Date.now() + (input.budgetMs ?? 1000);
+  const now = input.now ?? Date.now;
+  const deadlineAt = input.deadlineAt ?? now() + (input.budgetMs ?? 1000);
+  const expired = (): boolean => now() >= deadlineAt;
+  if (expired()) return unchanged;
   const signal = input.signal ?? process.kill;
-  const readIdentity: PidIdentityReader = input.readIdentity ?? ((p) => readPidIdentity(p));
-  const readGroupId: PgidReader = input.readGroupId ?? ((p) => readPgid(p));
+  const readIdentity: PidIdentityReader =
+    input.readIdentity ??
+    ((p) => readPidIdentity(p, { psTimeoutMs: Math.max(0, deadlineAt - now()) }));
+  const readGroupId: PgidReader =
+    input.readGroupId ?? ((p) => readPgid(p, { psTimeoutMs: Math.max(0, deadlineAt - now()) }));
   const state = rawIdentityState(pid, identity, signal, readIdentity);
-  if (state === "recycled" || state === "unknown") return unchanged;
-  if (state === "gone" && input.leaderJustExited !== true) return unchanged;
+  if (expired() || state === "recycled" || state === "unknown") return unchanged;
+  // An absent leader has nothing to vouch for its group: only a member known from before can.
+  if (state === "gone" && input.members.length === 0) return unchanged;
   let groupId = input.groupId;
   if (state === "same") {
     const fresh = readGroupId(pid);
+    if (expired()) return unchanged;
     if (fresh !== null) groupId = fresh;
   }
   const daemon = input.daemonGroupId !== undefined ? input.daemonGroupId : readGroupId(process.pid);
+  if (expired()) return unchanged;
   if (!isolatedGroupTarget(pid, groupId, daemon)) return { members: unchanged.members, groupId };
   try {
-    const reading = (input.readMembers ?? ((g, at) => readGroupMembers(g, at)))(pid, deadlineAt);
+    const reading = (input.readMembers ?? ((g, at) => readGroupMembers(g, at, { now })))(
+      pid,
+      deadlineAt,
+    );
+    if (expired()) return unchanged; // a reading that outlasted the deadline is unresolved evidence
+    if (
+      state === "gone" &&
+      !reading.members.some((f) => input.members.some((k) => sameMember(k, f)))
+    ) {
+      return unchanged; // no known member is in it: nothing vouches for this group
+    }
     return { members: mergeMembers(input.members, reading.members), groupId };
   } catch {
     return { members: unchanged.members, groupId };
@@ -629,7 +658,8 @@ export async function retireProcessGroup(input: RetireGroupInput): Promise<Retir
   let known: GroupMember[] = [...input.members];
   const read = (): { members: GroupMember[]; complete: boolean } | null => {
     if (!isolated() || left() <= 0) return null; // no group to list, or no time to list it
-    return readMembers(pid, input.deadlineAt);
+    const reading = readMembers(pid, input.deadlineAt);
+    return left() <= 0 ? null : reading; // a listing that ended past the deadline is unresolved
   };
   const list = (): GroupMember[] | null => read()?.members ?? null;
   const target = new GroupTarget(pid, signal, liveMembers, {

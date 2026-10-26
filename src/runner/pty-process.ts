@@ -901,6 +901,12 @@ class PtyProcessImpl implements PtyProcess {
    * expires or renews by itself (#581 cp8, H2).
    */
   private _groupMembers: GroupMember[] = [];
+  /**
+   * The absolute deadline of the retirement in progress, allocated before its first read or
+   * signal. Every look and signal made inside it, the native kill's exit callback included,
+   * shares it; null when no retirement is running (#581 cp9, M2).
+   */
+  private _retireDeadlineAt: number | null = null;
   /** The leader's start time at spawn: every later signal checks that the pid still has it. */
   private readonly _leaderStartMs: number | null;
   /**
@@ -1249,9 +1255,10 @@ class PtyProcessImpl implements PtyProcess {
    * Remember who is in the group while it is provably ours (see `noteGroupMembers`): once the
    * leader is gone nothing else can say the survivors are ours. Evidence only.
    */
-  private _noteGroupMembers(leaderJustExited = false): void {
+  private _noteGroupMembers(): void {
     const noted = noteGroupMembers({
-      leaderJustExited,
+      // A look made inside a retirement shares its deadline; outside one it has its own short budget.
+      deadlineAt: this._retireDeadlineAt ?? undefined,
       pid: this._pid,
       identity: this._identity,
       groupId: this._groupId,
@@ -1265,9 +1272,21 @@ class PtyProcessImpl implements PtyProcess {
     this._groupId = noted.groupId;
   }
 
+  /**
+   * Learn the group while the leader is alive and no retirement has begun: at the hand-over from
+   * spawn, when a turn starts and when one ends cleanly (#581 cp9, H2). A leader that later exits
+   * on its own then leaves behind members identified before it went, which can vouch for its
+   * group; nothing learned at the exit itself can (see `noteGroupMembers`). Evidence only.
+   */
+  _noteLiveGroup(): void {
+    if (this._alive && !this._disposed) this._noteGroupMembers();
+  }
+
   private _handleExit(info: { exitCode: number; signal?: number | string }): void {
     this._alive = false;
-    this._noteGroupMembers(true); // the leader just went: whoever is in its group now is ours
+    // The exit callback proves nothing about whose group this is (it can be delivered late): it
+    // adds members only where a recorded leader or an already-identified member vouches (cp9, H2).
+    this._noteGroupMembers();
     // Issue #176: capture a diagnostic snapshot the moment the PTY exits.
     // Reading the tail ring buffer now is cheap and avoids the
     // _onDataDisposable race (data events still flush before exit on
@@ -1366,6 +1385,10 @@ class PtyProcessImpl implements PtyProcess {
     if (!this._transcriptPath && !this._isolatedProjectDir) {
       return Promise.reject(new PtyTranscriptUnavailableError(this.label, this._noTranscriptWhy));
     }
+
+    // The servers started at boot or by the last turn are in the group by now: learn them
+    // while the leader can still be identified (#581 cp9, H2).
+    this._noteLiveGroup();
 
     this._turnInProgress = true;
     this._onChunk = opts.onChunk;
@@ -1552,6 +1575,9 @@ class PtyProcessImpl implements PtyProcess {
     const resolve = this._turnResolve;
     this._turnResolve = null;
     this._turnReject = null;
+    // A clean end: whatever the turn started (a lazily spawned server, a tool's helper) is
+    // learned while the leader is still there to vouch for it (#581 cp9, H2).
+    this._noteLiveGroup();
     if (resolve) resolve(result);
   }
 
@@ -1610,6 +1636,18 @@ class PtyProcessImpl implements PtyProcess {
   }
 
   private async _retire(): Promise<void> {
+    // ONE absolute deadline for the whole retirement, allocated before the member snapshot and
+    // before any native kill, so no read or signal below can start a budget of its own (cp9, M2).
+    const deadlineAt = Date.now() + this._exitCapMs;
+    this._retireDeadlineAt = deadlineAt;
+    try {
+      await this._retireWithin(deadlineAt);
+    } finally {
+      this._retireDeadlineAt = null;
+    }
+  }
+
+  private async _retireWithin(deadlineAt: number): Promise<void> {
     const firstRun = !this._disposed;
     this._disposed = true;
     // Read before kill(): bun-pty's own exit event flips this synchronously.
@@ -1629,8 +1667,9 @@ class PtyProcessImpl implements PtyProcess {
 
     if (firstRun && wasAlive) {
       if (probeable) {
-        // Not through bun-pty if the pid now belongs to someone else.
-        if (this._pidState(this._pid) !== "replaced") {
+        // Not through bun-pty if the pid now belongs to someone else, nor past the deadline: the
+        // identity read takes time and the native kill is a signal like any other.
+        if (this._pidState(this._pid) !== "replaced" && Date.now() < deadlineAt) {
           try {
             this._pty.kill("SIGTERM");
           } catch {
@@ -1644,7 +1683,7 @@ class PtyProcessImpl implements PtyProcess {
 
     // Always, whether or not the leader was alive: a leader that exited on its own can leave a
     // group behind, and bun-pty's exit event proves neither the leader's death nor the group's.
-    if (probeable) await this._confirmGone(firstRun);
+    if (probeable) await this._confirmGone(firstRun, deadlineAt);
 
     try {
       this._onDataDisposable?.dispose();
@@ -1764,9 +1803,8 @@ class PtyProcessImpl implements PtyProcess {
    * probes are `retireProcessGroup`; the escape scan of an isolated one-shot gets only what is
    * left of the same deadline. Throws `PtyExitUnconfirmedError` through `_mapGroupOutcome`.
    */
-  private async _confirmGone(initial: boolean): Promise<void> {
+  private async _confirmGone(initial: boolean, deadlineAt: number): Promise<void> {
     const pid = this._pid;
-    const deadlineAt = Date.now() + this._exitCapMs;
     const outcome = await retireProcessGroup({
       pid,
       identity: this._identity,
@@ -2104,6 +2142,7 @@ export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
     const proc = new PtyProcessImpl(pty, opts);
 
     if (opts._skipReadySettle) {
+      proc._noteLiveGroup(); // the hand-over: see `_noteLiveGroup`
       resolve(proc);
       return;
     }
@@ -2135,6 +2174,7 @@ export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
         reject(new Error(`PTY for ${cmd} exited before TUI settled (pid=${pty.pid})${detail}`));
         return;
       }
+      proc._noteLiveGroup(); // the hand-over: see `_noteLiveGroup`
       resolve(proc);
     });
   });

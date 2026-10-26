@@ -459,29 +459,41 @@ describe("noteGroupMembers (#581 cp8)", () => {
     expect(out.members).toEqual([{ pid: 9001, identity: "m1" }]);
   });
 
-  it("learns nothing from an absent leader, unless this is the instant its exit was first seen", () => {
+  it("learns nothing from an absent leader that nothing known vouches for", () => {
     expect(noteGroupMembers({ ...base, signal: gone, readIdentity: () => null }).members).toEqual(
       [],
     );
-    // Went red (empty) with the exit-time case no longer honoured.
+    // A member identified earlier that the listing does not show vouches for nothing either.
+    const had = [{ pid: 9000, identity: "m0" }];
     expect(
-      noteGroupMembers({
-        ...base,
-        signal: gone,
-        readIdentity: () => null,
-        leaderJustExited: true,
-      }).members,
-    ).toEqual([{ pid: 9001, identity: "m1" }]);
+      noteGroupMembers({ ...base, members: had, signal: gone, readIdentity: () => null }).members,
+    ).toEqual(had);
+  });
+
+  it("learns from an absent leader only while a member identified earlier is still in the group (cp9, H2)", () => {
+    const had = [{ pid: 9001, identity: "m1" }];
+    const out = noteGroupMembers({
+      ...base,
+      members: had,
+      signal: gone,
+      readIdentity: () => null,
+      readMembers: () => ({
+        members: [
+          { pid: 9001, identity: "m1" },
+          { pid: 9002, identity: "m2" },
+        ],
+        complete: true,
+      }),
+    });
+    expect(out.members).toEqual([
+      { pid: 9001, identity: "m1" },
+      { pid: 9002, identity: "m2" },
+    ]);
   });
 
   it("learns nothing when the pid is another process's or cannot be read", () => {
     for (const read of [() => "other", () => null]) {
-      const out = noteGroupMembers({
-        ...base,
-        signal: alive,
-        readIdentity: read,
-        leaderJustExited: true,
-      });
+      const out = noteGroupMembers({ ...base, signal: alive, readIdentity: read });
       expect(out.members).toEqual([]);
     }
   });

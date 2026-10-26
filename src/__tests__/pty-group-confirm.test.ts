@@ -246,9 +246,12 @@ describe("untrusted one-shot: always enforce", () => {
 
 describe("natural leader exit before dispose", () => {
   test("the group it left behind is still TERMed, KILLed and confirmed", async () => {
-    const os = makeOs({ leader: false, members: 2 });
+    // The members are identified while the leader is alive (the hand-over from spawn), and it is
+    // they, not the exit event, that vouch for the group once the leader is gone (#581 cp9, H2).
+    const os = makeOs({ members: 2 });
     const proc = await spawnOver(os);
     // The leader went by itself, with members still in its group: bun-pty's exit event.
+    os.leader = false;
     (native as FakeNative).fireExit();
     expect(proc.isAlive()).toBe(false);
     await proc.dispose();
@@ -257,11 +260,37 @@ describe("natural leader exit before dispose", () => {
     expect(groupUnconfirmedObservedCount()).toBe(0);
   });
 
+  test("members that joined after the hand-over are learned when a turn starts", async () => {
+    // Fault (site: `_startTurn`, drop the live snapshot): nothing vouches for the late members
+    // once the leader is gone. Predicted result: an empty log.
+    const os = makeOs({ members: 0 });
+    const proc = await spawnOver(os);
+    os.members = 2; // servers started by the CLI after the hand-over
+    const turn = proc.runTurn("hello", { timeoutMs: 5_000 }).catch(() => {});
+    os.leader = false;
+    (native as FakeNative).fireExit();
+    await turn;
+    await proc.dispose();
+    expect(os.log).toEqual([`-${proc.pid}:SIGTERM`, `-${proc.pid}:SIGKILL`]);
+  });
+
+  test("a leader never identified alive leaves no authority: its exit event vouches for nothing", async () => {
+    // Fault (site: `noteGroupMembers`, accept an absent leader's listing with no known member in
+    // it): the exit event records the members and dispose TERMs and KILLs `-pid`.
+    const os = makeOs({ leader: false, members: 2 });
+    const proc = await spawnOver(os);
+    (native as FakeNative).fireExit();
+    await proc.dispose(); // trusted, observe: reported, not signalled
+    expect(os.log).toEqual([]);
+    expect(groupUnconfirmedObservedCount()).toBe(1);
+  });
+
   test("a group id reused by a stranger's group is not ours: the members seen at the exit are gone", async () => {
     // Fault (site: `retireProcessGroup`, drop the fresh read of the earlier members): the late
     // dispose KILLs `-pid`, which by now is a stranger's. Predicted result: `-pid:SIGKILL` in the log.
-    const os = makeOs({ leader: false, members: 2, immuneMembers: true });
-    const proc = await spawnOver(os);
+    const os = makeOs({ members: 2, immuneMembers: true });
+    const proc = await spawnOver(os); // the members are identified while the leader is alive
+    os.leader = false;
     (native as FakeNative).fireExit(); // the group was alive, with these members, when the leader went
     os.salt = "-stranger"; // the group id is reused: other processes answer on it
     await proc.dispose();
@@ -272,8 +301,9 @@ describe("natural leader exit before dispose", () => {
   test("the members identified at the exit keep their authority however long the dispose is delayed: no clock decides", async () => {
     // Fault (site: `_confirmGone`, authority from a flag plus a freshness window): after 60 ms the
     // window has passed and the group is not signalled. Predicted result: an empty log.
-    const os = makeOs({ leader: false, members: 2 });
-    const proc = await spawnOver(os);
+    const os = makeOs({ members: 2 });
+    const proc = await spawnOver(os); // identified here, while the leader is alive
+    os.leader = false;
     (native as FakeNative).fireExit();
     await new Promise((r) => setTimeout(r, 60));
     await proc.dispose();

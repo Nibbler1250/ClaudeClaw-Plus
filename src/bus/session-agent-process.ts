@@ -254,6 +254,12 @@ export class PtyAgentProcess implements AgentProcess {
   private readonly identity: string | null;
   private _retirement: Promise<void> | null = null;
   private _retiredOnce = false;
+  /**
+   * The absolute deadline of the retirement in progress, allocated before its first read or
+   * signal. Every look and signal inside it, the native kill's exit callback included, shares
+   * it; null when no retirement is running (#581 cp9, M2).
+   */
+  private retireDeadlineAt: number | null = null;
   /** The child's process group id, read with its identity at construction; null when unreadable. */
   private groupId: number | null;
   private groupIdRefreshed = false;
@@ -569,7 +575,9 @@ export class PtyAgentProcess implements AgentProcess {
     }
     pty.onExit((e) => {
       this._exited = true;
-      this.snapshotGroupMembers(true); // the leader just went: whoever is in its group now is ours
+      // The exit callback proves nothing about whose group this is (it can be delivered late): it
+      // adds members only where a recorded leader or an already-identified member vouches.
+      this.snapshotGroupMembers();
       // A process that exited is not "stuck at boot": the exit log line
       // (session-manager, issue #393) is the one that speaks for it.
       this.endBootDialogPhase();
@@ -595,6 +603,7 @@ export class PtyAgentProcess implements AgentProcess {
     // a prompt still being typed.
     const run = this.writeChain.then(async () => {
       if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
+      this.noteLiveGroup(); // see `noteLiveGroup`
       this.pty.write(`/${cmd}`);
       await new Promise((r) => setTimeout(r, 200));
       if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
@@ -643,6 +652,7 @@ export class PtyAgentProcess implements AgentProcess {
     const text = sanitizePtyPromptText(line);
     const run = this.writeChain.then(async () => {
       if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
+      this.noteLiveGroup(); // see `noteLiveGroup`
       // Snapshot the compaction state at write time. A compaction that was
       // ALREADY running when the prompt arrived (the common case -- the inbound
       // prompt is what overflowed the context) can also FINISH during the 200ms
@@ -1369,13 +1379,14 @@ export class PtyAgentProcess implements AgentProcess {
   /**
    * Remember who is in the child's process group while it is provably ours (see
    * `noteGroupMembers`): once the leader is gone nothing else can say its survivors are ours.
-   * Called before the graceful quit, before any kill and when the exit is first seen. Evidence
+   * Called before the graceful quit, before any kill and when the exit is seen. Evidence
    * only; nothing is signalled.
    */
-  snapshotGroupMembers(leaderJustExited = false): void {
+  snapshotGroupMembers(): void {
     const seams = this.retireSeams;
     const noted = noteGroupMembers({
-      leaderJustExited,
+      // Inside a retirement the look shares its deadline; outside one it has its own short budget.
+      deadlineAt: this.retireDeadlineAt ?? undefined,
       pid: this.pid,
       identity: this.identity,
       groupId: this.groupId,
@@ -1389,6 +1400,17 @@ export class PtyAgentProcess implements AgentProcess {
     });
     this._groupMembers = noted.members;
     this.groupId = noted.groupId;
+  }
+
+  /**
+   * Learn the group while the leader is alive and no retirement has begun: before each prompt or
+   * slash command is typed, when the servers started at boot or by earlier turns are in it
+   * (#581 cp9, H2). A leader that later exits on its own then leaves behind members identified
+   * before it went, which can vouch for its group; nothing learned at the exit itself can (see
+   * `noteGroupMembers`). Evidence only.
+   */
+  noteLiveGroup(): void {
+    if (!this._exited && this._retirement === null) this.snapshotGroupMembers();
   }
 
   /**
@@ -1420,13 +1442,19 @@ export class PtyAgentProcess implements AgentProcess {
   private nativeKillAuthorised(): boolean {
     if (process.platform === "win32") return true; // no pid probe exists there
     if (!isSignalablePid(this.pid) || this.identity === null) return false;
+    // Inside a retirement the deadline is looked at before the reads and again after them, the
+    // last look before the native call: the identity read takes time (#581 cp9, M2).
+    const deadlineAt = this.retireDeadlineAt;
+    const expired = (): boolean => deadlineAt !== null && Date.now() >= deadlineAt;
+    if (expired()) return false;
     const seams = this.retireSeams;
     try {
       (seams.signalPid ?? process.kill)(this.pid, 0);
     } catch {
       return false; // ESRCH: nothing to kill. EPERM: not ours to signal.
     }
-    return sameIdentity((seams.readPidIdentity ?? readPidIdentity)(this.pid), this.identity);
+    const same = sameIdentity((seams.readPidIdentity ?? readPidIdentity)(this.pid), this.identity);
+    return same && !expired();
   }
 
   /**
@@ -1464,6 +1492,18 @@ export class PtyAgentProcess implements AgentProcess {
   }
 
   private async retireOnce(): Promise<void> {
+    // ONE absolute deadline for the whole retirement, allocated before the member snapshot and
+    // before any native kill, so no read or signal below can start a budget of its own (cp9, M2).
+    const deadlineAt = Date.now() + (this.retireSeams.exitCapMs ?? 7000);
+    this.retireDeadlineAt = deadlineAt;
+    try {
+      await this.retireWithin(deadlineAt);
+    } finally {
+      this.retireDeadlineAt = null;
+    }
+  }
+
+  private async retireWithin(deadlineAt: number): Promise<void> {
     // The first await comes before anything else: `_kill` below fires the exit callbacks, and
     // a caller reached through them must find `_retirement` already set and join it.
     await Promise.resolve();
@@ -1474,7 +1514,6 @@ export class PtyAgentProcess implements AgentProcess {
     if (initial) this.snapshotGroupMembers(); // before the native kill can take the leader down
     if (initial && wasAlive) this._kill("SIGTERM");
     if (process.platform === "win32" || !isSignalablePid(this.pid)) return; // no probe to make
-    const deadlineAt = Date.now() + (seams.exitCapMs ?? 7000);
     const outcome = await retireProcessGroup({
       pid: this.pid,
       identity: this.identity,

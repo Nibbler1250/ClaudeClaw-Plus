@@ -654,6 +654,11 @@ export class TranscriptTurn {
       return;
     }
     if (entry.type !== "user" || entry.isCompactSummary === true) return;
+    // A harness-injected entry (`isMeta`: a custom command's expansion, a continuation note) is
+    // arbitrary text and never a prompt we typed. It is excluded BEFORE any matching: the
+    // anchored command matcher alone cannot tell a recorded command from an expansion that
+    // merely contains the same tags (#581 cp9, CI1). It is not a foreign prompt either.
+    if (entry.isMeta === true) return;
     const text = userText((entry.message as { content?: unknown } | undefined)?.content);
     if (text === null) return;
     if (promptMatches(text, this.written, this.replCommand)) {

@@ -499,7 +499,9 @@ describe("M3: a disposal re-entered from the native exit callback joins the init
       },
       _liveMembers: () => 0,
       _exitGraceMs: 0,
-      _exitCapMs: 0,
+      // Not 0: since cp9 (M2) a spent cap allows no native kill, and without one the exit
+      // callback this test re-enters through never fires.
+      _exitCapMs: 50,
     });
     let callback: Promise<void> | undefined;
     handle.exits.push(() => {

@@ -44,6 +44,13 @@ export interface EscapeScanOptions {
   selfPid?: number;
   /** Replaces `process.getuid()`: only processes owned by this uid are ours to read. */
   uid?: number;
+  /**
+   * The retirement's ONE absolute deadline (`Date.now()` ms): the walk over `/proc` stops at it,
+   * per process, and says so with `incomplete` (#581 cp9, M2). Omitted: no deadline.
+   */
+  deadlineAt?: number;
+  /** Wall clock. Replaced in tests. */
+  now?: () => number;
 }
 
 /**
@@ -69,6 +76,11 @@ export interface UnknownProc {
 export interface EscapeScan {
   pids: number[];
   unknown: UnknownProc[];
+  /**
+   * The deadline ended the walk before every process was looked at: what is listed is all that was
+   * seen, and an empty `pids` is then not "nothing escaped".
+   */
+  incomplete?: boolean;
 }
 
 const isLinuxProc = (procDir: string): boolean =>
@@ -123,7 +135,13 @@ function descendsFrom(pid: number, selfPid: number, procDir: string): boolean {
  */
 export function findEscapees(
   { root, cwds, leaderStartMs = null }: EscapeScanTarget,
-  { procDir = "/proc", selfPid = process.pid, uid = process.getuid?.() }: EscapeScanOptions = {},
+  {
+    procDir = "/proc",
+    selfPid = process.pid,
+    uid = process.getuid?.(),
+    deadlineAt = Number.POSITIVE_INFINITY,
+    now = Date.now,
+  }: EscapeScanOptions = {},
 ): EscapeScan {
   const found: number[] = [];
   const unknown: UnknownProc[] = [];
@@ -131,6 +149,8 @@ export function findEscapees(
   const names = readdirSync(procDir); // a throw here is "could not look": not an empty answer
   for (const name of names) {
     if (!/^\d+$/.test(name)) continue;
+    // The walk is the retirement's too: past its deadline it stops and reports what it did not see.
+    if (now() >= deadlineAt) return { pids: found, unknown, incomplete: true };
     const pid = Number(name);
     if (pid === selfPid || !isSignalablePid(pid)) continue;
     try {
@@ -188,15 +208,6 @@ export interface EscapeKillOptions extends EscapeScanOptions {
   killGraceMs?: number;
   pollMs?: number;
   /**
-   * The retirement's ONE absolute deadline (`Date.now()` ms). Every wait is bounded by it in
-   * wall-clock time, not by the sleeps requested, and past it nothing is scanned or signalled:
-   * no scan has been made before it means `EscapeScanDeadlineError` (not an empty answer), and a
-   * scan cut short returns what it last saw, so the caller keeps what is unresolved held.
-   */
-  deadlineAt?: number;
-  /** Wall clock. Replaced in tests. */
-  now?: () => number;
-  /**
    * Told, once, about the processes the final scan could not read (see `UnknownProc`). They are
    * not a failure of this call: the caller keeps the root while they live.
    */
@@ -242,8 +253,13 @@ export async function terminateEscapees(
     if (scan.unknown.length > 0) onUnknown?.(scan.unknown);
     return scan.pids;
   };
+  // Every wait is bounded by `deadlineAt` in wall-clock time, not by the sleeps requested, and
+  // past it nothing is scanned or signalled: no complete scan before it means
+  // `EscapeScanDeadlineError` (not an empty answer), and a later scan cut short returns the last
+  // complete one, so the caller keeps what is unresolved held.
   if (expired()) throw new EscapeScanDeadlineError();
   const first = findEscapees(target, opts);
+  if (first.incomplete) throw new EscapeScanDeadlineError();
   if (first.pids.length === 0) return finish(first);
 
   // The identity of each pid, fixed the moment it was found.
@@ -256,12 +272,14 @@ export async function terminateEscapees(
   const send = (name: NodeJS.Signals): void => {
     if (expired()) return; // past the deadline there is no more scanning or signalling
     for (const pid of findEscapees(target, opts).pids) {
+      if (expired()) return; // the walk and each identity read below take time
       // A pid first seen now has no recorded identity: it is recorded, and signalled next round.
       if (!born.has(pid)) {
         born.set(pid, startMs(pid));
         continue;
       }
       if (!sameProcess(pid)) continue;
+      if (expired()) return; // the last look before kill(), after the identity read
       try {
         signal(pid, name);
       } catch {
@@ -276,7 +294,9 @@ export async function terminateEscapees(
     let seen = last;
     for (;;) {
       if (now() >= until) return seen; // out of time: the last scan stands, nothing new is started
-      seen = findEscapees(target, opts);
+      const next = findEscapees(target, opts);
+      if (next.incomplete) return seen; // cut short by the deadline: the last complete scan stands
+      seen = next;
       if (seen.pids.length === 0 || now() >= until) return seen;
       await sleep(Math.min(pollMs, Math.max(0, until - now())));
     }
