@@ -121,6 +121,37 @@ function nativeHandle() {
 const security = { level: "unrestricted", allowedTools: [], disallowedTools: [] } as const;
 
 describe("option B, strict: no member look at the exit or inside a retirement", () => {
+  test("bus: a retirement that failed and was cleared for retry still closes the live look (OB1)", async () => {
+    const h = nativeHandle();
+    let identity: string | null = "id"; // recorded at spawn
+    let listed = 0;
+    const p = new PtyAgentProcess("cp10-ob1", h as never, {
+      bootDialogMaxMs: 1,
+      retire: {
+        readPidIdentity: () => identity,
+        readPgid: groupOf,
+        readMembers: () => {
+          listed++;
+          return { members: foreign, complete: true };
+        },
+        signalPid: () => {},
+        liveMembers: () => 1,
+        describeGroup: () => ({ count: 1, comm: ["leader"] }),
+        exitCapMs: 12,
+        exitGraceMs: 0,
+      },
+    });
+    // Unreadable at retirement: no native kill, no exit callback, the retirement rejects.
+    identity = null;
+    await expect(p.retire()).rejects.toThrow();
+    expect(h.kills).toEqual([]);
+    identity = "id"; // readable again: the leader reads as the recorded process
+    const before = listed;
+    p.noteLiveGroup(); // what a queued prompt or slash command does next
+    // Went red (Received: 1) at 093b1524, and with the guard back on `_retirement === null` (I7).
+    expect(listed).toBe(before);
+  });
+
   test("bus: the native exit callback fired by the retirement's kill lists nothing", async () => {
     const h = nativeHandle();
     let listedInKill = 0;

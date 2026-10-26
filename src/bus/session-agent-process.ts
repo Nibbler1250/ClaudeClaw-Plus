@@ -254,6 +254,8 @@ export class PtyAgentProcess implements AgentProcess {
   private readonly identity: string | null;
   private _retirement: Promise<void> | null = null;
   private _retiredOnce = false;
+  /** Set synchronously by the first `retire()` and never cleared: no member look after it. */
+  private _retirementBegun = false;
   /**
    * The absolute deadline of the retirement in progress, allocated before its first read or
    * signal. Every look and signal inside it, the native kill's exit callback included, shares
@@ -1407,7 +1409,9 @@ export class PtyAgentProcess implements AgentProcess {
    * behind members identified before it went, which can vouch for its group. Evidence only.
    */
   noteLiveGroup(): void {
-    if (!this._exited && this._retirement === null) this.snapshotGroupMembers();
+    // `_retirementBegun`, not `_retirement`: a failed retirement clears `_retirement` so it can be
+    // retried, but it had begun, and no look may follow it (cp10, OB1).
+    if (!this._exited && !this._retirementBegun) this.snapshotGroupMembers();
   }
 
   /**
@@ -1478,6 +1482,7 @@ export class PtyAgentProcess implements AgentProcess {
    * belongs to the caller (`SessionManager.stop`) and happens before this.
    */
   retire(): Promise<void> {
+    this._retirementBegun = true;
     if (!this._retirement) {
       const run = this.retireOnce();
       this._retirement = run;
