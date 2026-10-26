@@ -32,9 +32,9 @@
 
 import { spawn as nodeSpawnChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { NATIVE_SCHEDULING_TOOLS_BLOCKLIST } from "../config";
 import { claudeExecutable, cleanSpawnEnv, withCleanProcessEnv } from "../runner";
@@ -45,19 +45,34 @@ import {
 } from "../runner/pty-mcp-config-writer";
 import { createSession } from "../sessions";
 import type { BusCore } from "./core";
+import { encodeCwdForProjectsDir } from "./jsonl-line-types";
 import { JsonlTailer } from "./jsonl-tailer";
 import { BUS_MCP_TOOLS } from "./mcp-tools";
 import { confirmTurnReceipt } from "./receipt-wiring";
+import {
+  confirmGoneAndClear,
+  confirmRetired,
+  createSystemProbe,
+  decideResume,
+  type OwnershipRecord,
+  OwnershipRecordError,
+  ownershipGuardApplies,
+  type OwnershipStore,
+  type ProcessProbe,
+  recordOwnership,
+} from "./session-ownership";
 import { capturePostMortem, type PostMortemOptions } from "./post-mortem";
 import type { ReceiptRecord } from "./receipt";
+import { PtyExitUnconfirmedError, type PtyProcess } from "../runner/pty-process";
 import {
   assertSessionSpawnable,
   assertSessionWritable,
+  fenceKey,
   fenceSession,
+  isSessionQuarantined,
   liftFence,
   quarantineSession,
 } from "../runner/pty-quarantine";
-import type { PtyProcess } from "../runner/pty-process";
 import { ensureTrustAccepted } from "../runner/pty-trust-prompt";
 import {
   type AgentProcess,
@@ -122,6 +137,24 @@ export interface SessionManagerOptions {
    * in tests to capture rotation without writing to disk.
    */
   persistRotatedSessionId?: (agentId: string, sessionId: string) => Promise<void>;
+  /**
+   * Where ownership records live (#595 round 3). When unset the bus keeps none, and a restart
+   * resumes as if no process of ours survived. The daemon wires `createFileOwnershipStore()`;
+   * tests inject a store so nothing is written under the operator's agents dir.
+   */
+  ownershipStore?: OwnershipStore;
+  /** Test seams for the ownership guard: the process reads and signals, boot id, and bounds in ms. */
+  processProbe?: ProcessProbe;
+  bootId?: string;
+  ownershipGuardMs?: number;
+  ownershipTermMs?: number;
+  /**
+   * Test seam: the bound in ms on each step of writing a NEW ownership record (the identity read
+   * and the write). Unset keeps `RECORD_STEP_MS`.
+   */
+  ownershipRecordMs?: number;
+  /** Test seam for the platform the ownership guard keys on (default: `process.platform`). */
+  platform?: NodeJS.Platform;
   /**
    * Optional logger override. Defaults to `console`.
    */
@@ -558,6 +591,67 @@ const RESTART_WINDOW_MS = 60 * 60 * 1000;
  */
 const SESSION_COLLISION_PATTERN = /Session ID [0-9a-fA-F-]{8,} is already in use/;
 
+/** How long `clearSession()` waits for `stop()` before the OS confirmation (and a SIGKILL) decides. */
+const CLEAR_STOP_BOUND_MS = 8000;
+
+const sleepMs = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * A spawn failed because the process it started could not be recorded (#595 r4). `retired` says
+ * whether the OS confirmed the unrecorded process gone; when it did not, its session is quarantined.
+ */
+export class SpawnUnrecordedError extends Error {
+  readonly code = "ownership-record-failed";
+  constructor(
+    agentId: string,
+    readonly stage: "identity-read" | "write",
+    readonly retired: boolean,
+  ) {
+    super(
+      `agent ${agentId}: the spawned claude could not be recorded (${stage}), so it was ended and the spawn failed` +
+        (retired ? "" : "; it is not confirmed gone, so its session is quarantined"),
+    );
+    this.name = "SpawnUnrecordedError";
+  }
+}
+
+/**
+ * A spawn was refused (#596 r12): the ownership record names a claude of a DIFFERENT session from a
+ * previous boot that could be neither proved gone nor proved ours, so it was not signalled and its
+ * record was kept. Starting another claude for the agent would overwrite that record and leave the
+ * survivor untracked beside it, so the spawn fails and the next boot retries.
+ */
+export class OtherSessionOwnerUnconfirmedError extends Error {
+  readonly code = "other-session-owner-unconfirmed";
+  constructor(
+    agentId: string,
+    readonly detail: string,
+  ) {
+    super(
+      `agent ${agentId}: a claude recorded for an earlier session of this agent could not be proved gone (${detail}), so no second claude was started beside it`,
+    );
+    this.name = "OtherSessionOwnerUnconfirmedError";
+  }
+}
+
+/** The `/clear` replacement exited during startup: nothing is running, so the clear did not happen. */
+export class ClearReplacementExitedError extends Error {
+  readonly code = "clear-replacement-exited";
+  constructor(agentId: string, exitedWithin: string) {
+    super(
+      `clear failed for agent ${agentId}: the replacement claude exited during startup (${exitedWithin}); the agent is not running`,
+    );
+    this.name = "ClearReplacementExitedError";
+  }
+}
+
+/**
+ * claude's refusal of `--resume <id>` when it cannot load a conversation for that id
+ * ("No conversation found with session ID: <id>", exit 1). #595: the one genuine resume
+ * failure that rotates the session; any other boot failure of a resumed spawn does not.
+ */
+const RESUME_NOT_FOUND_PATTERN = /No conversation found with session ID/;
+
 /**
  * Watch the spawned agent process for the session-id collision marker
  * during a short window after spawn. Resolves true iff the marker is
@@ -565,12 +659,15 @@ const SESSION_COLLISION_PATTERN = /Session ID [0-9a-fA-F-]{8,} is already in use
  * both are required because claude can echo a similar string in benign
  * contexts and a stale-id failure always pairs with an immediate
  * exit. Resolves false for: alive past the window, clean exit, exit
- * without the marker.
+ * without the marker. `pattern` names the marker (default: the session-id
+ * collision); #595 reuses the detector for a resumed spawn's "No conversation
+ * found" refusal.
  */
 export function detectSessionIdCollision(
   proc: Pick<AgentProcess, "onData" | "onExit" | "recentOutputTail">,
   windowMs: number,
   exitDrainMs: number = COLLISION_EXIT_DRAIN_MS,
+  pattern: RegExp = SESSION_COLLISION_PATTERN,
 ): Promise<boolean> {
   if (windowMs <= 0) return Promise.resolve(false);
   return new Promise((resolve) => {
@@ -588,7 +685,7 @@ export function detectSessionIdCollision(
     // resumed — the ordering a loaded host produces) counts as seen.
     const tailHasMarker = () => {
       const tail = proc.recentOutputTail?.();
-      return tail !== undefined && SESSION_COLLISION_PATTERN.test(tail);
+      return tail !== undefined && pattern.test(tail);
     };
     let markerSeen = tailHasMarker();
     // The marker can straddle two PTY chunks (Copilot on the PR): match on a
@@ -610,7 +707,7 @@ export function detectSessionIdCollision(
       // detection window closes.
       if (resolved) return;
       recent = (recent + chunk).slice(-COLLISION_MARKER_WINDOW_CHARS);
-      if (!markerSeen && SESSION_COLLISION_PATTERN.test(recent)) {
+      if (!markerSeen && pattern.test(recent)) {
         markerSeen = true;
         // The exit already came in ahead of this chunk (#326): the verdict
         // was only waiting for it.
@@ -676,8 +773,17 @@ export function detectSessionIdCollision(
  *     claude doesn't prompt-via-bus on every outbound reply.
  *
  * Operator-supplied `agent.mcp_config` is passed through unchanged.
+ *
+ * Session flag (#595): `--session-id <id>` CREATES a session, and claude refuses it with
+ * "Session ID <id> is already in use" when `<projects>/<cwd>/<id>.jsonl` exists. A spawn whose
+ * transcript already exists (a restart) must therefore `--resume <id>`; `resume` is that fact,
+ * read from the filesystem by the caller (`sessionTranscriptExists`). Default: create.
  */
-export function buildClaudeArgs(agent: AgentConfig, mode: SupervisionMode): string[] {
+export function buildClaudeArgs(
+  agent: AgentConfig,
+  mode: SupervisionMode,
+  opts: { resume?: boolean } = {},
+): string[] {
   const args: string[] = [];
   if (mode === "process-stream-json") {
     args.push("-p", "--input-format=stream-json", "--output-format=stream-json", "--verbose");
@@ -712,8 +818,26 @@ export function buildClaudeArgs(agent: AgentConfig, mode: SupervisionMode): stri
   if (agent.system_prompt_file) {
     args.push("--append-system-prompt", agent.system_prompt_file);
   }
-  args.push("--session-id", agent.session_id);
+  args.push(opts.resume ? "--resume" : "--session-id", agent.session_id);
   return args;
+}
+
+/**
+ * Whether the transcript claude would write for `sessionId` already exists: the very file the
+ * CLI `stat`s to decide "Session ID is already in use" (#595). `cwd` is the agent's REAL cwd (the
+ * CLI encodes the physical directory). `projectsDir` overrides the projects root (tests, and the
+ * tailer's own override); otherwise it is `$CLAUDE_CONFIG_DIR/projects`, as the child sees it.
+ */
+export function sessionTranscriptExists(opts: {
+  cwd: string;
+  sessionId: string;
+  env: Record<string, string | undefined>;
+  projectsDir?: string;
+}): boolean {
+  const root =
+    opts.projectsDir ??
+    join(opts.env.CLAUDE_CONFIG_DIR || join(opts.env.HOME || homedir(), ".claude"), "projects");
+  return existsSync(join(root, encodeCwdForProjectsDir(opts.cwd), `${opts.sessionId}.jsonl`));
 }
 
 /* ───────────────────────────────────────────────────────────────────── */
@@ -739,6 +863,24 @@ interface AgentRecord {
    *  spawn-time `onExit` cleanup can tell an exit the daemon asked for from
    *  one it did not — only the latter is logged. */
   stopping?: boolean;
+  /**
+   * The ownership record written for this process (#595 round 3), or null when none could be
+   * (identity unreadable, no store, tmux). Settles shortly after the spawn.
+   */
+  ownership?: Promise<OwnershipRecord | null>;
+  /**
+   * False from registration until the ownership write has settled (#595 r4): `getAgent()` hides the
+   * process until then, so no prompt reaches a claude that is not yet recorded.
+   */
+  deliverable: boolean;
+  /**
+   * Settles with `deliverable` (#595 r5): resolves once the ownership write has settled, rejects when
+   * it failed (the spawn is being failed). `recordingPending()` hands it to the bus, which holds
+   * every prompt for this agent on it, on both transports, rather than reading `getAgent()`'s
+   * undefined as 'unreachable' and sending the prompt over IPC to a claude that is not yet recorded.
+   */
+  recorded: Promise<void>;
+  settleRecorded: { ok: () => void; fail: (err: unknown) => void };
   /**
    * Live session JSONL tailer (issue #215). Present when `options.bus`
    * is set; feeds `response.turn_end` events so the bus can synthesize a
@@ -785,6 +927,27 @@ export class SessionManager {
    * Entries never reject (a failed confirmation quarantines the session instead).
    */
   private readonly retirements = new Map<string, Promise<void>>();
+  /** In-flight `clearSession()` per agent: a second `/clear` joins the first instead of racing it. */
+  private readonly clearInFlight = new Map<string, Promise<void>>();
+  /**
+   * Tail of the per-agent LIFECYCLE queue (#595 r4): spawn, restart and `/clear` all retire and/or
+   * start the agent's claude, so they run one after another, never beside each other.
+   */
+  private readonly lifecycleTail = new Map<string, Promise<unknown>>();
+
+  private enqueueLifecycle<T>(agent_id: string, op: () => Promise<T>): Promise<T> {
+    const prev = this.lifecycleTail.get(agent_id) ?? Promise.resolve();
+    const run = prev.then(op, op);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.lifecycleTail.set(agent_id, tail);
+    void tail.then(() => {
+      if (this.lifecycleTail.get(agent_id) === tail) this.lifecycleTail.delete(agent_id);
+    });
+    return run;
+  }
 
   constructor(options: SessionManagerOptions = {}) {
     this.options = options;
@@ -816,7 +979,213 @@ export class SessionManager {
   }
 
   async spawnAgent(agent: AgentConfig, origin: BusOrigin): Promise<AgentProcess> {
-    return this.spawnAgentInternal(agent, origin, /* retry */ 0);
+    return this.enqueueLifecycle(agent.id, () =>
+      this.spawnAgentInternal(agent, origin, /* retry */ 0),
+    );
+  }
+
+  /**
+   * Mint a fresh session id for `agent`, persist it, and adopt it on the live config. Used where
+   * a stored session cannot be resumed safely (#595 r2). `reason` is a fixed code: nothing the
+   * child printed is copied into the log line.
+   */
+  private async rotateStoredSession(agent: AgentConfig, reason: string): Promise<void> {
+    const fresh = randomUUID();
+    (this.options.logger ?? console).warn(
+      `[bus-session] agent=${agent.id} reason=${reason} session_id=${agent.session_id} — rotating to ${fresh} (the conversation of the old session is not carried over)`,
+    );
+    const persist =
+      this.options.persistRotatedSessionId ??
+      ((agentId: string, sessionId: string) => createSession(sessionId, agentId));
+    await persist(agent.id, fresh);
+    agent.session_id = fresh;
+  }
+
+  /**
+   * `/clear` as a CONTROLLED RESTART (#595 round 3). Typing `/clear` into the CLI moves it to a new
+   * transcript whose id this process never learns, so the stored id would name the pre-clear
+   * conversation. Instead the agent's claude is retired and started again on a freshly minted id,
+   * persisted: the stored id always equals the live transcript's id.
+   *
+   * Retirement keeps the #562 semantics: the session is fenced from the first synchronous step; the
+   * old process must be CONFIRMED gone by the OS (not by its exit event) before the new one starts;
+   * if it cannot be, the session is quarantined, the stored id is left alone, and this rejects. It
+   * never reports a clear that did not happen. Not available under tmux, where the daemon does not
+   * own the claude.
+   *
+   * Where the ownership guard does not apply (win32, `ownershipGuardApplies`) nothing can prove the
+   * old process gone (no record, and the POSIX `ps` it would be confirmed with does not exist), so a
+   * restart would quarantine every clear. There `/clear` keeps its pre-#595 behaviour: it is relayed
+   * to the agent as a slash command.
+   */
+  clearSession(agent_id: string): Promise<void> {
+    if (!ownershipGuardApplies(this.options.platform)) return this.relayClear(agent_id);
+    const inflight = this.clearInFlight.get(agent_id);
+    if (inflight) return inflight;
+    const p = this.enqueueLifecycle(agent_id, () => this.clearSessionInternal(agent_id)).finally(
+      () => {
+        this.clearInFlight.delete(agent_id);
+      },
+    );
+    this.clearInFlight.set(agent_id, p);
+    return p;
+  }
+
+  /** The pre-#595 `/clear`: typed into the agent's CLI; no restart, no new id, no exit confirmation. */
+  private async relayClear(agent_id: string): Promise<void> {
+    const record = this.agents.get(agent_id);
+    if (!record) throw new Error(`clear: no active agent for id=${agent_id}`);
+    await record.proc.send_slash("clear");
+  }
+
+  /**
+   * End the claude in `record` and return only once the OS confirms it gone (#562 semantics, shared by
+   * `/clear` and by a spawn that could not be recorded). The session is fenced from the first
+   * synchronous step; `owned` (the ownership record, if any) lets the confirmation SIGKILL exactly that
+   * process once; an exit that cannot be confirmed quarantines the session and throws. The registry
+   * slot is free when this returns.
+   */
+  private async retireLive(
+    agent_id: string,
+    record: AgentRecord,
+    owned: OwnershipRecord | null | undefined | Promise<OwnershipRecord | null>,
+    ctx: { quarantineReason: string; logReason: string; failure: string },
+  ): Promise<void> {
+    const log = this.options.logger ?? console;
+    const sessionId = record.agent.session_id;
+    const key = `bus:${agent_id}`;
+    const pid = record.proc.pid;
+    const probe = this.options.processProbe ?? createSystemProbe();
+    const stageMs = this.options.ownershipTermMs ?? 2000;
+
+    // #562: fenced before the first await, so nothing is spawned on the old session while it retires.
+    fenceKey(key, record, () => sessionId);
+    try {
+      const proven = (await owned) ?? null;
+      const stopped = this.stop(agent_id);
+      // A process that ignores /quit and SIGTERM must not hold the retirement forever: OS confirmation
+      // (with a SIGKILL of the recorded process) decides, not the exit event.
+      await Promise.race([stopped, sleepMs(CLEAR_STOP_BOUND_MS)]);
+      const confirm = async (): Promise<boolean> => {
+        // A PTY agent is retired through the group primitive (#581): its verdict counts too, so a
+        // leader the record shows gone beside a group the retirement quarantined is not retired.
+        const groupRun = this.retirementRuns.get(record);
+        if (groupRun) {
+          await groupRun;
+          if (isSessionQuarantined({ sessionId })) return false;
+        }
+        const store = this.options.ownershipStore;
+        if (proven && store) {
+          return confirmRetired({
+            store,
+            probe,
+            record: proven,
+            graceMs: stageMs,
+            killMs: stageMs,
+            logger: this.options.logger,
+          });
+        }
+        // No record to prove identity with: only a pid that no longer exists counts as gone.
+        return (await probe.read(pid, 1500).catch(() => undefined)) === null;
+      };
+      if (!(await confirm())) {
+        const unconfirmed = async (): Promise<void> => {
+          if (!(await confirm())) throw new PtyExitUnconfirmedError(key, pid);
+        };
+        quarantineSession(
+          key,
+          {
+            label: key,
+            pid,
+            sessionId,
+            cwd: record.agent.cwd,
+            isAlive: () => true,
+            dispose: unconfirmed,
+            confirmExit: unconfirmed,
+          } as unknown as PtyProcess,
+          ctx.quarantineReason,
+          record,
+        );
+        log.error(
+          `[bus-session] agent=${agent_id} reason=${ctx.logReason} session_id=${sessionId} pid=${pid} — ${ctx.failure}: the claude is not confirmed gone, so the session is quarantined and keeps its id`,
+        );
+        throw new Error(
+          `${ctx.failure} for agent ${agent_id}: the old claude (pid ${pid}) is not confirmed gone; session ${sessionId} stays quarantined and keeps its id`,
+        );
+      }
+      // Let stop()'s own bookkeeping land before a new process takes the registry slot.
+      await Promise.race([stopped, sleepMs(1000)]);
+      if (this.agents.get(agent_id) === record) {
+        // stop()'s own bookkeeping has not landed. When it does it finds this record gone and leaves
+        // the agent id alone (#595 r9), so the old process's tailer and MCP config are released here.
+        void record.tailer?.stop();
+        this.cleanupAgentMcpConfig(record.mcpConfigCwd, agent_id);
+        this.agents.delete(agent_id);
+      }
+    } finally {
+      liftFence(record);
+    }
+  }
+
+  /** Whether a retirement can be OS-confirmed for `record`: the ownership guard applies to it (#595 r9). */
+  private ownershipRetirementApplies(record: AgentRecord): boolean {
+    return (
+      this.options.ownershipStore !== undefined &&
+      ownershipGuardApplies(this.options.platform) &&
+      record.mode !== "tmux"
+    );
+  }
+
+  private async clearSessionInternal(agent_id: string): Promise<void> {
+    const record = this.agents.get(agent_id);
+    if (!record) throw new Error(`clear: no active agent for id=${agent_id}`);
+    if (record.mode === "tmux") {
+      throw new Error(
+        `clear: agent ${agent_id} runs under tmux, where its claude is not owned by the daemon and cannot be retired`,
+      );
+    }
+    const log = this.options.logger ?? console;
+    const { agent, origin } = record;
+    const oldId = agent.session_id;
+
+    await this.retireLive(agent_id, record, record.ownership, {
+      quarantineReason: "bus-clear-exit-unconfirmed",
+      logReason: "clear-retire-unconfirmed",
+      failure: "clear failed",
+    });
+
+    const fresh = randomUUID();
+    const persist =
+      this.options.persistRotatedSessionId ??
+      ((agentId: string, sessionId: string) => createSession(sessionId, agentId));
+    try {
+      await persist(agent_id, fresh);
+    } catch (err) {
+      log.error(
+        `[bus-session] agent=${agent_id} reason=clear-persist-failed session_id=${oldId} — the clear failed; the old session is restarted`,
+        err,
+      );
+      // The agent must not stay down for a failed write: bring the old session back, then fail.
+      await this.spawnAgentInternal(agent, origin, 0).catch((e) =>
+        log.error(`[bus-session] agent=${agent_id} reason=clear-restore-failed`, e),
+      );
+      throw new Error(`clear failed for agent ${agent_id}: the new session id could not be stored`);
+    }
+    agent.session_id = fresh;
+    // Spawn completion is not success (#595 r4): a replacement that exits during startup (auth
+    // failure, crash) leaves no agent. The spawn returns after its startup window, so a process that
+    // is not live and registered here did not survive it.
+    const replacement = await this.spawnAgentInternal(agent, origin, 0);
+    const live = this.agents.get(agent_id);
+    if (!live || live.proc !== replacement || live.proc._isExited()) {
+      log.error(
+        `[bus-session] agent=${agent_id} reason=clear-replacement-exited session_id=${fresh} — the clear failed: the replacement claude exited during startup; the agent is not running (old session ${oldId} was retired)`,
+      );
+      throw new ClearReplacementExitedError(agent_id, `new session ${fresh}`);
+    }
+    log.warn(
+      `[bus-session] agent=${agent_id} reason=session-cleared session_id=${oldId} — restarted on new session ${fresh} (the conversation of the old session is not carried over)`,
+    );
   }
 
   /**
@@ -833,6 +1202,12 @@ export class SessionManager {
     agent: AgentConfig,
     origin: BusOrigin,
     retry: number,
+    /**
+     * False for the start that follows a rotation in this same call: its id was minted a moment ago,
+     * so no record can name it, and running the guard again would rotate for ever on a store that
+     * cannot be read (#595 r10).
+     */
+    guard = true,
   ): Promise<AgentProcess> {
     if (this.agents.has(agent.id)) {
       throw new Error(`agent ${agent.id} is already spawned; call stop() or restart() first`);
@@ -850,7 +1225,66 @@ export class SessionManager {
     }
 
     const env = buildChildEnv(agent, busSock);
-    const args = this.options.argsOverride ?? buildClaudeArgs(agent, mode);
+    // #595: a stored session whose transcript exists is RESUMED. `--session-id` would create it
+    // again, and claude refuses that ("already in use"), which used to rotate the id and lose the
+    // conversation on every restart. The test seam (`argsOverride`) replaces the whole argv, so
+    // nothing is resumed there.
+    const transcriptExists = (): boolean =>
+      this.options.argsOverride === undefined &&
+      sessionTranscriptExists({
+        cwd: realCwd,
+        sessionId: agent.session_id,
+        env,
+        projectsDir: this.options.projectsDir,
+      });
+    let resume = transcriptExists();
+    // #595 r3: the CLI takes no lock on `--resume`, so a claude of ours that outlived the previous
+    // daemon would append to the same transcript as the one about to be resumed. The guard looks
+    // ONLY at the ownership record written when the bus spawned that claude, and signals only a
+    // process that record proves ours (previous boot, same start identity). Anything it cannot
+    // prove rotates to a fresh id instead (the conversation is lost, nothing is signalled).
+    // It runs whenever the guard applies, transcript or not (#595 r10): a claude that died before
+    // its first transcript line leaves a record and no transcript, and `--session-id` on the same id
+    // beside that orphan is the same two writers. A session with no record decides `no-record`.
+    // win32 has no guard and no record (`ownershipGuardApplies`): it keeps its pre-#595 behaviour.
+    if (guard && this.options.ownershipStore && ownershipGuardApplies(this.options.platform)) {
+      const decision = await decideResume({
+        agentId: agent.id,
+        sessionId: agent.session_id,
+        store: this.options.ownershipStore,
+        probe: this.options.processProbe ?? createSystemProbe(),
+        bootId: this.options.bootId,
+        deadlineMs: this.options.ownershipGuardMs,
+        termMs: this.options.ownershipTermMs,
+        killMs: this.options.ownershipTermMs,
+        logger: this.options.logger,
+      });
+      if (decision.kind === "refuse") {
+        (this.options.logger ?? console).warn(
+          `[bus-session] agent=${agent.id} reason=${decision.reason} cause=${decision.cause} session_id=${agent.session_id} — an earlier session's claude is not proved gone; not starting another beside it (its record is kept for the next boot)`,
+        );
+        throw new OtherSessionOwnerUnconfirmedError(agent.id, decision.cause);
+      }
+      if (decision.kind === "rotate") {
+        await this.rotateStoredSession(agent, decision.reason);
+        return this.spawnAgentInternal(agent, origin, retry, /* guard */ false);
+      }
+      if (decision.reason === "other-session-reaped") {
+        (this.options.logger ?? console).warn(
+          `[bus-session] agent=${agent.id} reason=other-session-orphan-reaped session_id=${agent.session_id} reaped_session_id=${decision.reapedSessionId} pid=${decision.reapedPid} — ended a claude this daemon spawned in an earlier boot for an older session of this agent before starting this one`,
+        );
+      }
+      if (decision.reason === "orphan-reaped") {
+        (this.options.logger ?? console).warn(
+          `[bus-session] agent=${agent.id} reason=resume-orphan-reaped session_id=${agent.session_id} pid=${decision.reapedPid} — ended a claude this daemon spawned in an earlier boot before starting its session again`,
+        );
+        // The orphan is confirmed gone; it may have written its first transcript line while the guard
+        // waited, so the flag is chosen on what is there NOW: `--resume` if it exists, else
+        // `--session-id` on the same id (#595 r10).
+        resume = transcriptExists();
+      }
+    }
+    const args = this.options.argsOverride ?? buildClaudeArgs(agent, mode, { resume });
 
     // Issue #165: synthesize the multiplexer `--mcp-config` for this agent
     // when the daemon has wired a synthesizer (active multiplexer) and the
@@ -906,6 +1340,11 @@ export class SessionManager {
       throw err;
     }
 
+    // #595 r4: the first statement after the process exists. Everything below until the write settles
+    // is synchronous, so the only gap in which a daemon death leaves an unrecorded claude is the
+    // identity read plus the write itself.
+    const recording = this.recordSpawnOwnership(agent, mode, proc);
+
     // Register the proc + attach the cleanup `onExit` BEFORE awaiting
     // the collision detector. Codex P1 on this PR: if the process exits
     // during the detection window for a non-collision reason (auth
@@ -916,6 +1355,12 @@ export class SessionManager {
     // correctness guard for the detector below, which may resolve inside
     // its own `onExit` call.) Registering after the await used to leave a
     // dead entry in `this.agents` that broke the next `already spawned` guard.
+    let settleRecorded!: AgentRecord["settleRecorded"];
+    const recorded = new Promise<void>((ok, fail) => {
+      settleRecorded = { ok, fail };
+    });
+    // A waiter reads the rejection; with none waiting it must not surface as an unhandled one.
+    recorded.catch(() => {});
     const record: AgentRecord = {
       agent,
       origin,
@@ -923,6 +1368,9 @@ export class SessionManager {
       proc,
       mcpConfigCwd,
       spawnedAt: Date.now(),
+      deliverable: false,
+      recorded,
+      settleRecorded,
     };
     // #402/#412: number this process's tailer generation and announce it to
     // the bus BEFORE the record goes live — from `agents.set` on, the bus's
@@ -940,6 +1388,12 @@ export class SessionManager {
       this.options.bus.noteSpawnedGeneration?.(agent.id, tailerGeneration);
     }
     this.agents.set(agent.id, record);
+    // #595 r3: the record that THIS daemon spawned this process, so a later start can prove ownership.
+    // The exit handler and a retirement read it as 'the record, or null': a failed write is handled
+    // below, not here.
+    record.ownership = recording.catch((err) =>
+      err instanceof OwnershipRecordError ? err.record : null,
+    );
     // The collision detector's verdict for this spawn, once it is armed below.
     // The exit log reads it so that "collision" is said by ONE judge (#326):
     // deciding from the screen tail at the instant of the exit mis-described a
@@ -970,18 +1424,23 @@ export class SessionManager {
             // armed (the exit replayed before it, or the window is 0).
             const collision = verdictPromise
               ? await verdictPromise
-              : tail !== undefined && SESSION_COLLISION_PATTERN.test(tail);
+              : tail !== undefined &&
+                (resume ? RESUME_NOT_FOUND_PATTERN : SESSION_COLLISION_PATTERN).test(tail);
+            const what = resume ? "resume refused (#595)" : "session-id collision";
             const verdict = collision
               ? retry === 0
-                ? " — session-id collision; the spawn is retried with a fresh id"
-                : " — session-id collision persisted after rotation"
+                ? ` — ${what}; the spawn is retried with a fresh id`
+                : ` — ${what} persisted after rotation`
               : uptimeMs < BOOT_FAILURE_WINDOW_MS
                 ? " — exited during boot; treat as a startup failure"
                 : "";
+            // A refused resume is named by its reason code; the screen adds nothing to it.
             const quoted =
-              tail === undefined
-                ? "    (no output captured in this supervision mode)"
-                : tail || "    (nothing was printed)";
+              collision && resume
+                ? "    (not quoted: the cause is the reason code above)"
+                : tail === undefined
+                  ? "    (no output captured in this supervision mode)"
+                  : tail || "    (nothing was printed)";
             (this.options.logger ?? console).warn(
               `[bus-session] agent=${agent.id} pid=${proc.pid} exited outside stop(): ` +
                 `code=${code} uptime=${(uptimeMs / 1000).toFixed(1)}s${verdict}. Last output:\n${quoted}`,
@@ -994,6 +1453,23 @@ export class SessionManager {
         // `stop()` has already fenced a record it is stopping; this is idempotent.
         this.fenceForRetirement(current);
         void this.retireOnOsWord(current, "bus-exit-unconfirmed");
+        // #595 r3: the exit event is not proof the OS process is gone (bun-pty fires it at once), so
+        // the ownership record is cleared only once the OS confirms; otherwise it stays for the
+        // next start to examine.
+        const ownershipStore = this.options.ownershipStore;
+        if (ownershipStore && current.ownership) {
+          const probe = this.options.processProbe ?? createSystemProbe();
+          void current.ownership.then((rec) =>
+            rec
+              ? confirmGoneAndClear({
+                  store: ownershipStore,
+                  probe,
+                  record: rec,
+                  logger: this.options.logger,
+                })
+              : undefined,
+          );
+        }
         // Issue #215: tear down the session tailer on natural exit too.
         void current.tailer?.stop();
         // Issue #165 (PR #184 re-review): a natural exit (crash, OOM,
@@ -1023,12 +1499,35 @@ export class SessionManager {
     const collisionWindow =
       this.options.sessionCollisionDetectMs ??
       (this.options.argsOverride !== undefined ? 0 : DEFAULT_COLLISION_DETECT_MS);
-    collisionVerdict = detectSessionIdCollision(proc, collisionWindow);
+    // A resumed spawn is judged on claude's resume refusal, a created one on the id collision.
+    collisionVerdict = detectSessionIdCollision(
+      proc,
+      collisionWindow,
+      COLLISION_EXIT_DRAIN_MS,
+      resume ? RESUME_NOT_FOUND_PATTERN : SESSION_COLLISION_PATTERN,
+    );
+    // #595 r4: a claude that could not be recorded must not keep running: after a daemon death the
+    // next boot would read 'no record' as 'nothing of ours' and resume beside it. End it, fail the spawn.
+    // Nothing is delivered to it until the record exists (`getAgent` hides it).
+    const recordFailure = await recording.then(
+      () => null,
+      (err: unknown) =>
+        err instanceof OwnershipRecordError ? err : new OwnershipRecordError("write", null, err),
+    );
+    if (recordFailure) {
+      // Held prompts fail now with their reason code; none is ever delivered to this process.
+      record.settleRecorded.fail(recordFailure);
+      await this.failUnrecordedSpawn(agent, record, recordFailure, mcpConfigCwd);
+    }
+    record.deliverable = true;
+    record.settleRecorded.ok();
     const collision = await collisionVerdict;
     if (collision && retry === 0) {
       const fresh = randomUUID();
+      // The reason is a fixed code: what claude printed is never copied into this line.
+      const reason = resume ? "resume-rejected-no-conversation" : "session-id-in-use";
       (this.options.logger ?? console).warn(
-        `[bus-session] agent=${agent.id} claude rejected session_id=${agent.session_id} as already in use — rotating to ${fresh} and respawning`,
+        `[bus-session] agent=${agent.id} reason=${reason} session_id=${agent.session_id} — rotating to ${fresh} and respawning (the conversation of the old session is not carried over)`,
       );
       // The public option takes `(agentId, sessionId)` for readability;
       // the legacy `createSession` storage layer takes them reversed.
@@ -1124,6 +1623,67 @@ export class SessionManager {
     }
 
     return proc;
+  }
+
+  /**
+   * Write the ownership record for a just-spawned process (#595 r3). Resolves null when there is
+   * nothing to record (no store, tmux, win32, the process already gone); REJECTS with `OwnershipRecordError`
+   * when the process is alive and could not be recorded (#595 r4), which fails the spawn. tmux is not
+   * recorded: the pid is a client that exits at once while the claude lives on in the tmux server.
+   */
+  private recordSpawnOwnership(
+    agent: AgentConfig,
+    mode: SupervisionMode,
+    proc: AgentProcess,
+  ): Promise<OwnershipRecord | null> {
+    const store = this.options.ownershipStore;
+    if (
+      !store ||
+      mode === "tmux" ||
+      !(proc.pid > 0) ||
+      !ownershipGuardApplies(this.options.platform)
+    )
+      return Promise.resolve(null);
+    return recordOwnership({
+      store,
+      probe: this.options.processProbe ?? createSystemProbe(),
+      agentId: agent.id,
+      sessionId: agent.session_id,
+      pid: proc.pid,
+      exe: basename(this.options.commandOverride ?? claudeExecutable()),
+      bootId: this.options.bootId,
+      timeoutMs: this.options.ownershipRecordMs,
+    });
+  }
+
+  /**
+   * The spawned claude could not be recorded: log ONE line (a reason code and the errno, never screen
+   * text), end the process through the shared retirement (so #562's fence and quarantine apply), and
+   * throw. Never returns.
+   */
+  private async failUnrecordedSpawn(
+    agent: AgentConfig,
+    record: AgentRecord,
+    failure: OwnershipRecordError,
+    mcpConfigCwd: string | undefined,
+  ): Promise<never> {
+    const cause = failure.cause as { code?: unknown; name?: unknown } | undefined;
+    const detail = String(cause?.code ?? cause?.name ?? "unknown");
+    (this.options.logger ?? console).error(
+      `[bus-session] agent=${agent.id} reason=${failure.code} stage=${failure.stage} cause=${detail} session_id=${agent.session_id} pid=${record.proc.pid} — the spawned claude could not be recorded; it is ended and the spawn fails`,
+    );
+    let retired = true;
+    try {
+      await this.retireLive(agent.id, record, failure.record, {
+        quarantineReason: "bus-spawn-unrecorded-exit-unconfirmed",
+        logReason: "spawn-retire-unconfirmed",
+        failure: "spawn failed",
+      });
+    } catch {
+      retired = false;
+    }
+    this.cleanupAgentMcpConfig(mcpConfigCwd, agent.id);
+    throw new SpawnUnrecordedError(agent.id, failure.stage, retired);
   }
 
   private async spawnPty(
@@ -1460,9 +2020,11 @@ export class SessionManager {
     const inflight = this.restartInFlight.get(agent_id);
     if (inflight) return inflight;
 
-    const p = this.restartInternal(agent_id, opts).finally(() => {
-      this.restartInFlight.delete(agent_id);
-    });
+    const p = this.enqueueLifecycle(agent_id, () => this.restartInternal(agent_id, opts)).finally(
+      () => {
+        this.restartInFlight.delete(agent_id);
+      },
+    );
     this.restartInFlight.set(agent_id, p);
     return p;
   }
@@ -1553,7 +2115,20 @@ export class SessionManager {
       log.warn(`[bus-session] agent=${agent_id} post-mortem capture failed`, err);
     }
 
-    await this.stop(agent_id);
+    if (opts.freshSession === false && this.ownershipRetirementApplies(record)) {
+      // The id is kept, so the old claude must be gone before the resume decision reads its record.
+      // `stop()` resolves on the wrapper's exit event, which is not proof the OS process ended (#562):
+      // a still-visible old pid reads as `current-boot-owner-alive` and would rotate a session the
+      // caller asked to preserve. Retire it as `/clear` does: OS-confirmed, quarantined if it will not
+      // go (#595 r9).
+      await this.retireLive(agent_id, record, record.ownership, {
+        quarantineReason: "bus-restart-exit-unconfirmed",
+        logReason: "restart-retire-unconfirmed",
+        failure: "restart failed",
+      });
+    } else {
+      await this.stop(agent_id);
+    }
 
     // Persist succeeded — adopt the fresh id on the live record now that the
     // old process is gone (so the respawn boots against the new session).
@@ -1569,7 +2144,8 @@ export class SessionManager {
       this.restartHistory.set(agent_id, history);
     }
 
-    return this.spawnAgent(agent, origin);
+    // Already inside the lifecycle queue: the internal spawn, never the queued public one.
+    return this.spawnAgentInternal(agent, origin, 0);
   }
 
   /**
@@ -1599,7 +2175,18 @@ export class SessionManager {
    * Adding a small accessor keeps the spawn lifecycle untouched.
    */
   getAgent(agent_id: string): AgentProcess | undefined {
-    return this.agents.get(agent_id)?.proc;
+    const record = this.agents.get(agent_id);
+    return record?.deliverable === false ? undefined : record?.proc;
+  }
+
+  /**
+   * Non-null while `agent_id`'s claude is spawned but its ownership record is not yet written
+   * (#595 r5): a state of its own, distinct from 'no such agent'. The promise resolves when the
+   * agent becomes deliverable and rejects if it could not be recorded. The bus holds prompts on it.
+   */
+  recordingPending(agent_id: string): Promise<void> | null {
+    const record = this.agents.get(agent_id);
+    return record && !record.deliverable ? record.recorded : null;
   }
 
   /** Test helper: list spawned agent_ids. Not part of the public spec. */
