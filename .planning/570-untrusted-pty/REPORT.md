@@ -2316,3 +2316,70 @@ The one full-suite fail is `session-manager.test.ts` "send_prompt_stream types t
 - Codex re-review of this delta (headless `codex exec`, Terry 26 Oct) and `/code-review:code-review` on the final head.
 - The CI integration workflow on the new head, and the candidate MCP soak.
 - Linux-only paths ran only through their fakes on this macOS host.
+
+## cp10: Codex re-review of 726f27c8 (H2 still open, H5 new); option B strict
+
+Commit on `feat/570-shared-pty`: `9569dd42`. Codex (headless `codex exec`, default seat, 26 Oct) re-reviewed `b1f36287..726f27c8`: **2 HIGH**. M2 and CI1 CLOSED; H1, H3, H4, M1, M3, L1 and L2 stay CLOSED. Report: `.claude/handoffs/581-artifacts/codex-581-rereview-cp9.md` (main checkout), probes and logs in `rev581c/`. Both HIGHs were confirmed in the source before any change. Version stays 2.2.358.
+
+### Ruling: option B, strict (Terry, 26 Oct)
+
+Codex also found that the cp9 invariant "no member look once retirement begins" did not hold: both exit callbacks and both adapters' retirement-start snapshots still called the acquisition. Of two options (keep exit-time vouching behind the H2 recheck, or remove every look at the exit and inside a retirement) Terry chose the second. Members are now learned only while the leader is alive and no retirement has begun: runner spawn hand-over, turn start and clean turn end; bus before each prompt or slash command, and before a stop's graceful quit (`session-manager.ts:1293`, now `noteLiveGroup`). Trade-off accepted: a member that first appears after the last such look, and survives a SIGTERM that ends the leader, has nothing to vouch for it, so it is withheld (trusted: observed and counted; untrusted: quarantined), never signalled.
+
+### Fix sites and RED lines
+
+**H2. A leader check before the listing vouched for what the listing found**
+- Fix: `noteGroupMembers` learns only while the leader reads `"same"` both before (`src/runner/pty-group-kill.ts:576`) and after (`:594`) the listing; the absent-leader case (b) is gone. The retirement's group-id refresh is kept only if the leader is still `"same"` after the read (`:686`). Inside a retirement a listing only narrows the members known (`stillPresent`, `:655`, used at `:674` and `:747`), never adds one.
+- RED on 726f27c8: `expect(noted.members).toEqual([])` received `[{"identity":"foreign","pid":424243}]`; the retirement that follows received `[[-424242,"SIGTERM"],[-424242,"SIGKILL"]]`; the initial-retirement race received the same two signals.
+
+**Option B, strict. No look at the exit or inside a retirement**
+- Fix: removed from the runner exit callback (`src/runner/pty-process.ts:1282`), the runner retirement start (`:1643`), the bus exit callback (`src/bus/session-agent-process.ts:578`) and the bus retirement start (`:1511`). `snapshotGroupMembers` is private behind `noteLiveGroup`; the runner's `_retireDeadlineAt`, which only the removed looks read, is gone.
+- RED on 726f27c8: bus and runner `listedInKill` / `listedInRetirement` `Expected: 0, Received: 1`.
+
+**H5. The runner's native kill accepted an unreadable identity**
+- Fix: `this._pidState(this._pid) === "same"` (`src/runner/pty-process.ts:1660`); unknown, gone and replaced all withhold bun-pty's kill, as the bus already did (`nativeKillAuthorised`).
+- RED on 726f27c8: `expect(h.kills).toEqual([])` received `["SIGTERM"]`.
+
+### Regression tests
+
+New `src/__tests__/pty-cp10-regressions.test.ts`, built from Codex's `cp9-boundaries.test.ts` probes and asserting the fixed outcome. On a `git archive 726f27c8` copy: **1 pass / 6 fail**, the pass being the positive control (a leader read as the recorded process is still killed through bun-pty). On the head: **7 pass**. The second assertion of the first test was observed red on its own as well (first assertion removed in a base copy): `[-424242 SIGTERM, SIGKILL]`.
+
+Codex's initial-retirement probe had to be re-staged: with no listing at the retirement's start its leader never vanished, so the head signalled a leader that was still the recorded process, which is correct. The test now makes the leader vanish during the group-id read the retirement still makes.
+
+One-site injections in a scratch copy of the working tree (`inject10.sh`; pristine `src` restored and diffed identical after each):
+
+| Injection | Result |
+|---|---|
+| I1 drop the recheck after the listing (`pty-group-kill.ts:594`) | 5 pass / 1 fail: `noteGroupMembers learns nothing from a listing the leader did not outlive` |
+| I2 put the retirement-start member learning back | 5 / 1: `a retirement learns no member, so a listing made in it cannot vouch for a foreign group` |
+| I3 put the bus exit-callback look back | 5 / 1: `bus: the native exit callback fired by the retirement's kill lists nothing` |
+| I4 put the runner retirement-start look back | 5 / 1: `runner: neither the retirement nor the exit callback it fires lists the group` |
+| I5 runner native kill back to `!== "replaced"` | 5 / 1: `an identity that cannot be read now withholds bun-pty's kill` |
+| I6 put the runner exit-callback look back | first GREEN (7/7): in that fixture the pid already answered ESRCH inside the callback, so the strict `noteGroupMembers` refused anyway. Added a test where bun-pty fires the callback from `kill()` while the leader still lives; then 6 / 1: `runner: an exit callback bun-pty fires from kill() while the leader still lives lists nothing` |
+
+### Tests changed, and why
+
+- `pty-proc-identity` noteGroupMembers: the cp9 "learns from an absent leader while a known member is in the group" case now asserts nothing is learned; new case: ours before the listing, a stranger's after it, learns nothing.
+- `pty-group-retire-primitive`: "members of a group that stays" now carries only the members known before the retirement, and an initial retirement of a live leader learns none.
+- `pty-group-kill` "checks again before the SIGKILL": the fixture's identity reads are ours for 3 reads, not 2, because the group-id refresh now reads the identity before and after.
+- `pty-cp8-regressions` M3: the leader exists with its recorded identity until the native kill (was ESRCH throughout), because H5 allows that kill only on a positive match.
+- `bus pty-agent-retire`: `snapshotGroupMembers()` is private; the tests call `noteLiveGroup()`, what `SessionManager.stop()` now calls.
+
+### Gates
+
+All on `git archive 9569dd42` (node_modules symlinked), `env -u ANTHROPIC_BASE_URL bun test`, output to file.
+
+| Gate | Result |
+|---|---|
+| 51 files: `src/runner/pty-*`, `src/__tests__/pty-*`, `src/bus/__tests__/pty-*`, `src/oneshot/pty-*`, `src/bus/__tests__/session-manager*` (working tree, pre-commit) | 1272 pass, 4 skip, 0 fail |
+| Full `bun test src` | 5598 pass, 9 skip, 3 fail |
+| `bun run lint` | exit 0, 0 errors (1437 warnings, 323 infos, same as base) |
+| `bun run typecheck` (ratchet) | 149, baseline 149 |
+| Version | 2.2.358 |
+
+The three full-suite fails were `session-manager.test.ts` "send_prompt_stream types the prompt into the pty" (the known 7.3 s load flake), and `jsonl-tailer.test.ts` "picks up new bytes appended after start()" and "a sidechain prompt does not become the prompt the next boundary belongs to". cp10 touches none of those files. Rerun alone, the two files once failed on the head copy and passed on a differently built base copy; rebuilt identically (`git archive` plus symlinked node_modules) and run twice each, **both head and base pass 104/104 both times**. Load-timing flakes, not cp10.
+
+### Not done here
+
+- Codex re-review of `726f27c8..9569dd42` and `/code-review:code-review` on the final head.
+- The CI integration workflow on the new head, and the candidate MCP soak.
+- Linux-only paths ran only through their fakes on this macOS host.
