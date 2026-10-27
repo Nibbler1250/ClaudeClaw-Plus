@@ -122,7 +122,8 @@ type ProcPidInfo = (
   buf: Uint8Array,
   size: number,
 ) => number;
-type ProcListPids = (
+/** `proc_listpids(type, typeinfo, buf, size)`: the bytes written, 0 on failure. A test seam too. */
+export type ProcListPids = (
   type: number,
   typeinfo: number,
   buf: Uint8Array | null,
@@ -249,18 +250,22 @@ export function libprocStartTime(pid: number): StartTime | null {
 /**
  * The pids of process group `pgid`, zombies included, or null when they cannot be listed (never
  * throws). A buffer the kernel filled to the brim may have been cut short, so it is grown and the
- * call repeated; still full after that, the answer is null rather than a partial list.
+ * call repeated; still full after that, the answer is null rather than a partial list. libproc's
+ * wrapper turns a failed call into 0, not -1 (xnu `libsyscall/wrappers/libproc/libproc.c`), so 0
+ * cannot be told from an empty group and is null too, as is a byte count that is not whole pids.
  */
-export function libprocGroupPids(pgid: number): number[] | null {
+export function libprocGroupPids(pgid: number, listpids?: ProcListPids): number[] | null {
   if (process.platform !== "darwin" || !Number.isInteger(pgid) || pgid <= 1) return null;
-  const call = load();
+  const call = listpids ? { listpids } : load();
   if (!call) return null;
   try {
-    let slots = Math.max(64, Math.ceil(call.listpids(PROC_PGRP_ONLY, pgid, null, 0) / 4) + 16);
+    const hint = call.listpids(PROC_PGRP_ONLY, pgid, null, 0);
+    if (!(hint > 0)) return null; // failed, or nothing to list: either way not a listing
+    let slots = Math.max(64, Math.ceil(hint / 4) + 16);
     for (let attempt = 0; attempt < 3; attempt++, slots *= 4) {
       const buf = new Uint8Array(slots * 4);
       const bytes = call.listpids(PROC_PGRP_ONLY, pgid, buf, buf.byteLength);
-      if (bytes < 0) return null;
+      if (!(bytes > 0) || bytes % 4 !== 0) return null;
       if (bytes < buf.byteLength) {
         const view = new DataView(buf.buffer, 0, bytes);
         const pids: number[] = [];

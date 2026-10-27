@@ -66,7 +66,7 @@ function defaultBsdInfo(pid: number): BsdInfo | null {
   if (!warnedNoLibproc && !libprocAvailable()) {
     warnedNoLibproc = true;
     console.warn(
-      "[pty-proc-identity] libproc is unavailable: no process identity can be read on this platform, so no claude will be signalled",
+      "[pty-proc-identity] libproc is unavailable: no process identity can be read on this platform, so nothing is signalled on identity evidence",
     );
   }
   return libprocBsdInfo(pid);
@@ -78,6 +78,9 @@ function darwinIdentity(start: StartTime): string {
 }
 
 const DARWIN_IDENTITY = /^(\d+)\.(\d{6})$/;
+
+/** An older daemon's macOS identity: `ps -o lstart=` in the C locale, e.g. `Tue Oct 27 13:05:35 2026`. */
+const LSTART_IDENTITY = /^[A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]?\d \d\d:\d\d:\d\d \d{4}$/;
 
 /** One macOS reading of a pid: who it is, its group, and whether it is a zombie. */
 interface DarwinReading {
@@ -322,17 +325,24 @@ export function compareIdentity(
   platform: string = process.platform,
 ): StartMatch {
   if (now === null || recorded === null) return "unknown";
-  if (now === recorded) return "same";
-  if (platform === "linux" || platform === "win32") return "different";
-  const seconds = (identity: string): { sec: number; precise: boolean } | null => {
-    const m = DARWIN_IDENTITY.exec(identity);
-    if (m) return { sec: Number(m[1]), precise: true };
+  if (platform === "linux" || platform === "win32") return now === recorded ? "same" : "different";
+  // An older daemon's identity is `ps lstart` text: second-precise. Anything else (libproc's
+  // `<sec>.<usec>`, or an opaque value a test stands in with) is compared exactly.
+  const legacySec = (identity: string): number | null => {
+    if (!LSTART_IDENTITY.test(identity)) return null;
     const ms = Date.parse(identity);
-    return Number.isNaN(ms) ? null : { sec: ms / 1000, precise: false };
+    return Number.isNaN(ms) ? null : ms / 1000;
   };
-  const a = seconds(now);
-  const b = seconds(recorded);
-  if (a && b && a.precise !== b.precise && a.sec === b.sec) return "unknown";
+  const secOf = (identity: string): number | null => {
+    const m = DARWIN_IDENTITY.exec(identity);
+    return m ? Number(m[1]) : legacySec(identity);
+  };
+  const legacy = legacySec(now) !== null || legacySec(recorded) !== null;
+  if (!legacy) return now === recorded ? "same" : "different";
+  // A second-precise side matching to the second, equal text included, cannot tell (#581 review, M1).
+  const a = secOf(now);
+  const b = secOf(recorded);
+  if (now === recorded || (a !== null && a === b)) return "unknown";
   return "different";
 }
 
@@ -350,10 +360,14 @@ export function compareStartMs(
   platform: string = process.platform,
 ): StartMatch {
   if (now === null || recorded === null) return "unknown";
-  if (now === recorded) return "same";
-  if (platform === "linux" || platform === "win32") return "different";
+  if (platform === "linux" || platform === "win32") return now === recorded ? "same" : "different";
   const second = (ms: number): number => Math.floor(ms / 1000) * 1000;
   const wholeSecond = (ms: number): boolean => ms % 1000 === 0;
+  // Equal values are the same process. An older daemon's whole-second record equal to a reading
+  // that is exactly on the second (one in a million) reads so too: every caller of this numeric
+  // form only keeps or reports on `same` (held processes, owners, groupGoneNow) or compares
+  // values read in one run (the escape scan); none signals on a persisted value (#581 review, M1).
+  if (now === recorded) return "same";
   if ((wholeSecond(recorded) || wholeSecond(now)) && second(now) === second(recorded))
     return "unknown";
   return "different";

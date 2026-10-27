@@ -3,7 +3,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { BsdInfo, KinfoProc } from "./libproc.js";
+import { type BsdInfo, type KinfoProc, libprocGroupPids } from "./libproc.js";
 import {
   compareIdentity,
   compareStartMs,
@@ -468,6 +468,27 @@ describe("readPidSnapshot and readGroupMembers (#581 cp8)", () => {
     expect(reading.members.length).toBeLessThan(130);
   });
 
+  it.skipIf(process.platform !== "darwin")(
+    "libproc: a failed listing (0, libproc's error value) or a byte count that is not whole pids is no listing (#581 review, M2)",
+    () => {
+      const pids = new Int32Array([4242, 4243]);
+      // The sizing call (no buffer) answers `hint`; the listing call answers `bytes`.
+      const answer =
+        (bytes: number, hint = 8) =>
+        (_type: number, _pgid: number, buf: Uint8Array | null, _size: number): number => {
+          if (!buf) return hint;
+          buf.set(new Uint8Array(pids.buffer).subarray(0, Math.min(bytes, 8)));
+          return bytes;
+        };
+      // Fault (site: the listing's `!(bytes > 0)` back to `bytes < 0`): 0 lists [], a complete
+      // empty group, and a retirement drops the members it knew.
+      expect(libprocGroupPids(4242, answer(0))).toBeNull();
+      expect(libprocGroupPids(4242, answer(8, 0))).toBeNull(); // the sizing call failed
+      expect(libprocGroupPids(4242, answer(5))).toBeNull();
+      expect(libprocGroupPids(4242, answer(8))).toEqual([4242, 4243]);
+    },
+  );
+
   describe("macOS (libproc)", () => {
     const SEC = 1_793_106_335;
     // The group's pids as libproc lists them, what libproc reads of each, and (for the pids it
@@ -606,10 +627,21 @@ describe("compareIdentity / compareStartMs", () => {
       expect(compareIdentity("1793106335.845980", "1793106335.845980", platform)).toBe("same");
       expect(compareIdentity(null, "1793106335.845980", platform)).toBe("unknown");
       expect(compareIdentity("1793106335.845980", null, platform)).toBe("unknown");
-      expect(compareStartMs(10_000, 10_000, platform)).toBe("same");
+      expect(compareStartMs(1_793_106_335_845.98, 1_793_106_335_845.98, platform)).toBe("same");
       expect(compareStartMs(null, 10_000, platform)).toBe("unknown");
       expect(compareStartMs(10_000, null, platform)).toBe("unknown");
     }
+    expect(compareStartMs(10_000, 10_000, "linux")).toBe("same");
+  });
+
+  it("macOS: `lstart` text equal to the reading is unknown, never the same (#581 review, M1)", () => {
+    // Fault (site: the equality checked before the precision rule): "same", so an older daemon's
+    // record would vouch for a process born later in that second.
+    const lstart = "Tue Oct 27 13:05:35 2026";
+    expect(compareIdentity(lstart, lstart, "darwin")).toBe("unknown");
+    // Opaque values (no `lstart` shape) compare exactly, as two libproc readings do.
+    expect(compareIdentity("boot-1", "boot-1", "darwin")).toBe("same");
+    expect(compareIdentity("boot-1", "boot-2", "darwin")).toBe("different");
   });
 
   it("macOS: libproc's reading against an older daemon's `lstart` text of the same second is unknown", () => {

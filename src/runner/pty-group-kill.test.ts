@@ -122,6 +122,50 @@ describe("retireProcessGroup over a fake kernel", () => {
     expect(k.calls.some(([, n]) => n === "SIGTERM" || n === "SIGKILL")).toBe(false);
   });
 
+  it("a member recorded by an older macOS daemon is kept as evidence, never as authority (#581 review, M3)", async () => {
+    // The leader is gone; the member a survivor record carries is `ps lstart` text, and the
+    // complete listing shows that pid with libproc's identity in the same second. That cannot
+    // say it is another process, so the member is kept for the next retry; nor can it vouch for
+    // the group, so nothing is signalled.
+    const legacy = "Tue Oct 27 13:05:35 2026";
+    const precise = `${Date.parse(legacy) / 1000}.845980`;
+    const signals: Array<[number, NodeJS.Signals | 0]> = [];
+    const signal: SignalFn = (target, name) => {
+      if (target === PID) throw errno("ESRCH");
+      signals.push([target, name]);
+    };
+    let t = 0;
+    const out = await withPlatformAsync("darwin", () =>
+      retireProcessGroup({
+        pid: PID,
+        identity: legacy,
+        groupId: PID,
+        daemonGroupId: DAEMON_GROUP,
+        members: [{ pid: PID + 1, identity: legacy }],
+        readIdentity: () => null,
+        readGroupId: () => PID,
+        readMembers: () => ({ members: [{ pid: PID + 1, identity: precise }], complete: true }),
+        signal,
+        liveMembers: () => undefined,
+        describe: () => ({ count: 1, comm: ["sleep"] }),
+        initial: false,
+        allowUnrecordedInitial: false,
+        sendTerm: true,
+        deadlineAt: 1000,
+        termGraceMs: 10,
+        pollMs: 10,
+        now: () => t,
+        sleep: async (ms) => {
+          t += ms;
+        },
+      }),
+    );
+    expect(out.groupGone).toBe(false);
+    // Fault (site: `unresolved` in retireProcessGroup returns nothing): members is [].
+    expect(out.members).toEqual([{ pid: PID + 1, identity: legacy }]);
+    expect(signals.some(([, n]) => n === "SIGTERM" || n === "SIGKILL")).toBe(false);
+  });
+
   it("counts an unreaped zombie as gone where /proc can tell, and not otherwise", () => {
     const zombie: SignalFn = () => {}; // kill(.., 0) succeeds for a zombie
     // Went red (false) with the /proc answer ignored.

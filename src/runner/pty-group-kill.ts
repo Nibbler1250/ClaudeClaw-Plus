@@ -646,6 +646,15 @@ export async function retireProcessGroup(input: RetireGroupInput): Promise<Retir
   let known: GroupMember[] = [...input.members];
   const stillPresent = (fresh: readonly GroupMember[]): GroupMember[] =>
     known.filter((k) => fresh.some((f) => sameMember(k, f)));
+  // Kept as evidence, never as authority: a member the listing shows at the same pid with an
+  // identity that cannot be compared (an older daemon's second-precise record matching to the
+  // second, #581 review M3). Only `stillPresent` (an exact match) vouches for a signal.
+  const unresolved = (fresh: readonly GroupMember[]): GroupMember[] =>
+    known.filter(
+      (k) =>
+        !fresh.some((f) => sameMember(k, f)) &&
+        fresh.some((f) => f.pid === k.pid && compareIdentity(f.identity, k.identity) === "unknown"),
+    );
   const read = (): { members: GroupMember[]; complete: boolean } | null => {
     if (!isolated() || left() <= 0) return null; // no group to list, or no time to list it
     const reading = readMembers(pid, input.deadlineAt);
@@ -665,7 +674,7 @@ export async function retireProcessGroup(input: RetireGroupInput): Promise<Retir
       if (fresh === null) return false;
       const present = stillPresent(fresh);
       if (present.length === 0) return false;
-      known = present;
+      known = [...present, ...unresolved(fresh)];
       return true;
     },
   });
@@ -736,9 +745,10 @@ export async function retireProcessGroup(input: RetireGroupInput): Promise<Retir
     const { members: fresh, complete } = taken.fresh;
     // A complete listing that shows none of the members known is positive absence: nothing
     // vouches for what is there. An incomplete one cannot say, so the evidence is kept.
+    // A member that cannot be compared is not shown absent, so it is carried either way.
     const present = stillPresent(fresh);
-    if (present.length > 0) carried = present;
-    else if (complete) carried = [];
+    if (present.length > 0) carried = [...present, ...unresolved(fresh)];
+    else if (complete) carried = unresolved(fresh);
   }
   const described = taken?.described ?? { count: undefined, comm: [] };
   const reason: GroupReason = probe.eperm
