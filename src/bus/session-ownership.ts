@@ -38,6 +38,14 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { getAgentsDir } from "../config";
+import {
+  BSDINFO_OFFSETS,
+  decodeBsdInfoStart,
+  libprocStartTime,
+  PROC_BSDINFO_SIZE,
+  PROC_PIDTBSDINFO,
+  type StartTime,
+} from "../runner/libproc";
 
 /**
  * Whether the ownership guard applies on this platform (#595 r5). It reads POSIX process state
@@ -348,93 +356,15 @@ const PS_ROW = /^\s*(\S+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}
 
 /* ── macOS: sub-second birth time through libproc ───────────────────────── */
 
-/**
- * `proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof info)` fills a `struct proc_bsdinfo`.
- * Source: the macOS SDK header `<sys/proc_info.h>` (checked against MacOSX26.5.sdk): `PROC_PIDTBSDINFO`
- * is 3, `PROC_PIDTBSDINFO_SIZE` is `sizeof(struct proc_bsdinfo)` = 136. Layout (little-endian; arm64 and
- * x86_64 agree): twelve 4-byte fields `pbi_flags`..`rfu_1` (0..47, so `pbi_status` is at 4, `pbi_pid` at
- * 12, `pbi_uid` at 20), `pbi_comm[16]` (48), `pbi_name[32]` (64), seven 4-byte fields `pbi_nfiles`..
- * `pbi_nice` (96..119), then the two `uint64_t` fields `pbi_start_tvsec` (120) and `pbi_start_tvusec`
- * (128), which sit on their natural 8-byte alignment with no padding.
- */
-export const PROC_PIDTBSDINFO = 3;
-export const PROC_BSDINFO_SIZE = 136;
-export const BSDINFO_OFFSETS = { pid: 12, startSec: 120, startUsec: 128 } as const;
-
-export interface StartTime {
-  sec: number;
-  usec: number;
-}
-
-/** Decode `pbi_start_tvsec` / `pbi_start_tvusec` from a `proc_bsdinfo` buffer; null if it is not `pid`'s. */
-export function decodeBsdInfoStart(buf: Uint8Array, pid: number): StartTime | null {
-  if (buf.byteLength < PROC_BSDINFO_SIZE) return null;
-  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  if (view.getUint32(BSDINFO_OFFSETS.pid, true) !== pid) return null;
-  const sec = Number(view.getBigUint64(BSDINFO_OFFSETS.startSec, true));
-  const usec = Number(view.getBigUint64(BSDINFO_OFFSETS.startUsec, true));
-  if (!Number.isSafeInteger(sec) || sec <= 0 || !(usec >= 0 && usec < 1_000_000)) return null;
-  return { sec, usec };
-}
-
-type ProcPidInfo = (
-  pid: number,
-  flavor: number,
-  arg: bigint,
-  buf: Uint8Array,
-  size: number,
-) => number;
-let procPidInfo: ProcPidInfo | null | undefined;
-
-/** `proc_pidinfo` from libSystem through `bun:ffi` (built in; loaded lazily like runner.ts does). */
-function loadProcPidInfo(): ProcPidInfo | null {
-  if (procPidInfo !== undefined) return procPidInfo;
-  procPidInfo = null;
-  try {
-    const ffi = require("bun:ffi") as {
-      // biome-ignore lint/suspicious/noExplicitAny: bun:ffi is untyped under tsc
-      dlopen: (name: string, symbols: Record<string, unknown>) => { symbols: any };
-      FFIType: Record<string, number>;
-    };
-    for (const name of ["libSystem.B.dylib", "/usr/lib/libSystem.B.dylib"]) {
-      try {
-        const lib = ffi.dlopen(name, {
-          proc_pidinfo: {
-            args: [
-              ffi.FFIType.i32,
-              ffi.FFIType.i32,
-              ffi.FFIType.u64,
-              ffi.FFIType.ptr,
-              ffi.FFIType.i32,
-            ],
-            returns: ffi.FFIType.i32,
-          },
-        });
-        procPidInfo = lib.symbols.proc_pidinfo as ProcPidInfo;
-        break;
-      } catch {
-        // try the next name
-      }
-    }
-  } catch {
-    // no bun:ffi (not Bun): the caller falls back to second precision
-  }
-  return procPidInfo;
-}
-
-/** The microsecond start time of `pid` from libproc, or null when it cannot be had (never throws). */
-export function libprocStartTime(pid: number): StartTime | null {
-  if (process.platform !== "darwin") return null;
-  const call = loadProcPidInfo();
-  if (!call) return null;
-  try {
-    const buf = new Uint8Array(PROC_BSDINFO_SIZE);
-    if (call(pid, PROC_PIDTBSDINFO, 0n, buf, PROC_BSDINFO_SIZE) !== PROC_BSDINFO_SIZE) return null;
-    return decodeBsdInfoStart(buf, pid);
-  } catch {
-    return null;
-  }
-}
+// The libproc reader is shared with the PTY layer (#581): one way to ask macOS who a pid is.
+export {
+  BSDINFO_OFFSETS,
+  decodeBsdInfoStart,
+  libprocStartTime,
+  PROC_BSDINFO_SIZE,
+  PROC_PIDTBSDINFO,
+  type StartTime,
+};
 
 /**
  * `<lstart>` or `<lstart>+<usec>`. libproc's answer is used only when it agrees with `ps` on the

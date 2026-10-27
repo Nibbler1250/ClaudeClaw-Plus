@@ -22,7 +22,12 @@
 
 import { readFileSync, readdirSync, readlinkSync, statSync } from "node:fs";
 import { isSignalablePid } from "./pty-group-kill.js";
-import { type StartMsReader, sameStart, procStartMs, processStartMs } from "./pty-proc-identity.js";
+import {
+  type StartMsReader,
+  compareStartMs,
+  procStartMs,
+  processStartMs,
+} from "./pty-proc-identity.js";
 
 export interface EscapeScanTarget {
   /** The throwaway `CLAUDE_CONFIG_DIR`. Null: look only at working directories. */
@@ -268,7 +273,7 @@ export async function terminateEscapees(
   const sameProcess = (pid: number): boolean => {
     const then = born.get(pid) ?? null;
     const now = startMs(pid);
-    return then !== null && now !== null && sameStart(now, then);
+    return compareStartMs(now, then) === "same";
   };
   const send = (name: NodeJS.Signals): void => {
     if (expired()) return; // past the deadline there is no more scanning or signalling

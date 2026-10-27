@@ -32,10 +32,10 @@ import {
   type GroupMember,
   type StartMsReader,
   cachedStartMs,
+  compareStartMs,
   currentBootId,
   processStartMs,
   recordedOnAnotherBoot,
-  sameStart,
 } from "../runner/pty-proc-identity.js";
 
 export { processStartMs };
@@ -543,9 +543,9 @@ export function heldProcAlive(
     if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
     // EPERM: it exists, and is not ours to signal; fall through to the identity check
   }
-  const now = (deps.startMs ?? processStartMs)(proc.pid);
-  if (proc.startMs === null || now === null) return true; // cannot tell: assume it is the same
-  return sameStart(now, proc.startMs);
+  // Cannot tell (a missing reading, or an older daemon's second-precise record matching to the
+  // second): assume it is the same.
+  return compareStartMs((deps.startMs ?? processStartMs)(proc.pid), proc.startMs) !== "different";
 }
 
 let heldAliveDefault: (proc: HeldProc) => boolean = (proc) => heldProcAlive(proc);
@@ -822,9 +822,9 @@ export function isOwnerDead(
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "ESRCH";
   }
-  const now = (deps.startMs ?? processStartMs)(owner.pid);
-  if (owner.startMs === null || now === null) return false; // cannot tell: assume it is the owner
-  return !sameStart(now, owner.startMs);
+  // Cannot tell (a missing reading, or an older daemon's second-precise record matching to the
+  // second): assume it is the owner.
+  return compareStartMs((deps.startMs ?? processStartMs)(owner.pid), owner.startMs) === "different";
 }
 
 /** Create the per-call temp cwd (mode 0700, owner file inside). Removed again on error. */
@@ -916,7 +916,7 @@ export interface SweepDeps {
   /** Replaces `process.getuid()`. */
   uid?: number;
   isOwnerDead?: (owner: OwnerRecord) => boolean;
-  /** Replaces `ps` for the owners' start times; asked once per pid per pass. */
+  /** Replaces the OS read of the owners' start times; asked once per pid per pass. */
   startMs?: StartMsReader;
   /** Replaces the check of a recorded survivor's group (with identity). True: it is gone. */
   groupGone?: (survivor: { pid: number; startMs: number | null }) => boolean;
@@ -1064,7 +1064,7 @@ export function sweepStaleOneShotDirs(
   deps: SweepDeps = {},
 ): number {
   const uid = deps.uid ?? process.getuid?.();
-  // One `ps` per pid for the whole pass: the same owner pid names many directories.
+  // One OS read per pid for the whole pass: the same owner pid names many directories.
   const startMs = cachedStartMs(deps.startMs);
   const ownerDead =
     deps.isOwnerDead ??

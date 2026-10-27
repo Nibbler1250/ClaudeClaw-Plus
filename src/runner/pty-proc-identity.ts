@@ -13,10 +13,26 @@
  * #581 cp2: `readPidIdentity` below is the ONLY place that asks the OS who a pid is. The numeric
  * start time (`processStartMs`, `procStartMs`) is a projection of that one reading, not a second
  * reader, and every comparison is exact: no window is allowed to widen "the same process".
+ *
+ * macOS (#581, after #596): the identity is the microsecond start time libproc reports, the reader
+ * the bus ownership guard uses (`./libproc`), and no `ps` is spawned to read it. #596's rule holds
+ * here too: an identity that is only second-precise never authorises a signal. Off libproc there
+ * is no macOS identity at all (null: "cannot tell"), and an identity persisted by an older daemon
+ * (the second-precise `ps lstart` text, or its whole-second number) that matches to the second is
+ * `unknown` (`compareIdentity`, `compareStartMs`), never the same process and never another one.
  */
 
-import { spawnSync } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
+import {
+  type BsdInfo,
+  type KinfoProc,
+  kinfoProc,
+  libprocAvailable,
+  libprocBsdInfo,
+  libprocGroupPids,
+  SZOMB,
+  type StartTime,
+} from "./libproc.js";
 
 /** A numeric start time: ms since boot on Linux, epoch ms elsewhere. Null when unreadable. */
 export type StartMsReader = (pid: number) => number | null;
@@ -27,43 +43,67 @@ export type PidIdentityReader = (pid: number) => string | null;
 /** Clock ticks per second of `/proc/<pid>/stat` times. 100 on every Linux build in use. */
 const LINUX_CLOCK_TICKS_PER_SECOND = 100;
 
-/** Seams for the one reader. Production passes nothing; tests name a platform, a fake `/proc` or `ps`. */
+/** Seams for the one reader. Production passes nothing; tests name a platform, a fake `/proc` or libproc. */
 export interface IdentityReadDeps {
   platform?: string;
   /** `/proc`; replaced by a fake tree in tests. Linux only. */
   procDir?: string;
-  /** Prints `lstart` for a pid in the C locale, or null when `ps` cannot say. Replaced in tests. */
-  ps?: (pid: number) => string | null;
-  /** Prints `pgid lstart` for one pid (the snapshot's `ps`). Replaced in tests. */
-  psSnapshot?: (pid: number) => string | null;
-  /** Prints `pid pgid stat lstart` for every process (the member listing's `ps`). Replaced in tests. */
-  psAll?: (timeoutMs: number) => string | null;
+  /** macOS: one libproc `proc_bsdinfo` reading of a pid, or null. Replaced in tests. */
+  bsdInfo?: (pid: number) => BsdInfo | null;
+  /** macOS: the pids of one process group, zombies included, or null. Replaced in tests. */
+  groupPids?: (pgid: number) => number[] | null;
   /**
-   * Upper bound on any `ps` this call may start, in ms (default 2000). A caller that owns an
-   * absolute deadline passes what is left of it; zero or less starts nothing and reads as null.
+   * macOS: one `sysctl(KERN_PROC_PID)` reading of a pid libproc would not answer for: a zombie
+   * (read, and so marked), `"gone"`, or null when it cannot be read. Replaced in tests.
    */
-  psTimeoutMs?: number;
+  kinfo?: (pid: number) => KinfoProc | "gone" | null;
 }
 
-const PS_TIMEOUT_MS = 2000;
+let warnedNoLibproc = false;
 
-/** One bounded `ps` in the C locale: the same process reads the same text in every environment. */
-function runPs(args: string[], timeoutMs: number): string | null {
-  if (!(timeoutMs > 0)) return null; // no time left: do not start a subprocess
-  const r = spawnSync("ps", args, {
-    encoding: "utf8",
-    // The C locale fixes the text of the month and weekday names: the same process reads the same
-    // string in every environment the daemon is started from.
-    env: { ...process.env, LC_ALL: "C" },
-    timeout: Math.min(PS_TIMEOUT_MS, timeoutMs),
-  });
-  return r.status === 0 ? (r.stdout ?? "") : null;
+/** libproc's reading, said once when this platform cannot give one (then nothing is signalled). */
+function defaultBsdInfo(pid: number): BsdInfo | null {
+  if (!warnedNoLibproc && !libprocAvailable()) {
+    warnedNoLibproc = true;
+    console.warn(
+      "[pty-proc-identity] libproc is unavailable: no process identity can be read on this platform, so no claude will be signalled",
+    );
+  }
+  return libprocBsdInfo(pid);
 }
 
-function psLstart(pid: number, timeoutMs = PS_TIMEOUT_MS): string | null {
-  const out = (runPs(["-o", "lstart=", "-p", String(pid)], timeoutMs) ?? "").trim();
-  return out || null;
+/** The macOS identity: libproc's start time as `<epoch seconds>.<microseconds, six digits>`. */
+function darwinIdentity(start: StartTime): string {
+  return `${start.sec}.${String(start.usec).padStart(6, "0")}`;
 }
+
+const DARWIN_IDENTITY = /^(\d+)\.(\d{6})$/;
+
+/** One macOS reading of a pid: who it is, its group, and whether it is a zombie. */
+interface DarwinReading {
+  identity: string;
+  pgid: number;
+  zombie: boolean;
+}
+
+/**
+ * libproc's reading of `pid` (#596's reader); for a pid libproc does not answer, the kernel's
+ * `kinfo_proc`, which tells a zombie (still holding its pid, so still that process) from a pid that
+ * is gone. Both report the same start time. `"gone"`: no such process. Null: cannot be read.
+ */
+function readDarwin(pid: number, deps: IdentityReadDeps): DarwinReading | "gone" | null {
+  const info = (deps.bsdInfo ?? defaultBsdInfo)(pid);
+  if (info) {
+    return { identity: darwinIdentity(info.start), pgid: info.pgid, zombie: info.status === SZOMB };
+  }
+  const k = (deps.kinfo ?? kinfoProc)(pid);
+  if (k === null) return null;
+  if (k === "gone") return "gone";
+  return { identity: darwinIdentity(k.start), pgid: k.pgid, zombie: k.zombie };
+}
+
+const readable = (r: DarwinReading | "gone" | null): DarwinReading | null =>
+  r === null || r === "gone" ? null : r;
 
 /**
  * A process's birth identity: something a reused pid cannot share with the process that held
@@ -71,24 +111,22 @@ function psLstart(pid: number, timeoutMs = PS_TIMEOUT_MS): string | null {
  *   Linux     field 22 of `/proc/<pid>/stat`, start time in clock ticks since boot, as the raw
  *             digits (a plain file read). Only comparable with a reading from the same boot; a
  *             copy that outlives the daemon is stored with the boot id (`recordedOnAnotherBoot`).
- *   macOS/BSD `ps -o lstart=` in the C locale, the start time to the second (one `ps` spawn, about
- *             10-20 ms, paid once at spawn and once per signal, never per poll). Reuse inside the
- *             same second would need the pid counter to wrap in that second; that is the limit
- *             of this platform and no tolerance is added to it.
- *   null      the pid is gone, the identity cannot be read or parsed (Windows, no `ps`, a
+ *   macOS/BSD libproc's start time to the microsecond, `<sec>.<usec>` (one `proc_pidinfo` call,
+ *             no subprocess). libproc does not answer for a zombie, which still holds its pid:
+ *             the kernel's `kinfo_proc` gives the same start time for it (`readDarwin`).
+ *   null      the pid is gone, the identity cannot be read or parsed (Windows, no libproc, a
  *             malformed stat), or the pid is not one that names a process.
  * `comm` (field 2 of the stat) may hold spaces and parens, so fields are split after the last
  * `)`, where field 3 is the first.
  */
 export function readPidIdentity(pid: number, deps: IdentityReadDeps = {}): string | null {
-  const { platform = process.platform, procDir = "/proc", psTimeoutMs = PS_TIMEOUT_MS } = deps;
-  const ps = deps.ps ?? ((p: number) => psLstart(p, psTimeoutMs));
+  const { platform = process.platform, procDir = "/proc" } = deps;
   if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
     if (platform === "win32") return null;
     if (platform === "linux")
       return parseLinuxStat(readFileSync(`${procDir}/${pid}/stat`, "utf8"))?.identity ?? null;
-    return ps(pid);
+    return readable(readDarwin(pid, deps))?.identity ?? null;
   } catch {
     return null;
   }
@@ -122,10 +160,10 @@ function parseLinuxStat(stat: string): LinuxStat | null {
 /**
  * A process's identity AND its process group id from ONE reading, so the two cannot belong to
  * different processes (#581 cp8, L1). The identity is the one `readPidIdentity` reports: Linux
- * reads one `/proc/<pid>/stat`; macOS runs one bounded `ps -o pgid=,lstart=`.
+ * reads one `/proc/<pid>/stat`; macOS makes one libproc call (`readDarwin`).
  */
 export function readPidSnapshot(pid: number, deps: IdentityReadDeps = {}): PidSnapshot | null {
-  const { platform = process.platform, procDir = "/proc", psTimeoutMs = PS_TIMEOUT_MS } = deps;
+  const { platform = process.platform, procDir = "/proc" } = deps;
   if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
     if (platform === "win32") return null;
@@ -133,10 +171,8 @@ export function readPidSnapshot(pid: number, deps: IdentityReadDeps = {}): PidSn
       const parsed = parseLinuxStat(readFileSync(`${procDir}/${pid}/stat`, "utf8"));
       return parsed ? { identity: parsed.identity, pgid: parsed.pgid } : null;
     }
-    const out =
-      deps.psSnapshot?.(pid) ?? runPs(["-o", "pgid=,lstart=", "-p", String(pid)], psTimeoutMs);
-    const m = /^\s*(\d+)\s+(.+?)\s*$/.exec(out ?? "");
-    return m?.[1] && m[2] ? { identity: m[2], pgid: Number(m[1]) } : null;
+    const r = readable(readDarwin(pid, deps));
+    return r ? { identity: r.identity, pgid: r.pgid } : null;
   } catch {
     return null;
   }
@@ -167,8 +203,11 @@ export type GroupMembersReader = (pgid: number, deadlineAt: number) => GroupMemb
  * The live (non-zombie) members of process group `pgid`, each with the birth identity read in the
  * SAME reading that showed its group, so a member is never a stranger that took a dead member's
  * pid between two reads. Bounded by `deadlineAt`: Linux checks it as it walks `/proc`, and macOS
- * gives its one `ps` what is left of it. A table that cannot be read (or the deadline) returns
- * what was seen with `complete: false`; the caller treats it as positive evidence only.
+ * between the libproc reads of the group's pids. A table that cannot be read (or the deadline)
+ * returns what was seen with `complete: false`; the caller treats it as positive evidence only.
+ * macOS: libproc lists the group's pids (zombies included) and each is read (`readDarwin`), its
+ * group re-checked in that reading. A pid gone since the listing is skipped; one that cannot be
+ * read at all leaves the listing incomplete.
  */
 export function readGroupMembers(
   pgid: number,
@@ -209,15 +248,27 @@ export function readGroupMembers(
     }
     return { members, complete };
   }
-  const left = deadlineAt - now();
-  const out = deps.psAll?.(left) ?? runPs(["-axo", "pid=,pgid=,stat=,lstart="], left);
-  if (out === null) return { members, complete: false };
-  for (const line of out.split("\n")) {
-    const m = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.+?)\s*$/.exec(line);
-    if (!m || Number(m[2]) !== pgid || m[3]?.startsWith("Z")) continue;
-    members.push({ pid: Number(m[1]), identity: m[4] ?? "" });
+  if (now() >= deadlineAt) return { members, complete: false };
+  let pids: number[] | null;
+  try {
+    pids = (deps.groupPids ?? libprocGroupPids)(pgid);
+  } catch {
+    pids = null;
   }
-  return { members, complete: true };
+  if (pids === null) return { members, complete: false };
+  let complete = true;
+  for (const pid of pids) {
+    if (now() >= deadlineAt) return { members, complete: false };
+    const r = readDarwin(pid, deps);
+    if (r === "gone") continue; // gone since the listing
+    if (r === null) {
+      complete = false; // a member this reading could not see
+      continue;
+    }
+    if (r.pgid !== pgid || r.zombie) continue; // left the group, or a zombie
+    members.push({ pid, identity: r.identity });
+  }
+  return { members, complete };
 }
 
 /** Do two member lists name the same process? Exact on both pid and raw identity. */
@@ -228,8 +279,10 @@ export function sameMember(a: GroupMember, b: GroupMember): boolean {
 /**
  * The numeric start time a raw identity stands for, for the places that compare ages (a leader
  * against the processes born after it) and for records that persist a number. Linux: ticks * 10
- * ms since boot (exact, so equal ticks give equal ms). Elsewhere: the epoch ms of the C-locale
- * `lstart` text. Null for a null or unparseable identity.
+ * ms since boot (exact, so equal ticks give equal ms). macOS: the epoch ms of libproc's start time,
+ * to the microsecond (`<sec>.<usec>` gives sec * 1000 + usec / 1000). An older daemon's
+ * second-precise `lstart` text still projects, to whole-second epoch ms. Null for a null or
+ * unparseable identity.
  */
 export function startMsFromIdentity(
   identity: string | null,
@@ -239,6 +292,8 @@ export function startMsFromIdentity(
   if (platform === "linux") {
     return /^\d+$/.test(identity) ? (Number(identity) * 1000) / LINUX_CLOCK_TICKS_PER_SECOND : null;
   }
+  const m = DARWIN_IDENTITY.exec(identity);
+  if (m) return Number(m[1]) * 1000 + Number(m[2]) / 1000;
   const ms = Date.parse(identity);
   return Number.isNaN(ms) ? null : ms;
 }
@@ -251,14 +306,60 @@ export function sameIdentity(a: string | null, b: string | null): boolean {
   return a !== null && b !== null && a === b;
 }
 
+/** What comparing a birth identity read now with a recorded one shows. */
+export type StartMatch = "same" | "different" | "unknown";
+
 /**
- * Do two start times, read by `processStartMs`, belong to one process? Exactly equal, on every
- * platform. On Linux two reads of one process are identical and a different process in the next
- * tick differs by 10 ms. On macOS two reads of one process come from the same `lstart` text and
- * are identical, and a process born one second later differs by 1000 ms: a window of any size
- * would only let a recycled pid read as the same process (#570 r14e, H1; #581 cp2). A comparison
- * that authorises a signal must not be given a tolerance.
+ * Compare an identity read now with a recorded one. `same` only when both were read and are
+ * equal; `unknown` when either is missing, or (macOS) when one side is the second-precise `lstart`
+ * text of an older daemon and the other is libproc's reading of the same second: a second-precise
+ * match never authorises a signal (#596), and it is not proof of another process either.
+ * Everything else is `different`.
  */
+export function compareIdentity(
+  now: string | null,
+  recorded: string | null,
+  platform: string = process.platform,
+): StartMatch {
+  if (now === null || recorded === null) return "unknown";
+  if (now === recorded) return "same";
+  if (platform === "linux" || platform === "win32") return "different";
+  const seconds = (identity: string): { sec: number; precise: boolean } | null => {
+    const m = DARWIN_IDENTITY.exec(identity);
+    if (m) return { sec: Number(m[1]), precise: true };
+    const ms = Date.parse(identity);
+    return Number.isNaN(ms) ? null : { sec: ms / 1000, precise: false };
+  };
+  const a = seconds(now);
+  const b = seconds(recorded);
+  if (a && b && a.precise !== b.precise && a.sec === b.sec) return "unknown";
+  return "different";
+}
+
+/**
+ * Compare a start time read now with a recorded one (`processStartMs`), the numeric form of
+ * `compareIdentity`. Exact on every platform: on Linux the next tick is another process, and on
+ * macOS a process born a microsecond later is (#570 r14e, H1; #581 cp2). A comparison that
+ * authorises a signal must not be given a tolerance. The one `unknown` besides a missing reading
+ * is macOS's second-precise record: a whole-second value an older daemon persisted, against a
+ * reading in that same second. Linux start times are often whole seconds and are never read so.
+ */
+export function compareStartMs(
+  now: number | null,
+  recorded: number | null,
+  platform: string = process.platform,
+): StartMatch {
+  if (now === null || recorded === null) return "unknown";
+  if (now === recorded) return "same";
+  if (platform === "linux" || platform === "win32") return "different";
+  const second = (ms: number): number => Math.floor(ms / 1000) * 1000;
+  const wholeSecond = (ms: number): boolean => ms % 1000 === 0;
+  if ((wholeSecond(recorded) || wholeSecond(now)) && second(now) === second(recorded))
+    return "unknown";
+  return "different";
+}
+
+/** Do two start times, read by `processStartMs`, belong to one process? Exactly equal (`compareStartMs`). */
 export function sameStart(a: number, b: number): boolean {
   return a === b;
 }
@@ -316,7 +417,7 @@ export function currentBootId(platform: string = bootIdPlatform()): string | nul
 /**
  * Was a persisted start time recorded on a boot other than this one? Then no process it names
  * can be alive: every one of them is gone, and nothing may be signalled on its account. Only
- * Linux needs this (its start times count from boot; macOS `ps lstart` is epoch time). A
+ * Linux needs this (its start times count from boot; macOS start times are epoch time). A
  * Linux record with no boot id predates the field and is treated as another boot's. When this
  * boot's id cannot be read the answer is no: nothing can be shown to differ.
  */
@@ -333,7 +434,7 @@ export function recordedOnAnotherBoot(
   return recorded == null || recorded !== now;
 }
 
-/** A reader that asks `ps` once per pid: for one sweep pass, which looks at the same pid several times. */
+/** A reader that asks the OS once per pid: for one sweep pass, which looks at the same pid several times. */
 export function cachedStartMs(read: StartMsReader = processStartMs): StartMsReader {
   const seen = new Map<number, number | null>();
   return (pid) => {
@@ -345,7 +446,7 @@ export function cachedStartMs(read: StartMsReader = processStartMs): StartMsRead
 /**
  * What a recorded pid is now: the process we recorded (`same`), nothing (`gone`), another
  * process that was given the pid after ours was reaped (`recycled`), or a pid that exists while
- * either start time is unknown (`unknown`: it cannot be told from a stranger).
+ * the start times cannot tell (`unknown`: a stranger cannot be ruled out, see `compareStartMs`).
  */
 export type PidIdentity = "same" | "gone" | "recycled" | "unknown";
 
@@ -355,7 +456,6 @@ export function pidIdentity(
   { exists, read }: { exists: (pid: number) => boolean; read: StartMsReader },
 ): PidIdentity {
   if (!exists(pid)) return "gone";
-  const now = read(pid);
-  if (expectedStartMs == null || now === null) return "unknown";
-  return sameStart(now, expectedStartMs) ? "same" : "recycled";
+  const match = compareStartMs(read(pid), expectedStartMs ?? null);
+  return match === "same" ? "same" : match === "different" ? "recycled" : "unknown";
 }

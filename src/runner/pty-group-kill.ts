@@ -13,9 +13,9 @@
  * any of it is left.
  */
 
-import { spawnSync } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
 import { basename } from "node:path";
+import { libprocBsdInfo, libprocGroupPids, SZOMB } from "./libproc.js";
 import {
   type GroupMember,
   type GroupMembersReader,
@@ -23,12 +23,12 @@ import {
   type PgidReader,
   type PidIdentityReader,
   type StartMsReader,
+  compareIdentity,
   pidIdentity,
   processStartMs,
   readGroupMembers,
   readPgid,
   readPidIdentity,
-  sameIdentity,
   sameMember,
 } from "./pty-proc-identity.js";
 
@@ -222,7 +222,7 @@ class GroupTarget {
   /**
    * One look at the leader and its group, telling the two apart: the leader (pid absent, or a
    * different process now, or every member a zombie) and then every other member of the group.
-   * `withIdentity` also re-reads the leader's identity (a `ps` spawn on macOS), which the
+   * `withIdentity` also re-reads the leader's identity (a libproc call on macOS), which the
    * retirement does on its first and last check only.
    */
   probe(withIdentity: boolean): GroupProbe {
@@ -245,8 +245,8 @@ class GroupTarget {
 
   /**
    * Both the leader and its group are gone, or the pid is no longer ours to ask about. The
-   * identity is read on the first poll and then every tenth, not every one: it costs a `ps`
-   * spawn, and a pid is not reused within 20 ms of being asked about.
+   * identity is read on the first poll and then every tenth, not every one: it costs a
+   * `/proc` or libproc read, and a pid is not reused within 20 ms of being asked about.
    */
   gone(): boolean {
     if (this.polls++ % 10 === 0 && this.identity() === "recycled") return true;
@@ -385,7 +385,7 @@ export interface RetireGroupInput {
   readGroupId?: PgidReader;
   /**
    * Reads a pid's birth identity now. Replaced in tests. The default is bounded by what is left
-   * of `deadlineAt`, so a `ps` it starts cannot outlast the retirement.
+   * of `deadlineAt`, so nothing it starts can outlast the retirement.
    */
   readIdentity?: PidIdentityReader;
   /** `process.kill`. Replaced in tests: a fake never reaches a real pid. */
@@ -446,8 +446,8 @@ const TERM_RETRY_MS = 100;
 const REPORT_MARGIN_MS = 250;
 
 /**
- * Group members by name, for the report: Linux from `/proc`, elsewhere one `ps` bounded by what
- * is left of `deadlineAt` (none left: not counted, no subprocess).
+ * Group members by name, for the report: Linux from `/proc`, macOS from libproc (the group's pids,
+ * each read once). Past `deadlineAt` nothing is counted.
  */
 export function describeGroup(
   pid: number,
@@ -477,18 +477,16 @@ export function describeGroup(
         names.add(stat.slice(open + 1, close));
       }
     } else {
-      const left = deadlineAt - Date.now();
-      if (!(left > 0)) return { count: undefined, comm: [] };
-      const r = spawnSync("ps", ["-axo", "pgid=,stat=,comm="], {
-        encoding: "utf8",
-        timeout: Math.min(2000, left),
-      });
-      if (r.status !== 0) return { count: undefined, comm: [] };
-      for (const line of (r.stdout ?? "").split("\n")) {
-        const m = /^\s*(\d+)\s+(\S+)\s+(.+)$/.exec(line);
-        if (!m || Number(m[1]) !== pid || m[2]?.startsWith("Z")) continue;
+      if (Date.now() >= deadlineAt) return { count: undefined, comm: [] };
+      const pids = libprocGroupPids(pid);
+      if (pids === null) return { count: undefined, comm: [] };
+      for (const member of pids) {
+        if (Date.now() >= deadlineAt) return { count: undefined, comm: [] };
+        // A pid libproc cannot read is gone or a zombie: neither is counted (this is a report).
+        const info = libprocBsdInfo(member);
+        if (!info || info.pgid !== pid || info.status === SZOMB) continue;
         count++;
-        names.add(m[3] ?? "");
+        names.add(info.name);
       }
     }
   } catch {
@@ -505,9 +503,8 @@ function rawIdentityState(
   read: PidIdentityReader,
 ): PidIdentity {
   if (!exists(signal, pid)) return "gone";
-  const now = read(pid);
-  if (recorded === null || now === null) return "unknown";
-  return sameIdentity(now, recorded) ? "same" : "recycled";
+  const match = compareIdentity(read(pid), recorded);
+  return match === "same" ? "same" : match === "different" ? "recycled" : "unknown";
 }
 
 /** Add the members of `fresh` that are not in `into` yet. */
@@ -566,11 +563,8 @@ export function noteGroupMembers(input: NoteMembersInput): {
   const expired = (): boolean => now() >= deadlineAt;
   if (expired()) return unchanged;
   const signal = input.signal ?? process.kill;
-  const readIdentity: PidIdentityReader =
-    input.readIdentity ??
-    ((p) => readPidIdentity(p, { psTimeoutMs: Math.max(0, deadlineAt - now()) }));
-  const readGroupId: PgidReader =
-    input.readGroupId ?? ((p) => readPgid(p, { psTimeoutMs: Math.max(0, deadlineAt - now()) }));
+  const readIdentity: PidIdentityReader = input.readIdentity ?? ((p) => readPidIdentity(p));
+  const readGroupId: PgidReader = input.readGroupId ?? ((p) => readPgid(p));
   const leaderIsOurs = (): boolean =>
     rawIdentityState(pid, identity, signal, readIdentity) === "same" && !expired();
   if (!leaderIsOurs()) return unchanged;
@@ -628,12 +622,10 @@ export async function retireProcessGroup(input: RetireGroupInput): Promise<Retir
     sleep = defaultSleep,
   } = input;
   const left = (): number => input.deadlineAt - now();
-  const readIdentity: PidIdentityReader =
-    input.readIdentity ?? ((p) => readPidIdentity(p, { psTimeoutMs: Math.max(0, left()) }));
+  const readIdentity: PidIdentityReader = input.readIdentity ?? ((p) => readPidIdentity(p));
   const readMembers: GroupMembersReader =
     input.readMembers ?? ((pgid, deadlineAt) => readGroupMembers(pgid, deadlineAt, { now }));
-  const readGroupId: PgidReader =
-    input.readGroupId ?? ((p) => readPgid(p, { psTimeoutMs: Math.max(0, left()) }));
+  const readGroupId: PgidReader = input.readGroupId ?? ((p) => readPgid(p));
   const describe = input.describe ?? ((p, at) => describeGroup(p, at));
   const unknown: RetireGroupOutcome = {
     leaderGone: false,
@@ -687,7 +679,7 @@ export async function retireProcessGroup(input: RetireGroupInput): Promise<Retir
   }
 
   const look = (withIdentity: boolean): GroupProbe => target.probe(withIdentity);
-  // Identity is read on the first and the last check of a wait only (a `ps` spawn on macOS).
+  // Identity is read on the first and the last check of a wait only (a libproc call on macOS).
   // A SIGTERM that could not be sent yet is tried again every TERM_RETRY_MS inside the grace: a
   // leader that is dying can read as "identity unknown" for a moment, and waiting out the whole
   // grace for a signal that was merely early would turn a prompt exit into a SIGKILL.

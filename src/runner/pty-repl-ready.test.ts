@@ -265,11 +265,14 @@ describe("a pending ready gate ends with the child (r15, A2)", () => {
   it("dispose during the gate rejects the turn at once, not at the gate deadline", async () => {
     const clock = gateClock();
     const child = await spawnWithClock(clock);
-    const turned = turn(child, GATE_MS);
+    // The outcome is taken from the start: the turn can reject while dispose() is still running,
+    // and a rejection with no handler yet fails the test (about 1 run in 3 since #581 decision 2
+    // made the retirement's reads fast).
+    const turned = outcome(turn(child, GATE_MS));
     await settled(100);
     expect(clock.pending.size).toBe(1); // the gate is waiting on its deadline
     await child.dispose();
-    const result = await outcome(turned);
+    const result = await turned;
     expect(result).toBeInstanceOf(PtyNotReadyError);
     expect((result as Error).message).toMatch(/\(closed\)/);
     expect(clock.pending.size).toBe(0); // the deadline timer was cleared, not left to fire

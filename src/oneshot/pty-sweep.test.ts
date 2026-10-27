@@ -1084,6 +1084,20 @@ describe("start-time comparison on every platform (r14d, H1; #581 cp2)", () => {
       expect(withPlatform(platform, () => isOwnerDead(owner, same))).toBe(false);
     }
   });
+
+  it("macOS: a whole-second start an older daemon recorded is still the held process and the owner, read in that second (#581 decision 2)", () => {
+    // Before libproc, macOS start times were `ps lstart` whole seconds. A reading in the same
+    // second cannot show the record names another process, so nothing is swept on its account.
+    const legacy = 1_793_106_335_000;
+    const held = { pid: 4242, startMs: legacy };
+    const owner = live({ pid: 4242, startMs: legacy, instance: "an-earlier-daemon" });
+    const deps = { kill: alive, startMs: () => legacy + 845.98, anotherBoot: () => false };
+    expect(withPlatform("darwin", () => heldProcAlive(held, deps))).toBe(true);
+    expect(withPlatform("darwin", () => isOwnerDead(owner, deps))).toBe(false);
+    // Linux start times are exact, whole seconds or not: the same numbers there are another process.
+    expect(withPlatform("linux", () => heldProcAlive(held, deps))).toBe(false);
+    expect(withPlatform("linux", () => isOwnerDead(owner, deps))).toBe(true);
+  });
 });
 
 // #570 r15 (A1): a Linux start time counts from boot, so a record written before a reboot can

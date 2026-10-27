@@ -62,6 +62,16 @@ async function spawnShell(script: string, extra: Partial<PtyProcessOptions> = {}
   await until(() => existsSync(bgFile) && readFileSync(bgFile, "utf8").trim() !== "");
   const bg = Number(readFileSync(bgFile, "utf8").trim());
   strays.push(bg, child.pid);
+  // A live look once the background child exists (a turn's start and end make it in production):
+  // only members identified while the leader lived vouch for its group once it is gone (#581 cp9,
+  // option B). The spawn hand-over alone can run before the shell forks. Since #581 decision 2 it
+  // reads libproc in microseconds rather than a `ps` in tens of ms, and it then lists the leader
+  // only: these tests failed about 1 run in 2 that way, each SIGTERM withheld from the HUP-proof
+  // child of a leader already gone. Not on a child whose OS is a stand-in.
+  const fakeOs = ["_signalPid", "_readPidIdentity", "_readPgid", "_liveMembers"].some(
+    (seam) => seam in extra,
+  );
+  if (!fakeOs) (child as unknown as { _noteLiveGroup(): void })._noteLiveGroup();
   return { child, bg };
 }
 

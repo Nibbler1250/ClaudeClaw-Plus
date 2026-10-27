@@ -1,9 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { BsdInfo, KinfoProc } from "./libproc.js";
 import {
+  compareIdentity,
+  compareStartMs,
   currentBootId,
+  type IdentityReadDeps,
   pidIdentity,
   procStartMs,
   processStartMs,
@@ -19,6 +24,16 @@ import {
 } from "./pty-proc-identity.js";
 import { noteGroupMembers } from "./pty-group-kill.js";
 import { withPlatform } from "./pty-test-platform.js";
+
+/** One libproc `proc_bsdinfo` reading, as `libprocBsdInfo` returns it. */
+const info = (pid: number, sec: number, usec: number, pgid = pid, status = 2): BsdInfo => ({
+  pid,
+  status,
+  uid: 501,
+  pgid,
+  name: "claude",
+  start: { sec, usec },
+});
 
 /** #570 r14 (E): on Linux the start time comes from `/proc/<pid>/stat` field 22, not from `ps`. */
 
@@ -88,19 +103,44 @@ describe("pidIdentity (the numeric projection) is exact on every platform", () =
   const exists = () => true;
   const readAt = (ms: number) => () => ms;
 
-  it("calls a pid whose start moved by one tick, one second or two seconds recycled", () => {
-    for (const platform of ["linux", "darwin"] as const) {
-      for (const moved of [10, 1_000, 2_000]) {
+  it("calls a pid whose start moved by one tick (Linux), one microsecond (macOS), one second or two seconds recycled", () => {
+    // macOS start times are libproc's, to the microsecond: epoch ms with a fractional part.
+    const cases = [
+      { platform: "linux", base: 10_000, moves: [10, 1_000, 2_000] },
+      { platform: "darwin", base: 1_793_106_335_845.98, moves: [0.001, 1_000, 2_000] },
+    ] as const;
+    for (const { platform, base, moves } of cases) {
+      for (const moved of moves) {
         expect(
           withPlatform(platform, () =>
-            pidIdentity(4242, 10_000, { exists, read: readAt(10_000 + moved) }),
+            pidIdentity(4242, base, { exists, read: readAt(base + moved) }),
           ),
         ).toBe("recycled");
       }
       expect(
-        withPlatform(platform, () => pidIdentity(4242, 10_000, { exists, read: readAt(10_000) })),
+        withPlatform(platform, () => pidIdentity(4242, base, { exists, read: readAt(base) })),
       ).toBe("same");
     }
+  });
+
+  it("macOS: a whole-second start an older daemon recorded is unknown against a reading in that second, never the same", () => {
+    // Before #581 macOS start times came from `ps lstart`, whole seconds. A reading now in the same
+    // second cannot tell the recorded process from a stranger born in that second (#596's rule).
+    const legacy = 1_793_106_335_000;
+    const read = readAt(1_793_106_335_845.98);
+    expect(withPlatform("darwin", () => pidIdentity(4242, legacy, { exists, read }))).toBe(
+      "unknown",
+    );
+    // Another second is another process, as before.
+    expect(
+      withPlatform("darwin", () =>
+        pidIdentity(4242, legacy, { exists, read: readAt(legacy + 1_000.5) }),
+      ),
+    ).toBe("recycled");
+    // Linux start times are often whole seconds too, and are exact: never read as a legacy record.
+    expect(
+      withPlatform("linux", () => pidIdentity(4242, 10_000, { exists, read: readAt(10_010) })),
+    ).toBe("recycled");
   });
 
   it("cannot tell a stranger from the leader when either start time is unknown", () => {
@@ -168,30 +208,29 @@ describe("readPidIdentity (the one reader)", () => {
     for (const bad of [0, -1, 1.5, Number.NaN]) expect(readPidIdentity(bad, linux())).toBeNull();
   });
 
-  it("macOS: the C-locale `lstart` text exactly as `ps` printed it", () => {
-    const ps = (pid: number): string | null => (pid === 42 ? "Fri Oct 23 10:00:00 2026" : null);
-    expect(readPidIdentity(42, { platform: "darwin", ps })).toBe("Fri Oct 23 10:00:00 2026");
-    expect(readPidIdentity(43, { platform: "darwin", ps })).toBeNull();
+  it("macOS: libproc's start time to the microsecond, `<sec>.<usec>`", () => {
+    const bsdInfo = (pid: number) => (pid === 42 ? info(42, 1_793_106_335, 5_980) : null);
+    expect(readPidIdentity(42, { platform: "darwin", bsdInfo })).toBe("1793106335.005980");
+    expect(readPidIdentity(43, { platform: "darwin", bsdInfo })).toBeNull();
   });
 
-  it("macOS: a process born one second later is a different identity, and so is its numeric start", () => {
-    const text: Record<number, string> = {
-      1: "Fri Oct 23 10:00:00 2026",
-      2: "Fri Oct 23 10:00:01 2026",
-    };
-    const ps = (pid: number): string | null => text[pid] ?? null;
-    const a = readPidIdentity(1, { platform: "darwin", ps });
-    const b = readPidIdentity(2, { platform: "darwin", ps });
+  it("macOS: a process born one microsecond later, in the same second, is a different identity", () => {
+    // Fault (site: `darwinIdentity`, microseconds dropped): both read "1793106335" and match.
+    const starts: Record<number, number> = { 1: 845_980, 2: 845_981 };
+    const bsdInfo = (pid: number) =>
+      starts[pid] === undefined ? null : info(pid, 1_793_106_335, starts[pid] as number);
+    const a = readPidIdentity(1, { platform: "darwin", bsdInfo });
+    const b = readPidIdentity(2, { platform: "darwin", bsdInfo });
     expect(sameIdentity(a, b)).toBe(false);
     const aMs = startMsFromIdentity(a, "darwin");
     const bMs = startMsFromIdentity(b, "darwin");
-    expect(aMs).not.toBeNull();
-    expect((bMs as number) - (aMs as number)).toBe(1_000);
+    expect(aMs).toBe(1_793_106_335_845.98);
+    expect(bMs).toBe(1_793_106_335_845.981);
     expect(sameStart(aMs as number, bMs as number)).toBe(false);
   });
 
   it("Windows reads nothing", () => {
-    expect(readPidIdentity(42, { platform: "win32", ps: () => "x" })).toBeNull();
+    expect(readPidIdentity(42, { platform: "win32", bsdInfo: () => info(42, 1, 0) })).toBeNull();
   });
 
   it("an identity that cannot be read is the same as nothing", () => {
@@ -207,6 +246,11 @@ describe("readPidIdentity (the one reader)", () => {
     expect(startMsFromIdentity(null, "linux")).toBeNull();
     expect(startMsFromIdentity("Fri Oct 23 10:00:00 2026", "win32")).toBeNull();
     expect(startMsFromIdentity("not a date", "darwin")).toBeNull();
+    expect(startMsFromIdentity("1793106335.845980", "darwin")).toBe(1_793_106_335_845.98);
+    // An older daemon's `lstart` text still projects, to the whole second.
+    expect(startMsFromIdentity("Fri Oct 23 10:00:00 2026", "darwin")).toBe(
+      Date.parse("Fri Oct 23 10:00:00 2026"),
+    );
   });
 
   it("procStartMs and processStartMs read through it", () => {
@@ -216,20 +260,25 @@ describe("readPidIdentity (the one reader)", () => {
   });
 
   it.skipIf(process.platform !== "darwin")(
-    "macOS, real `ps`: steady across reads and unaffected by the caller's locale",
+    "macOS, real libproc: steady across reads, to the microsecond, and the second `ps` reports",
     () => {
       const first = readPidIdentity(process.pid);
-      expect(first).not.toBeNull();
+      expect(first).toMatch(/^\d+\.\d{6}$/);
       expect(readPidIdentity(process.pid)).toBe(first);
-      expect(first).toMatch(/^[A-Z][a-z]{2} [A-Z][a-z]{2} [ 0-9]\d \d\d:\d\d:\d\d \d{4}$/);
-      const saved = process.env.LC_ALL;
-      process.env.LC_ALL = "fr_FR.UTF-8";
-      try {
-        expect(readPidIdentity(process.pid)).toBe(first);
-      } finally {
-        if (saved === undefined) delete process.env.LC_ALL;
-        else process.env.LC_ALL = saved;
-      }
+      // The same birth `ps` reports, to the second it can see (UTC, so no zone is guessed).
+      const lstart = execFileSync("/bin/ps", ["-o", "lstart=", "-p", String(process.pid)], {
+        env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
+      })
+        .toString()
+        .trim();
+      expect(Number(first?.split(".")[0])).toBe(Date.parse(`${lstart} UTC`) / 1000);
+      // And the group id libproc reads is the one `ps` reports.
+      const pgid = Number(
+        execFileSync("/bin/ps", ["-o", "pgid=", "-p", String(process.pid)])
+          .toString()
+          .trim(),
+      );
+      expect(readPidSnapshot(process.pid)).toEqual({ identity: first as string, pgid });
     },
   );
 
@@ -380,13 +429,13 @@ describe("readPidSnapshot and readGroupMembers (#581 cp8)", () => {
     expect(readPidSnapshot(0, { ...linux, procDir: proc })).toBeNull();
   });
 
-  it("reads `pgid lstart` from one ps elsewhere", () => {
-    const psSnapshot = () => "  4242 Sat Oct 24 01:37:34 2026\n";
-    expect(readPidSnapshot(4242, { platform: "darwin", psSnapshot })).toEqual({
-      identity: "Sat Oct 24 01:37:34 2026",
-      pgid: 4242,
+  it("reads the identity and the group id from one libproc reading on macOS", () => {
+    const bsdInfo = () => info(4242, 1_793_106_335, 845_980, 4200);
+    expect(readPidSnapshot(4242, { platform: "darwin", bsdInfo })).toEqual({
+      identity: "1793106335.845980",
+      pgid: 4200,
     });
-    expect(readPidSnapshot(4242, { platform: "darwin", psSnapshot: () => null })).toBeNull();
+    expect(readPidSnapshot(4242, { platform: "darwin", bsdInfo: () => null })).toBeNull();
   });
 
   it("lists the live members of a group with their identities, not zombies or other groups", () => {
@@ -419,23 +468,172 @@ describe("readPidSnapshot and readGroupMembers (#581 cp8)", () => {
     expect(reading.members.length).toBeLessThan(130);
   });
 
-  it("starts no ps with no time left, and parses the one table elsewhere", () => {
-    expect(readGroupMembers(100, 0, { platform: "darwin", now: () => 5 })).toEqual({
-      members: [],
-      complete: false,
+  describe("macOS (libproc)", () => {
+    const SEC = 1_793_106_335;
+    // The group's pids as libproc lists them, what libproc reads of each, and (for the pids it
+    // does not answer) what the kernel's kinfo_proc says.
+    const table: Record<number, ReturnType<typeof info> | null> = {
+      100: info(100, SEC, 1, 100), // the leader
+      101: info(101, SEC, 2, 100), // a member
+      103: info(103, SEC, 3, 300), // listed, but its own reading puts it in another group now
+    };
+    const kinfoTable: Record<number, KinfoProc | "gone" | null> = {
+      104: "gone", // gone since the listing
+      105: { pid: 105, zombie: true, pgid: 100, start: { sec: SEC, usec: 5 } }, // a zombie
+      106: { pid: 106, zombie: false, pgid: 100, start: { sec: SEC, usec: 6 } }, // libproc would not say
+    };
+    const deps = (over: Partial<IdentityReadDeps> = {}) => ({
+      platform: "darwin",
+      groupPids: () => [100, 101, 103, 104, 105, 106],
+      bsdInfo: (pid: number) => table[pid] ?? null,
+      kinfo: (pid: number) => kinfoTable[pid] ?? null,
+      ...over,
     });
-    const psAll = () =>
-      [
-        "  100   100 Ss   Sat Oct 24 01:37:34 2026",
-        "  101   100 S    Sat Oct  4 01:37:35 2026",
-        "  102   100 Z    Sat Oct 24 01:37:36 2026",
-        "  103   300 S    Sat Oct 24 01:37:37 2026",
-      ].join("\n");
-    const reading = readGroupMembers(100, Date.now() + 5000, { platform: "darwin", psAll });
-    expect(reading.members).toEqual([
-      { pid: 100, identity: "Sat Oct 24 01:37:34 2026" },
-      { pid: 101, identity: "Sat Oct  4 01:37:35 2026" },
-    ]);
+
+    it("lists the live members with their identities: not zombies, the gone, or other groups", () => {
+      const reading = readGroupMembers(100, Date.now() + 5000, deps());
+      expect(reading).toEqual({
+        members: [
+          { pid: 100, identity: `${SEC}.000001` },
+          { pid: 101, identity: `${SEC}.000002` },
+          { pid: 106, identity: `${SEC}.000006` },
+        ],
+        complete: true,
+      });
+    });
+
+    it("is incomplete when a listed pid cannot be read at all", () => {
+      // Fault (site: the unreadable branch, `complete = false` dropped): this reads complete, and a
+      // retirement would take a member it could not see as positive absence.
+      const reading = readGroupMembers(100, Date.now() + 5000, deps({ kinfo: () => null }));
+      expect(reading.complete).toBe(false);
+      expect(reading.members.map((m) => m.pid)).toEqual([100, 101]); // what it saw is kept
+    });
+
+    it("a zombie still holds its pid, so it keeps the identity it was born with", () => {
+      // libproc does not answer for a zombie. A leader that has exited but is not yet reaped is
+      // still the process recorded at spawn, and must read so: a retirement that took it as
+      // unknown withheld the group's SIGTERM (#581 decision 2, seen in pty-group-retire).
+      const zombie = deps({ bsdInfo: () => null });
+      expect(readPidIdentity(105, zombie)).toBe(`${SEC}.000005`);
+      expect(readPidSnapshot(105, zombie)).toEqual({ identity: `${SEC}.000005`, pgid: 100 });
+      expect(readPidIdentity(104, zombie)).toBeNull(); // gone
+    });
+
+    it("is incomplete when the group cannot be listed, and starts nothing with no time left", () => {
+      expect(readGroupMembers(100, Date.now() + 5000, deps({ groupPids: () => null }))).toEqual({
+        members: [],
+        complete: false,
+      });
+      let asked = 0;
+      const counting = deps({
+        groupPids: () => {
+          asked++;
+          return [100];
+        },
+      });
+      expect(readGroupMembers(100, 0, { ...counting, now: () => 5 })).toEqual({
+        members: [],
+        complete: false,
+      });
+      expect(asked).toBe(0);
+    });
+  });
+
+  it.skipIf(process.platform !== "darwin")(
+    "macOS, real libproc: lists a real group, leaving out a zombie member, as `ps` sees it",
+    async () => {
+      // A group leader with a live sleeper, and a member whose own child exits unreaped: a zombie
+      // in the group whose parent is not the leader (so its parent's pid is not its group's id).
+      const leader = spawn(
+        "/bin/sh",
+        ["-c", "sleep 30 & sh -c '(exit 0) & exec sleep 30' & exec sleep 30"],
+        {
+          detached: true,
+          stdio: "ignore",
+        },
+      );
+      try {
+        await Bun.sleep(400);
+        const pgid = leader.pid as number;
+        const rows = execFileSync("/bin/ps", ["-axo", "pid=,pgid=,stat="])
+          .toString()
+          .split("\n")
+          .map((l) => l.trim().split(/\s+/))
+          .filter((f) => Number(f[1]) === pgid);
+        const live = rows.filter((f) => !f[2]?.startsWith("Z")).map((f) => Number(f[0]));
+        expect(rows.some((f) => f[2]?.startsWith("Z"))).toBe(true); // the zombie is there
+        const reading = readGroupMembers(pgid, Date.now() + 5000);
+        expect(reading.complete).toBe(true);
+        expect(reading.members.map((m) => m.pid).sort((a, b) => a - b)).toEqual(
+          live.sort((a, b) => a - b),
+        );
+        for (const m of reading.members) expect(m.identity).toBe(readPidIdentity(m.pid) as string);
+        // The zombie itself still has its identity and group, through the kernel's kinfo_proc.
+        const zombie = Number(rows.find((f) => f[2]?.startsWith("Z"))?.[0]);
+        const zombieParent = Number(
+          execFileSync("/bin/ps", ["-o", "ppid=", "-p", String(zombie)])
+            .toString()
+            .trim(),
+        );
+        expect(zombieParent).not.toBe(pgid);
+        const lstart = execFileSync("/bin/ps", ["-o", "lstart=", "-p", String(zombie)], {
+          env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
+        })
+          .toString()
+          .trim();
+        const snap = readPidSnapshot(zombie);
+        expect(snap?.identity).toMatch(/^\d+\.\d{6}$/);
+        expect(Number(snap?.identity.split(".")[0])).toBe(Date.parse(`${lstart} UTC`) / 1000);
+        expect(snap?.pgid).toBe(pgid);
+      } finally {
+        try {
+          process.kill(-(leader.pid as number), "SIGKILL");
+        } catch {}
+      }
+    },
+  );
+});
+
+/**
+ * #581 (decision 2, after #596): an identity or start time read now against a recorded one.
+ * A second-precise record (an older macOS daemon's `ps lstart`) that matches to the second is
+ * `unknown`: it never authorises a signal, and it is not proof that the process is gone either.
+ */
+describe("compareIdentity / compareStartMs", () => {
+  it("same only when both were read and are equal; a missing reading cannot tell", () => {
+    for (const platform of ["linux", "darwin"]) {
+      expect(compareIdentity("1793106335.845980", "1793106335.845980", platform)).toBe("same");
+      expect(compareIdentity(null, "1793106335.845980", platform)).toBe("unknown");
+      expect(compareIdentity("1793106335.845980", null, platform)).toBe("unknown");
+      expect(compareStartMs(10_000, 10_000, platform)).toBe("same");
+      expect(compareStartMs(null, 10_000, platform)).toBe("unknown");
+      expect(compareStartMs(10_000, null, platform)).toBe("unknown");
+    }
+  });
+
+  it("macOS: libproc's reading against an older daemon's `lstart` text of the same second is unknown", () => {
+    const lstart = "Tue Oct 27 13:05:35 2026";
+    const sec = Date.parse(lstart) / 1000; // the zone `ps` printed it in, as the old reader parsed it
+    // Fault (site: `compareIdentity`, the second-precise branch removed): this reads "different",
+    // and a survivor record from before the upgrade would take its live leader as recycled.
+    expect(compareIdentity(`${sec}.845980`, lstart, "darwin")).toBe("unknown");
+    expect(compareIdentity(lstart, `${sec}.845980`, "darwin")).toBe("unknown");
+    // Another second is another process; two precise readings are compared exactly.
+    expect(compareIdentity(`${sec + 1}.000000`, lstart, "darwin")).toBe("different");
+    expect(compareIdentity(`${sec}.845980`, `${sec}.845981`, "darwin")).toBe("different");
+    // Linux identities are exact ticks: never read as second-precise.
+    expect(compareIdentity("12345", "12346", "linux")).toBe("different");
+  });
+
+  it("macOS: a whole-second start time against a reading in that second is unknown; Linux stays exact", () => {
+    const legacy = 1_793_106_335_000;
+    // Fault (site: `compareStartMs`, the whole-second branch removed): "different", so a live owner
+    // recorded by an older daemon reads as dead and its directories are swept.
+    expect(compareStartMs(legacy + 845.98, legacy, "darwin")).toBe("unknown");
+    expect(compareStartMs(legacy + 1_000.5, legacy, "darwin")).toBe("different");
+    expect(compareStartMs(legacy + 845.98, legacy + 845.981, "darwin")).toBe("different");
+    expect(compareStartMs(10_010, 10_000, "linux")).toBe("different");
   });
 });
 

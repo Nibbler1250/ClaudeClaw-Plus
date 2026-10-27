@@ -108,6 +108,20 @@ describe("retireProcessGroup over a fake kernel", () => {
     expect(await retire(signal)).toBe(false);
   });
 
+  it("an older macOS daemon's second-precise identity is neither the leader nor a stranger (#581 decision 2)", async () => {
+    // A survivor record written before libproc identities: `ps lstart` text. libproc reads the
+    // same second now. That never authorises a signal (#596), nor proves the leader recycled,
+    // which would take the group as long gone and release what holds it.
+    const lstart = "Tue Oct 27 13:05:35 2026";
+    const now = `${Date.parse(lstart) / 1000}.845980`;
+    const k = fakeKernel(null); // the group does not go on its own
+    const gone = await withPlatformAsync("darwin", () =>
+      retire(k.signal, { identity: lstart, readIdentity: () => now }),
+    );
+    expect(gone).toBe(false);
+    expect(k.calls.some(([, n]) => n === "SIGTERM" || n === "SIGKILL")).toBe(false);
+  });
+
   it("counts an unreaped zombie as gone where /proc can tell, and not otherwise", () => {
     const zombie: SignalFn = () => {}; // kill(.., 0) succeeds for a zombie
     // Went red (false) with the /proc answer ignored.
