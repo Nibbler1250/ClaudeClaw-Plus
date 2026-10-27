@@ -11,6 +11,7 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { PtyExitUnconfirmedError, spawnPty } from "../runner/pty-process";
+import { withPlatformAsync } from "../runner/pty-test-platform";
 
 interface FakeChild {
   pid: number;
@@ -247,21 +248,36 @@ describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () =
     expect(os.alive).toBe(true);
   });
 
-  test("with no identity recorded at spawn the initial retirement may signal, a later one may not", async () => {
+  test("Linux: with no identity recorded at spawn the initial retirement may signal, a later one may not", async () => {
     // Fault (site: `GroupTarget.sendGroup`, drop the `initial` clause): the initial retirement refuses
     // to signal and the process outlives it. Predicted result: dispose() rejects with
     // no SIGKILL logged.
     const os = makeOs();
     os.immune = true;
     const proc = await spawnWith(os, { _readPidIdentity: () => null });
-    await expect(proc.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
+    await expect(withPlatformAsync("linux", () => proc.dispose())).rejects.toBeInstanceOf(
+      PtyExitUnconfirmedError,
+    );
     const killsAfterFirst = os.log.filter((e) => e.endsWith(":SIGKILL")).length;
     expect(killsAfterFirst).toBe(1);
 
     os.immune = false;
-    await expect(proc.confirmExit?.()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
+    await expect(
+      withPlatformAsync("linux", async () => proc.confirmExit?.()),
+    ).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
 
     expect(os.log.filter((e) => e.endsWith(":SIGKILL")).length).toBe(killsAfterFirst);
+  });
+
+  test("macOS: with no identity recorded at spawn nothing is signalled, the initial retirement included (#581 decision 2, review H1)", async () => {
+    const os = makeOs();
+    os.immune = true;
+    const proc = await spawnWith(os, { _readPidIdentity: () => null });
+    await expect(withPlatformAsync("darwin", () => proc.dispose())).rejects.toBeInstanceOf(
+      PtyExitUnconfirmedError,
+    );
+    // Fault (site: `allowUnrecordedInitial` true on every platform): one SIGKILL is logged.
+    expect(os.log.filter((e) => e.endsWith(":SIGTERM") || e.endsWith(":SIGKILL"))).toEqual([]);
   });
 
   test("a pid that cannot be a real child is never signalled (no kill(-1), no kill(0))", async () => {

@@ -1802,7 +1802,10 @@ class PtyProcessImpl implements PtyProcess {
       liveMembers: this._liveMembers,
       describe: this._describeGroup,
       initial,
-      allowUnrecordedInitial: true,
+      // Linux only (#570 r14, B): a leader with no identity recorded at spawn may be signalled on
+      // group membership alone in the first termination. On macOS nothing is signalled without
+      // identity evidence (#581 decision 2, review H1): such a child is quarantined instead.
+      allowUnrecordedInitial: process.platform !== "darwin",
       sendTerm: initial,
       deadlineAt,
       termGraceMs: this._exitGraceMs,

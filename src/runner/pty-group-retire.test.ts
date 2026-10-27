@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PtyExitUnconfirmedError, type PtyProcessOptions, spawnPty } from "./pty-process.js";
 import { processStartMs, readPidIdentity } from "./pty-proc-identity.js";
+import { withPlatformAsync } from "./pty-test-platform.js";
 
 /**
  * #570 r12 (A): retiring a PTY child stops its whole process group and proves it. These run a
@@ -156,7 +157,7 @@ describe("retiring a PTY child", () => {
     expect(alive(bg)).toBe(false);
   });
 
-  it("signals the group, not the bare pid, of a child that exited on its own with no start time recorded, during the dispose that follows", async () => {
+  it("Linux: signals the group, not the bare pid, of a child that exited on its own with no start time recorded, during the dispose that follows", async () => {
     const error = spyOn(console, "error").mockImplementation(() => {});
     const warn = spyOn(console, "warn").mockImplementation(() => {});
     try {
@@ -175,12 +176,42 @@ describe("retiring a PTY child", () => {
       });
       await until(() => !child.isAlive());
       // The kernel never lets the pid go, so the retirement is (rightly) unconfirmed.
-      await expect(child.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
+      await expect(withPlatformAsync("linux", () => child.dispose())).rejects.toBeInstanceOf(
+        PtyExitUnconfirmedError,
+      );
       // Went red ([] sent) with `firstTermination` not passed by dispose.
       expect(sent).toEqual([
         [-child.pid, "SIGTERM"],
         [-child.pid, "SIGKILL"],
       ]);
+    } finally {
+      error.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it("macOS: signals nothing for a child with no identity recorded, even in the first termination (#581 decision 2, review H1)", async () => {
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const sent: Array<[number, unknown]> = [];
+      const kernel = (pid: number, name: unknown): void => {
+        if (name !== 0) sent.push([pid, name]);
+      };
+      const { child } = await spawnShell("echo $$ > $BG", {
+        _readPidIdentity: () => null,
+        _signalPid: kernel as never,
+        _liveMembers: () => undefined,
+        _exitGraceMs: 40,
+        _exitCapMs: 100,
+      });
+      await until(() => !child.isAlive());
+      // Unconfirmed, and so quarantined by the caller: never signalled on group membership alone.
+      await expect(withPlatformAsync("darwin", () => child.dispose())).rejects.toBeInstanceOf(
+        PtyExitUnconfirmedError,
+      );
+      // Fault (site: `allowUnrecordedInitial` true on every platform): SIGTERM and SIGKILL go out.
+      expect(sent).toEqual([]);
     } finally {
       error.mockRestore();
       warn.mockRestore();
