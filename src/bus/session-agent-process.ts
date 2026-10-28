@@ -22,6 +22,24 @@ import type { ChildProcess } from "node:child_process";
 // process-stream-json, tmux) must not require the native PTY dep just to
 // construct an AgentProcess (Codex P1 on PR #149).
 import { sanitizePtyPromptText } from "../runner/pty-prompt-sanitizer";
+// The common termination and confirmation of a PTY child and its process group (#581 cp3). These
+// modules need no native PTY dependency.
+import { type GroupConfirmMode, judgeGroupOutcome } from "../runner/pty-group-confirm";
+import {
+  type GroupDescription,
+  type SignalFn,
+  isSignalablePid,
+  noteGroupMembers,
+  retireProcessGroup,
+} from "../runner/pty-group-kill";
+import {
+  type GroupMember,
+  type GroupMembersReader,
+  type PgidReader,
+  readPidIdentity,
+  readPidSnapshot,
+  sameIdentity,
+} from "../runner/pty-proc-identity";
 // `pty-output-parser` is a pure module (no bun-pty), so reusing its
 // cursor-move→space expander does NOT pull the native PTY dep into the bus
 // module — same rationale as importing the sanitiser above.
@@ -174,6 +192,37 @@ export interface AgentProcess {
 }
 
 /**
+ * The bus PTY's exit could not be confirmed by the OS (the leader, or, when enforced, its group).
+ * A transport exit callback is not proof, so the session must not be reused (#581 cp3).
+ */
+export class PtyAgentExitUnconfirmedError extends Error {
+  constructor(
+    public readonly agent_id: string,
+    public readonly pid: number,
+  ) {
+    super(`bus PTY ${agent_id} (pid ${pid}) is not confirmed gone; its exit is unconfirmed`);
+    this.name = "PtyAgentExitUnconfirmedError";
+  }
+}
+
+/** Test seams of `PtyAgentProcess.retire()`. Production passes none. */
+export interface PtyRetireSeams {
+  signalPid?: SignalFn;
+  readPidIdentity?: (pid: number) => string | null;
+  liveMembers?: (pid: number) => number | undefined;
+  describeGroup?: (pid: number, deadlineAt: number) => GroupDescription;
+  /** SIGTERM grace before SIGKILL (default 2000 ms, as #562). */
+  exitGraceMs?: number;
+  /** The one deadline of the whole retirement (default 7000 ms, as #562). */
+  exitCapMs?: number;
+  groupConfirm?: GroupConfirmMode;
+  /** Lists a process group's members with their birth identities (default: the OS). */
+  readMembers?: GroupMembersReader;
+  /** Reads a process group id (the child's at construction, the daemon's at retirement). */
+  readPgid?: PgidReader;
+}
+
+/**
  * Minimal subset of bun-pty's `IPty` we depend on. Declared as a structural
  * interface so we can avoid hard-importing `bun-pty` at top-level and tests
  * that don't exercise PTY mode skip the native module entirely.
@@ -200,6 +249,29 @@ export class PtyAgentProcess implements AgentProcess {
     return this._lastDataAt;
   }
   private _exited = false;
+  /** Seams, identity and state of `retire()`. */
+  private readonly retireSeams: PtyRetireSeams;
+  private readonly identity: string | null;
+  private _retirement: Promise<void> | null = null;
+  private _retiredOnce = false;
+  /** Set synchronously by the first `retire()` and never cleared: no member look after it. */
+  private _retirementBegun = false;
+  /**
+   * The absolute deadline of the retirement in progress, allocated before its first read or
+   * signal. Every look and signal inside it, the native kill's exit callback included, shares
+   * it; null when no retirement is running (#581 cp9, M2).
+   */
+  private retireDeadlineAt: number | null = null;
+  /** The child's process group id, read with its identity at construction; null when unreadable. */
+  private groupId: number | null;
+  private groupIdRefreshed = false;
+  /**
+   * Group members identified positively (pid and birth identity) by a live look, while the leader
+   * was the recorded process and before any retirement began (#581 cp10, option B). A retirement
+   * only narrows them. Evidence only: each is read again before it grants any authority, and
+   * nothing here expires or renews by itself (#581 cp8, H2).
+   */
+  private _groupMembers: GroupMember[] = [];
   /** Set with `_exited` (issue #393): the code a late `onExit` subscriber is
    *  replayed with. */
   private _exitCode = -1;
@@ -387,15 +459,11 @@ export class PtyAgentProcess implements AgentProcess {
    */
   private static readonly OUTSTANDING_ENQUEUE_TTL_MS = 15 * 60_000;
   /**
-   * True once a JSONL tailer is feeding `notePromptIngested`. Gates the
-   * stricter post-compaction rule below: without a transcript there is nothing
-   * better than the screen, so the original heuristics must stay in force.
+   * True once a JSONL tailer has delivered a line to this process. Observation only (it words the
+   * rotation warning): it decides nothing, because the screen never confirms a turn, with or
+   * without a transcript (#581 cp8, M1).
    */
   private transcriptAvailable = false;
-  /** #383: disarmed by a silent confirm window (vs never armed), so that a
-   *  line arriving later can re-arm without re-arming a runtime that has no
-   *  transcript at all. */
-  private transcriptDisarmed = false;
   private readonly transcriptGraceMs: number;
   /** Count of lines the tailer has read (#383). `0` until it has; a counter
    *  rather than a timestamp, so two lines in one millisecond cannot hide. */
@@ -432,11 +500,24 @@ export class PtyAgentProcess implements AgentProcess {
       transcriptGraceMs?: number;
       /** Bound on the boot-dialog watch window (test seam; default 15 s). */
       bootDialogMaxMs?: number;
+      /** Test seams of `retire()` (signals, probes, deadlines). */
+      retire?: PtyRetireSeams;
     } = {},
   ) {
     this.agent_id = agent_id;
     this.pty = pty;
     this.pid = pty.pid;
+    this.retireSeams = opts.retire ?? {};
+    // The birth identity and the process group id, from ONE reading taken while the child is
+    // certainly the one we spawned. A test that names its own readers gets its own fake OS.
+    if (this.retireSeams.readPidIdentity || this.retireSeams.readPgid) {
+      this.identity = (this.retireSeams.readPidIdentity ?? readPidIdentity)(pty.pid);
+      this.groupId = (this.retireSeams.readPgid ?? ((p) => p))(pty.pid);
+    } else {
+      const snapshot = readPidSnapshot(pty.pid);
+      this.identity = snapshot?.identity ?? null;
+      this.groupId = snapshot?.pgid ?? null;
+    }
     this.submitConfirmMs = opts.submitConfirmMs ?? 1500;
     this.transcriptGraceMs = opts.transcriptGraceMs ?? 3000;
     this.maxSubmitNudges = opts.maxSubmitNudges ?? 2;
@@ -445,6 +526,10 @@ export class PtyAgentProcess implements AgentProcess {
     this.bootDialogTimer = setTimeout(() => this.onBootWindowExpired(), this.bootDialogMaxMs);
     pty.onData((chunk) => {
       this._lastDataAt = Date.now();
+      if (!this.groupIdRefreshed) {
+        this.groupIdRefreshed = true;
+        this.refreshGroupId();
+      }
       if (this.bootDialogActive) this.handleBootDialog(chunk);
       // Keep a small ANSI-stripped tail so send_prompt_stream can tell whether a
       // submit actually started a turn (the idle REPL footer disappears on turn
@@ -486,8 +571,15 @@ export class PtyAgentProcess implements AgentProcess {
         }
       }
     });
+    // The reading at construction can predate the child's `setsid()`; read the group id again.
+    for (const ms of [25, 250]) {
+      const timer = setTimeout(() => this.refreshGroupId(), ms);
+      timer.unref?.();
+    }
     pty.onExit((e) => {
       this._exited = true;
+      // No member look here: the exit callback proves nothing about whose group this is (it can
+      // be delivered late). Members are learned only while the leader is alive (cp10, option B).
       // A process that exited is not "stuck at boot": the exit log line
       // (session-manager, issue #393) is the one that speaks for it.
       this.endBootDialogPhase();
@@ -513,6 +605,7 @@ export class PtyAgentProcess implements AgentProcess {
     // a prompt still being typed.
     const run = this.writeChain.then(async () => {
       if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
+      this.noteLiveGroup(); // see `noteLiveGroup`
       this.pty.write(`/${cmd}`);
       await new Promise((r) => setTimeout(r, 200));
       if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
@@ -561,6 +654,7 @@ export class PtyAgentProcess implements AgentProcess {
     const text = sanitizePtyPromptText(line);
     const run = this.writeChain.then(async () => {
       if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
+      this.noteLiveGroup(); // see `noteLiveGroup`
       // Snapshot the compaction state at write time. A compaction that was
       // ALREADY running when the prompt arrived (the common case -- the inbound
       // prompt is what overflowed the context) can also FINISH during the 200ms
@@ -770,27 +864,23 @@ export class PtyAgentProcess implements AgentProcess {
           // prompt written 14:04:47). Gating on it would leave the reported
           // failure untouched.
           //
-          // So: whenever a transcript is proven live, it is the only thing that
-          // may CONFIRM a turn. The screen's claim is held, unresolved and
-          // without spending a nudge, for a bounded grace period. If the
-          // transcript still has not spoken, the honest answer is "unknown" —
-          // not "yes" (the wedge) and not "no" (which would strand a turn that
-          // really is running).
-          if (this.transcriptAvailable) {
-            // Reset whenever the screen stops claiming (see the idle/compaction
-            // branches): otherwise one repaint window before a compaction burns
-            // the whole grace, and the post-compaction turn — the case this
-            // machinery exists for — gets none of it.
-            if (screenClaimedTurnAtMs === 0) screenClaimedTurnAtMs = Date.now();
-            if (Date.now() - screenClaimedTurnAtMs < this.transcriptGraceMs) continue;
-            outcome = "unconfirmed-live";
-            break;
-          }
-          outcome = "turn-started";
-          // A turn confirmed → re-arm the one-shot wedge warning, so a LATER
-          // genuine wedge on this long-lived process still surfaces a diagnostic
-          // instead of being silenced for the rest of the process lifetime.
-          this.warnedUnconfirmedDelivery = false;
+          // So: the transcript is the only thing that may CONFIRM a turn, on every
+          // route and whether or not a tailer has spoken yet (#581 cp8, M1: a
+          // repaint of an old conversation on a process with no transcript line
+          // was enough to report `turn-started`). The screen's claim is held,
+          // unresolved and without spending a nudge, for a bounded grace period.
+          // If the transcript still has not spoken, the honest answer is
+          // "unknown" — not "yes" (the wedge) and not "no" (which would strand a
+          // turn that really is running). The caller's at-most-once re-delivery
+          // check reads the transcript too, so "unknown" never doubles a prompt.
+          //
+          // Reset whenever the screen stops claiming (see the idle/compaction
+          // branches): otherwise one repaint window before a compaction burns
+          // the whole grace, and the post-compaction turn — the case this
+          // machinery exists for — gets none of it.
+          if (screenClaimedTurnAtMs === 0) screenClaimedTurnAtMs = Date.now();
+          if (Date.now() - screenClaimedTurnAtMs < this.transcriptGraceMs) continue;
+          outcome = "unconfirmed-live";
           break;
         }
         // Only now, with the idle footer positively on screen (so no turn is
@@ -845,22 +935,19 @@ export class PtyAgentProcess implements AgentProcess {
             `the session transcript did not record the prompt within ` +
             `${this.transcriptGraceMs}ms; reporting unconfirmed rather than guessing.`,
         );
-        // #383 (1): the screen showed a turn and the transcript wrote NOTHING
-        // — not the prompt, not a single line — since this prompt was handed
-        // to us. A slow transcript still writes the turn's lines; a silent one
-        // has been rotated away (`/clear` opens a new file the tailer bound to
-        // this process never sees). Trusting it would end every later
-        // delivery `unconfirmed-live` for the life of the process. Fall back
-        // to the screen; the next line this tailer reads — which a rotated
-        // file never produces — re-arms it (`markTranscriptLine`), as does a
-        // tailer bound by a later spawn (`enableTranscriptConfirmation`).
+        // #383 (1): the screen showed a turn and the transcript wrote NOTHING — not the
+        // prompt, not a single line — since this prompt was handed to us. A slow
+        // transcript still writes the turn's lines; a silent one has been rotated away
+        // (`/clear` opens a new file the tailer bound to this process never sees).
+        // This used to fall back to the screen for later deliveries. It no longer does
+        // (#581 cp8, M1): the screen never confirms anything. The delivery stays
+        // `unconfirmed-live`, which the bus re-checks against the transcript, and the
+        // wedge watchdog's restart binds a tailer to the new source. This says so.
         if (this.transcriptAvailable && this.transcriptLineSeq === transcriptLineBeforeWrite) {
-          this.transcriptAvailable = false;
-          this.transcriptDisarmed = true;
           console.warn(
             `[delivery-confirm] agent=${this.agent_id}: the session transcript wrote nothing ` +
-              `during the whole confirm window; treating it as rotated away and falling back ` +
-              `to screen confirmation until a tailer speaks again.`,
+              `during the whole confirm window; it may have been rotated away. Deliveries stay ` +
+              `unconfirmed until a transcript line arrives or the agent is restarted.`,
           );
         }
         // #383 (2): this screen state used to resolve as `turn-started`, which
@@ -1108,14 +1195,7 @@ export class PtyAgentProcess implements AgentProcess {
    */
   private markTranscriptLine(): void {
     this.transcriptLineSeq++;
-    if (!this.transcriptAvailable && this.transcriptDisarmed) {
-      this.transcriptAvailable = true;
-      this.transcriptDisarmed = false;
-      console.warn(
-        `[delivery-confirm] agent=${this.agent_id}: the session transcript spoke again; ` +
-          `transcript confirmation re-armed.`,
-      );
-    }
+    this.transcriptAvailable = true;
   }
 
   notePromptIngested(ingestion: PromptIngestion): void {
@@ -1313,14 +1393,177 @@ export class PtyAgentProcess implements AgentProcess {
     this.dataHandlers.push(handler);
   }
 
-  /** Internal — called by SessionManager.stop(). */
+  /**
+   * Remember who is in the child's process group while it is provably ours (see
+   * `noteGroupMembers`): once the leader is gone nothing else can say its survivors are ours.
+   * Reached only through `noteLiveGroup`. Evidence only; nothing is signalled.
+   */
+  private snapshotGroupMembers(): void {
+    const seams = this.retireSeams;
+    // Only ever outside a retirement (`noteLiveGroup`), so the look has its own short budget.
+    const noted = noteGroupMembers({
+      pid: this.pid,
+      identity: this.identity,
+      groupId: this.groupId,
+      members: this._groupMembers,
+      signal: seams.signalPid,
+      readIdentity: seams.readPidIdentity,
+      readMembers:
+        seams.readMembers ??
+        (seams.readPidIdentity ? () => ({ members: [], complete: true }) : undefined),
+      readGroupId: seams.readPgid,
+    });
+    this._groupMembers = noted.members;
+    this.groupId = noted.groupId;
+  }
+
+  /**
+   * Learn the group while the leader is alive and no retirement has begun: before each prompt or
+   * slash command is typed, when the servers started at boot or by earlier turns are in it
+   * (#581 cp9, H2), and before a stop's graceful quit. These are the ONLY looks (cp10, option B):
+   * none at the exit and none inside a retirement. A leader that later exits on its own leaves
+   * behind members identified before it went, which can vouch for its group. Evidence only.
+   */
+  noteLiveGroup(): void {
+    // `_retirementBegun`, not `_retirement`: a failed retirement clears `_retirement` so it can be
+    // retried, but it had begun, and no look may follow it (cp10, OB1).
+    if (!this._exited && !this._retirementBegun) this.snapshotGroupMembers();
+  }
+
+  /**
+   * The group id read at construction can predate the child's `setsid()`; the first output proves
+   * the child has run. Re-read it, but only while the pid still has the identity recorded.
+   */
+  private refreshGroupId(): void {
+    if (this.identity === null) return;
+    const seams = this.retireSeams;
+    if (seams.readPgid) {
+      this.groupId = seams.readPgid(this.pid);
+      return;
+    }
+    if (seams.readPidIdentity) return; // a stand-in OS names its group id explicitly or not at all
+    const snapshot = readPidSnapshot(this.pid);
+    if (snapshot !== null && sameIdentity(snapshot.identity, this.identity)) {
+      this.groupId = snapshot.pgid;
+    }
+  }
+
+  /**
+   * May the native handle be asked to kill the child? bun-pty's `kill()` signals the pid it holds
+   * and fires the exit callbacks, so it is a signal like any other: it needs the same proof as
+   * the OS signals of `retireProcessGroup`, BEFORE it is made (#581 cp8, H4). The child must be a
+   * valid target, have an identity recorded at construction, be there now, and have that same
+   * identity now. An unrecorded identity, a recycled pid, an unreadable one or a target that is
+   * not signalable gets no native kill: closing our end is separate from signalling a process.
+   */
+  private nativeKillAuthorised(): boolean {
+    if (process.platform === "win32") return true; // no pid probe exists there
+    if (!isSignalablePid(this.pid) || this.identity === null) return false;
+    // Inside a retirement the deadline is looked at before the reads and again after them, the
+    // last look before the native call: the identity read takes time (#581 cp9, M2).
+    const deadlineAt = this.retireDeadlineAt;
+    const expired = (): boolean => deadlineAt !== null && Date.now() >= deadlineAt;
+    if (expired()) return false;
+    const seams = this.retireSeams;
+    try {
+      (seams.signalPid ?? process.kill)(this.pid, 0);
+    } catch {
+      return false; // ESRCH: nothing to kill. EPERM: not ours to signal.
+    }
+    const same = sameIdentity((seams.readPidIdentity ?? readPidIdentity)(this.pid), this.identity);
+    return same && !expired();
+  }
+
+  /**
+   * Internal — called by SessionManager.stop() (the delayed `/quit` fallback) and by `retire()`.
+   * Local timers are always ended; the native kill is made only when `nativeKillAuthorised`.
+   */
   _kill(signal?: string): void {
     this.endBootDialogPhase();
+    if (!this.nativeKillAuthorised()) return;
     try {
       this.pty.kill(signal);
     } catch {
       /* already gone */
     }
+  }
+
+  /**
+   * Retire the process and prove it from the OS, the leader AND its process group, through the
+   * common primitive (`retireProcessGroup`); an exit callback proves nothing (bun-pty fires it
+   * from `kill()` whether or not the child died). Joined: every caller shares the one in-flight
+   * retirement. A rejection is retryable. Rejects with `PtyAgentExitUnconfirmedError` when the
+   * leader is not proven gone, or when its group is not and `pty.groupConfirm` is "enforce"; in
+   * "observe" an unconfirmed group is logged and counted instead. The graceful `/quit` phase
+   * belongs to the caller (`SessionManager.stop`) and happens before this.
+   */
+  retire(): Promise<void> {
+    this._retirementBegun = true;
+    if (!this._retirement) {
+      const run = this.retireOnce();
+      this._retirement = run;
+      run.catch(() => {
+        if (this._retirement === run) this._retirement = null;
+      });
+    }
+    return this._retirement;
+  }
+
+  private async retireOnce(): Promise<void> {
+    // ONE absolute deadline for the whole retirement, allocated before the member snapshot and
+    // before any native kill, so no read or signal below can start a budget of its own (cp9, M2).
+    const deadlineAt = Date.now() + (this.retireSeams.exitCapMs ?? 7000);
+    this.retireDeadlineAt = deadlineAt;
+    try {
+      await this.retireWithin(deadlineAt);
+    } finally {
+      this.retireDeadlineAt = null;
+    }
+  }
+
+  private async retireWithin(deadlineAt: number): Promise<void> {
+    // The first await comes before anything else: `_kill` below fires the exit callbacks, and
+    // a caller reached through them must find `_retirement` already set and join it.
+    await Promise.resolve();
+    const initial = !this._retiredOnce;
+    this._retiredOnce = true;
+    const seams = this.retireSeams;
+    const wasAlive = !this._exited;
+    // No member look here: a retirement learns no member (cp10, option B). The evidence is what
+    // `noteLiveGroup` learned while the leader was alive and before the retirement began.
+    if (initial && wasAlive) this._kill("SIGTERM");
+    if (process.platform === "win32" || !isSignalablePid(this.pid)) return; // no probe to make
+    const outcome = await retireProcessGroup({
+      pid: this.pid,
+      identity: this.identity,
+      groupId: this.groupId,
+      members: this._groupMembers,
+      readGroupId: seams.readPgid,
+      readMembers:
+        seams.readMembers ??
+        (seams.readPidIdentity ? () => ({ members: [], complete: true }) : undefined),
+      readIdentity: seams.readPidIdentity,
+      signal: seams.signalPid,
+      liveMembers: seams.liveMembers,
+      describe: seams.describeGroup,
+      initial,
+      // An unrecorded identity is never signalled from the bus: a made-up pid must not reach a
+      // real process.
+      allowUnrecordedInitial: false,
+      sendTerm: initial,
+      deadlineAt,
+      termGraceMs: seams.exitGraceMs ?? 2000,
+    });
+    // What the OS vouched for in this call replaces what an earlier one carried: members that
+    // were not seen again are not remembered, and nothing about time or a flag survives.
+    this._groupMembers = outcome.members;
+    this.groupId = outcome.groupId;
+    const verdict = judgeGroupOutcome(outcome, {
+      untrusted: false,
+      mode: seams.groupConfirm,
+      key: this.agent_id,
+    });
+    if (verdict.fatal) throw new PtyAgentExitUnconfirmedError(this.agent_id, this.pid);
   }
 
   _isExited(): boolean {

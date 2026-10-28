@@ -9,6 +9,30 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { PtyAgentProcess, type PromptIngestion, type PtyHandle } from "../session-agent-process";
 
+/**
+ * Acceptance comes from the transcript only (#581 cp8, M1): the screen can say a turn is running,
+ * but a delivery is confirmed when the CLI writes a `user` record for the prompt. This stands in
+ * for that record: it feeds one for every prompt text typed into the fake PTY (control keys and
+ * slash commands are not prompts).
+ */
+function ingestTypedPrompts(proc: PtyAgentProcess, writes: string[]): () => void {
+  const done = new Set<number>();
+  const iv = setInterval(() => {
+    writes.forEach((w, i) => {
+      if (done.has(i)) return;
+      done.add(i);
+      if (w === "\r" || w === "\x15" || w.startsWith("\x1b") || w.startsWith("/")) return;
+      proc.notePromptIngested({
+        text: w,
+        source: "user",
+        promptId: `typed-${i}`,
+        ingestedAtMs: Date.now(),
+      });
+    });
+  }, 2);
+  return () => clearInterval(iv);
+}
+
 describe("PtyAgentProcess.send_prompt_stream", () => {
   it("serialises concurrent prompts so their bytes don't interleave", async () => {
     const { handle, writes, emit } = bootPty();
@@ -19,6 +43,7 @@ describe("PtyAgentProcess.send_prompt_stream", () => {
     // prompt. (A silent fake never confirms and now nudges to budget — covered
     // by the idle-REPL test below — which would mask the interleave check here.)
     const iv = setInterval(() => emit("assistant is streaming a response chunk"), 2);
+    const stopTranscript = ingestTypedPrompts(proc, writes);
 
     // Fire two prompts without awaiting the first — without serialisation the
     // second `write(line)` would land inside the first's 200ms settle window,
@@ -27,6 +52,7 @@ describe("PtyAgentProcess.send_prompt_stream", () => {
     const b = proc.send_prompt_stream("second");
     await Promise.all([a, b]);
     clearInterval(iv);
+    stopTranscript();
 
     // Each prompt's text is immediately followed by its own CR.
     expect(writes).toEqual(["first", "\r", "second", "\r"]);
@@ -104,10 +130,12 @@ describe("PtyAgentProcess.send_slash (#441)", () => {
     const { handle, writes, emit } = bootPty();
     const proc = new PtyAgentProcess("alpha", handle, { submitConfirmMs: 5 });
     const iv = setInterval(() => emit("assistant is streaming a response chunk"), 2);
+    const stopTranscript = ingestTypedPrompts(proc, writes);
     const a = proc.send_prompt_stream("hello");
     const b = proc.send_slash("quit");
     await Promise.all([a, b]);
     clearInterval(iv);
+    stopTranscript();
     expect(writes).toEqual(["hello", "\r", "/quit", "\r"]);
   });
 });
@@ -200,9 +228,11 @@ describe("PtyAgentProcess.send_prompt_stream delivery-confirm (#wedge)", () => {
     // The anchored probe must read this as turn-started, not wait out a phantom
     // compaction (which would also block the serialised writeChain).
     const iv = setInterval(() => emit("the daemon was Compacting the old logs when it ran"), 8);
+    const stopTranscript = ingestTypedPrompts(proc, writes);
     const t0 = Date.now();
     await p;
     clearInterval(iv);
+    stopTranscript();
     expect(writes.filter((w) => w === "\r").length).toBe(1); // only the submit
     expect(Date.now() - t0).toBeLessThan(2500); // resolved fast, not the 5s deadline
   });
@@ -506,6 +536,13 @@ describe("PtyAgentProcess compaction latch", () => {
     setTimeout(() => {
       emit("\nCompacted (ctrl+o to see full summary)");
       phase = "streaming";
+      // The CLI submitted the buffered prompt itself: its transcript records it.
+      proc.notePromptIngested({
+        text: "hello",
+        source: "user",
+        promptId: "buffered",
+        ingestedAtMs: Date.now(),
+      });
     }, 120);
     await p;
     clearInterval(iv);
@@ -675,9 +712,11 @@ describe("PtyAgentProcess compaction latch", () => {
       emit("\n> " + poisoned);
       emit("\nassistant is streaming a chunk");
     }, 5);
+    const stopTranscript = ingestTypedPrompts(proc, writes);
     await p;
     const elapsed = Date.now() - t0;
     clearInterval(iv);
+    stopTranscript();
     // A real turn is streaming, so this must confirm on the first window
     // (~230ms). If the echo armed the latch the loop would instead wait out
     // maxCompactionWaitMs and only return after ~2200ms.
@@ -702,9 +741,11 @@ describe("PtyAgentProcess compaction latch", () => {
       emit("\n│ > " + poisoned + "        │");
       emit("\nassistant is streaming a chunk");
     }, 5);
+    const stopTranscript = ingestTypedPrompts(proc, writes);
     await p;
     const elapsed = Date.now() - t0;
     clearInterval(iv);
+    stopTranscript();
     expect(elapsed).toBeLessThan(1000);
     expect(writes.filter((w) => w === "\r").length).toBe(1);
   });
@@ -784,23 +825,23 @@ describe("PtyAgentProcess transcript-confirmed delivery (issue #362)", () => {
     expect(writes).toContain("\x15");
   });
 
-  it("keeps the old screen behaviour for that same ordering when no transcript is live", async () => {
+  it("does not fall back to the screen for that same ordering when no transcript is live (#581 cp8, M1)", async () => {
     const { handle, writes, emit } = bootPty();
     const proc = new PtyAgentProcess("f1b", handle, {
       submitConfirmMs: 20,
       maxSubmitNudges: 2,
       transcriptGraceMs: 60,
     });
-    // No enableTranscriptConfirmation: also the blind-tailer case, where a
-    // path mismatch means no line is ever read. Such an agent must degrade to
-    // the previous behaviour, never stall waiting on a transcript that cannot
-    // speak. Identical config to the test above — only the transcript differs.
+    // No enableTranscriptConfirmation: also the blind-tailer case, where a path mismatch means
+    // no line is ever read. Such an agent used to degrade to the screen's word. It no longer
+    // does: a repaint of an old conversation is not a turn, so the delivery is unconfirmed (and
+    // the bus re-checks it against the transcript), never reported as started.
 
     const { done, stop } = await compactionEndsThenWrite(proc, emit, "please summarise");
-    await done;
+    expect(await done).toBe("unconfirmed-live");
     stop();
 
-    expect(writes).not.toContain("\x15");
+    expect(writes).toContain("\x15");
   });
 
   it("confirms as soon as the transcript records the prompt, whatever the screen shows", async () => {
@@ -1021,14 +1062,19 @@ describe("PtyAgentProcess.send_prompt_stream resolves with its verdict (issue #3
   // existing behaviour tests above already establish by other means. (Exit
   // mid-confirm still rejects — pinned in the #wedge block above.)
 
-  it("turn-started when the screen shows a turn and no transcript is live", async () => {
+  it("unconfirmed-live when the screen shows a turn and no transcript is live: the screen never confirms (#581 cp8, M1)", async () => {
     const { handle, emit } = bootPty();
-    const proc = new PtyAgentProcess("v1", handle, { submitConfirmMs: 30, maxSubmitNudges: 2 });
+    const proc = new PtyAgentProcess("v1", handle, {
+      submitConfirmMs: 30,
+      maxSubmitNudges: 2,
+      transcriptGraceMs: 60,
+    });
     const p = proc.send_prompt_stream("hello");
     const iv = setInterval(() => emit("assistant is streaming a response chunk here"), 8);
     const outcome = await p;
     clearInterval(iv);
-    expect(outcome).toBe("turn-started");
+    // Went red ("turn-started") with the screen allowed to confirm when no tailer has spoken.
+    expect(outcome).toBe("unconfirmed-live");
   });
 
   it("turn-started when the transcript records the prompt, whatever the screen shows", async () => {
@@ -1072,7 +1118,7 @@ describe("PtyAgentProcess.send_prompt_stream resolves with its verdict (issue #3
     expect(writes).toContain("\x15"); // the box was cleared: the prompt is nowhere else now
   });
 
-  it("a transcript that writes nothing during the whole confirm window is treated as rotated away: screen confirmation resumes (#383)", async () => {
+  it("a transcript that writes nothing during the whole confirm window may be rotated away: deliveries stay unconfirmed, never screen-confirmed (#383, #581 cp8)", async () => {
     const { handle, emit } = bootPty();
     const proc = new PtyAgentProcess("v5", handle, {
       submitConfirmMs: 20,
@@ -1091,10 +1137,11 @@ describe("PtyAgentProcess.send_prompt_stream resolves with its verdict (issue #3
       expect(await first).toBe("unconfirmed-live"); // silent transcript, as before
       clearInterval(iv);
       expect(warns.some((w) => w.includes("rotated away"))).toBe(true);
-      // Disarmed: the next delivery is judged by the screen again.
+      // The screen is not asked instead (#581 cp8, M1): the next delivery is unconfirmed too,
+      // until a transcript line arrives or the agent is restarted onto a new source.
       const second = proc.send_prompt_stream("second after clear");
       iv = setInterval(() => emit("more turn output\n"), 5);
-      expect(await second).toBe("turn-started");
+      expect(await second).toBe("unconfirmed-live");
       clearInterval(iv);
     } finally {
       spy.mockRestore();

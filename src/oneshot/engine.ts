@@ -41,6 +41,12 @@ export interface OneShotResult {
   exitCode: number;
   sessionId?: string;
   usage?: { inputTokens?: number; outputTokens?: number };
+  /**
+   * Why a non-zero call failed, as a code from a fixed set (`not-ready:login-required`, `timeout`,
+   * `no-reply:timeout`...) with the milliseconds each phase took. Never screen text, a transcript
+   * or an environment: it is what a harness may print (#570 r14, D).
+   */
+  diagnostic?: { reason: string; phasesMs: Record<string, number> };
 }
 
 export interface OneShotEngine {
@@ -85,15 +91,18 @@ export async function runOneShot(req: OneShotRequest): Promise<OneShotResult> {
   // falls back; invalid loaded configuration is never swallowed.
   let settings: ReturnType<typeof parseOneShotSettings> | undefined;
   let defaultModel = "";
+  let ptyEnabled = false;
   try {
-    settings = getSettings().oneShot;
-    defaultModel = getSettings().model;
+    const loaded = getSettings();
+    settings = loaded.oneShot;
+    defaultModel = loaded.model;
+    ptyEnabled = loaded.pty.enabled;
   } catch (error) {
     if (!(error instanceof Error) || !error.message.startsWith("Settings not loaded")) throw error;
   }
   const id = printRuntime()?.forcePrint
     ? "print"
-    : resolveOneShotEngine(settings ?? parseOneShotSettings(undefined), req.route);
+    : resolveOneShotEngine(settings ?? parseOneShotSettings(undefined), req.route, ptyEnabled);
   const declarations = settings?.engines ?? {};
   validateRouteEngine(
     id,

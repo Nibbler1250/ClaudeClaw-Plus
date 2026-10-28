@@ -51,8 +51,8 @@ export const DEFAULT_IMAGE_OUTPUT_ROOT = join(HEARTBEAT_DIR, "outbox", "discord"
 /**
  * Claude Code's native scheduling tools, blocked on every claude process the
  * daemon spawns — both the interactive bus PTY session (`buildClaudeArgs`) and
- * every headless `claude -p` path (`buildSecurityArgs`, e.g. the `dispatch_job`
- * subagent runner).
+ * every other claude spawn (`buildSecurityArgs`, e.g. the `dispatch_job`
+ * subagent runner, whether it runs on PTY or as `claude -p`).
  *
  * Their wakeups are tied to the specific session that registered them. Under
  * the bus runtime a session rotates/churns independently of the daemon, and a
@@ -240,6 +240,10 @@ const DEFAULT_SETTINGS: Settings = {
     maxConcurrent: 32,
     quietWindowMs: 500,
     sentinelMaxWaitMs: 30_000,
+    // #581: what a failed process-GROUP exit confirmation does to a trusted PTY. "observe" logs
+    // and counts it; "enforce" quarantines the session like an unconfirmed leader. Untrusted
+    // one-shots always enforce. Flipping this default is the later PR that follows the soak.
+    groupConfirm: "observe",
   },
   mcp: {
     // Default empty — the multiplexer is dormant out of the box. Operators
@@ -285,9 +289,12 @@ const DEFAULT_SETTINGS: Settings = {
   },
   // Default runtime: `bus` (Sprint 5.4 flip after Hetzner staging soak ended
   // 2026-05-25). `runtime: "pty"` remains as a permanent first-class option
-  // for operators who need the `claude -p` / API-billed path — particularly
-  // enterprise deployments where audit, cost-ceiling, or regulatory
-  // constraints make API billing the safer or only viable route.
+  // for operators who want the legacy per-event runner. It runs on the PTY
+  // supervisor by default (a long-lived PTY per session key, reused across
+  // turns); with `pty.enabled: false` (or on win32) it is the
+  // `claude -p` / API-billed path — particularly for enterprise deployments
+  // where audit, cost-ceiling, or regulatory constraints make API billing the
+  // safer or only viable route.
   runtime: "bus",
   // One default agent so a fresh install actually mounts something. The
   // runtime default is `bus`, which spawns one `claude` per `agents[]` entry;
@@ -726,11 +733,14 @@ export interface PtyConfig {
    * and callers still parse. Default: 30000.
    */
   sentinelMaxWaitMs: number;
+  /** Trusted PTYs: "observe" (log + count) or "enforce" (quarantine) on an unconfirmed process group. */
+  groupConfirm: "observe" | "enforce";
 }
 
 /**
- * Daemon runtime selector. `pty` is the legacy stack (PTY supervisor +
- * `claude -p` for non-PTY paths) and remains the v1 default. `bus` mounts
+ * Daemon runtime selector. `pty` is the legacy stack (PTY supervisor, with
+ * `claude -p` only when `pty.enabled` is false or on win32); it was the v1
+ * default, but the default is now `bus`. `bus` mounts
  * the Sprint 1-4 Bus stack (BusCore + SessionManager + per-surface
  * adapters + JSONL tailer) per spec §10 Sprint 5.
  *
@@ -802,11 +812,13 @@ export interface Settings {
   /**
    * Daemon runtime selector. Defaults to `"bus"` (event-bus + per-agent
    * processes, multi-channel routing, MCP multiplexer) — subscription-billed
-   * interactive mode. `"pty"` selects the `claude -p` subprocess path —
-   * API-billed (Agent SDK pool post-2026-06-15), kept as a permanent
-   * first-class option for enterprise deployments where API billing is the
-   * safer or only viable route (audit trails, predictable cost ceilings,
-   * regulatory constraints).
+   * interactive mode. `"pty"` selects the legacy per-event runner: the
+   * PTY supervisor by default (a long-lived PTY per session key, reused
+   * across turns until retired or idle-reaped), or one `claude -p`
+   * subprocess per call when `pty.enabled` is false (or on win32) — API-billed (Agent SDK pool
+   * post-2026-06-15). Kept as a permanent first-class option for enterprise
+   * deployments where API billing is the safer or only viable route (audit
+   * trails, predictable cost ceilings, regulatory constraints).
    */
   runtime: RuntimeMode;
   /**
@@ -1081,6 +1093,20 @@ export function resolvePtyEnabled(
   return fallback;
 }
 
+const invalidGroupConfirmWarned = new Set<string>();
+/** `pty.groupConfirm`: "observe" or "enforce"; anything else is "observe", with one warning. */
+export function resolveGroupConfirm(value: unknown): "observe" | "enforce" {
+  if (value === "observe" || value === "enforce") return value;
+  if (value !== undefined) {
+    const key = JSON.stringify(value);
+    if (!invalidGroupConfirmWarned.has(key)) {
+      invalidGroupConfirmWarned.add(key);
+      console.warn('pty.groupConfirm must be "observe" or "enforce"; using "observe"');
+    }
+  }
+  return "observe";
+}
+
 function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Settings {
   const rawLevel = raw.security?.level;
   const level: SecurityLevel =
@@ -1307,6 +1333,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
         Number.isFinite(raw.pty?.sentinelMaxWaitMs) && Number(raw.pty.sentinelMaxWaitMs) > 0
           ? Number(raw.pty.sentinelMaxWaitMs)
           : 30_000,
+      groupConfirm: resolveGroupConfirm(raw.pty?.groupConfirm),
     },
     runtime: parseRuntimeMode(raw.runtime),
     // #508: absent key → the fresh-install default; `[]` stays empty.

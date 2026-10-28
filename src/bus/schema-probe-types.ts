@@ -20,6 +20,14 @@ export interface ProbeRunner {
   screenTail?(): string;
   /** Hard kill if still alive. */
   kill(): void;
+  /** The pid of the probe's claude, for the quarantine record when its exit cannot be confirmed. */
+  readonly pid?: number;
+  /**
+   * Prove the exit from the OS, the leader AND its process group, through the common primitive
+   * (#581 cp3), after `kill()`. Optional: a test stub without a process has nothing to confirm.
+   * Rejects when it could not be proven.
+   */
+  retire?(): Promise<void>;
 }
 
 export interface ProbeRunnerSpawnArgs {
