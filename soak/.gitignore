@@ -1,0 +1,12 @@
+# Run outputs never belong in the repo (the default SOAK_BASE is outside the checkout anyway).
+results/
+trigger/
+state.json
+*.jsonl
+ps.csv
+summary.json
+summary.stdout.json
+counts.md
+meta.json
+*.log
+__pycache__/
