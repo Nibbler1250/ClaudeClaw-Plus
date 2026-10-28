@@ -62,8 +62,8 @@ def load(path):
 # 1. project MCP servers: one normal, one slow to exit, one deaf to SIGTERM
 write(ws / ".mcp.json", {"mcpServers": {
     "soak-ok": {"type": "stdio", "command": str(mcp / "mcp-ok"), "args": []},
-    "soak-lent": {"type": "stdio", "command": str(mcp / "mcp-lent"), "args": []},
-    "soak-sourd": {"type": "stdio", "command": str(mcp / "mcp-sourd"), "args": []},
+    "soak-slow": {"type": "stdio", "command": str(mcp / "mcp-slow"), "args": []},
+    "soak-deaf": {"type": "stdio", "command": str(mcp / "mcp-deaf"), "args": []},
 }})
 
 # 2. daemon settings (keeps an existing apiToken; pty.groupConfirm left at its default)

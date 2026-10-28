@@ -32,8 +32,8 @@ Every agent (runner, cron threads, bus) gets three stdio MCP servers from `ws/.m
 | Name | SIGTERM | SIGHUP / stdin EOF |
 |---|---|---|
 | `mcp-ok` | exits | exits |
-| `mcp-lent` | exits after ~5 s | ignored |
-| `mcp-sourd` | ignored (SIGKILL only) | ignored |
+| `mcp-slow` | exits after ~5 s | ignored |
+| `mcp-deaf` | ignored (SIGKILL only) | ignored |
 
 ### Scenarios
 
@@ -44,7 +44,7 @@ Every agent (runner, cron threads, bus) gets three stdio MCP servers from `ws/.m
 | c | `SessionManager.clearSession("default")` on the bus agent | old claude and its MCP servers gone within 30 s, no orphan, bus nonce ok, at most one bus claude |
 | d | `/compact` on the bus agent, then a nonce | nonce ok, no second writer on a session, no orphan |
 | e | SIGKILL the claude of an idle agent (alternates runner / bus) | every MCP server of that claude gone (while idle, or after the next turn), no orphan, follow-up nonce ok |
-| f | retire an agent (`retirePtySession("global")` for the runner, `SessionManager.restart` for the bus) | retire ok, `mcp-lent` and `mcp-sourd` were attached and are gone within 30 s, no orphan, follow-up ok |
+| f | retire an agent (`retirePtySession("global")` for the runner, `SessionManager.restart` for the bus) | retire ok, `mcp-slow` and `mcp-deaf` were attached and are gone within 30 s, no orphan, follow-up ok |
 
 Scenario e records, per MCP PID, `gone_idle_s` (seconds until it disappeared while the agent stayed idle,
 or `null`) and `gone_after_next_turn_s`. The idle window is 60 s by default; `--e-idle-seconds N`
@@ -161,7 +161,7 @@ In a `short` run, also check that `detector_proof(fake)` shows `flagged == injec
   daemon logs `exited outside stop()` and does not bring the agent back, so the harness restarts the
   isolated daemon to recover it and counts orphans at that stop too (`e_bus_respawned_by_pilot`).
 - **Runner MCP servers survive an idle SIGKILL** (upstream issue #606). After the runner claude is
-  killed while idle, `mcp-lent` and `mcp-sourd` can outlive the idle window and only go after the next
+  killed while idle, `mcp-slow` and `mcp-deaf` can outlive the idle window and only go after the next
   turn on that agent. Scenario e passes if they are gone after that turn and reports
   `e_retired_while_idle` separately; use `--e-idle-seconds` to measure the delay.
 - **First turn on a resumed session can be refused** (`PTY prompt not accepted`). The daemon reports
@@ -187,4 +187,4 @@ In a `short` run, also check that `detector_proof(fake)` shows `flagged == injec
 - `plugin/index.js`: daemon plugin (trigger-file protocol) that calls `runUserMessage`,
   `killActiveReport`, `retirePtySession`, `runOneShot`, `snapshotSupervisor` and the captured bus
   `SessionManager`.
-- `mcp/fake_mcp.py` and the `mcp-ok`, `mcp-lent`, `mcp-sourd` symlinks.
+- `mcp/fake_mcp.py` and the `mcp-ok`, `mcp-slow`, `mcp-deaf` symlinks.

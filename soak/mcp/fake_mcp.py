@@ -2,20 +2,20 @@
 """Fake stdio MCP server for the soak harness. Behaviour comes from the executable name (argv[0] basename,
 which is also the process comm the pilot uses to find it):
   mcp-ok    : exits on SIGTERM, SIGHUP or stdin EOF (a normal server)
-  mcp-lent  : on SIGTERM waits ~5 s then exits; ignores SIGHUP and stdin EOF (slow to exit)
-  mcp-sourd : ignores SIGTERM, SIGHUP and stdin EOF; only SIGKILL stops it (deaf to SIGTERM)
+  mcp-slow : on SIGTERM waits ~5 s then exits; ignores SIGHUP and stdin EOF (slow to exit)
+  mcp-deaf : ignores SIGTERM, SIGHUP and stdin EOF; only SIGKILL stops it (deaf to SIGTERM)
 One tool: echo.
 Keep the shebang a direct interpreter path (not /usr/bin/env): with env the process comm becomes "python3"
 and the pilot can no longer identify the servers."""
 import json, os, signal, sys, threading, time
 kind = os.path.basename(sys.argv[0])
-if kind == "mcp-lent":
+if kind == "mcp-slow":
     def slow(*_):
         time.sleep(5)
         os._exit(0)
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=slow, daemon=False).start())
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
-elif kind == "mcp-sourd":
+elif kind == "mcp-deaf":
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
 def send(o):

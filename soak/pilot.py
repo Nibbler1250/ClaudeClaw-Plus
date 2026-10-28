@@ -71,7 +71,7 @@ PLUGIN_OUT = RESULTS / "plugin"
 STATE_FILE = BASE / "state.json"
 ISO_CREDS = Path(ISO_HOME) / ".claude" / ".credentials.json"
 MCP_DIR = str(REPO / "soak" / "mcp")
-MCP_KINDS = ("mcp-ok", "mcp-lent", "mcp-sourd")
+MCP_KINDS = ("mcp-ok", "mcp-slow", "mcp-deaf")
 
 NONCE = re.compile(r"N-[0-9a-f]{8}")
 CRON_JOBS = {  # name: (schedule, model, timeout s, prompt template)
@@ -1029,11 +1029,11 @@ class Actions(BaseActions):
         orph = self.post_check("f")
         ev = self.runner_turn(path="f-followup") if target == "runner" else self.bus_turn(path="f-followup-bus")
         kinds = set(kids.values())
-        lent = [gone.get(p) for p, k in kids.items() if k == "mcp-lent"]
-        ok = (bool((res.get("retire") or {}).get("ok")) and {"mcp-lent", "mcp-sourd"} <= kinds
+        slow = [gone.get(p) for p, k in kids.items() if k == "mcp-slow"]
+        ok = (bool((res.get("retire") or {}).get("ok")) and {"mcp-slow", "mcp-deaf"} <= kinds
               and all(v is not None for v in gone.values()) and not orph["claude"] and not orph["mcp"] and ev["verdict"] == "ok")
         self._scenario("f", ok, target=target, retire=res.get("retire"), old_claude=old, mcp=kids, gone_s=gone,
-                       lent_exit_s=lent, orphans=orph, followup=ev["verdict"],
+                       slow_exit_s=slow, orphans=orph, followup=ev["verdict"],
                        counter_after=(res.get("after") or {}).get("counter"))
 
 
@@ -1109,7 +1109,7 @@ def summarize(out: Path):
         "e_retired_while_idle": {t: f"{sum(1 for e in sc if e['name'] == 'e' and e.get('target') == t and e.get('retired_while_idle'))}/{sum(1 for e in sc if e['name'] == 'e' and e.get('target') == t)}" for t in ("runner", "bus")},
         "e_bus_respawned_by_pilot": sum(1 for e in sc if e["name"] == "e" and e.get("respawn_by_pilot") is not None),
         "a_reported_killed": sum(1 for e in sc if e["name"] == "a" and e.get("reported_killed")),
-        "f_lent_exit_s": [x for e in sc if e["name"] == "f" for x in (e.get("lent_exit_s") or [])],
+        "f_slow_exit_s": [x for e in sc if e["name"] == "f" for x in (e.get("slow_exit_s") or [])],
         "detector_proof(fake)": {"injected": len(fakes), "flagged": sum(1 for e in fakes if e["verdict"] == "FALSE_COMPLETION")},
         "live_daemon_pid_changes": sum(1 for e in ev if e["kind"] == "live_daemon_pid_changed"),
         "pilot_errors": [e for e in ev if e["kind"] == "PILOT_ERROR"][:10],
