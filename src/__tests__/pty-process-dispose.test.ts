@@ -206,25 +206,42 @@ describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () =
   test("the identity is read again immediately before each SIGKILL: a pid reused after the last wait check is left alone", async () => {
     // Every earlier look says "same". The pid is handed over after the wait's last check and
     // before the signal, so only a read made right before the signal sees the stranger.
+    // The hand-over is placed by order, not by the clock. Every identity read follows its own
+    // existence probe (`<pid>:0`); inside a wait check that probe follows the check's leader
+    // probe (`<pid>:0`), while a read made after a completed check follows its group probe
+    // (`-<pid>:0`). After SIGTERM, that read is the one before the next signal. A wall-clock
+    // cut-off raced the retirement's own clock: a wait could end on a check that read no
+    // identity, and the pre-SIGKILL read was then the one that crossed the cut-off, still "same".
+    // Fault (site: `GroupTarget.sendGroup`, drop the identity read before kill()): no read sees
+    // the stranger. Predicted result: `flipped` false and a `-pid:SIGKILL` entry.
     const os = makeOs();
-    const grace = 200;
     let flipped = false;
-    let t0 = Number.POSITIVE_INFINITY;
+    let flipAt = -1;
+    let waitChecksAfterTerm = 0;
     os.identity = null; // the reader below answers instead
     const proc = await spawnWith(os, {
-      _exitGraceMs: grace,
+      _exitGraceMs: 200,
       _exitCapMs: 800,
-      _readPidIdentity: () => {
+      _readPidIdentity: (pid) => {
         if (flipped) return "boot-2";
-        if (Date.now() >= t0 + grace) flipped = true; // this read is the wait's last check: still "same"
-        return "boot-1";
+        if (!os.log.some((e) => e.endsWith(":SIGTERM"))) return "boot-1";
+        if (os.log.at(-2) !== `-${pid}:0`) {
+          waitChecksAfterTerm++; // a read inside a wait check: still "same"
+          return "boot-1";
+        }
+        flipped = true; // the read after the wait's last check: the pid is a stranger's now
+        flipAt = os.log.length;
+        return "boot-2";
       },
     });
-    t0 = Date.now();
 
     await proc.dispose();
 
+    expect(waitChecksAfterTerm).toBeGreaterThan(0);
     expect(flipped).toBe(true);
+    // No wait check (its group probe, `-pid:0`) came after the read that saw the stranger: it was
+    // the last read before the signal, not one made earlier in the wait and kept until kill().
+    expect(os.log.slice(flipAt).filter((e) => e.startsWith("-"))).toEqual([]);
     expect(os.log.filter((e) => e.endsWith(":SIGKILL"))).toEqual([]);
     expect(os.alive).toBe(true); // the stranger is untouched
   });
