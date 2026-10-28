@@ -11,6 +11,7 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { PtyExitUnconfirmedError, spawnPty } from "../runner/pty-process";
+import { withPlatformAsync } from "../runner/pty-test-platform";
 
 interface FakeChild {
   pid: number;
@@ -76,7 +77,8 @@ function makeOs(): FakeOs {
         if (!os.alive) throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
         return;
       }
-      if (sig === "SIGKILL" && pid > 0 && !os.immune) os.alive = false;
+      // SIGKILL to the leader or to its group (-pid) takes it, unless it is immune.
+      if (sig === "SIGKILL" && !os.immune) os.alive = false;
     },
   };
   return os;
@@ -115,7 +117,7 @@ afterEach(() => {
 
 describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () => {
   test("a child that outlives SIGTERM keeps dispose pending until SIGKILL has taken it", async () => {
-    // Fault (site: `_retire`, drop the pid confirmation): dispose() resolves as soon as
+    // Fault (site: `_retire`, drop the OS confirmation): dispose() resolves as soon as
     // bun-pty's synthetic exit event has fired. Predicted result: `settled` is already true
     // at the check below, and the OS still shows the child.
     const os = makeOs();
@@ -140,8 +142,8 @@ describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () =
     expect(fake.kills).toEqual(["SIGTERM"]);
   });
 
-  test("SIGKILL goes straight to the OS, to the group first and then the leader", async () => {
-    // Fault (site: `_confirmGoneByPid`, send SIGKILL through bun-pty instead of the OS): the
+  test("SIGKILL goes straight to the OS, to the group (which already reaches the leader)", async () => {
+    // Fault (site: `retireProcessGroup`, send SIGKILL through bun-pty instead of the OS): the
     // fake bun-pty's second kill() is a no-op, so the OS never sees a SIGKILL. Predicted
     // result: no `SIGKILL` in the OS log and dispose() rejects at the cap.
     const os = makeOs();
@@ -150,11 +152,13 @@ describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () =
     await proc.dispose();
 
     const kills = os.log.filter((e) => e.endsWith(":SIGKILL"));
-    expect(kills).toEqual([`-${proc.pid}:SIGKILL`, `${proc.pid}:SIGKILL`]);
+    // The group signal reaches the leader, a member of its own group, so no second, bare-pid
+    // signal goes out: it would only be one more chance to hit a reused pid.
+    expect(kills).toEqual([`-${proc.pid}:SIGKILL`]);
   });
 
   test("a process that survives SIGKILL makes dispose() reject, and a later confirmation succeeds", async () => {
-    // Fault (site: `_confirmGoneByPid`, return instead of throwing at the cap): dispose()
+    // Fault (site: `_confirmGone`, return instead of throwing at the cap): dispose()
     // resolves with the child still alive. Predicted result: the rejects assertion fails.
     const os = makeOs();
     os.immune = true;
@@ -184,8 +188,49 @@ describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () =
     expect(child?.kills).toEqual([]);
   });
 
+  test("a pid reused one tick after the child was born (a raw Linux start time one higher) is never signalled", async () => {
+    // The identity is compared exactly as read: a window of one tick (10 ms) or one second would
+    // call the stranger the child.
+    const os = makeOs();
+    os.identity = "500000";
+    const proc = await spawnWith(os);
+    os.identity = "500001";
+
+    await proc.dispose();
+
+    expect(os.log.filter((e) => e.endsWith(":SIGKILL"))).toEqual([]);
+    expect(os.alive).toBe(true);
+    expect(child?.kills).toEqual([]);
+  });
+
+  test("the identity is read again immediately before each SIGKILL: a pid reused after the last wait check is left alone", async () => {
+    // Every earlier look says "same". The pid is handed over after the wait's last check and
+    // before the signal, so only a read made right before the signal sees the stranger.
+    const os = makeOs();
+    const grace = 200;
+    let flipped = false;
+    let t0 = Number.POSITIVE_INFINITY;
+    os.identity = null; // the reader below answers instead
+    const proc = await spawnWith(os, {
+      _exitGraceMs: grace,
+      _exitCapMs: 800,
+      _readPidIdentity: () => {
+        if (flipped) return "boot-2";
+        if (Date.now() >= t0 + grace) flipped = true; // this read is the wait's last check: still "same"
+        return "boot-1";
+      },
+    });
+    t0 = Date.now();
+
+    await proc.dispose();
+
+    expect(flipped).toBe(true);
+    expect(os.log.filter((e) => e.endsWith(":SIGKILL"))).toEqual([]);
+    expect(os.alive).toBe(true); // the stranger is untouched
+  });
+
   test("a later confirmation whose identity cannot be read sends no signal and stays unconfirmed", async () => {
-    // Fault (site: `_maySignal`, treat "unknown" as signalable on any retirement): the later
+    // Fault (site: `GroupTarget.sendGroup`, treat "unknown" as signalable on any retirement): the later
     // confirmation SIGKILLs a pid it cannot vouch for. Predicted result: a second pair of
     // SIGKILL entries and `os.alive` false.
     const os = makeOs();
@@ -193,7 +238,7 @@ describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () =
     const proc = await spawnWith(os);
     await expect(proc.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
     const killsAfterFirst = os.log.filter((e) => e.endsWith(":SIGKILL")).length;
-    expect(killsAfterFirst).toBe(2); // initial window, identity matched
+    expect(killsAfterFirst).toBe(1); // initial window, identity matched: the group signal
 
     os.identity = null; // `ps` / `/proc` unreadable now
     os.immune = false;
@@ -203,21 +248,36 @@ describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () =
     expect(os.alive).toBe(true);
   });
 
-  test("with no identity recorded at spawn the initial retirement may signal, a later one may not", async () => {
-    // Fault (site: `_maySignal`, drop the `initial` clause): the initial retirement refuses
+  test("Linux: with no identity recorded at spawn the initial retirement may signal, a later one may not", async () => {
+    // Fault (site: `GroupTarget.sendGroup`, drop the `initial` clause): the initial retirement refuses
     // to signal and the process outlives it. Predicted result: dispose() rejects with
     // no SIGKILL logged.
     const os = makeOs();
     os.immune = true;
     const proc = await spawnWith(os, { _readPidIdentity: () => null });
-    await expect(proc.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
+    await expect(withPlatformAsync("linux", () => proc.dispose())).rejects.toBeInstanceOf(
+      PtyExitUnconfirmedError,
+    );
     const killsAfterFirst = os.log.filter((e) => e.endsWith(":SIGKILL")).length;
-    expect(killsAfterFirst).toBe(2);
+    expect(killsAfterFirst).toBe(1);
 
     os.immune = false;
-    await expect(proc.confirmExit?.()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
+    await expect(
+      withPlatformAsync("linux", async () => proc.confirmExit?.()),
+    ).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
 
     expect(os.log.filter((e) => e.endsWith(":SIGKILL")).length).toBe(killsAfterFirst);
+  });
+
+  test("macOS: with no identity recorded at spawn nothing is signalled, the initial retirement included (#581 decision 2, review H1)", async () => {
+    const os = makeOs();
+    os.immune = true;
+    const proc = await spawnWith(os, { _readPidIdentity: () => null });
+    await expect(withPlatformAsync("darwin", () => proc.dispose())).rejects.toBeInstanceOf(
+      PtyExitUnconfirmedError,
+    );
+    // Fault (site: `allowUnrecordedInitial` true on every platform): one SIGKILL is logged.
+    expect(os.log.filter((e) => e.endsWith(":SIGTERM") || e.endsWith(":SIGKILL"))).toEqual([]);
   });
 
   test("a pid that cannot be a real child is never signalled (no kill(-1), no kill(0))", async () => {

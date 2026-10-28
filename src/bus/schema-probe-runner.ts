@@ -28,6 +28,7 @@
 
 import { cleanSpawnEnv, withCleanProcessEnv } from "../runner";
 import { stripAnsi } from "../runner/pty-output-parser";
+import { assertSessionSpawnable } from "../runner/pty-quarantine";
 import { ensureTrustAccepted } from "../runner/pty-trust-prompt";
 import { PtyAgentProcess } from "./session-agent-process";
 import type { ProbeRunner, ProbeRunnerFactory } from "./schema-probe-types";
@@ -94,14 +95,18 @@ export const defaultPtyRunnerFactory: ProbeRunnerFactory = async ({
   // `homeOverride` means "the home claude reads and writes": the probe
   // predicts the JSONL path under it, so the child must use it too.
   if (homeDir) env.HOME = homeDir;
-  const handle = withCleanProcessEnv(() =>
-    bunPty.spawn(claudeBin, args, {
+  const handle = withCleanProcessEnv(() => {
+    // #581 cp6: the probe had no final gate. The synchronous word for its generated session id
+    // (and the key `confirmProbeGone` quarantines it under), on the line before the native call
+    // and after every await above. No await between.
+    assertSessionSpawnable({ sessionKey: `schema-probe:${sessionId}`, sessionId });
+    return bunPty.spawn(claudeBin, args, {
       cwd,
       cols: 120,
       rows: 30,
       env,
-    }),
-  );
+    });
+  });
 
   const proc = new PtyAgentProcess(`schema-probe-${sessionId.slice(0, 8)}`, handle);
 
@@ -154,6 +159,10 @@ export const defaultPtyRunnerFactory: ProbeRunnerFactory = async ({
     },
     kill() {
       proc._kill("SIGTERM");
+    },
+    pid: proc.pid,
+    retire() {
+      return proc.retire();
     },
   };
   return runner;

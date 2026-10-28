@@ -35,6 +35,8 @@ import {
 } from "./schema-probe-assertions";
 import { defaultPtyRunnerFactory } from "./schema-probe-runner";
 import type { ProbeRunner, ProbeRunnerFactory, ProbeRunnerSpawnArgs } from "./schema-probe-types";
+import { quarantineSession } from "../runner/pty-quarantine";
+import type { PtyProcess } from "../runner/pty-process";
 
 export { SCHEMA_VERSION };
 
@@ -434,6 +436,7 @@ export class SchemaProbe {
         } catch {
           /* swallow */
         }
+        await confirmProbeGone(runner, sessionId);
       }
     }
 
@@ -566,6 +569,37 @@ function hashSchemaShape(collected: CollectedJsonl): string {
 export { ASSERTION_DEFS, runAssertions };
 export type { AssertionResult, CollectedJsonl };
 export { defaultPtyRunnerFactory };
+/**
+ * The probe's claude is gone only when the OS says so, the leader and its group (#581 cp3): the
+ * kill above is a request, and bun-pty's exit event is not proof. When it cannot be had the
+ * probe's session id is quarantined and the failure is logged; the probe's own verdict is not
+ * changed by it.
+ */
+async function confirmProbeGone(runner: ProbeRunner, sessionId: string): Promise<void> {
+  if (!runner.retire) return;
+  try {
+    await runner.retire();
+  } catch (err) {
+    console.error(
+      `[schema-probe] teardown: exit not confirmed (${(err as Error)?.name ?? "error"}); session ${sessionId} is quarantined`,
+    );
+    const retire = runner.retire.bind(runner);
+    quarantineSession(
+      `schema-probe:${sessionId}`,
+      {
+        label: `schema-probe-${sessionId.slice(0, 8)}`,
+        pid: runner.pid ?? 0,
+        sessionId,
+        dispose: retire,
+        confirmExit: retire,
+      } as unknown as PtyProcess,
+      "schema-probe-exit-unconfirmed",
+    );
+  }
+}
+
+export const __confirmProbeGoneForTests = confirmProbeGone;
+
 export type { ProbeRunner, ProbeRunnerFactory, ProbeRunnerSpawnArgs };
 
 /** For tests only — verifies the win32 `shell: true` branch off-Windows. */

@@ -240,6 +240,10 @@ const DEFAULT_SETTINGS: Settings = {
     maxConcurrent: 32,
     quietWindowMs: 500,
     sentinelMaxWaitMs: 30_000,
+    // #581: what a failed process-GROUP exit confirmation does to a trusted PTY. "observe" logs
+    // and counts it; "enforce" quarantines the session like an unconfirmed leader. Untrusted
+    // one-shots always enforce. Flipping this default is the later PR that follows the soak.
+    groupConfirm: "observe",
   },
   mcp: {
     // Default empty — the multiplexer is dormant out of the box. Operators
@@ -729,6 +733,8 @@ export interface PtyConfig {
    * and callers still parse. Default: 30000.
    */
   sentinelMaxWaitMs: number;
+  /** Trusted PTYs: "observe" (log + count) or "enforce" (quarantine) on an unconfirmed process group. */
+  groupConfirm: "observe" | "enforce";
 }
 
 /**
@@ -1087,6 +1093,20 @@ export function resolvePtyEnabled(
   return fallback;
 }
 
+const invalidGroupConfirmWarned = new Set<string>();
+/** `pty.groupConfirm`: "observe" or "enforce"; anything else is "observe", with one warning. */
+export function resolveGroupConfirm(value: unknown): "observe" | "enforce" {
+  if (value === "observe" || value === "enforce") return value;
+  if (value !== undefined) {
+    const key = JSON.stringify(value);
+    if (!invalidGroupConfirmWarned.has(key)) {
+      invalidGroupConfirmWarned.add(key);
+      console.warn('pty.groupConfirm must be "observe" or "enforce"; using "observe"');
+    }
+  }
+  return "observe";
+}
+
 function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Settings {
   const rawLevel = raw.security?.level;
   const level: SecurityLevel =
@@ -1313,6 +1333,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
         Number.isFinite(raw.pty?.sentinelMaxWaitMs) && Number(raw.pty.sentinelMaxWaitMs) > 0
           ? Number(raw.pty.sentinelMaxWaitMs)
           : 30_000,
+      groupConfirm: resolveGroupConfirm(raw.pty?.groupConfirm),
     },
     runtime: parseRuntimeMode(raw.runtime),
     // #508: absent key → the fresh-install default; `[]` stays empty.

@@ -1,0 +1,303 @@
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  isSignalablePid,
+  procLiveMembers,
+  processGroupGone,
+  retireProcessGroup,
+  type RetireGroupInput,
+  type SignalFn,
+} from "./pty-group-kill.js";
+import { withPlatformAsync } from "./pty-test-platform.js";
+
+/** #570 r12 (A): a retired PTY child must be proven gone, with its group. */
+
+const PID = 424242;
+const errno = (code: string): NodeJS.ErrnoException => Object.assign(new Error(code), { code });
+
+/** A process table: the group dies on the given signal (or never). */
+function fakeKernel(diesOn: NodeJS.Signals | null, { visible = true } = {}) {
+  const calls: Array<[number, NodeJS.Signals | 0]> = [];
+  let alive = true;
+  const signal: SignalFn = (target, name) => {
+    calls.push([target, name]);
+    if (name === 0) {
+      if (!alive || !visible) throw errno("ESRCH");
+      return;
+    }
+    if (name === diesOn) alive = false;
+  };
+  return { signal, calls };
+}
+
+/** The leader is the process recorded at spawn: its raw identity matches what is read now. */
+const IDENT = "boot-1";
+const DAEMON_GROUP = 4000;
+
+/** The one retirement, over a fake kernel and a virtual clock; true when leader and group are gone. */
+async function retire(
+  signal: SignalFn,
+  over: Partial<RetireGroupInput> & { pid?: number } = {},
+): Promise<boolean> {
+  let t = 0;
+  const pid = over.pid ?? PID;
+  const out = await retireProcessGroup({
+    pid,
+    identity: IDENT,
+    groupId: pid,
+    daemonGroupId: DAEMON_GROUP,
+    members: [],
+    readMembers: () => ({ members: [], complete: true }),
+    readGroupId: () => pid,
+    readIdentity: () => IDENT,
+    signal,
+    liveMembers: () => undefined,
+    describe: () => ({ count: undefined, comm: [] }),
+    initial: true,
+    allowUnrecordedInitial: false,
+    sendTerm: true,
+    deadlineAt: 4000,
+    termGraceMs: 2000,
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    ...over,
+  });
+  return out.leaderGone && out.groupGone;
+}
+
+describe("retireProcessGroup over a fake kernel", () => {
+  it("SIGTERMs the group once, not the bare pid as well, and is done once both answer ESRCH", async () => {
+    const k = fakeKernel("SIGTERM");
+    expect(await retire(k.signal)).toBe(true);
+    // The leader is a member of its own group: a second signal to the bare pid adds nothing and
+    // is one more chance to hit a reused pid (#570 r14, B).
+    expect(k.calls.filter(([, n]) => n === "SIGTERM")).toEqual([[-PID, "SIGTERM"]]);
+    expect(k.calls.some(([, n]) => n === "SIGKILL")).toBe(false);
+  });
+
+  it("escalates to SIGKILL when the group outlives SIGTERM", async () => {
+    const k = fakeKernel("SIGKILL");
+    // Went red (false, then no SIGKILL calls) with the escalation removed.
+    expect(await retire(k.signal)).toBe(true);
+    expect(k.calls.filter(([, n]) => n === "SIGKILL")).toEqual([[-PID, "SIGKILL"]]);
+  });
+
+  it("reports failure, never success, when the group survives SIGKILL", async () => {
+    const k = fakeKernel(null);
+    expect(await retire(k.signal)).toBe(false);
+  });
+
+  it("does not take the leader's disappearance for the group's", async () => {
+    // kill(pid, 0) says ESRCH (leader reaped) but the group still has a member.
+    const signal: SignalFn = (target, name) => {
+      if (name === 0 && target === PID) throw errno("ESRCH");
+    };
+    // Went red (true) with only the leader checked.
+    expect(await retire(signal)).toBe(false);
+  });
+
+  it("reads EPERM as alive, not gone", async () => {
+    const signal: SignalFn = (_target, name) => {
+      if (name === 0) throw errno("EPERM");
+    };
+    // Went red (true) with every error read as "gone".
+    expect(await retire(signal)).toBe(false);
+  });
+
+  it("an older macOS daemon's second-precise identity is neither the leader nor a stranger (#581 decision 2)", async () => {
+    // A survivor record written before libproc identities: `ps lstart` text. libproc reads the
+    // same second now. That never authorises a signal (#596), nor proves the leader recycled,
+    // which would take the group as long gone and release what holds it.
+    const lstart = "Tue Oct 27 13:05:35 2026";
+    const now = `${Date.parse(lstart) / 1000}.845980`;
+    const k = fakeKernel(null); // the group does not go on its own
+    const gone = await withPlatformAsync("darwin", () =>
+      retire(k.signal, { identity: lstart, readIdentity: () => now }),
+    );
+    expect(gone).toBe(false);
+    expect(k.calls.some(([, n]) => n === "SIGTERM" || n === "SIGKILL")).toBe(false);
+  });
+
+  it("a member recorded by an older macOS daemon is kept as evidence, never as authority (#581 review, M3)", async () => {
+    // The leader is gone; the member a survivor record carries is `ps lstart` text, and the
+    // complete listing shows that pid with libproc's identity in the same second. That cannot
+    // say it is another process, so the member is kept for the next retry; nor can it vouch for
+    // the group, so nothing is signalled.
+    const legacy = "Tue Oct 27 13:05:35 2026";
+    const precise = `${Date.parse(legacy) / 1000}.845980`;
+    const signals: Array<[number, NodeJS.Signals | 0]> = [];
+    const signal: SignalFn = (target, name) => {
+      if (target === PID) throw errno("ESRCH");
+      signals.push([target, name]);
+    };
+    let t = 0;
+    const out = await withPlatformAsync("darwin", () =>
+      retireProcessGroup({
+        pid: PID,
+        identity: legacy,
+        groupId: PID,
+        daemonGroupId: DAEMON_GROUP,
+        members: [{ pid: PID + 1, identity: legacy }],
+        readIdentity: () => null,
+        readGroupId: () => PID,
+        readMembers: () => ({ members: [{ pid: PID + 1, identity: precise }], complete: true }),
+        signal,
+        liveMembers: () => undefined,
+        describe: () => ({ count: 1, comm: ["sleep"] }),
+        initial: false,
+        allowUnrecordedInitial: false,
+        sendTerm: true,
+        deadlineAt: 1000,
+        termGraceMs: 10,
+        pollMs: 10,
+        now: () => t,
+        sleep: async (ms) => {
+          t += ms;
+        },
+      }),
+    );
+    expect(out.groupGone).toBe(false);
+    // Fault (site: `unresolved` in retireProcessGroup returns nothing): members is [].
+    expect(out.members).toEqual([{ pid: PID + 1, identity: legacy }]);
+    expect(signals.some(([, n]) => n === "SIGTERM" || n === "SIGKILL")).toBe(false);
+  });
+
+  it("counts an unreaped zombie as gone where /proc can tell, and not otherwise", () => {
+    const zombie: SignalFn = () => {}; // kill(.., 0) succeeds for a zombie
+    // Went red (false) with the /proc answer ignored.
+    expect(processGroupGone(PID, zombie, () => 0)).toBe(true);
+    expect(processGroupGone(PID, zombie, () => 1)).toBe(false);
+    expect(processGroupGone(PID, zombie, () => undefined)).toBe(false);
+  });
+
+  describe("pid identity (#570 r13, B)", () => {
+    const signalled = (calls: Array<[number, NodeJS.Signals | 0]>) =>
+      calls.filter(([, name]) => name !== 0);
+
+    it("signals nothing when the pid now has a different identity", async () => {
+      const k = fakeKernel("SIGKILL");
+      // Went red with the identity check removed from `send` (signals went to the stranger),
+      // and with the poll not noticing the reuse (false, the call waited out and failed).
+      expect(await retire(k.signal, { readIdentity: () => "boot-2" })).toBe(true);
+      expect(signalled(k.calls)).toEqual([]);
+    });
+
+    it("checks again before the SIGKILL: a pid reused after the SIGTERM is not killed", async () => {
+      const k = fakeKernel(null);
+      let reads = 0;
+      // The first readings (before SIGTERM) are ours; every later one is a stranger's. Three: the
+      // group-id refresh reads the identity before and after the group id (cp10, H2), then SIGTERM.
+      const readIdentity = () => (reads++ < 3 ? IDENT : "boot-2");
+      // A short SIGTERM grace, so the escalation is reached before any poll can notice the reuse.
+      const result = await retire(k.signal, { readIdentity, termGraceMs: 100 });
+      // Went red (a SIGKILL among the signals) when the escalation reused the identity read
+      // before the SIGTERM instead of reading it again.
+      expect(signalled(k.calls).every(([, name]) => name === "SIGTERM")).toBe(true);
+      // Went red (2 signals) with the bare pid signalled after the group, and (a SIGKILL among
+      // them) with the identity cached instead of read again.
+      expect(signalled(k.calls).length).toBe(1);
+      expect(result).toBe(true); // a reused pid means the group we started is gone
+    });
+
+    it("signals nothing when the leader is gone and the group has no member either", async () => {
+      const k = fakeKernel("SIGKILL", { visible: false });
+      // Went red with the identity check removed, and with the bare pid signalled after "gone".
+      expect(await retire(k.signal)).toBe(true);
+      expect(signalled(k.calls)).toEqual([]);
+    });
+
+    it("signals nothing for an unrecorded identity unless the caller allows the initial window", async () => {
+      const refused = fakeKernel("SIGKILL");
+      await retire(refused.signal, { identity: null, readIdentity: () => null });
+      expect(signalled(refused.calls)).toEqual([]);
+
+      const allowed = fakeKernel("SIGKILL");
+      const warn = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        await retire(allowed.signal, {
+          identity: null,
+          readIdentity: () => null,
+          allowUnrecordedInitial: true,
+        });
+      } finally {
+        warn.mockRestore();
+      }
+      expect(signalled(allowed.calls).length).toBeGreaterThan(0);
+    });
+  });
+
+  it("never signals a pid that could reach init, itself, or every process", async () => {
+    for (const pid of [0, 1, -1, -PID, Number.NaN, 1.5, process.pid]) {
+      const k = fakeKernel("SIGTERM");
+      // Went red (true) with the pid guard removed.
+      expect(isSignalablePid(pid)).toBe(false);
+      expect(await retire(k.signal, { pid })).toBe(false);
+      expect(k.calls).toEqual([]);
+    }
+  });
+});
+
+describe("procLiveMembers", () => {
+  let proc: string;
+  beforeEach(() => {
+    proc = mkdtempSync(join(tmpdir(), "fake-proc-"));
+  });
+  afterEach(() => rmSync(proc, { recursive: true, force: true }));
+
+  const entry = (pid: number, comm: string, state: string, pgrp: number): void => {
+    mkdirSync(join(proc, String(pid)));
+    writeFileSync(
+      join(proc, String(pid), "stat"),
+      `${pid} (${comm}) ${state} 1 ${pgrp} ${pgrp} 0\n`,
+    );
+  };
+
+  it("counts live members of the group, not zombies or other groups", () => {
+    entry(PID, "sh", "Z", PID); // the leader, dead and unreaped
+    entry(PID + 1, "sleep", "S", PID); // a live member
+    entry(PID + 2, "other", "S", 777); // another group
+    mkdirSync(join(proc, "self")); // not a pid
+    expect(procLiveMembers(PID, proc)).toBe(1);
+  });
+
+  it("parses a command name that contains spaces and parentheses", () => {
+    entry(PID + 1, "a) S 1 1 (b", "S", PID);
+    expect(procLiveMembers(PID, proc)).toBe(1);
+  });
+
+  it("is zero when only zombies are left", () => {
+    entry(PID, "sh", "Z", PID);
+    expect(procLiveMembers(PID, proc)).toBe(0);
+  });
+
+  it("is unknown, not zero, when no member can be seen at all", () => {
+    entry(PID + 2, "other", "S", 777);
+    // Went red (0) with zero allowed without a zombie having been seen.
+    expect(procLiveMembers(PID, proc)).toBeUndefined();
+  });
+
+  // #570 r13, D: an entry whose stat cannot be read may be a live member.
+  it("counts an unreadable entry as unknown, so a zombie beside it does not make the group gone", () => {
+    entry(PID, "sh", "Z", PID);
+    mkdirSync(join(proc, String(PID + 1)));
+    mkdirSync(join(proc, String(PID + 1), "stat")); // reading a directory fails with EISDIR
+    // Went red (0, "gone") with a failed read skipped, as before r13.
+    expect(procLiveMembers(PID, proc)).toBeUndefined();
+  });
+
+  it("still counts a live member it can see when another entry is unreadable", () => {
+    entry(PID + 1, "sleep", "S", PID);
+    mkdirSync(join(proc, String(PID + 2)));
+    mkdirSync(join(proc, String(PID + 2), "stat"));
+    expect(procLiveMembers(PID, proc)).toBe(1);
+  });
+
+  it("does not take X (dead) state for alive", () => {
+    entry(PID, "sh", "X", PID);
+    expect(procLiveMembers(PID, proc)).toBe(0);
+  });
+});

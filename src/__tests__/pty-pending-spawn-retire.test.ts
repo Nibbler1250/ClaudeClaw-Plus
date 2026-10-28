@@ -317,8 +317,30 @@ describe("a pending spawn that never settles", () => {
     expect(PENDING_SPAWN_BOUND_MS).toBe(15_000);
     expect(retiring.done()).toBe(false);
 
+    // #581 cp3: from the moment the bound passes until the quarantine is recorded, the session
+    // is never spawnable, not even for one microtask. Watched at microtask granularity, with a
+    // macrotask yield now and then so timers and I/O are not starved. Fault (site: the bound
+    // branch of `retireEntry`, lift the entry fence and yield before `quarantineSession`):
+    // a check in the gap does not throw. Predicted result: `gaps` is not empty.
+    const gaps: number[] = [];
+    let watching = true;
+    const watcher = (async () => {
+      for (let i = 0; watching; i++) {
+        try {
+          assertSessionSpawnable({ sessionKey: "thread:n" });
+          gaps.push(i);
+        } catch {
+          /* fenced or quarantined: as it must be */
+        }
+        if (i % 50 === 49) await new Promise<void>((r) => setImmediate(r));
+        else await Promise.resolve();
+      }
+    })();
     expire();
     await expect(retiring.p).rejects.toBeInstanceOf(PtyQuarantinedError);
+    watching = false;
+    await watcher;
+    expect(gaps).toEqual([]);
     expect(isSessionQuarantined({ sessionKey: "thread:n" })).toBe(true);
     expect(isSessionQuarantined({ sessionId: "sess-1" })).toBe(true);
     expect(() => assertSessionSpawnable({ sessionKey: "thread:n" })).toThrow(PtyQuarantinedError);

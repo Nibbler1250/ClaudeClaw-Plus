@@ -68,6 +68,8 @@ import {
   assertSessionSpawnable,
   assertSessionWritable,
   fenceKey,
+  fenceSession,
+  isSessionQuarantined,
   liftFence,
   quarantineSession,
 } from "../runner/pty-quarantine";
@@ -911,6 +913,20 @@ export class SessionManager {
    * finally.
    */
   private readonly restartInFlight = new Map<string, Promise<AgentProcess>>();
+  /**
+   * The quarantine/fence identity of each PTY agent's retirement, one per record (#581 cp8, H3).
+   * The fence is keyed by this object, so `stop()` and a natural exit fence and release through
+   * the same one.
+   */
+  private readonly retirementHandles = new WeakMap<AgentRecord, PtyProcess>();
+  /** The OS-confirmed retirement of a record, once begun. Joined by every caller. */
+  private readonly retirementRuns = new WeakMap<AgentRecord, Promise<void>>();
+  /**
+   * Retirements in flight by agent id. A spawn for the same agent waits for them: the session is
+   * fenced until the OS has spoken, and a respawn right after a crash must not fail on that.
+   * Entries never reject (a failed confirmation quarantines the session instead).
+   */
+  private readonly retirements = new Map<string, Promise<void>>();
   /** In-flight `clearSession()` per agent: a second `/clear` joins the first instead of racing it. */
   private readonly clearInFlight = new Map<string, Promise<void>>();
   /**
@@ -1051,6 +1067,13 @@ export class SessionManager {
       // (with a SIGKILL of the recorded process) decides, not the exit event.
       await Promise.race([stopped, sleepMs(CLEAR_STOP_BOUND_MS)]);
       const confirm = async (): Promise<boolean> => {
+        // A PTY agent is retired through the group primitive (#581): its verdict counts too, so a
+        // leader the record shows gone beside a group the retirement quarantined is not retired.
+        const groupRun = this.retirementRuns.get(record);
+        if (groupRun) {
+          await groupRun;
+          if (isSessionQuarantined({ sessionId })) return false;
+        }
         const store = this.options.ownershipStore;
         if (proven && store) {
           return confirmRetired({
@@ -1301,6 +1324,7 @@ export class SessionManager {
       // #562 round 8: the same gate every other start on a session passes. The bus names its
       // agent's session with `--session-id`, so a transcript the PTY supervisor still has an
       // unconfirmed writer on is not started beside it.
+      await this.retirements.get(agent.id); // a retirement of this agent's last process, if any
       await assertSessionWritable({ sessionId: agent.session_id });
       if (mode === "pty-stdin") {
         proc = await this.spawnPty(agent, args, env, realCwd);
@@ -1423,6 +1447,12 @@ export class SessionManager {
             );
           })();
         }
+        // The session is fenced BEFORE the registry owner goes (#581 cp8, H3): an exit callback
+        // proves nothing about the OS (bun-pty fires it from kill() whether or not the child died),
+        // so the process is retired on the OS's word and the session stays unspawnable until then.
+        // `stop()` has already fenced a record it is stopping; this is idempotent.
+        this.fenceForRetirement(current);
+        void this.retireOnOsWord(current, "bus-exit-unconfirmed");
         // #595 r3: the exit event is not proof the OS process is gone (bun-pty fires it at once), so
         // the ownership record is cleared only once the OS confirms; otherwise it stays for the
         // next start to examine.
@@ -1693,18 +1723,18 @@ export class SessionManager {
     // fork-time read of `environ`). The bun-pty handle is the first thing
     // returned so the post-spawn restore happens after the child has
     // inherited the stripped env.
-    // #562 round 9: the synchronous final word, after the `bun-pty` import above. No await
-    // between this check and the spawn.
-    assertSessionSpawnable({ sessionId: agent.session_id });
-    const pty = withCleanProcessEnv(() =>
-      ptySpawn(cmd, args, {
+    const pty = withCleanProcessEnv(() => {
+      // #562 round 9, moved into the callback by #581 cp6: the synchronous final word, after
+      // the `bun-pty` import above, on the line before the native call. No await between.
+      assertSessionSpawnable({ sessionId: agent.session_id });
+      return ptySpawn(cmd, args, {
         name: "xterm-256color",
         cols: 120,
         rows: 30,
         cwd: realCwd,
         env,
-      }),
-    );
+      });
+    });
     // Boot-dialog handling lives in PtyAgentProcess's output-driven watcher
     // (issue #193): it answers the dev-channels confirmation with Enter and the
     // new "Bypass Permissions mode" confirmation by selecting "Yes, I accept"
@@ -1762,11 +1792,12 @@ export class SessionManager {
         `is not implemented in Sprint 1; stop() will use SIGTERM. Use 'pty-stdin' ` +
         `or 'process-stream-json' for graceful slash-command lifecycle.\n`,
     );
-    // #562 round 9: the synchronous final word; no await between it and the spawn below.
-    assertSessionSpawnable({ sessionId: agent.session_id });
     const claudeBin = this.options.commandOverride ?? "claude";
     const sessionName = `claudeclaw-${agent.id}`;
     const tmuxArgs = ["new-session", "-d", "-s", sessionName, claudeBin, ...args];
+    // #562 round 9, after the argv is prepared by #581 cp6: the synchronous final word, on the
+    // line before the spawn. No await between.
+    assertSessionSpawnable({ sessionId: agent.session_id });
     const child = nodeSpawnChildProcess("tmux", tmuxArgs, {
       cwd: realCwd,
       env,
@@ -1814,34 +1845,56 @@ export class SessionManager {
     if (!record) return Promise.resolve();
     // Issue #393: this exit is asked for — keep the spawn-time exit log quiet.
     record.stopping = true;
+    // The session is fenced from this synchronous step on, before the graceful phase and before
+    // the registry owner can go (#581 cp8, H3).
+    this.fenceForRetirement(record);
+    // While the process is certainly alive, remember who is in its group: if the graceful quit
+    // ends it, that is the only evidence the survivors are still ours (#581 cp8, H2).
+    if (record.proc instanceof PtyAgentProcess) record.proc.noteLiveGroup();
     return new Promise<void>((resolve) => {
       const finalise = (): void => {
         // Issue #215: tear down the session tailer.
         void record.tailer?.stop();
-        // Everything below is keyed by the agent id, so it belongs to whichever record holds the id
-        // NOW. This callback can arrive late (a `/clear` or restart confirmed the old pid gone through
-        // the OS and already spawned the replacement): then it must not drop the replacement's
-        // registry entry, revoke its MCP identity or reset its restart budget (#595 r9).
-        if (this.agents.get(agent_id) === record) {
-          // Issue #165: release the multiplexer identity + delete the
-          // synthesized per-agent --mcp-config when this spawn had one.
-          this.cleanupAgentMcpConfig(record.mcpConfigCwd, agent_id);
-          // Drop from registry (the onExit handler installed in spawnAgent()
-          // will also do this; harmless to do twice).
-          this.agents.delete(agent_id);
-          // Drop the restart-budget entry too — otherwise a stopped-and-never-
-          // restarted agent leaves a stranded number[] for the life of the
-          // manager (slow leak in a primitive whose purpose is to bound growth).
-          this.restartHistory.delete(agent_id);
+        // Everything below is bound to THIS record: it runs only while this record still holds the
+        // registry slot (#595 r9, as on main). An empty slot is not a way in: whoever emptied it (the
+        // exit callback, `retireLive`, a failed spawn) released this record's config and identity, and
+        // a replacement may already be synthesising its own under the same agent id.
+        if (this.agents.get(agent_id) !== record) {
+          resolve();
+          return;
         }
+        // Issue #165: release the multiplexer identity + delete the
+        // synthesized per-agent --mcp-config when this spawn had one.
+        this.cleanupAgentMcpConfig(record.mcpConfigCwd, agent_id);
+        // Drop from registry (the onExit handler installed in spawnAgent()
+        // will also do this; harmless to do twice).
+        this.agents.delete(agent_id);
+        // Drop the restart-budget entry too — otherwise a stopped-and-never-
+        // restarted agent leaves a stranded number[] for the life of the
+        // manager (slow leak in a primitive whose purpose is to bound growth).
+        this.restartHistory.delete(agent_id);
         resolve();
       };
+      // An exit callback is not proof the process (and the group it started) is gone: bun-pty
+      // fires it from kill() whether or not the child died. A PTY agent is retired through the
+      // common primitive and the session is released only on the OS's word; when that cannot be
+      // had the session id is quarantined, so nothing resumes it beside a live writer (#581 cp3).
+      let confirming = false;
+      const confirmThenFinalise = (): void => {
+        if (confirming) return;
+        confirming = true;
+        if (!(record.proc instanceof PtyAgentProcess)) {
+          finalise();
+          return;
+        }
+        void this.retireOnOsWord(record, "bus-stop-exit-unconfirmed").then(finalise);
+      };
       if (record.proc._isExited()) {
-        finalise();
+        confirmThenFinalise();
         return;
       }
       record.proc.onExit(() => {
-        finalise();
+        confirmThenFinalise();
       });
       // Try graceful first: /quit via the active relay channel. If that path
       // fails (closed stdin, dead PTY), fall through to SIGTERM.
@@ -1857,10 +1910,73 @@ export class SessionManager {
           // the recorded path that produces `<command-name>/exit</...>`
           // envelopes in the JSONL — see Spike 0.5).
           setTimeout(() => {
-            if (!record.proc._isExited()) record.proc._kill();
+            if (record.proc._isExited()) return;
+            // The native kill is made only to a child proven to be ours (PtyAgentProcess._kill).
+            // When it is not made, no exit event follows, so the OS is asked directly: the
+            // retirement signals what it can prove and quarantines the session when it cannot.
+            // A plain child's SIGTERM is always sent and its exit event finalises it.
+            record.proc._kill();
+            if (record.proc instanceof PtyAgentProcess && !record.proc._isExited()) {
+              confirmThenFinalise();
+            }
           }, 2000).unref?.();
         });
     });
+  }
+
+  /**
+   * Fence the session of a PTY agent from now, synchronously (#581 cp8, H3). Idempotent; a no-op
+   * for a process that is not a PTY. The fence ends in `retireOnOsWord`: lifted when the OS
+   * confirms the exit, handed to the quarantine in the same step when it does not.
+   */
+  private fenceForRetirement(record: AgentRecord): void {
+    const proc = record.proc;
+    if (!(proc instanceof PtyAgentProcess) || this.retirementHandles.has(record)) return;
+    // Captured now, while the process is the one on this session: a restart sets the shared
+    // `AgentConfig`'s `session_id` to a fresh id once `stop()` resolves, and a fence or quarantine
+    // that followed it would cover the new, unused id instead of the dying process's transcript.
+    const sessionId = record.agent.session_id;
+    const handle = {
+      label: record.agent.id,
+      pid: proc.pid,
+      sessionId,
+      dispose: () => proc.retire(),
+      confirmExit: () => proc.retire(),
+    } as unknown as PtyProcess;
+    this.retirementHandles.set(record, handle);
+    fenceSession(record.agent.id, handle);
+  }
+
+  /**
+   * Retire a PTY agent's process through the common primitive and release its session only on the
+   * OS's word. Joined: every caller gets the one run for the record. Never rejects: a failed
+   * confirmation quarantines the session (the fence changes hands in one step).
+   */
+  private retireOnOsWord(record: AgentRecord, reason: string): Promise<void> {
+    const existing = this.retirementRuns.get(record);
+    if (existing) return existing;
+    const proc = record.proc;
+    if (!(proc instanceof PtyAgentProcess)) return Promise.resolve();
+    this.fenceForRetirement(record);
+    const handle = this.retirementHandles.get(record) as PtyProcess;
+    const agentId = record.agent.id;
+    const run: Promise<void> = proc.retire().then(
+      () => {
+        liftFence(handle);
+      },
+      (err: unknown) => {
+        console.error(
+          `[bus-session] agent=${agentId} exit not confirmed (${(err as Error)?.name ?? "error"}); session ${record.agent.session_id} is quarantined`,
+        );
+        quarantineSession(agentId, handle, reason);
+      },
+    );
+    this.retirementRuns.set(record, run);
+    this.retirements.set(agentId, run);
+    void run.then(() => {
+      if (this.retirements.get(agentId) === run) this.retirements.delete(agentId);
+    });
+    return run;
   }
 
   /**

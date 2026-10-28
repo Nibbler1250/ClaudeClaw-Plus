@@ -1,14 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { EventEmitter } from "node:events";
 import type { spawn } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  mkdtempSync,
+  writeFileSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { _setSettingsFileForTests, loadSettings, reloadSettings } from "../config.js";
 import { runOneShot, type OneShotRequest } from "./engine.js";
+import { applyPtyIsolationVersionGate } from "./claude-version.js";
 import { engines } from "./registry.js";
 import { KNOWN_ROUTES, UNTRUSTED_ROUTES, parseOneShotSettings } from "./config.js";
-import { UNTRUSTED_CLAUDE_ARGS } from "./isolation.js";
+import { PRINT_ONLY_UNTRUSTED_ARGS, UNTRUSTED_CLAUDE_ARGS } from "./isolation.js";
+import { untrustedPtyProjectDir } from "./pty-cleanup.js";
 import { buildPrintArgs, withPrintRuntime } from "./print.js";
 import { PtyClosedError, __buildClaudeArgsForTests } from "../runner/pty-process.js";
 import {
@@ -56,7 +66,7 @@ function recordingSpawn(record: { args: string[]; input: string; cwd: string }):
   }) as unknown as typeof spawn;
 }
 
-/** The PTY engine cannot take untrusted calls; open it only to exercise cleanup. */
+/** Force the PTY engine's isolation capability on, whatever the claude version gate decided. */
 async function withPtyIsolation<T>(call: () => T | Promise<T>): Promise<T> {
   const caps = engines.get("pty")!.caps;
   const previous = caps.isolation;
@@ -98,7 +108,8 @@ let configDir: string;
 beforeEach(async () => {
   configDir = mkdtempSync(join(tmpdir(), "oneshot-test-"));
   const file = join(configDir, "settings.json");
-  writeFileSync(file, "{}");
+  // These are explicit print-engine contracts, independent of the runner default.
+  writeFileSync(file, JSON.stringify({ oneShot: { default: "print" } }));
   _setSettingsFileForTests(file);
   await loadSettings();
   injectOneShotTrustForTests(async () => {});
@@ -283,9 +294,13 @@ describe("one-shot isolation contract", () => {
       expect(build).toBeDefined();
       const args = build!();
       const start = args.indexOf("--tools");
-      expect(args.slice(start, start + UNTRUSTED_CLAUDE_ARGS.length)).toEqual([
-        ...UNTRUSTED_CLAUDE_ARGS,
-      ]);
+      const expected =
+        engine.id === "pty"
+          ? UNTRUSTED_CLAUDE_ARGS.filter(
+              (arg) => !(PRINT_ONLY_UNTRUSTED_ARGS as readonly string[]).includes(arg),
+            )
+          : [...UNTRUSTED_CLAUDE_ARGS];
+      expect(args.slice(start, start + expected.length)).toEqual(expected);
       for (const flag of [
         "--mcp-config",
         "--resume",
@@ -426,35 +441,58 @@ describe("one-shot isolation contract", () => {
       expect(cwd).not.toBe("");
       expect(existsSync(cwd)).toBe(false);
     });
-    it("is removed when the spawn never lands", async () => {
+    it("is kept while the spawn has not landed, and removed once it has landed and its exit is confirmed", async () => {
+      // #581 cp5: a claude that may still land is a writer, so nothing of the call is removed
+      // until that child is confirmed gone. Went red with the first pass left in place (the
+      // directory was removed at once).
       let cwd = "";
+      let land!: (pty: never) => void;
       injectSpawnPty((opts) => {
         cwd = opts.cwd;
-        return new Promise(() => {});
+        return new Promise((resolve) => {
+          land = resolve;
+        });
       });
       const result = await withPtyIsolation(() =>
         engines.get("pty")!.run({ ...req, timeoutMs: 30 }),
       );
       expect(result.exitCode).toBe(124);
       expect(cwd).not.toBe("");
+      expect(existsSync(cwd)).toBe(true);
+      land(ptyDouble(() => new Promise(() => {})));
+      for (let i = 0; i < 300 && existsSync(cwd); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
       expect(existsSync(cwd)).toBe(false);
     });
     it("is removed after a normal turn", async () => {
       let cwd = "";
+      const saved = process.env.CLAUDE_CONFIG_DIR;
+      process.env.CLAUDE_CONFIG_DIR = configDir;
       injectSpawnPty(async (opts) => {
         cwd = opts.cwd;
         return {
-          runTurn: async () => ({
-            text: "ok",
-            sessionId: "s",
-            bytesCaptured: 2,
-            cleanBoundary: true,
-          }),
+          runTurn: async () => {
+            // The untrusted result is the transcript reply the process read (#570, #581 cp4), not
+            // the screen; the fake claude's transcript is still left on disk for cleanup to remove.
+            const project = untrustedPtyProjectDir(opts.cwd, opts.env.CLAUDE_CONFIG_DIR!);
+            mkdirSync(project, { recursive: true });
+            writeFileSync(
+              join(project, "s.jsonl"),
+              `${JSON.stringify({ type: "assistant", message: { id: "m", model: "haiku", content: [{ type: "text", text: "ok" }] } })}\n`,
+            );
+            return { text: "ok", sessionId: "s", bytesCaptured: 2, cleanBoundary: true };
+          },
           dispose: async () => {},
         } as never;
       });
-      const result = await withPtyIsolation(() => engines.get("pty")!.run(req));
-      expect(result.text).toBe("ok");
+      try {
+        const result = await withPtyIsolation(() => engines.get("pty")!.run(req));
+        expect(result.text).toBe("ok");
+      } finally {
+        if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+        else process.env.CLAUDE_CONFIG_DIR = saved;
+      }
       expect(existsSync(cwd)).toBe(false);
     });
   });
@@ -548,9 +586,9 @@ describe("one-shot configuration", () => {
   it("rejects bad routing during settings load", async () => {
     writeFileSync(
       join(configDir, "settings.json"),
-      JSON.stringify({ oneShot: { routes: { "memory.recall": "pty" } } }),
+      JSON.stringify({ oneShot: { routes: { "memory.recall": "missing" } } }),
     );
-    await expect(reloadSettings()).rejects.toThrow("spike");
+    await expect(reloadSettings()).rejects.toThrow("Unknown");
   });
   it("routes trusted requests to the selected engine and logs once", async () => {
     const original = console.info;
@@ -603,8 +641,8 @@ describe("one-shot configuration", () => {
       engines.delete("fake");
     }
   });
-  it("defaults every route to print", () =>
-    expect(parseOneShotSettings(undefined)).toEqual({ default: "print", engines: {}, routes: {} }));
+  it("preserves an absent default for runtime route resolution", () =>
+    expect(parseOneShotSettings(undefined)).toEqual({ engines: {}, routes: {} }));
   it("rejects resume routes on engines without resume capability", () => {
     engines.set("stateless", {
       id: "stateless",
@@ -624,11 +662,29 @@ describe("one-shot configuration", () => {
     { default: "pty" },
     { routes: { "tuner.*": "pty" } },
   ]) {
-    it(`rejects untrusted PTY before the isolation spike: ${JSON.stringify(settings)}`, () =>
-      expect(() => parseOneShotSettings(settings)).toThrow("spike"));
+    it(`accepts untrusted PTY now the isolation spike is green: ${JSON.stringify(settings)}`, () =>
+      expect(() => parseOneShotSettings(settings)).not.toThrow());
+    it(`loads before the startup gate has run, with isolation still off: ${JSON.stringify(settings)}`, () => {
+      const saved = engines.get("pty")!.caps.isolation;
+      engines.get("pty")!.caps.isolation = false;
+      try {
+        expect(() => parseOneShotSettings(settings)).not.toThrow();
+      } finally {
+        engines.get("pty")!.caps.isolation = saved;
+      }
+    });
   }
-  it("the PTY engine does not advertise isolation until the spike is green", () =>
-    expect(engines.get("pty")!.caps.isolation).toBe(false));
+  it("the PTY engine advertises isolation once the startup gate has seen a measured claude (#570)", () => {
+    const saved = engines.get("pty")!.caps.isolation;
+    try {
+      applyPtyIsolationVersionGate("2.1.304", () => {});
+      expect(engines.get("pty")!.caps.isolation).toBe(true);
+      applyPtyIsolationVersionGate("2.1.303", () => {});
+      expect(engines.get("pty")!.caps.isolation).toBe(false);
+    } finally {
+      engines.get("pty")!.caps.isolation = saved;
+    }
+  });
   it("rejects untrusted routes on any engine without the isolation capability", () => {
     engines.set("noiso", {
       id: "noiso",

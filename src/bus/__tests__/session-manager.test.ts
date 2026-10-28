@@ -477,6 +477,24 @@ describe("process-stream-json supervision", () => {
     expect(stopIdx).toBeGreaterThanOrEqual(0);
     expect(exitIdx).toBeLessThanOrEqual(stopIdx);
   }, 10000);
+
+  it("stop() waits for the exit of a child that outlives /quit and dies a while after SIGTERM", async () => {
+    // Ignores stdin (so /quit and EOF do nothing) and takes a second to die after SIGTERM: the
+    // 2 s fallback's SIGTERM is sent, but the exit event comes later. Only a PTY agent is retired
+    // through the OS's word at that point; a plain child is finalised from its exit event.
+    const slowMgr = new SessionManager({
+      commandOverride: "/bin/sh",
+      argsOverride: ["-c", 'trap "sleep 1; exit 0" TERM; while :; do sleep 0.1; done'],
+      busSocketPath: "/tmp/test-bus-slow.sock",
+    });
+    const agent = mkAgent({ id: "psj-slow-term", supervision: "process-stream-json" });
+    const proc = await slowMgr.spawnAgent(agent, "cron");
+    const events: string[] = [];
+    proc.onExit(() => events.push("exit"));
+    await slowMgr.stop(agent.id);
+    events.push("stop-resolved");
+    expect(events).toEqual(["exit", "stop-resolved"]);
+  }, 10000);
 });
 
 /* ───────────────────────────────────────────────────────────────────── */

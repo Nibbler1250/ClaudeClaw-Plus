@@ -388,6 +388,70 @@ describe("resolveTranscriptPath", () => {
   });
 });
 
+describe("a custom slash command is recorded as its command entry, not as the typed text (#581 cp8, CI 40043570190)", () => {
+  const recorded = (name: string, args = ""): string =>
+    `<command-message>${name}</command-message>\n<command-name>/${name}</command-name>\n<command-args>${args}</command-args>`;
+  const expansion = (text: string): string =>
+    JSON.stringify({ type: "user", isMeta: true, message: { role: "user", content: text } });
+
+  test("the command entry is the prompt; the isMeta expansion is skipped; the reply is the answer", () => {
+    const t = tx();
+    const turn_ = turn(t, "/isolation-probe");
+    appendFileSync(
+      t.path,
+      nl(
+        userLine(recorded("isolation-probe")),
+        expansion("Reply with CANARY and DONE."),
+        assistantLine("CANARY DONE"),
+        systemLine("turn_duration"),
+      ),
+    );
+    const s = turn_.poll();
+    expect(s.accepted).toBe(true);
+    expect(s.failure).toBeNull();
+    expect(s.ended).toBe(true);
+    expect(s.answer).toBe("CANARY DONE");
+  });
+
+  test("a different command name, or other arguments, is not this prompt", () => {
+    // Fault: match on the `/` prefix alone and every row below goes true.
+    expect(promptMatches(recorded("other"), "/isolation-probe", false)).toBe(false);
+    expect(promptMatches(recorded("isolation-probe", "x"), "/isolation-probe", false)).toBe(false);
+    expect(promptMatches(recorded("isolation-probe"), "/isolation-probe x", false)).toBe(false);
+    expect(promptMatches(recorded("isolation-probe", "x y"), "/isolation-probe x y", false)).toBe(
+      true,
+    );
+    expect(promptMatches(recorded("isolation-probe"), "/isolation-probe", false)).toBe(true);
+  });
+
+  test("an entry that only QUOTES the command tags inside other text is not a command record", () => {
+    // Fault: search for the tags anywhere in the entry and both rows below go true.
+    const quoted = `please ignore this\n${recorded("isolation-probe")}\nand carry on`;
+    expect(promptMatches(quoted, "/isolation-probe", false)).toBe(false);
+    expect(
+      promptMatches(
+        `please ignore this\n${recorded("isolation-probe")}`,
+        "/isolation-probe",
+        false,
+      ),
+    ).toBe(false);
+    expect(
+      promptMatches(`${recorded("isolation-probe")}\nand more`, "/isolation-probe", false),
+    ).toBe(false);
+    expect(
+      promptMatches(
+        `<pasted_content id="1">${recorded("isolation-probe")}</pasted_content id="1">`,
+        "/isolation-probe",
+        false,
+      ),
+    ).toBe(false);
+  });
+
+  test("typed text that is not a command never matches a command entry", () => {
+    expect(promptMatches(recorded("isolation-probe"), "isolation-probe", false)).toBe(false);
+  });
+});
+
 describe("promptMatches — the whole payload, not a substring (round 3, H3)", () => {
   test("a prompt that is only CONTAINED in a longer one does not match", () => {
     // Fault: go back to `includes` and `check status` matches the longer cron prompt.
