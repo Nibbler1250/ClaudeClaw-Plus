@@ -133,7 +133,7 @@ describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () =
     os.signalPid = (pid, sig) => {
       if (sig === "SIGKILL" && atKill === null && procRef) {
         atKill = { exitReported: !procRef.isAlive(), osAlive: os.alive, settled };
-        killAfterMs = Date.now() - disposedAt;
+        killAfterMs = performance.now() - disposedAt;
       }
       signalPid(pid, sig);
     };
@@ -142,7 +142,7 @@ describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () =
     const fake = child as FakeChild | null;
     if (!fake) throw new Error("fake bun-pty was not used");
 
-    disposedAt = Date.now();
+    disposedAt = performance.now();
     const disposing = proc.dispose().then(() => {
       settled = true;
     });
