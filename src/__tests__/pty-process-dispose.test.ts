@@ -9,7 +9,7 @@
  * deterministic. The real library and a real stubborn child are in
  * `pty-process-dispose-real.test.ts`.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { PtyExitUnconfirmedError, spawnPty } from "../runner/pty-process";
 import { withPlatformAsync } from "../runner/pty-test-platform";
 
@@ -160,6 +160,40 @@ describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () =
 
     expect(os.alive).toBe(false);
     expect(fake.kills).toEqual(["SIGTERM"]);
+  });
+
+  test("a leader that died on its own is retired by its exit; a retirement that fails is retried by the next dispose(), which rejects (#606)", async () => {
+    // The exit-triggered retirement cannot confirm the exit (the process survives SIGKILL). It
+    // is only logged; the caller's next dispose() must make a fresh attempt and reject, since
+    // that rejection is what the supervisor quarantines on.
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const os = makeOs();
+      os.immune = true;
+      const proc = await spawnWith(os);
+      const fake = child as FakeChild | null;
+      if (!fake) throw new Error("fake bun-pty was not used");
+
+      for (const cb of fake.exitCbs) cb({ exitCode: 1 }); // died on its own, no kill() from us
+      expect(proc.isAlive()).toBe(false);
+      for (
+        let w = 0;
+        w < 100 && !warn.mock.calls.some((c) => /after the exit failed/.test(String(c[0])));
+        w++
+      ) {
+        await new Promise<void>((r) => setTimeout(r, 20));
+      }
+      // The exit itself ran the retirement: SIGKILL went to the group, and it failed.
+      expect(os.log.filter((e) => e.endsWith(":SIGKILL")).length).toBeGreaterThan(0);
+      expect(warn.mock.calls.some((c) => /after the exit failed/.test(String(c[0])))).toBe(true);
+      expect(fake.kills).toEqual([]);
+
+      const before = os.log.length;
+      await expect(proc.dispose()).rejects.toBeInstanceOf(PtyExitUnconfirmedError);
+      expect(os.log.length).toBeGreaterThan(before); // a fresh attempt, not the cached rejection
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   test("SIGKILL goes straight to the OS, to the group (which already reaches the leader)", async () => {
