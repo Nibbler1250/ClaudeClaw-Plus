@@ -835,6 +835,10 @@ class PtyProcessImpl implements PtyProcess {
   /** When the screen last painted: readiness timing only. */
   private _lastDataAt = 0;
   private _disposed = false;
+  /** Set at the hand-over from `spawnPty`: from then on the caller owns the process (#606). */
+  private _handedOver = false;
+  /** The retirement was started by the exit itself, not by a caller (#606). */
+  private _selfRetired = false;
   /** The retirement in flight or last settled OK; cleared when it rejects so a retry runs. */
   private _disposal: Promise<void> | null = null;
   private readonly _signalPid: (pid: number, signal: NodeJS.Signals | 0) => void;
@@ -1276,6 +1280,12 @@ class PtyProcessImpl implements PtyProcess {
     if (this._alive && !this._disposed) this._noteGroupMembers();
   }
 
+  /** The hand-over from `spawnPty`: learn the group and arm the retirement on an unplanned exit. */
+  _handOver(): void {
+    this._handedOver = true;
+    this._noteLiveGroup();
+  }
+
   private _handleExit(info: { exitCode: number; signal?: number | string }): void {
     this._alive = false;
     // No member look here: the exit callback proves nothing about whose group this is (it can be
@@ -1299,6 +1309,28 @@ class PtyProcessImpl implements PtyProcess {
     // A child that exited while the ready gate waited will never show a footer. A boot screen it
     // died on (a login menu) is still the better reason.
     this._endReplGate?.(this._blockedBootReason() ?? "exited");
+
+    // #606: a leader that dies on its own (crash, OOM kill) leaves its group behind, MCP servers
+    // that ignore SIGTERM, SIGHUP and stdin EOF included, and nothing else retires it until the
+    // entry is next touched: the next turn on a session that may not see one for hours. Retire it
+    // now. Deferred out of bun-pty's `fire()` loop (see the NOTE above), on a real timer like the
+    // retirement's own. A later `dispose()` (respawn, /kill, shutdown) joins this one, and one that
+    // could not confirm the exit is retried by it, so a quarantine still happens where it did.
+    if (this._handedOver && !this._disposed) {
+      setTimeout(() => {
+        if (this._disposed) return;
+        this._selfRetired = true;
+        console.warn(
+          `[pty-process] ${this.label}: exited outside a retirement (code=${this._exitInfo?.exitCode ?? "?"}, signal=${this._exitInfo?.signal ?? "none"}); retiring its group now`,
+        );
+        this.dispose().catch((err) => {
+          // The next dispose() makes a fresh attempt, and its caller quarantines on a rejection.
+          console.warn(
+            `[pty-process] ${this.label}: retiring the group after the exit failed (${(err as Error)?.message ?? "error"}); left to the next dispose`,
+          );
+        });
+      }, 0);
+    }
 
     if (this._turnInProgress) {
       // A reply the transcript committed (even one not read yet) stays the outcome: the
@@ -1698,8 +1730,10 @@ class PtyProcessImpl implements PtyProcess {
    * the screen is no longer collected.
    */
   _awaitReplReady(budgetMs: number): Promise<ReplReadyVerdict> {
-    // A child that is already retired or gone will never show a footer: no wait, no timers.
-    if (this._disposed) return Promise.resolve({ ok: false, reason: "closed" });
+    // A child that is already retired or gone will never show a footer: no wait, no timers. One
+    // retired by its own exit (#606) reports the exit, as it did before that retirement existed.
+    if (this._disposed && !this._selfRetired)
+      return Promise.resolve({ ok: false, reason: "closed" });
     if (!this._alive)
       return Promise.resolve({ ok: false, reason: this._blockedBootReason() ?? "exited" });
     return new Promise((resolve) => {
@@ -2132,7 +2166,7 @@ export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
     const proc = new PtyProcessImpl(pty, opts);
 
     if (opts._skipReadySettle) {
-      proc._noteLiveGroup(); // the hand-over: see `_noteLiveGroup`
+      proc._handOver(); // the hand-over: see `_noteLiveGroup`
       resolve(proc);
       return;
     }
@@ -2164,7 +2198,7 @@ export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
         reject(new Error(`PTY for ${cmd} exited before TUI settled (pid=${pty.pid})${detail}`));
         return;
       }
-      proc._noteLiveGroup(); // the hand-over: see `_noteLiveGroup`
+      proc._handOver(); // the hand-over: see `_noteLiveGroup`
       resolve(proc);
     });
   });
