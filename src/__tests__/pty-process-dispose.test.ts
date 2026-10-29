@@ -120,23 +120,43 @@ describe("PtyProcess.dispose — the OS decides, not bun-pty's exit event", () =
     // Fault (site: `_retire`, drop the OS confirmation): dispose() resolves as soon as
     // bun-pty's synthetic exit event has fired. Predicted result: `settled` is already true
     // at the check below, and the OS still shows the child.
+    // The state is read when SIGKILL reaches the OS, not after a fixed sleep: a 60 ms timer
+    // that fired late under CPU load landed past the 150 ms grace, after SIGKILL had already
+    // taken the child (#613).
     const os = makeOs();
+    let settled = false;
+    let atKill: { exitReported: boolean; osAlive: boolean; settled: boolean } | null = null;
+    let procRef: { isAlive(): boolean } | null = null;
+    let disposedAt = 0;
+    let killAfterMs = -1;
+    const signalPid = os.signalPid;
+    os.signalPid = (pid, sig) => {
+      if (sig === "SIGKILL" && atKill === null && procRef) {
+        atKill = { exitReported: !procRef.isAlive(), osAlive: os.alive, settled };
+        killAfterMs = Date.now() - disposedAt;
+      }
+      signalPid(pid, sig);
+    };
     const proc = await spawnWith(os);
+    procRef = proc;
     const fake = child as FakeChild | null;
     if (!fake) throw new Error("fake bun-pty was not used");
 
-    let settled = false;
+    disposedAt = Date.now();
     const disposing = proc.dispose().then(() => {
       settled = true;
     });
-    await new Promise<void>((r) => setTimeout(r, 60));
-
-    // bun-pty already reported the exit, and the OS still has the process.
-    expect(proc.isAlive()).toBe(false);
-    expect(os.alive).toBe(true);
-    expect(settled).toBe(false);
-
     await disposing;
+
+    // When SIGKILL went out, bun-pty had already reported the exit, the OS still had the
+    // process, and dispose() was still pending.
+    expect(atKill).toEqual({ exitReported: true, osAlive: true, settled: false });
+    // The group got SIGTERM first and SIGKILL only once the grace was out. A timer never fires
+    // early, so this lower bound cannot flake under load; the margin covers clock rounding.
+    const term = os.log.findIndex((e) => e.endsWith(":SIGTERM"));
+    expect(term).toBeGreaterThanOrEqual(0);
+    expect(term).toBeLessThan(os.log.findIndex((e) => e.endsWith(":SIGKILL")));
+    expect(killAfterMs).toBeGreaterThanOrEqual(140);
 
     expect(os.alive).toBe(false);
     expect(fake.kills).toEqual(["SIGTERM"]);
