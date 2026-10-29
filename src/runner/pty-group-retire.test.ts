@@ -152,7 +152,24 @@ describe("retiring a PTY child", () => {
   it("sweeps the descendants of a child that already exited on its own", async () => {
     const { child, bg } = await spawnShell(BG_THEN_EXIT);
     await learnThenExit(child);
-    expect(alive(bg)).toBe(true); // the leader is gone, its background child is not
+    // The leader is gone and its background child may not be yet: since #606 the exit itself
+    // starts the sweep (the next test), and this dispose joins it.
+    await child.dispose();
+    expect(alive(bg)).toBe(false);
+  });
+
+  it("retires the group of a leader that died on its own while idle, without waiting for a dispose (#606)", async () => {
+    // The runner case: the PTY claude is SIGKILLed between turns and its MCP servers ignore
+    // SIGTERM, SIGHUP and stdin EOF. Nothing touches the entry until the next turn, which on a
+    // rarely used session can be hours. Went red (the child alive at the deadline) with the
+    // retirement left to the next dispose.
+    const { child, bg } = await spawnShell(
+      "(trap '' HUP TERM; : > $BG.ready; exec sleep 60) & echo $! > $BG; while [ ! -e $BG.ready ] || [ ! -e $BG.go ]; do sleep 0.02; done",
+      { _exitGraceMs: 300, _exitCapMs: 3300 },
+    );
+    await learnThenExit(child);
+    await until(() => !alive(bg), 3000);
+    // The dispose that comes later (the next turn's respawn, /kill, shutdown) joins it.
     await child.dispose();
     expect(alive(bg)).toBe(false);
   });
