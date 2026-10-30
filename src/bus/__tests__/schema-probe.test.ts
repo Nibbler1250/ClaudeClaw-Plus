@@ -38,6 +38,7 @@ import {
   SCHEMA_VERSION,
 } from "../schema-probe";
 import { encodeCwdForProjectsDirPrefix } from "../jsonl-line-types";
+import { _setClaudeExecutableForTests } from "../../runner/claude-executable";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
 
@@ -393,6 +394,34 @@ describe("SchemaProbe.run() — skip mode", () => {
     const res = await probe.run();
     expect(res.status).toBe("skipped");
     expect(existsSync(harness.cacheFile)).toBe(false);
+  });
+});
+
+describe("SchemaProbe.run() — default claude binary", () => {
+  afterEach(() => _setClaudeExecutableForTests(null));
+
+  it("spawns claudeExecutable() when no claudeBin is given", async () => {
+    // On Windows that is the resolved claude.exe: bun-pty cannot start the
+    // `claude.cmd` shim a bare "claude" resolves to.
+    _setClaudeExecutableForTests(harness.claudeBin);
+    let spawnedBin: string | null = null;
+    const probe = new SchemaProbe(
+      {
+        mode: "warn-only",
+        force: true,
+        cacheFile: harness.cacheFile,
+        homeOverride: harness.homeDir,
+        timeoutMs: FAST_TIMEOUT_MS,
+      },
+      async ({ claudeBin }) => {
+        spawnedBin = claudeBin;
+        throw new Error("stop after spawn");
+      },
+    );
+    const res = await probe.run();
+    // `--version` ran against the same binary (the stub's version came back).
+    expect(res.claudeVersion).toBe("claude 2.1.143");
+    expect(spawnedBin).toBe(harness.claudeBin);
   });
 });
 
@@ -768,6 +797,14 @@ describe("captureClaudeVersion — win32 shell-true branch is platform-injectabl
     expect(calls[0]?.cmd).toBe("/fake/claude.cmd");
     expect(calls[0]?.args).toEqual(["--version"]);
     expect(calls[0]?.opts.shell).toBe(true);
+  });
+
+  it("passes shell: false on win32 for a resolved claude.exe (a path with spaces stays one argv)", async () => {
+    const { spawn, calls } = makeFakeSpawn();
+    const exe = "C:\\Users\\Jane Doe\\AppData\\Roaming\\npm\\claude.EXE";
+    await __captureClaudeVersionForTests(exe, 1000, "win32", spawn);
+    expect(calls[0]?.cmd).toBe(exe);
+    expect(calls[0]?.opts.shell).toBe(false);
   });
 
   it("passes shell: false on POSIX platforms (no shell injection surface)", async () => {
