@@ -11,6 +11,7 @@ import {
   reprobeUnsupportedLatch,
   sharedLibTargets,
   decideWarmupAction,
+  zipExtractCommand,
 } from "../whisper";
 
 /**
@@ -240,5 +241,29 @@ describe("decideWarmupAction", () => {
 
   test("leaves a working binary alone", async () => {
     expect(await decideWarmupAction(process.execPath)).toBe("ok");
+  });
+});
+
+describe("zipExtractCommand", () => {
+  test("win32 uses the System32 bsdtar, not unzip (absent on a stock Windows)", () => {
+    expect(zipExtractCommand("C:\\t\\w.zip", "C:\\t\\x", "win32", "D:\\Win")).toEqual([
+      "D:\\Win\\System32\\tar.exe",
+      "-xf",
+      "C:\\t\\w.zip",
+      "-C",
+      "C:\\t\\x",
+    ]);
+  });
+
+  test("Linux and macOS keep unzip", () => {
+    for (const platform of ["linux", "darwin"] as const) {
+      expect(zipExtractCommand("/t/w.zip", "/t/x", platform)).toEqual([
+        "unzip",
+        "-o",
+        "/t/w.zip",
+        "-d",
+        "/t/x",
+      ]);
+    }
   });
 });

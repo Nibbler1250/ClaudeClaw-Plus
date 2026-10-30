@@ -1,7 +1,7 @@
 import { execSync } from "node:child_process";
 import { chmod, mkdir, rename, rm, stat, access, readdir, open, readFile } from "node:fs/promises";
 import { statSync } from "node:fs";
-import { basename, extname, join } from "node:path";
+import { basename, extname, join, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getSettings } from "./config";
 
@@ -318,6 +318,25 @@ async function downloadFile(
   await rename(tmpPath, destPath);
 }
 
+/**
+ * Argv that extracts a zip archive. `unzip` is not on a stock Windows; the
+ * bsdtar in System32 (Windows 10 1803+) reads zip. Called by absolute path:
+ * a Git for Windows GNU `tar` earlier on PATH cannot read zip and treats
+ * `C:` as a remote host. Exported for tests.
+ */
+export function zipExtractCommand(
+  archivePath: string,
+  extractDir: string,
+  platform: NodeJS.Platform = process.platform,
+  systemRoot: string = process.env.SystemRoot ?? "C:\\Windows",
+): string[] {
+  if (platform === "win32") {
+    const tar = win32.join(systemRoot, "System32", "tar.exe");
+    return [tar, "-xf", archivePath, "-C", extractDir];
+  }
+  return ["unzip", "-o", archivePath, "-d", extractDir];
+}
+
 async function downloadAndExtractBinary(): Promise<void> {
   const platformKey = `${process.platform}-${process.arch}`;
   const source = BINARY_SOURCES[platformKey];
@@ -357,7 +376,7 @@ async function downloadAndExtractBinary(): Promise<void> {
       throw new Error(`Failed to extract tar.gz: ${proc.stderr.toString()}`);
     }
   } else {
-    const proc = Bun.spawnSync(["unzip", "-o", archivePath, "-d", extractDir]);
+    const proc = Bun.spawnSync(zipExtractCommand(archivePath, extractDir));
     if (proc.exitCode !== 0) {
       throw new Error(`Failed to extract zip: ${proc.stderr.toString()}`);
     }
