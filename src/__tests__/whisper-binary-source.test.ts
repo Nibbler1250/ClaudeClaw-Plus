@@ -11,6 +11,7 @@ import {
   reprobeUnsupportedLatch,
   sharedLibTargets,
   decideWarmupAction,
+  findExecutable,
   zipExtractCommand,
 } from "../whisper";
 
@@ -265,5 +266,35 @@ describe("zipExtractCommand", () => {
         "/t/x",
       ]);
     }
+  });
+});
+
+describe("findExecutable", () => {
+  // The v1.7.6 Windows zip holds Release/main.exe (a stub that exits 1) next
+  // to Release/whisper-cli.exe. Listing order is up to the filesystem (ext4
+  // hashes names), so the stub is also planted in 20 sibling directories:
+  // a first-listed-wins search takes a stub unless `Release` happens to be
+  // listed before all of them.
+  test("prefers whisper-cli over the main stub wherever the stub is listed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "whisper-find-"));
+    await mkdir(join(root, "Release"));
+    await writeFile(join(root, "Release", "main.exe"), "");
+    await writeFile(join(root, "Release", "whisper-cli.exe"), "");
+    for (let i = 0; i < 20; i++) {
+      await mkdir(join(root, `a${i}`));
+      await writeFile(join(root, `a${i}`, "main.exe"), "");
+    }
+    expect(await findExecutable(root, ["whisper-cli", "main"], "win32")).toBe(
+      join(root, "Release", "whisper-cli.exe"),
+    );
+  });
+
+  test("falls back to main when there is no whisper-cli", async () => {
+    const root = await mkdtemp(join(tmpdir(), "whisper-find-"));
+    await mkdir(join(root, "bin"));
+    await writeFile(join(root, "bin", "main"), "");
+    expect(await findExecutable(root, ["whisper-cli", "main"], "linux")).toBe(
+      join(root, "bin", "main"),
+    );
   });
 });

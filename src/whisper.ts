@@ -227,11 +227,20 @@ export async function binaryIsRunnable(binaryPath: string): Promise<boolean> {
   }
 }
 
-async function findExecutable(dir: string, names: string[]): Promise<string | null> {
-  const suffix = process.platform === "win32" ? ".exe" : "";
-  const targets = names.flatMap((n) => (suffix ? [n + suffix, n] : [n]));
+/**
+ * First file named after `names[0]`, else `names[1]`, ... anywhere under `dir`.
+ * Names are tried in order over the whole tree, never "first listed wins": the
+ * v1.7.6 Windows zip ships `Release/main.exe`, a deprecation stub that exits 1,
+ * next to `whisper-cli.exe`, and NTFS lists `main.exe` first. Exported for tests.
+ */
+export async function findExecutable(
+  dir: string,
+  names: string[],
+  platform: NodeJS.Platform = process.platform,
+): Promise<string | null> {
+  const suffix = platform === "win32" ? ".exe" : "";
 
-  async function search(current: string): Promise<string | null> {
+  async function search(current: string, targets: string[]): Promise<string | null> {
     let entries: Awaited<ReturnType<typeof readdir>>;
     try {
       entries = await readdir(current, { withFileTypes: true });
@@ -242,14 +251,18 @@ async function findExecutable(dir: string, names: string[]): Promise<string | nu
       const fullPath = join(current, entry.name);
       if (entry.isFile() && targets.includes(entry.name)) return fullPath;
       if (entry.isDirectory()) {
-        const found = await search(fullPath);
+        const found = await search(fullPath, targets);
         if (found) return found;
       }
     }
     return null;
   }
 
-  return search(dir);
+  for (const name of names) {
+    const found = await search(dir, suffix ? [name + suffix, name] : [name]);
+    if (found) return found;
+  }
+  return null;
 }
 
 function formatBytes(bytes: number): string {
