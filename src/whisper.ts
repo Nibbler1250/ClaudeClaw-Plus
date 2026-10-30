@@ -1,7 +1,7 @@
 import { execSync } from "node:child_process";
 import { chmod, mkdir, rename, rm, stat, access, readdir, open, readFile } from "node:fs/promises";
 import { statSync } from "node:fs";
-import { basename, extname, join } from "node:path";
+import { basename, extname, join, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getSettings } from "./config";
 
@@ -227,11 +227,20 @@ export async function binaryIsRunnable(binaryPath: string): Promise<boolean> {
   }
 }
 
-async function findExecutable(dir: string, names: string[]): Promise<string | null> {
-  const suffix = process.platform === "win32" ? ".exe" : "";
-  const targets = names.flatMap((n) => (suffix ? [n + suffix, n] : [n]));
+/**
+ * First file named after `names[0]`, else `names[1]`, ... anywhere under `dir`.
+ * Names are tried in order over the whole tree, never "first listed wins": the
+ * v1.7.6 Windows zip ships `Release/main.exe`, a deprecation stub that exits 1,
+ * next to `whisper-cli.exe`, and NTFS lists `main.exe` first. Exported for tests.
+ */
+export async function findExecutable(
+  dir: string,
+  names: string[],
+  platform: NodeJS.Platform = process.platform,
+): Promise<string | null> {
+  const suffix = platform === "win32" ? ".exe" : "";
 
-  async function search(current: string): Promise<string | null> {
+  async function search(current: string, targets: string[]): Promise<string | null> {
     let entries: Awaited<ReturnType<typeof readdir>>;
     try {
       entries = await readdir(current, { withFileTypes: true });
@@ -242,14 +251,18 @@ async function findExecutable(dir: string, names: string[]): Promise<string | nu
       const fullPath = join(current, entry.name);
       if (entry.isFile() && targets.includes(entry.name)) return fullPath;
       if (entry.isDirectory()) {
-        const found = await search(fullPath);
+        const found = await search(fullPath, targets);
         if (found) return found;
       }
     }
     return null;
   }
 
-  return search(dir);
+  for (const name of names) {
+    const found = await search(dir, suffix ? [name + suffix, name] : [name]);
+    if (found) return found;
+  }
+  return null;
 }
 
 function formatBytes(bytes: number): string {
@@ -318,6 +331,25 @@ async function downloadFile(
   await rename(tmpPath, destPath);
 }
 
+/**
+ * Argv that extracts a zip archive. `unzip` is not on a stock Windows; the
+ * bsdtar in System32 (Windows 10 1803+) reads zip. Called by absolute path:
+ * a Git for Windows GNU `tar` earlier on PATH cannot read zip and treats
+ * `C:` as a remote host. Exported for tests.
+ */
+export function zipExtractCommand(
+  archivePath: string,
+  extractDir: string,
+  platform: NodeJS.Platform = process.platform,
+  systemRoot: string = process.env.SystemRoot ?? "C:\\Windows",
+): string[] {
+  if (platform === "win32") {
+    const tar = win32.join(systemRoot, "System32", "tar.exe");
+    return [tar, "-xf", archivePath, "-C", extractDir];
+  }
+  return ["unzip", "-o", archivePath, "-d", extractDir];
+}
+
 async function downloadAndExtractBinary(): Promise<void> {
   const platformKey = `${process.platform}-${process.arch}`;
   const source = BINARY_SOURCES[platformKey];
@@ -357,7 +389,7 @@ async function downloadAndExtractBinary(): Promise<void> {
       throw new Error(`Failed to extract tar.gz: ${proc.stderr.toString()}`);
     }
   } else {
-    const proc = Bun.spawnSync(["unzip", "-o", archivePath, "-d", extractDir]);
+    const proc = Bun.spawnSync(zipExtractCommand(archivePath, extractDir));
     if (proc.exitCode !== 0) {
       throw new Error(`Failed to extract zip: ${proc.stderr.toString()}`);
     }

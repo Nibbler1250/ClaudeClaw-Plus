@@ -35,6 +35,7 @@ import {
 } from "./schema-probe-assertions";
 import { defaultPtyRunnerFactory } from "./schema-probe-runner";
 import type { ProbeRunner, ProbeRunnerFactory, ProbeRunnerSpawnArgs } from "./schema-probe-types";
+import { claudeExecutable } from "../runner/claude-executable";
 import { quarantineSession } from "../runner/pty-quarantine";
 import type { PtyProcess } from "../runner/pty-process";
 
@@ -49,7 +50,7 @@ export interface SchemaProbeOptions {
   mode?: "warn-only" | "required" | "skip";
   /** Cache file path. Defaults to `~/.claudeclaw/schema-probe-cache.json`. */
   cacheFile?: string;
-  /** Path to claude binary; defaults to PATH lookup of `claude`. */
+  /** Path to claude binary; defaults to `claudeExecutable()` (`claude.exe` on Windows). */
   claudeBin?: string;
   /** Force re-probe regardless of cache. */
   force?: boolean;
@@ -173,7 +174,9 @@ async function captureClaudeVersion(
       // it that way so this win32 shell path never becomes a sink.
       // (runner.ts resolves the underlying claude.exe instead — that's for
       // Bun.spawn + long argvs; here we're on node:child_process with `--version`.)
-      shell: platform === "win32",
+      // A resolved `claude.exe` needs no shell, and a shell would split a path
+      // with spaces in it (`C:\Users\Jane Doe\...`).
+      shell: platform === "win32" && !claudeBin.toLowerCase().endsWith(".exe"),
     });
     let out = "";
     let settled = false;
@@ -315,7 +318,8 @@ export class SchemaProbe {
       return { status: "skipped", claudeVersion: "", schemaHash: "" };
     }
 
-    const claudeBin = this.opts.claudeBin ?? "claude";
+    // claude.exe on Windows: bun-pty cannot start the `claude.cmd` shim.
+    const claudeBin = this.opts.claudeBin ?? claudeExecutable();
     const version = await captureClaudeVersion(claudeBin);
     if (!version) {
       return this.handleFailure("", [

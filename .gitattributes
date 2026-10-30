@@ -1,3 +1,16 @@
+# Line endings: LF in the repo and in every checkout, whatever core.autocrlf
+# says. A Windows clone with autocrlf=true otherwise gets CRLF everywhere and
+# `bun run lint` (Biome) fails on every file.
+* text=auto eol=lf
+
+# Binary assets: never touched.
+*.png   binary
+*.woff2 binary
+*.bin   binary
+
+# Third-party licence text, committed with CRLF: kept byte for byte.
+src/ui/page/fonts/OFL-spacegrotesk.txt -text
+
 # Plus-specific files that must not be overwritten when manually merging upstream.
 # The 'ours' merge driver keeps our version on conflict during a manual upstream pull.
 # Enable before merging: git config merge.ours.driver true
